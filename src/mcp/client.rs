@@ -312,8 +312,18 @@ async fn authenticate_with_key(
     let key_pair = keys::load_secret_key(path, None)
         .map_err(|e| format!("Failed to load private key from {}: {}", key_path, e))?;
 
-    // Wrap the key with the preferred hash algorithm (use default None for auto-detection)
-    let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
+    // For RSA keys, we need to use the best supported hash algorithm (rsa-sha2-256 or rsa-sha2-512)
+    // Otherwise, the server may reject the legacy ssh-rsa (SHA1) signature
+    let hash_alg = handle
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    debug!("Using RSA hash algorithm for key auth: {:?}", hash_alg);
+
+    // Wrap the key with the preferred hash algorithm
+    let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
 
     handle
         .authenticate_publickey(username, key_with_hash)
@@ -348,8 +358,18 @@ async fn authenticate_with_agent(
     for identity in identities {
         debug!("Trying SSH agent identity: {:?}", identity.comment());
 
+        // For RSA keys, we need to use the best supported hash algorithm (rsa-sha2-256 or rsa-sha2-512)
+        // Otherwise, the server may reject the legacy ssh-rsa (SHA1) signature
+        let hash_alg = handle
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        debug!("Using RSA hash algorithm: {:?}", hash_alg);
+
         match handle
-            .authenticate_publickey_with(username, identity.clone(), None, &mut agent)
+            .authenticate_publickey_with(username, identity.clone(), hash_alg, &mut agent)
             .await
         {
             Ok(result) if result.success() => {
