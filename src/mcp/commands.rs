@@ -133,7 +133,10 @@ impl McpSSHCommands {
         }
     }
 
-    /// Execute a command on a connected SSH session
+    /// Execute a command on a connected SSH session.
+    ///
+    /// On timeout, returns partial output with `timed_out: true` instead of an error.
+    /// The session remains active and can be reused for subsequent commands.
     async fn ssh_execute(
         &self,
         /// Session ID returned from ssh_connect
