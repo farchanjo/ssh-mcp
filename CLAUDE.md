@@ -44,7 +44,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | **client.rs** | 785 | SSH connection, authentication, command execution |
 | **async_command.rs** | 183 | Async command types (`RunningCommand`, `OutputBuffer`) |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
-| **commands.rs** | 787 | `McpSSHCommands` MCP tool implementations |
+| **commands.rs** | 774 | `McpSSHCommands` MCP tool implementations |
 
 ### SOLID Architecture Modules
 
@@ -52,9 +52,9 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | Module | Lines | Description |
 |--------|-------|-------------|
 | **mod.rs** | 18 | Module exports and global storage instances |
-| **traits.rs** | 100 | `SessionStorage` and `CommandStorage` trait definitions |
+| **traits.rs** | 107 | `SessionStorage` and `CommandStorage` trait definitions |
 | **session.rs** | 491 | `DashMapSessionStorage` with agent index and tests |
-| **command.rs** | 812 | `DashMapCommandStorage` with session index and tests |
+| **command.rs** | 994 | `DashMapCommandStorage` with session index and tests
 
 Storage abstractions enable dependency injection and testability:
 - `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
@@ -427,7 +427,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
 - Lock-free data structures (`DashMap`) for concurrent access
-- 308 unit tests (`cargo test --all-features`)
+- 314 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 
