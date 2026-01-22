@@ -1,5 +1,4 @@
 use std::env;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,7 +10,6 @@ use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
 use russh::{ChannelMsg, Disconnect, client, keys};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -32,7 +30,7 @@ pub struct SessionInfo {
 }
 
 /// Client handler for russh that accepts all host keys
-struct SshClientHandler;
+pub(crate) struct SshClientHandler;
 
 impl client::Handler for SshClientHandler {
     type Error = russh::Error;
@@ -801,115 +799,7 @@ async fn execute_ssh_command(
 }
 
 #[cfg(feature = "port_forward")]
-async fn setup_port_forwarding(
-    handle_arc: Arc<Mutex<client::Handle<SshClientHandler>>>,
-    local_port: u16,
-    remote_address: &str,
-    remote_port: u16,
-) -> Result<SocketAddr, String> {
-    // Create a TCP listener for the local port
-    let listener_addr = format!("127.0.0.1:{}", local_port);
-    let listener = TcpListener::bind(&listener_addr)
-        .await
-        .map_err(|e| format!("Failed to bind to local port {}: {}", local_port, e))?;
-
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to get local address: {}", e))?;
-
-    let remote_addr_clone = remote_address.to_string();
-
-    // Spawn an async task to handle port forwarding connections
-    tokio::spawn(async move {
-        debug!("Port forwarding active on {}", local_addr);
-
-        loop {
-            match listener.accept().await {
-                Ok((local_stream, client_addr)) => {
-                    debug!("New connection from {} to forwarded port", client_addr);
-
-                    // Clone handle arc for this connection
-                    let handle_arc = handle_arc.clone();
-                    let remote_host = remote_addr_clone.clone();
-
-                    // Spawn a task for each connection
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_port_forward_connection(
-                            handle_arc,
-                            local_stream,
-                            &remote_host,
-                            remote_port,
-                        )
-                        .await
-                        {
-                            debug!("Port forwarding connection error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    Ok(local_addr)
-}
-
-/// Handle a single port forwarding connection using async I/O
-#[cfg(feature = "port_forward")]
-async fn handle_port_forward_connection(
-    handle_arc: Arc<Mutex<client::Handle<SshClientHandler>>>,
-    local_stream: tokio::net::TcpStream,
-    remote_host: &str,
-    remote_port: u16,
-) -> Result<(), String> {
-    // Lock the handle to open a channel
-    let handle = handle_arc.lock().await;
-
-    // Open a direct-tcpip channel to the remote destination
-    let channel = handle
-        .channel_open_direct_tcpip(
-            remote_host,
-            remote_port as u32,
-            "127.0.0.1",
-            0, // Local originator port (not significant for direct-tcpip)
-        )
-        .await
-        .map_err(|e| format!("Failed to open direct-tcpip channel: {}", e))?;
-
-    // Drop the handle lock so other operations can proceed
-    drop(handle);
-
-    // Convert channel to stream for bidirectional I/O
-    let channel_stream = channel.into_stream();
-
-    // Split both streams for bidirectional forwarding
-    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
-    let (mut channel_read, mut channel_write) = tokio::io::split(channel_stream);
-
-    // Use tokio::io::copy for efficient bidirectional forwarding
-    let local_to_remote = tokio::io::copy(&mut local_read, &mut channel_write);
-    let remote_to_local = tokio::io::copy(&mut channel_read, &mut local_write);
-
-    // Run both directions concurrently until one completes or errors
-    tokio::select! {
-        result = local_to_remote => {
-            if let Err(e) = result {
-                debug!("Local to remote copy ended: {}", e);
-            }
-        }
-        result = remote_to_local => {
-            if let Err(e) = result {
-                debug!("Remote to local copy ended: {}", e);
-            }
-        }
-    }
-
-    debug!("Port forwarding connection closed");
-    Ok(())
-}
+use super::forward::setup_port_forwarding;
 
 #[cfg(test)]
 mod tests {
@@ -1369,204 +1259,6 @@ mod tests {
                 }
                 let result = resolve_compression(None);
                 assert!(result);
-            }
-        }
-    }
-
-    mod error_classification {
-        use super::*;
-
-        mod auth_errors_not_retryable {
-            use super::*;
-
-            #[test]
-            fn test_authentication_failed() {
-                assert!(!is_retryable_error("Authentication failed"));
-                assert!(!is_retryable_error("AUTHENTICATION FAILED"));
-                assert!(!is_retryable_error("authentication failed for user"));
-            }
-
-            #[test]
-            fn test_password_authentication_failed() {
-                assert!(!is_retryable_error("Password authentication failed"));
-                assert!(!is_retryable_error(
-                    "password authentication failed: wrong password"
-                ));
-            }
-
-            #[test]
-            fn test_key_authentication_failed() {
-                assert!(!is_retryable_error("Key authentication failed"));
-                assert!(!is_retryable_error(
-                    "key authentication failed: invalid key"
-                ));
-            }
-
-            #[test]
-            fn test_agent_authentication_failed() {
-                assert!(!is_retryable_error("Agent authentication failed"));
-                assert!(!is_retryable_error("agent authentication failed: no keys"));
-            }
-
-            #[test]
-            fn test_permission_denied() {
-                assert!(!is_retryable_error("Permission denied"));
-                assert!(!is_retryable_error("permission denied (publickey)"));
-                assert!(!is_retryable_error("PERMISSION DENIED"));
-            }
-
-            #[test]
-            fn test_publickey_error() {
-                assert!(!is_retryable_error("publickey"));
-                assert!(!is_retryable_error("Publickey authentication required"));
-            }
-
-            #[test]
-            fn test_auth_fail() {
-                assert!(!is_retryable_error("auth fail"));
-                assert!(!is_retryable_error("Auth fail: invalid credentials"));
-            }
-
-            #[test]
-            fn test_no_authentication() {
-                assert!(!is_retryable_error("No authentication methods available"));
-                assert!(!is_retryable_error("no authentication methods succeeded"));
-            }
-
-            #[test]
-            fn test_all_auth_methods_failed() {
-                assert!(!is_retryable_error("All authentication methods failed"));
-            }
-        }
-
-        mod connection_errors_retryable {
-            use super::*;
-
-            #[test]
-            fn test_connection_refused() {
-                assert!(is_retryable_error("Connection refused"));
-                assert!(is_retryable_error("connection refused by server"));
-            }
-
-            #[test]
-            fn test_connection_reset() {
-                assert!(is_retryable_error("Connection reset"));
-                assert!(is_retryable_error("connection reset by peer"));
-            }
-
-            #[test]
-            fn test_connection_timed_out() {
-                assert!(is_retryable_error("Connection timed out"));
-                assert!(is_retryable_error("connection timed out after 30s"));
-            }
-
-            #[test]
-            fn test_timeout() {
-                assert!(is_retryable_error("timeout"));
-                assert!(is_retryable_error("Operation timeout"));
-                assert!(is_retryable_error("TIMEOUT waiting for response"));
-            }
-
-            #[test]
-            fn test_network_unreachable() {
-                assert!(is_retryable_error("Network is unreachable"));
-                assert!(is_retryable_error("network is unreachable"));
-            }
-
-            #[test]
-            fn test_no_route_to_host() {
-                assert!(is_retryable_error("No route to host"));
-                assert!(is_retryable_error("no route to host"));
-            }
-
-            #[test]
-            fn test_host_is_down() {
-                assert!(is_retryable_error("Host is down"));
-                assert!(is_retryable_error("host is down"));
-            }
-
-            #[test]
-            fn test_temporary_failure() {
-                assert!(is_retryable_error("Temporary failure in name resolution"));
-                assert!(is_retryable_error("temporary failure"));
-            }
-
-            #[test]
-            fn test_resource_temporarily_unavailable() {
-                assert!(is_retryable_error("Resource temporarily unavailable"));
-            }
-
-            #[test]
-            fn test_handshake_failed() {
-                assert!(is_retryable_error("Handshake failed"));
-                assert!(is_retryable_error("SSH handshake failed"));
-            }
-
-            #[test]
-            fn test_failed_to_connect() {
-                assert!(is_retryable_error("Failed to connect"));
-                assert!(is_retryable_error("failed to connect to server"));
-            }
-
-            #[test]
-            fn test_broken_pipe() {
-                assert!(is_retryable_error("Broken pipe"));
-                assert!(is_retryable_error("broken pipe error"));
-            }
-
-            #[test]
-            fn test_would_block() {
-                assert!(is_retryable_error("Would block"));
-                assert!(is_retryable_error("operation would block"));
-            }
-        }
-
-        mod edge_cases {
-            use super::*;
-
-            #[test]
-            fn test_empty_string_is_retryable() {
-                // Empty string doesn't match any auth patterns, doesn't contain "ssh"
-                assert!(is_retryable_error(""));
-            }
-
-            #[test]
-            fn test_unknown_error_without_ssh() {
-                // Unknown errors that don't contain "ssh" are retryable (conservative)
-                assert!(is_retryable_error("Something went wrong"));
-            }
-
-            #[test]
-            fn test_ssh_protocol_error_not_retryable() {
-                // SSH protocol errors without timeout/connect keywords are not retryable
-                assert!(!is_retryable_error("SSH protocol error"));
-                assert!(!is_retryable_error("SSH version mismatch"));
-            }
-
-            #[test]
-            fn test_ssh_with_timeout_is_retryable() {
-                // SSH errors with timeout keyword are retryable
-                assert!(is_retryable_error("SSH connection timeout"));
-            }
-
-            #[test]
-            fn test_ssh_with_connect_is_retryable() {
-                // SSH errors with connect keyword are retryable
-                assert!(is_retryable_error("SSH failed to connect"));
-            }
-
-            #[test]
-            fn test_case_insensitivity() {
-                assert!(!is_retryable_error("PERMISSION DENIED"));
-                assert!(is_retryable_error("CONNECTION REFUSED"));
-            }
-
-            #[test]
-            fn test_auth_error_takes_precedence_over_connection() {
-                // If both auth and connection keywords present, auth should win
-                assert!(!is_retryable_error(
-                    "Connection timeout during authentication failed"
-                ));
             }
         }
     }
