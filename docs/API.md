@@ -8,6 +8,10 @@ This document provides a complete API reference for all MCP tools exposed by the
 - [Tools](#tools)
   - [ssh_connect](#ssh_connect)
   - [ssh_execute](#ssh_execute)
+  - [ssh_execute_async](#ssh_execute_async)
+  - [ssh_get_command_output](#ssh_get_command_output)
+  - [ssh_list_commands](#ssh_list_commands)
+  - [ssh_cancel_command](#ssh_cancel_command)
   - [ssh_forward](#ssh_forward)
   - [ssh_disconnect](#ssh_disconnect)
   - [ssh_list_sessions](#ssh_list_sessions)
@@ -18,17 +22,22 @@ This document provides a complete API reference for all MCP tools exposed by the
   - [Authentication](#authentication)
   - [Retry Logic](#retry-logic)
   - [Configuration Priority](#configuration-priority)
+  - [Async vs Sync Command Execution](#async-vs-sync-command-execution)
 
 ---
 
 ## Overview
 
-SSH MCP exposes 5 tools for managing SSH connections and operations:
+SSH MCP exposes 9 tools for managing SSH connections and operations:
 
 | Tool | Description | Feature Flag |
 |------|-------------|--------------|
 | `ssh_connect` | Establish SSH connection | - |
-| `ssh_execute` | Execute remote command | - |
+| `ssh_execute` | Execute remote command (synchronous) | - |
+| `ssh_execute_async` | Start command in background | - |
+| `ssh_get_command_output` | Poll or wait for async command output | - |
+| `ssh_list_commands` | List all async commands | - |
+| `ssh_cancel_command` | Cancel a running async command | - |
 | `ssh_forward` | Setup port forwarding | `port_forward` |
 | `ssh_disconnect` | Close SSH session | - |
 | `ssh_list_sessions` | List active sessions | - |
@@ -242,6 +251,366 @@ Multiple commands:
   "arguments": {
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
     "command": "cd /app && git pull && npm install && npm run build"
+  }
+}
+```
+
+---
+
+### ssh_execute_async
+
+Starts a shell command in the background on a connected SSH session and returns immediately with a `command_id` for tracking. Use this for long-running commands (builds, deployments, data processing) or when you want to run multiple commands concurrently.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `session_id` | `string` | Yes | - | Session ID returned from `ssh_connect` |
+| `command` | `string` | Yes | - | Shell command to execute on the remote server |
+| `timeout_secs` | `u64` | No | `180` | Maximum execution time in seconds. The command will be terminated if it exceeds this limit. Falls back to `SSH_COMMAND_TIMEOUT` env var. |
+
+#### Response
+
+Returns `SshExecuteAsyncResponse`:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "command": "npm run build",
+  "started_at": "2024-01-15T14:30:00.000Z",
+  "message": "Command started in background. Use ssh_get_command_output to poll for results."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command_id` | `string` | Unique UUID v4 identifier for tracking this command |
+| `session_id` | `string` | Session ID where the command is running |
+| `command` | `string` | The command that was started |
+| `started_at` | `string` | ISO 8601 timestamp when the command started |
+| `message` | `string` | Human-readable message with next steps |
+
+#### Limits
+
+- Maximum 10 concurrent async commands per session
+- Commands are automatically cancelled when the session is disconnected
+- Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
+
+#### Example Usage
+
+Start a build process:
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "command": "cd /app && npm run build",
+    "timeout_secs": 300
+  }
+}
+```
+
+Start multiple commands in parallel:
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "command": "npm run build"
+  }
+}
+```
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "command": "npm test"
+  }
+}
+```
+
+---
+
+### ssh_get_command_output
+
+Retrieves the output and status of an async command started with `ssh_execute_async`. Supports both polling (immediate return) and blocking (wait until complete) modes.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command_id` | `string` | Yes | - | Command ID returned from `ssh_execute_async` |
+| `wait` | `bool` | No | `false` | If `false`, returns immediately with current status. If `true`, blocks until the command completes or `wait_timeout_secs` is reached. |
+| `wait_timeout_secs` | `u64` | No | `30` | Maximum time to wait when `wait=true`. Range: 1-300 seconds. |
+
+#### Response
+
+Returns `SshAsyncOutputResponse`:
+
+When command is still running (`wait=false` or wait timeout reached):
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "running",
+  "stdout": "Installing dependencies...\n",
+  "stderr": "",
+  "exit_code": null,
+  "error": null,
+  "timed_out": false
+}
+```
+
+When command has completed:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "completed",
+  "stdout": "Build successful!\nOutput written to dist/\n",
+  "stderr": "",
+  "exit_code": 0,
+  "error": null,
+  "timed_out": false
+}
+```
+
+When command was cancelled:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "cancelled",
+  "stdout": "Partial output before cancellation...\n",
+  "stderr": "",
+  "exit_code": null,
+  "error": null,
+  "timed_out": false
+}
+```
+
+When command failed to start:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "failed",
+  "stdout": "",
+  "stderr": "",
+  "exit_code": null,
+  "error": "Failed to open channel: session disconnected",
+  "timed_out": false
+}
+```
+
+When command execution timed out:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "completed",
+  "stdout": "Partial output before timeout...\n",
+  "stderr": "",
+  "exit_code": -1,
+  "error": null,
+  "timed_out": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command_id` | `string` | The command identifier |
+| `status` | `string` | Current status: `running`, `completed`, `cancelled`, or `failed` |
+| `stdout` | `string` | Standard output (may be partial if still running) |
+| `stderr` | `string` | Standard error output (may be partial if still running) |
+| `exit_code` | `i32 \| null` | Exit code when completed, `null` if running/cancelled/failed, `-1` if timed out |
+| `error` | `string \| null` | Error message if status is `failed`, otherwise `null` |
+| `timed_out` | `bool` | `true` if the command exceeded its `timeout_secs` limit |
+
+#### Status Values
+
+| Status | Description | Available Fields |
+|--------|-------------|------------------|
+| `running` | Command is still executing | `stdout`, `stderr` (partial output collected so far) |
+| `completed` | Command finished execution | `stdout`, `stderr`, `exit_code`, `timed_out` |
+| `cancelled` | Command was stopped by user via `ssh_cancel_command` | `stdout`, `stderr` (partial output) |
+| `failed` | Command failed to start | `error` message describing the failure |
+
+#### Example Usage
+
+Poll for status (non-blocking):
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "wait": false
+  }
+}
+```
+
+Wait for completion (blocking):
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "wait": true,
+    "wait_timeout_secs": 120
+  }
+}
+```
+
+---
+
+### ssh_list_commands
+
+Lists all async commands across all sessions or filtered by session and/or status.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `session_id` | `string` | No | `null` | Filter commands by session ID. If omitted, returns commands from all sessions. |
+| `status` | `string` | No | `null` | Filter by status: `running`, `completed`, `cancelled`, or `failed`. If omitted, returns all statuses. |
+
+#### Response
+
+Returns `AsyncCommandListResponse`:
+
+```json
+{
+  "commands": [
+    {
+      "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "command": "npm run build",
+      "status": "running",
+      "started_at": "2024-01-15T14:30:00.000Z"
+    },
+    {
+      "command_id": "b2c3d4e5-f6a7-8901-bcde-f23456789012",
+      "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "command": "npm test",
+      "status": "completed",
+      "started_at": "2024-01-15T14:30:05.000Z"
+    }
+  ],
+  "count": 2
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `commands` | `AsyncCommandInfo[]` | Array of command metadata objects |
+| `count` | `usize` | Total number of commands matching the filter |
+
+#### AsyncCommandInfo Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command_id` | `string` | Unique command identifier |
+| `session_id` | `string` | Session where the command is running |
+| `command` | `string` | The shell command being executed |
+| `status` | `string` | Current status: `running`, `completed`, `cancelled`, or `failed` |
+| `started_at` | `string` | ISO 8601 timestamp when the command started |
+
+#### Example Usage
+
+List all commands:
+
+```json
+{
+  "tool": "ssh_list_commands",
+  "arguments": {}
+}
+```
+
+List running commands for a specific session:
+
+```json
+{
+  "tool": "ssh_list_commands",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "running"
+  }
+}
+```
+
+List all completed commands:
+
+```json
+{
+  "tool": "ssh_list_commands",
+  "arguments": {
+    "status": "completed"
+  }
+}
+```
+
+---
+
+### ssh_cancel_command
+
+Cancels a running async command and returns any partial output collected before cancellation.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command_id` | `string` | Yes | - | Command ID to cancel |
+
+#### Response
+
+Returns `SshCancelCommandResponse`:
+
+When successfully cancelled:
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "cancelled": true,
+  "message": "Command cancelled successfully",
+  "stdout": "Partial output before cancellation...\n",
+  "stderr": ""
+}
+```
+
+When command was not running (already completed/cancelled/failed):
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "cancelled": false,
+  "message": "Command is not running (status: completed)",
+  "stdout": "Full output from completed command...\n",
+  "stderr": ""
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command_id` | `string` | The command identifier |
+| `cancelled` | `bool` | `true` if the command was successfully cancelled, `false` if it was not running |
+| `message` | `string` | Human-readable status message |
+| `stdout` | `string` | Standard output collected before cancellation (or full output if already completed) |
+| `stderr` | `string` | Standard error collected before cancellation |
+
+#### Example Usage
+
+```json
+{
+  "tool": "ssh_cancel_command",
+  "arguments": {
+    "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
   }
 }
 ```
@@ -477,6 +846,45 @@ interface SessionListResponse {
   sessions: SessionInfo[];
   count: number;
 }
+
+interface SshExecuteAsyncResponse {
+  command_id: string;
+  session_id: string;
+  command: string;
+  started_at: string;
+  message: string;
+}
+
+interface SshAsyncOutputResponse {
+  command_id: string;
+  status: "running" | "completed" | "cancelled" | "failed";
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+  error: string | null;
+  timed_out: boolean;
+}
+
+interface AsyncCommandInfo {
+  command_id: string;
+  session_id: string;
+  command: string;
+  status: "running" | "completed" | "cancelled" | "failed";
+  started_at: string;
+}
+
+interface AsyncCommandListResponse {
+  commands: AsyncCommandInfo[];
+  count: number;
+}
+
+interface SshCancelCommandResponse {
+  command_id: string;
+  cancelled: boolean;
+  message: string;
+  stdout: string;
+  stderr: string;
+}
 ```
 
 ---
@@ -514,6 +922,15 @@ All errors are returned as string messages. Common error patterns:
 | `Failed to open channel` | SSH session corrupted |
 
 > **Note**: Command timeouts are **not errors**. When a command times out, `ssh_execute` returns a successful response with `timed_out: true`, `exit_code: -1`, and any partial output collected. The session remains connected.
+
+### Async Command Errors
+
+| Error | Cause |
+|-------|-------|
+| `No async command found with ID: xxx` | Command ID not found or already cleaned up |
+| `Maximum concurrent commands (10) reached for session` | Session has too many running commands |
+| `No active SSH session with ID: xxx` | Session not found when starting async command |
+| `Wait timeout must be between 1 and 300 seconds` | Invalid `wait_timeout_secs` value |
 
 ### Port Forwarding Errors
 
@@ -651,6 +1068,254 @@ Response:
 Session abc-123-def-456 disconnected successfully
 ```
 
+### Async Command Workflow
+
+This example demonstrates running multiple commands in parallel and monitoring their progress.
+
+1. **Connect to server**
+
+```json
+{
+  "tool": "ssh_connect",
+  "arguments": {
+    "address": "build-server.example.com:22",
+    "username": "ci",
+    "name": "build-pipeline"
+  }
+}
+```
+
+Response:
+```json
+{
+  "session_id": "build-session-123",
+  "message": "Successfully connected to ci@build-server.example.com:22",
+  "authenticated": true,
+  "retry_attempts": 0
+}
+```
+
+2. **Start build and test in parallel**
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "build-session-123",
+    "command": "cd /app && npm run build",
+    "timeout_secs": 300
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "build-cmd-456",
+  "session_id": "build-session-123",
+  "command": "cd /app && npm run build",
+  "started_at": "2024-01-15T14:30:00.000Z",
+  "message": "Command started in background. Use ssh_get_command_output to poll for results."
+}
+```
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "build-session-123",
+    "command": "cd /app && npm test",
+    "timeout_secs": 180
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "test-cmd-789",
+  "session_id": "build-session-123",
+  "command": "cd /app && npm test",
+  "started_at": "2024-01-15T14:30:01.000Z",
+  "message": "Command started in background. Use ssh_get_command_output to poll for results."
+}
+```
+
+3. **Check running commands**
+
+```json
+{
+  "tool": "ssh_list_commands",
+  "arguments": {
+    "session_id": "build-session-123",
+    "status": "running"
+  }
+}
+```
+
+Response:
+```json
+{
+  "commands": [
+    {
+      "command_id": "build-cmd-456",
+      "session_id": "build-session-123",
+      "command": "cd /app && npm run build",
+      "status": "running",
+      "started_at": "2024-01-15T14:30:00.000Z"
+    },
+    {
+      "command_id": "test-cmd-789",
+      "session_id": "build-session-123",
+      "command": "cd /app && npm test",
+      "status": "running",
+      "started_at": "2024-01-15T14:30:01.000Z"
+    }
+  ],
+  "count": 2
+}
+```
+
+4. **Wait for build to complete**
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "build-cmd-456",
+    "wait": true,
+    "wait_timeout_secs": 120
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "build-cmd-456",
+  "status": "completed",
+  "stdout": "> app@1.0.0 build\n> webpack --mode production\n\nBuild successful!\nOutput: dist/bundle.js (245kb)\n",
+  "stderr": "",
+  "exit_code": 0,
+  "error": null,
+  "timed_out": false
+}
+```
+
+5. **Wait for tests to complete**
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "test-cmd-789",
+    "wait": true,
+    "wait_timeout_secs": 60
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "test-cmd-789",
+  "status": "completed",
+  "stdout": "> app@1.0.0 test\n> jest\n\nPASS src/app.test.js\nTests: 42 passed, 42 total\n",
+  "stderr": "",
+  "exit_code": 0,
+  "error": null,
+  "timed_out": false
+}
+```
+
+6. **Disconnect (cleans up all async commands)**
+
+```json
+{
+  "tool": "ssh_disconnect",
+  "arguments": {
+    "session_id": "build-session-123"
+  }
+}
+```
+
+Response:
+```
+Session build-session-123 disconnected successfully
+```
+
+### Cancelling a Long-Running Command
+
+1. **Start a potentially slow command**
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "arguments": {
+    "session_id": "abc-123-def-456",
+    "command": "find / -name '*.log' -type f"
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "search-cmd-111",
+  "session_id": "abc-123-def-456",
+  "command": "find / -name '*.log' -type f",
+  "started_at": "2024-01-15T15:00:00.000Z",
+  "message": "Command started in background. Use ssh_get_command_output to poll for results."
+}
+```
+
+2. **Check progress after a few seconds**
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "search-cmd-111",
+    "wait": false
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "search-cmd-111",
+  "status": "running",
+  "stdout": "/var/log/syslog\n/var/log/auth.log\n/var/log/kern.log\n",
+  "stderr": "",
+  "exit_code": null,
+  "error": null,
+  "timed_out": false
+}
+```
+
+3. **Cancel the command (taking too long)**
+
+```json
+{
+  "tool": "ssh_cancel_command",
+  "arguments": {
+    "command_id": "search-cmd-111"
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "search-cmd-111",
+  "cancelled": true,
+  "message": "Command cancelled successfully",
+  "stdout": "/var/log/syslog\n/var/log/auth.log\n/var/log/kern.log\n/var/log/daemon.log\n",
+  "stderr": ""
+}
+```
+
 ---
 
 ## Important Notes
@@ -744,3 +1409,49 @@ All configuration values follow a three-tier priority system:
 | Max retries | `max_retries` | `SSH_MAX_RETRIES` | 3 |
 | Retry delay | `retry_delay_ms` | `SSH_RETRY_DELAY_MS` | 1000ms |
 | Compression | `compress` | `SSH_COMPRESSION` | true |
+
+### Async vs Sync Command Execution
+
+SSH MCP provides two ways to execute commands: synchronous (`ssh_execute`) and asynchronous (`ssh_execute_async`).
+
+#### When to Use `ssh_execute` (Synchronous)
+
+| Scenario | Reason |
+|----------|--------|
+| Quick commands (< 30s) | No need for background execution overhead |
+| Need immediate result | Blocks until command completes |
+| Simple one-off commands | Simpler workflow without polling |
+| Interactive debugging | Direct feedback loop |
+
+#### When to Use `ssh_execute_async` (Asynchronous)
+
+| Scenario | Reason |
+|----------|--------|
+| Long-running commands | Builds, deployments, data processing |
+| Parallel execution | Run multiple commands concurrently |
+| Progress monitoring | Poll for partial output during execution |
+| Cancellation needed | Ability to stop mid-execution |
+| Timeout management | Monitor and cancel commands that exceed expectations |
+
+#### Async Command Lifecycle
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ ssh_execute_    │     │ ssh_get_command │     │ ssh_cancel_     │
+│ async           │────>│ _output         │────>│ command         │
+│                 │     │ (poll/wait)     │     │ (optional)      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+        │                       │                       │
+        v                       v                       v
+   command_id             status/output            cancelled=true
+   returned               returned                 partial output
+```
+
+#### Async Command Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Max concurrent per session | 10 | Maximum running commands per SSH session |
+| Default timeout | 180s | Configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` |
+| Max wait timeout | 300s | Maximum value for `wait_timeout_secs` parameter |
+| Auto-cleanup | On disconnect | All async commands cancelled when session disconnects |
