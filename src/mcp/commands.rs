@@ -9,7 +9,6 @@
 //! - `ssh_list_sessions`: List all active sessions
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
 use russh::Disconnect;
@@ -154,26 +153,20 @@ impl McpSSHCommands {
                 .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
         };
 
-        // Wrap command execution with timeout
-        match tokio::time::timeout(
-            Duration::from_secs(timeout),
-            execute_ssh_command(&handle_arc, &command),
-        )
-        .await
-        {
-            Ok(result) => result.map(StructuredContent).map_err(|e| {
+        // Execute command with timeout - timeout returns partial output, not an error
+        match execute_ssh_command(&handle_arc, &command, timeout).await {
+            Ok(response) => {
+                if response.timed_out {
+                    warn!(
+                        "Command timed out after {}s but returning partial output: {}",
+                        timeout, command
+                    );
+                }
+                Ok(StructuredContent(response))
+            }
+            Err(e) => {
                 error!("Command execution failed: {}", e);
-                e
-            }),
-            Err(_) => {
-                error!(
-                    "Command execution timed out after {}s: {}",
-                    timeout, command
-                );
-                Err(format!(
-                    "Command execution timed out after {} seconds",
-                    timeout
-                ))
+                Err(e)
             }
         }
     }

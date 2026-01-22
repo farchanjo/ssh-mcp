@@ -390,26 +390,38 @@ async fn authenticate_with_agent(
     Err("Agent authentication failed: no identities accepted".to_string())
 }
 
-/// Execute a command on an SSH session.
+/// Execute a command on an SSH session with timeout support.
 ///
 /// Opens a session channel, executes the command, and collects the output.
+/// If the command times out, returns partial output with `timed_out: true`
+/// instead of an error, keeping the session alive.
 ///
 /// # Arguments
 ///
 /// * `handle_arc` - Shared handle to the SSH session
 /// * `command` - Shell command to execute
+/// * `timeout_secs` - Command execution timeout in seconds
 ///
 /// # Returns
 ///
-/// * `Ok(SshCommandResponse)` - Command output with stdout, stderr, and exit code
-/// * `Err(message)` - Error message if execution fails
+/// * `Ok(SshCommandResponse)` - Command output with stdout, stderr, exit code, and timeout flag
+/// * `Err(message)` - Error message if execution fails (NOT for timeouts)
+///
+/// # Timeout Behavior
+///
+/// On timeout, the function:
+/// 1. Returns partial stdout/stderr collected so far
+/// 2. Sets `timed_out: true` in the response
+/// 3. Sets `exit_code: -1` (no exit code available)
+/// 4. Closes the channel gracefully to keep the session alive
 ///
 /// # Exit Code
 ///
-/// Returns -1 as exit code if the remote server doesn't provide one.
+/// Returns -1 as exit code if the remote server doesn't provide one or on timeout.
 pub(crate) async fn execute_ssh_command(
     handle_arc: &Arc<Mutex<client::Handle<SshClientHandler>>>,
     command: &str,
+    timeout_secs: u64,
 ) -> Result<SshCommandResponse, String> {
     // Lock the handle for this operation
     let handle = handle_arc.lock().await;
@@ -432,42 +444,60 @@ pub(crate) async fn execute_ssh_command(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code: Option<u32> = None;
+    let mut timed_out = false;
 
-    // Read channel messages until EOF
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                stdout.extend_from_slice(&data);
-            }
-            Some(ChannelMsg::ExtendedData { data, ext }) => {
-                // ext == 1 is stderr in SSH protocol
-                if ext == 1 {
-                    stderr.extend_from_slice(&data);
+    // Create timeout future
+    let timeout_duration = Duration::from_secs(timeout_secs);
+
+    // Read channel messages with timeout
+    let result = tokio::time::timeout(timeout_duration, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
                 }
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = Some(exit_status);
-            }
-            Some(ChannelMsg::Eof) => {
-                // Continue to wait for exit status if not received yet
-                if exit_code.is_some() {
+                Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    // ext == 1 is stderr in SSH protocol
+                    if ext == 1 {
+                        stderr.extend_from_slice(&data);
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = Some(exit_status);
+                }
+                Some(ChannelMsg::Eof) => {
+                    // Continue to wait for exit status if not received yet
+                    if exit_code.is_some() {
+                        break;
+                    }
+                }
+                Some(ChannelMsg::Close) => {
+                    break;
+                }
+                Some(_) => {
+                    // Ignore other message types
+                }
+                None => {
+                    // Channel closed
                     break;
                 }
             }
-            Some(ChannelMsg::Close) => {
-                break;
-            }
-            Some(_) => {
-                // Ignore other message types
-            }
-            None => {
-                // Channel closed
-                break;
-            }
         }
+    })
+    .await;
+
+    // Handle timeout - return partial output, don't treat as error
+    if result.is_err() {
+        timed_out = true;
+        warn!(
+            "Command timed out after {}s, returning partial output ({} bytes stdout, {} bytes stderr)",
+            timeout_secs,
+            stdout.len(),
+            stderr.len()
+        );
     }
 
-    // Close the channel
+    // Always close the channel gracefully to keep the session alive
     let _ = channel.close().await;
 
     let stdout_str = String::from_utf8_lossy(&stdout).into_owned();
@@ -477,6 +507,7 @@ pub(crate) async fn execute_ssh_command(
         stdout: stdout_str,
         stderr: stderr_str,
         exit_code: exit_code.map(|c| c as i32).unwrap_or(-1),
+        timed_out,
     })
 }
 
