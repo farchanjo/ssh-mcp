@@ -41,7 +41,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
 | **session.rs** | 41 | `SshClientHandler` for russh client |
-| **client.rs** | 862 | SSH connection, authentication, command execution |
+| **client.rs** | 785 | SSH connection, authentication, command execution |
 | **async_command.rs** | 183 | Async command types (`RunningCommand`, `OutputBuffer`) |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
 | **commands.rs** | 787 | `McpSSHCommands` MCP tool implementations |
@@ -53,8 +53,8 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 |--------|-------|-------------|
 | **mod.rs** | 18 | Module exports and global storage instances |
 | **traits.rs** | 100 | `SessionStorage` and `CommandStorage` trait definitions |
-| **session.rs** | 217 | `DashMapSessionStorage` with agent index and tests |
-| **command.rs** | 246 | `DashMapCommandStorage` with session index and tests |
+| **session.rs** | 491 | `DashMapSessionStorage` with agent index and tests |
+| **command.rs** | 812 | `DashMapCommandStorage` with session index and tests |
 
 Storage abstractions enable dependency injection and testability:
 - `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
@@ -83,12 +83,12 @@ let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
 #### Authentication Layer (`src/mcp/auth/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 38 | Module exports and usage examples |
-| **traits.rs** | 41 | `AuthStrategy` trait definition |
-| **password.rs** | 69 | `PasswordAuth` strategy with tests |
-| **key.rs** | 97 | `KeyAuth` strategy (RSA, Ed25519) with tests |
-| **agent.rs** | 109 | `AgentAuth` strategy (SSH agent) with tests |
-| **chain.rs** | 175 | `AuthChain` for trying multiple strategies with tests |
+| **mod.rs** | 36 | Module exports and usage examples |
+| **traits.rs** | 40 | `AuthStrategy` trait definition |
+| **password.rs** | 129 | `PasswordAuth` strategy with tests |
+| **key.rs** | 205 | `KeyAuth` strategy (RSA, Ed25519) with tests |
+| **agent.rs** | 139 | `AgentAuth` strategy (SSH agent) with tests |
+| **chain.rs** | 323 | `AuthChain` for trying multiple strategies with tests |
 
 Authentication uses the Strategy pattern (Open-Closed Principle):
 
@@ -427,7 +427,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
 - Lock-free data structures (`DashMap`) for concurrent access
-- 182 unit tests (`cargo test --all-features`)
+- 308 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 
