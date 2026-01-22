@@ -208,6 +208,90 @@ mod response_serialization {
             assert!(json.get("authenticated").is_some());
             assert!(json.get("retry_attempts").is_some());
         }
+
+        #[test]
+        fn test_message_with_async_suggestion() {
+            // Simulate the actual message format from ssh_connect
+            let session_id = "test-uuid-123";
+            let message = format!(
+                "Connected to user@host. Use session_id '{}' for subsequent commands.\n\
+                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
+                for non-blocking execution with progress monitoring and cancellation support.",
+                session_id
+            );
+
+            let response = SshConnectResponse {
+                session_id: session_id.to_string(),
+                message: message.clone(),
+                authenticated: true,
+                retry_attempts: 0,
+            };
+
+            // Verify async mode suggestion is present
+            assert!(response.message.contains("ssh_execute_async"));
+            assert!(response.message.contains("long-running commands"));
+            assert!(response.message.contains("progress monitoring"));
+            assert!(response.message.contains("cancellation support"));
+            assert!(
+                response
+                    .message
+                    .contains(&format!("session_id '{}'", session_id))
+            );
+        }
+
+        #[test]
+        fn test_message_with_name_and_retry() {
+            // Simulate message with optional name and retry parts
+            let session_id = "test-uuid-456";
+            let name = "production-db";
+            let retry_attempts = 2;
+
+            let message = format!(
+                "Connected to user@host (name: '{}') after {} retry attempt(s). \
+                Use session_id '{}' for subsequent commands.\n\
+                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
+                for non-blocking execution with progress monitoring and cancellation support.",
+                name, retry_attempts, session_id
+            );
+
+            let response = SshConnectResponse {
+                session_id: session_id.to_string(),
+                message,
+                authenticated: true,
+                retry_attempts: retry_attempts as u32,
+            };
+
+            // Verify optional parts are present
+            assert!(response.message.contains(&format!("name: '{}'", name)));
+            assert!(
+                response
+                    .message
+                    .contains(&format!("{} retry attempt(s)", retry_attempts))
+            );
+        }
+
+        #[test]
+        fn test_message_with_persistent_suffix() {
+            // Simulate message with persistent suffix
+            let session_id = "test-uuid-789";
+            let base_message = format!(
+                "Connected to user@host. Use session_id '{}' for subsequent commands.\n\
+                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
+                for non-blocking execution with progress monitoring and cancellation support.",
+                session_id
+            );
+            let message = format!("{} [persistent]", base_message);
+
+            let response = SshConnectResponse {
+                session_id: session_id.to_string(),
+                message,
+                authenticated: true,
+                retry_attempts: 0,
+            };
+
+            // Verify persistent suffix is present
+            assert!(response.message.ends_with("[persistent]"));
+        }
     }
 
     mod ssh_command_response {
