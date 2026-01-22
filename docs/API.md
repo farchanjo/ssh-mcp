@@ -49,6 +49,8 @@ Establishes an SSH connection to a remote server with automatic retry logic.
 | `username` | `string` | Yes | - | SSH username for authentication |
 | `password` | `string` | No | `null` | Password for password-based authentication |
 | `key_path` | `string` | No | `null` | Absolute path to private key file for key-based authentication |
+| `name` | `string` | No | `null` | Human-readable name for the session (e.g., "production-db", "staging-server"). Helps LLMs identify sessions more easily. |
+| `persistent` | `bool` | No | `false` | When `true`, disables inactivity timeout, keeping the session open indefinitely until explicitly disconnected via `ssh_disconnect` or the process dies. Keepalive still works (30s interval, 3 max attempts). |
 | `timeout_secs` | `u64` | No | `30` | Connection timeout in seconds. Falls back to `SSH_CONNECT_TIMEOUT` env var. |
 | `max_retries` | `u32` | No | `3` | Maximum retry attempts for transient failures. Falls back to `SSH_MAX_RETRIES` env var. |
 | `retry_delay_ms` | `u64` | No | `1000` | Initial delay between retries in milliseconds. Uses exponential backoff (capped at 10s). Falls back to `SSH_RETRY_DELAY_MS` env var. |
@@ -97,10 +99,21 @@ Returns `SshConnectResponse`:
 }
 ```
 
+With persistent session:
+
+```json
+{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Successfully connected to user@192.168.1.1:22 [persistent session]",
+  "authenticated": true,
+  "retry_attempts": 0
+}
+```
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `session_id` | `string` | Unique UUID v4 identifier for the session |
-| `message` | `string` | Human-readable success message |
+| `message` | `string` | Human-readable success message. Includes "[persistent session]" suffix when `persistent=true`. |
 | `authenticated` | `bool` | Always `true` on success |
 | `retry_attempts` | `u32` | Number of retry attempts needed |
 
@@ -128,6 +141,33 @@ With key file:
     "key_path": "/home/user/.ssh/id_rsa",
     "timeout_secs": 60,
     "compress": true
+  }
+}
+```
+
+With session name (for LLM identification):
+
+```json
+{
+  "tool": "ssh_connect",
+  "arguments": {
+    "address": "db.example.com:22",
+    "username": "admin",
+    "name": "production-database"
+  }
+}
+```
+
+With persistent session (no inactivity timeout):
+
+```json
+{
+  "tool": "ssh_connect",
+  "arguments": {
+    "address": "worker.example.com:22",
+    "username": "deploy",
+    "name": "long-running-job",
+    "persistent": true
   }
 }
 ```
@@ -328,6 +368,7 @@ Returns `SessionListResponse`:
   "sessions": [
     {
       "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "production-db",
       "host": "192.168.1.100:22",
       "username": "admin",
       "connected_at": "2024-01-15T10:30:00.000Z",
@@ -359,6 +400,7 @@ Returns `SessionListResponse`:
 | Field | Type | Description |
 |-------|------|-------------|
 | `session_id` | `string` | Unique session identifier |
+| `name` | `string` | Optional human-readable session name (omitted from JSON when not set) |
 | `host` | `string` | SSH server address |
 | `username` | `string` | Authenticated username |
 | `connected_at` | `string` | ISO 8601 timestamp of connection |
@@ -422,6 +464,7 @@ interface PortForwardingResponse {
 
 interface SessionInfo {
   session_id: string;
+  name?: string;  // Optional, omitted when not set
   host: string;
   username: string;
   connected_at: string;
@@ -579,6 +622,7 @@ Response:
   "sessions": [
     {
       "session_id": "abc-123-def-456",
+      "name": "prod-deploy",
       "host": "prod-server.example.com:22",
       "username": "deploy",
       "connected_at": "2024-01-15T14:30:00.000Z",

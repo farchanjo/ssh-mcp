@@ -70,6 +70,13 @@ stateDiagram-v2
 | `Forwarding` | Port forwarding setup in progress |
 | `Disconnecting` | Graceful disconnect in progress |
 
+### Session Properties
+
+| Property | Description |
+|----------|-------------|
+| `name` | Optional human-readable identifier for LLM identification |
+| `persistent` | When true, disables inactivity timeout (keepalive still active) |
+
 ---
 
 ## SSH Connection Flow
@@ -150,13 +157,14 @@ sequenceDiagram
 
     Note over Cmd,Store: Session Storage Phase
     Cmd->>Cmd: Generate UUID
-    Cmd->>Cmd: Create SessionInfo
+    Cmd->>Cmd: Create SessionInfo with optional name
+    Cmd->>Cmd: Set persistent flag if requested
     Cmd->>Cmd: Wrap Handle in Arc Mutex
     Cmd->>Store: Lock SSH_SESSIONS
     Cmd->>Store: Insert StoredSession
     Cmd->>Store: Unlock SSH_SESSIONS
 
-    Cmd-->>Client: SshConnectResponse
+    Cmd-->>Client: SshConnectResponse with persistent indicator
 ```
 
 ### Configuration Resolution Priority
