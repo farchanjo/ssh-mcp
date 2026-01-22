@@ -23,10 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::async_command::{
-    ASYNC_COMMANDS, MAX_ASYNC_COMMANDS_PER_SESSION, OutputBuffer, RunningCommand,
-    count_session_commands, get_session_command_ids, register_command, unregister_command,
-};
+use super::async_command::{MAX_ASYNC_COMMANDS_PER_SESSION, OutputBuffer, RunningCommand};
 use super::client::{connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async};
 use super::config::{
     resolve_command_timeout, resolve_compression, resolve_connect_timeout, resolve_max_retries,
@@ -34,10 +31,8 @@ use super::config::{
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
-use super::session::{
-    SSH_SESSIONS, StoredSession, get_agent_session_ids, register_session_agent,
-    remove_agent_sessions, unregister_session_agent,
-};
+use super::message::{AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder};
+use super::storage::{COMMAND_STORAGE, CommandStorage, SESSION_STORAGE, SessionStorage};
 use super::types::{
     AgentDisconnectResponse, AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse,
     SessionInfo, SessionListResponse, SshAsyncOutputResponse, SshCancelCommandResponse,
@@ -49,94 +44,6 @@ use super::types::{
 /// This struct provides all SSH-related MCP tools for connecting to servers,
 /// executing commands, and managing port forwarding.
 pub struct McpSSHCommands;
-
-/// Build a descriptive connection message for LLM memory.
-#[allow(clippy::too_many_arguments)]
-fn build_connect_message(
-    session_id: &str,
-    agent_id: Option<&str>,
-    name: Option<&str>,
-    username: &str,
-    host: &str,
-    retry_attempts: u32,
-    persistent: bool,
-    reused: bool,
-) -> String {
-    let header = if reused {
-        "SESSION REUSED"
-    } else {
-        "SSH CONNECTION ESTABLISHED"
-    };
-
-    let mut lines = vec![format!("{}. REMEMBER THESE IDENTIFIERS:", header)];
-
-    if let Some(aid) = agent_id {
-        lines.push(format!("• agent_id: '{}'", aid));
-    }
-    lines.push(format!("• session_id: '{}'", session_id));
-    if let Some(n) = name {
-        lines.push(format!("• name: '{}'", n));
-    }
-    lines.push(format!("• host: {}@{}", username, host));
-    if retry_attempts > 0 {
-        lines.push(format!("• retry_attempts: {}", retry_attempts));
-    }
-    if persistent {
-        lines.push("• persistent: true".to_string());
-    }
-
-    lines.push(String::new()); // empty line
-    lines.push(format!(
-        "Use ssh_execute with session_id '{}' to run commands.",
-        session_id
-    ));
-    if let Some(aid) = agent_id {
-        lines.push(format!(
-            "Use ssh_disconnect_agent with agent_id '{}' to disconnect all sessions for this agent.",
-            aid
-        ));
-    }
-
-    lines.join("\n")
-}
-
-/// Build a descriptive command start message for LLM memory.
-fn build_execute_message(
-    command_id: &str,
-    session_id: &str,
-    agent_id: Option<&str>,
-    command: &str,
-) -> String {
-    let mut lines = vec![
-        "COMMAND STARTED. REMEMBER THESE IDENTIFIERS:".to_string(),
-        format!("• command_id: '{}'", command_id),
-        format!("• session_id: '{}'", session_id),
-    ];
-
-    if let Some(aid) = agent_id {
-        lines.push(format!("• agent_id: '{}'", aid));
-    }
-
-    // Truncate command if too long
-    let cmd_display = if command.len() > 50 {
-        format!("{}...", &command[..47])
-    } else {
-        command.to_string()
-    };
-    lines.push(format!("• command: '{}'", cmd_display));
-
-    lines.push(String::new()); // empty line
-    lines.push(format!(
-        "Use ssh_get_command_output with command_id '{}' to poll for results.",
-        command_id
-    ));
-    lines.push(format!(
-        "Use ssh_cancel_command with command_id '{}' to cancel.",
-        command_id
-    ));
-
-    lines.join("\n")
-}
 
 #[Tools]
 impl McpSSHCommands {
@@ -188,36 +95,27 @@ impl McpSSHCommands {
 
         // Check if session_id was provided for potential reuse
         if let Some(ref sid) = session_id {
-            // DashMap: use .get() which returns Option<Ref<K, V>>
-            let handle_and_info = SSH_SESSIONS
-                .get(sid)
-                .map(|s| (s.handle.clone(), s.info.clone()));
-
-            if let Some((handle_arc, info)) = handle_and_info {
+            if let Some(session_ref) = SESSION_STORAGE.get(sid) {
                 // Health check with 5 second timeout
                 let health_timeout = Duration::from_secs(5);
                 let now = chrono::Utc::now().to_rfc3339();
 
-                match execute_ssh_command(&handle_arc, "echo 1", health_timeout).await {
+                match execute_ssh_command(&session_ref.handle, "echo 1", health_timeout).await {
                     Ok(response) if !response.timed_out && response.exit_code == 0 => {
                         // Update health status in storage
-                        if let Some(mut stored) = SSH_SESSIONS.get_mut(sid) {
-                            stored.info.last_health_check = Some(now);
-                            stored.info.healthy = Some(true);
-                        }
+                        SESSION_STORAGE.update_health(sid, now, true);
 
                         info!("Reusing healthy session {}", sid);
-                        let reuse_agent_id = info.agent_id.clone();
-                        let message = build_connect_message(
+                        let reuse_agent_id = session_ref.info.agent_id.clone();
+                        let message = ConnectMessageBuilder::new(
                             sid,
-                            reuse_agent_id.as_deref(),
-                            info.name.as_deref(),
-                            &info.username,
-                            &info.host,
-                            0,
-                            false,
-                            true, // reused
-                        );
+                            &session_ref.info.username,
+                            &session_ref.info.host,
+                        )
+                        .with_agent_id(reuse_agent_id.as_deref())
+                        .with_name(session_ref.info.name.as_deref())
+                        .reused(true)
+                        .build();
                         return Ok(StructuredContent(SshConnectResponse {
                             session_id: sid.clone(),
                             agent_id: reuse_agent_id,
@@ -229,7 +127,7 @@ impl McpSSHCommands {
                     _ => {
                         // Session dead - remove it
                         warn!("Session {} is dead, removing", sid);
-                        SSH_SESSIONS.remove(sid);
+                        SESSION_STORAGE.remove(sid);
                     }
                 }
             } else {
@@ -281,30 +179,20 @@ impl McpSSHCommands {
                     healthy: None,
                 };
 
-                // DashMap: direct insert, no lock needed
-                SSH_SESSIONS.insert(
-                    new_session_id.clone(),
-                    StoredSession {
-                        info: session_info,
-                        handle: Arc::new(handle),
-                    },
-                );
+                // Insert session using storage abstraction
+                SESSION_STORAGE.insert(new_session_id.clone(), session_info, Arc::new(handle));
 
                 // Register in agent index if agent_id is provided
                 if let Some(ref aid) = agent_id {
-                    register_session_agent(aid, &new_session_id);
+                    SESSION_STORAGE.register_agent(aid, &new_session_id);
                 }
 
-                let message = build_connect_message(
-                    &new_session_id,
-                    agent_id.as_deref(),
-                    name.as_deref(),
-                    &username,
-                    &address,
-                    retry_attempts,
-                    persistent,
-                    false, // not reused
-                );
+                let message = ConnectMessageBuilder::new(&new_session_id, &username, &address)
+                    .with_agent_id(agent_id.as_deref())
+                    .with_name(name.as_deref())
+                    .with_retry_attempts(retry_attempts)
+                    .with_persistent(persistent)
+                    .build();
 
                 Ok(StructuredContent(SshConnectResponse {
                     session_id: new_session_id,
@@ -334,7 +222,7 @@ impl McpSSHCommands {
         info!("Disconnecting SSH session: {}", session_id);
 
         // Cancel all async commands for this session (sync O(1) lookup)
-        let command_ids = get_session_command_ids(&session_id);
+        let command_ids = COMMAND_STORAGE.list_by_session(&session_id);
         if !command_ids.is_empty() {
             info!(
                 "Cancelling {} async commands for session {}",
@@ -342,28 +230,28 @@ impl McpSSHCommands {
                 session_id
             );
 
-            // Cancel and remove each command using DashMap API
+            // Cancel and remove each command
             for cmd_id in &command_ids {
-                if let Some(cmd) = ASYNC_COMMANDS.get(cmd_id) {
+                if let Some(cmd) = COMMAND_STORAGE.get_direct(cmd_id) {
                     cmd.cancel_token.cancel();
                 }
             }
 
-            // Remove cancelled commands using unregister_command
+            // Remove cancelled commands
             for cmd_id in command_ids {
-                unregister_command(&cmd_id);
+                COMMAND_STORAGE.unregister(&cmd_id);
             }
         }
 
-        // DashMap: remove returns Option<(K, V)>
-        if let Some((_, stored)) = SSH_SESSIONS.remove(&session_id) {
+        // Remove session from storage
+        if let Some(session_ref) = SESSION_STORAGE.remove(&session_id) {
             // Unregister from agent index if agent_id exists
-            if let Some(ref agent_id) = stored.info.agent_id {
-                unregister_session_agent(agent_id, &session_id);
+            if let Some(ref agent_id) = session_ref.info.agent_id {
+                SESSION_STORAGE.unregister_agent(agent_id, &session_id);
             }
 
             // Gracefully disconnect the session
-            if let Err(e) = stored
+            if let Err(e) = session_ref
                 .handle
                 .disconnect(Disconnect::ByApplication, "Session closed by user", "en")
                 .await
@@ -396,20 +284,20 @@ impl McpSSHCommands {
 
         // Get session IDs to check (either all or filtered by agent)
         let session_ids_to_check: Vec<String> = if let Some(ref aid) = agent_id {
-            get_agent_session_ids(aid)
+            SESSION_STORAGE.get_agent_sessions(aid)
         } else {
-            SSH_SESSIONS.iter().map(|e| e.key().clone()).collect()
+            SESSION_STORAGE.session_ids()
         };
 
         // Get sessions and their handles for health checks
         let sessions_snapshot: Vec<_> = session_ids_to_check
             .into_iter()
             .filter_map(|session_id| {
-                SSH_SESSIONS.get(&session_id).map(|entry| {
+                SESSION_STORAGE.get(&session_id).map(|session_ref| {
                     (
                         session_id,
-                        entry.value().handle.clone(),
-                        entry.value().info.clone(),
+                        session_ref.handle.clone(),
+                        session_ref.info.clone(),
                     )
                 })
             })
@@ -446,21 +334,21 @@ impl McpSSHCommands {
             }
         }
 
-        // Update healthy sessions (DashMap: direct get_mut)
+        // Update healthy sessions using storage abstraction
         for (id, info) in &healthy_sessions {
-            if let Some(mut stored) = SSH_SESSIONS.get_mut(id) {
-                stored
-                    .info
-                    .last_health_check
-                    .clone_from(&info.last_health_check);
-                stored.info.healthy = info.healthy;
+            if let Some(ref last_check) = info.last_health_check {
+                SESSION_STORAGE.update_health(
+                    id,
+                    last_check.clone(),
+                    info.healthy.unwrap_or(false),
+                );
             }
         }
 
-        // Remove dead sessions (DashMap: direct remove)
+        // Remove dead sessions using storage abstraction
         for id in &dead_session_ids {
             warn!("Removing dead session {} from storage", id);
-            SSH_SESSIONS.remove(id);
+            SESSION_STORAGE.remove(id);
         }
 
         let session_infos: Vec<SessionInfo> =
@@ -493,8 +381,8 @@ impl McpSSHCommands {
                 local_port, remote_address, remote_port, session_id
             );
 
-            // DashMap: direct get, no lock needed
-            let handle_arc = SSH_SESSIONS
+            // Get session handle using storage abstraction
+            let handle_arc = SESSION_STORAGE
                 .get(&session_id)
                 .map(|s| s.handle.clone())
                 .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
@@ -550,7 +438,7 @@ impl McpSSHCommands {
         let timeout = resolve_command_timeout(timeout_secs);
 
         // Check session limit (sync O(1) lookup)
-        let current_count = count_session_commands(&session_id);
+        let current_count = COMMAND_STORAGE.count_by_session(&session_id);
         if current_count >= MAX_ASYNC_COMMANDS_PER_SESSION {
             return Err(format!(
                 "Maximum async commands per session reached ({}). Cancel or wait for existing commands to complete.",
@@ -558,8 +446,8 @@ impl McpSSHCommands {
             ));
         }
 
-        // DashMap: direct get, no lock needed - also get agent_id for response
-        let (handle_arc, agent_id) = SSH_SESSIONS
+        // Get session handle and agent_id using storage abstraction
+        let (handle_arc, agent_id) = SESSION_STORAGE
             .get(&session_id)
             .map(|s| (s.handle.clone(), s.info.agent_id.clone()))
             .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
@@ -576,7 +464,7 @@ impl McpSSHCommands {
         let cancel_token = CancellationToken::new();
 
         // Create command info
-        let info = AsyncCommandInfo {
+        let cmd_info = AsyncCommandInfo {
             command_id: command_id.clone(),
             session_id: session_id.clone(),
             command: command.clone(),
@@ -584,11 +472,11 @@ impl McpSSHCommands {
             started_at: started_at.clone(),
         };
 
-        // Store running command using register_command for proper indexing
-        register_command(
+        // Store running command using storage abstraction
+        COMMAND_STORAGE.register(
             command_id.clone(),
             RunningCommand {
-                info: info.clone(),
+                info: cmd_info,
                 cancel_token: cancel_token.clone(),
                 status_rx,
                 status_tx: status_tx.clone(),
@@ -617,8 +505,9 @@ impl McpSSHCommands {
             timed_out,
         ));
 
-        let message =
-            build_execute_message(&command_id, &session_id, agent_id.as_deref(), &command);
+        let message = ExecuteMessageBuilder::new(&command_id, &session_id, &command)
+            .with_agent_id(agent_id.as_deref())
+            .build();
 
         Ok(StructuredContent(SshExecuteResponse {
             command_id,
@@ -651,9 +540,9 @@ impl McpSSHCommands {
         let wait = wait.unwrap_or(false);
         let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
 
-        // DashMap: direct get, no lock needed
-        let (status_rx, output, exit_code, error, timed_out) = ASYNC_COMMANDS
-            .get(&command_id)
+        // Get command using storage abstraction
+        let (status_rx, output, exit_code, error, timed_out) = COMMAND_STORAGE
+            .get_direct(&command_id)
             .map(|cmd| {
                 (
                     cmd.status_rx.clone(),
@@ -719,8 +608,8 @@ impl McpSSHCommands {
             _ => None,
         });
 
-        // DashMap: iterate without lock
-        let filtered: Vec<AsyncCommandInfo> = ASYNC_COMMANDS
+        // Use storage abstraction for iteration
+        let filtered: Vec<AsyncCommandInfo> = COMMAND_STORAGE
             .iter()
             .filter(|entry| {
                 let cmd = entry.value();
@@ -760,9 +649,9 @@ impl McpSSHCommands {
         /// Command ID to cancel
         command_id: String,
     ) -> Result<StructuredContent<SshCancelCommandResponse>, String> {
-        // DashMap: direct get, no lock needed
-        let (cancel_token, output, status_rx) = ASYNC_COMMANDS
-            .get(&command_id)
+        // Get command using storage abstraction
+        let (cancel_token, output, status_rx) = COMMAND_STORAGE
+            .get_direct(&command_id)
             .map(|cmd| {
                 let current_status = *cmd.status_rx.borrow();
                 (
@@ -832,21 +721,18 @@ impl McpSSHCommands {
         info!("Disconnecting all sessions for agent: {}", agent_id);
 
         // Get and remove all session IDs for this agent atomically
-        let session_ids = remove_agent_sessions(&agent_id);
+        let session_ids = SESSION_STORAGE.remove_agent_sessions(&agent_id);
 
         if session_ids.is_empty() {
+            let message = AgentDisconnectMessageBuilder::new(&agent_id)
+                .with_sessions_disconnected(0)
+                .with_commands_cancelled(0)
+                .build();
             return Ok(StructuredContent(AgentDisconnectResponse {
                 agent_id: agent_id.clone(),
                 sessions_disconnected: 0,
                 commands_cancelled: 0,
-                message: format!(
-                    "AGENT CLEANUP COMPLETE. SUMMARY:\n\
-                    • agent_id: '{}'\n\
-                    • sessions_disconnected: 0\n\
-                    • commands_cancelled: 0\n\n\
-                    No sessions found for agent '{}'.",
-                    agent_id, agent_id
-                ),
+                message,
             }));
         }
 
@@ -855,9 +741,9 @@ impl McpSSHCommands {
         // Process each session
         for session_id in &session_ids {
             // Cancel all async commands for this session
-            let command_ids = get_session_command_ids(session_id);
+            let command_ids = COMMAND_STORAGE.list_by_session(session_id);
             for cmd_id in &command_ids {
-                if let Some(cmd) = ASYNC_COMMANDS.get(cmd_id) {
+                if let Some(cmd) = COMMAND_STORAGE.get_direct(cmd_id) {
                     cmd.cancel_token.cancel();
                 }
             }
@@ -865,12 +751,12 @@ impl McpSSHCommands {
 
             // Remove cancelled commands
             for cmd_id in command_ids {
-                unregister_command(&cmd_id);
+                COMMAND_STORAGE.unregister(&cmd_id);
             }
 
             // Disconnect the session
-            if let Some((_, stored)) = SSH_SESSIONS.remove(session_id)
-                && let Err(e) = stored
+            if let Some(session_ref) = SESSION_STORAGE.remove(session_id)
+                && let Err(e) = session_ref
                     .handle
                     .disconnect(Disconnect::ByApplication, "Agent cleanup", "en")
                     .await
@@ -886,18 +772,16 @@ impl McpSSHCommands {
             sessions_disconnected, total_commands_cancelled, agent_id
         );
 
+        let message = AgentDisconnectMessageBuilder::new(&agent_id)
+            .with_sessions_disconnected(sessions_disconnected)
+            .with_commands_cancelled(total_commands_cancelled)
+            .build();
+
         Ok(StructuredContent(AgentDisconnectResponse {
             agent_id: agent_id.clone(),
             sessions_disconnected,
             commands_cancelled: total_commands_cancelled,
-            message: format!(
-                "AGENT CLEANUP COMPLETE. SUMMARY:\n\
-                • agent_id: '{}'\n\
-                • sessions_disconnected: {}\n\
-                • commands_cancelled: {}\n\n\
-                All sessions and commands for agent '{}' have been terminated.",
-                agent_id, sessions_disconnected, total_commands_cancelled, agent_id
-            ),
+            message,
         }))
     }
 }
