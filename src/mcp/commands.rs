@@ -232,8 +232,8 @@ impl McpSSHCommands {
 
             // Cancel and remove each command
             for cmd_id in &command_ids {
-                if let Some(cmd) = COMMAND_STORAGE.get_direct(cmd_id) {
-                    cmd.cancel_token.cancel();
+                if let Some(cmd_ref) = COMMAND_STORAGE.get_ref(cmd_id) {
+                    cmd_ref.running.cancel_token.cancel();
                 }
             }
 
@@ -749,8 +749,8 @@ impl McpSSHCommands {
             // Cancel all async commands for this session
             let command_ids = COMMAND_STORAGE.list_by_session(session_id);
             for cmd_id in &command_ids {
-                if let Some(cmd) = COMMAND_STORAGE.get_direct(cmd_id) {
-                    cmd.cancel_token.cancel();
+                if let Some(cmd_ref) = COMMAND_STORAGE.get_ref(cmd_id) {
+                    cmd_ref.running.cancel_token.cancel();
                 }
             }
             total_commands_cancelled += command_ids.len();
