@@ -8,6 +8,9 @@ This document describes the operational flows of the SSH MCP server, including c
 - [SSH Connection Flow](#ssh-connection-flow)
 - [Authentication Flow](#authentication-flow)
 - [Command Execution Flow](#command-execution-flow)
+- [Async Command Execution Flow](#async-command-execution-flow)
+- [Async Command Lifecycle](#async-command-lifecycle)
+- [Command Cancellation Flow](#command-cancellation-flow)
 - [Port Forwarding Flow](#port-forwarding-flow)
 - [Error Handling and Retry Logic](#error-handling-and-retry-logic)
 
@@ -518,6 +521,523 @@ flowchart TD
 - No error is returned; instead, a valid response with partial output is provided
 - The channel is closed gracefully to avoid resource leaks
 - Clients should check the `timed_out` flag to detect timeout conditions
+
+---
+
+## Async Command Execution Flow
+
+Flow of the `ssh_execute_async` operation for long-running commands that return immediately with a command ID for polling.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant AsyncStore as ASYNC_COMMANDS
+    participant Store as SSH_SESSIONS
+    participant Task as Background Task
+    participant Handle as russh Handle
+    participant Channel as SSH Channel
+    participant Server as Remote Server
+
+    Client->>Cmd: ssh_execute_async request
+
+    Note over Cmd,AsyncStore: Check session command limit
+    Cmd->>AsyncStore: count_session_commands
+    AsyncStore-->>Cmd: current_count
+
+    alt Limit reached
+        Cmd-->>Client: Error max commands reached
+    end
+
+    Note over Cmd,Store: Get session handle
+    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Get session by ID
+    Cmd->>Store: Clone Arc of handle
+    Cmd->>Store: Unlock SSH_SESSIONS
+
+    Note over Cmd: Generate command_id UUID
+
+    Note over Cmd,AsyncStore: Create shared state
+    Cmd->>Cmd: Create watch channel for status
+    Cmd->>Cmd: Create OutputBuffer Arc Mutex
+    Cmd->>Cmd: Create exit_code Arc Mutex
+    Cmd->>Cmd: Create error Arc Mutex
+    Cmd->>Cmd: Create timed_out AtomicBool
+    Cmd->>Cmd: Create CancellationToken
+
+    Note over Cmd,AsyncStore: Store running command
+    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Insert RunningCommand
+    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+
+    Note over Cmd,Task: Spawn background task
+    Cmd->>Task: tokio spawn execute_ssh_command_async
+
+    Note over Cmd,Client: Return immediately
+    Cmd-->>Client: SshExecuteAsyncResponse with command_id
+
+    Note over Task: Background execution begins
+
+    Task->>Handle: channel_open_session
+    Handle->>Server: SSH_MSG_CHANNEL_OPEN session
+    Server-->>Handle: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+    Handle-->>Task: Channel
+
+    Task->>Channel: exec with command
+    Channel->>Server: SSH_MSG_CHANNEL_REQUEST exec
+    Server-->>Channel: SSH_MSG_CHANNEL_SUCCESS
+
+    Note over Task: tokio select with biased ordering
+
+    loop Collect output via select
+        alt Cancellation signaled
+            Task->>Task: cancel_token.cancelled
+            Task->>Channel: close
+            Task->>Task: status_tx.send Cancelled
+        else Timeout reached
+            Task->>Task: tokio time sleep timeout
+            Task->>Task: timed_out.store true
+            Task->>Channel: close
+            Task->>Task: status_tx.send Completed
+        else Output received
+            Task->>Task: collect_async_output
+            Channel-->>Task: ChannelMsg Data or ExtendedData
+            Task->>Task: Append to output buffer
+            Task->>Task: Store exit_code
+            Task->>Task: status_tx.send Completed
+        end
+    end
+```
+
+### Polling for Output
+
+The `ssh_get_command_output` tool allows clients to poll for command status and output.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant AsyncStore as ASYNC_COMMANDS
+    participant Task as Background Task
+
+    Client->>Cmd: ssh_get_command_output request
+
+    Note over Cmd,AsyncStore: Get command state
+    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Get command by ID
+    Cmd->>Cmd: Clone status_rx output exit_code error timed_out
+    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+
+    alt wait equals true
+        Note over Cmd: Wait for completion with timeout
+        Cmd->>Cmd: Clone status_rx
+        loop Wait loop with timeout
+            Cmd->>Cmd: Check status_rx.borrow
+            alt Status not Running
+                Note over Cmd: Break loop
+            else Status Running
+                Cmd->>Cmd: status_rx.changed await
+            end
+        end
+    end
+
+    Note over Cmd: Read current state
+    Cmd->>Cmd: status_rx.borrow
+    Cmd->>Cmd: output.lock
+    Cmd->>Cmd: exit_code.lock
+    Cmd->>Cmd: error.lock
+    Cmd->>Cmd: timed_out.load
+
+    Cmd-->>Client: SshAsyncOutputResponse
+```
+
+### Async Command State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted
+
+    NotStarted --> Running: ssh_execute_async called
+
+    Running --> Collecting: Channel opened
+
+    Collecting --> Collecting: Data received
+    Collecting --> Completed: Channel closed normally
+    Collecting --> Completed: Timeout reached
+    Collecting --> Cancelled: Cancel token triggered
+    Collecting --> Failed: Channel open error
+    Collecting --> Failed: Exec error
+
+    Completed --> [*]
+    Cancelled --> [*]
+    Failed --> [*]
+
+    note right of Running
+        Background task spawned
+        command_id returned to client
+    end note
+
+    note right of Collecting
+        Output buffered incrementally
+        Client can poll anytime
+    end note
+
+    note right of Completed
+        timed_out flag indicates
+        if timeout was hit
+    end note
+```
+
+### Async Command Limits
+
+```mermaid
+flowchart TD
+    Start([ssh_execute_async]) --> CountCommands[Count session commands]
+    CountCommands --> CheckLimit{count >= 10?}
+
+    CheckLimit -->|Yes| RejectError([Error: Max commands reached])
+    CheckLimit -->|No| GetSession[Get session handle]
+
+    GetSession --> SessionExists{Session found?}
+    SessionExists -->|No| SessionError([Error: No active session])
+    SessionExists -->|Yes| CreateState[Create shared state]
+
+    CreateState --> Store[Store in ASYNC_COMMANDS]
+    Store --> Spawn[Spawn background task]
+    Spawn --> Return([Return command_id])
+
+    style Start fill:#e3f2fd
+    style Return fill:#e8f5e9
+    style RejectError fill:#ffebee
+    style SessionError fill:#ffebee
+```
+
+---
+
+## Async Command Lifecycle
+
+Complete lifecycle of an async command from creation to cleanup.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: Client calls ssh_execute_async
+
+    state Pending {
+        [*] --> ValidateSession
+        ValidateSession --> CheckLimit
+        CheckLimit --> CreateState
+        CreateState --> StoreCommand
+        StoreCommand --> SpawnTask
+    }
+
+    Pending --> Running: Task spawned successfully
+    Pending --> Error: Validation failed
+
+    state Running {
+        [*] --> OpenChannel
+        OpenChannel --> ExecuteCommand
+        ExecuteCommand --> CollectOutput
+
+        state CollectOutput {
+            [*] --> WaitForData
+            WaitForData --> ProcessData: Data received
+            WaitForData --> ProcessStderr: Stderr received
+            ProcessData --> WaitForData
+            ProcessStderr --> WaitForData
+            WaitForData --> StoreExit: Exit status received
+            StoreExit --> WaitForData
+            WaitForData --> [*]: Channel closed
+        }
+    }
+
+    Running --> Completed: Normal completion
+    Running --> Completed: Timeout with partial output
+    Running --> Cancelled: Cancel requested
+    Running --> Failed: Channel or exec error
+
+    state Completed {
+        [*] --> OutputAvailable
+        OutputAvailable --> AwaitingCleanup
+    }
+
+    state Cancelled {
+        [*] --> PartialOutput
+        PartialOutput --> AwaitingCleanup
+    }
+
+    state Failed {
+        [*] --> ErrorStored
+        ErrorStored --> AwaitingCleanup
+    }
+
+    Completed --> Cleaned: Automatic cleanup after 5 minutes
+    Cancelled --> Cleaned: Automatic cleanup after 5 minutes
+    Failed --> Cleaned: Automatic cleanup after 5 minutes
+
+    Cleaned --> [*]
+
+    note right of Running
+        Client can poll with
+        ssh_get_command_output
+        at any time
+    end note
+
+    note right of Completed
+        exit_code and timed_out
+        fields indicate result
+    end note
+```
+
+### Status Transitions
+
+| From | To | Trigger |
+|------|-----|---------|
+| Pending | Running | Task spawned, channel open successful |
+| Running | Completed | Normal exit or timeout |
+| Running | Cancelled | `ssh_cancel_command` called |
+| Running | Failed | Channel open error, exec error |
+
+### AsyncCommandStatus Values
+
+```mermaid
+flowchart LR
+    subgraph StatusValues["AsyncCommandStatus Enum"]
+        Running["Running"]
+        Completed["Completed"]
+        Cancelled["Cancelled"]
+        Failed["Failed"]
+    end
+
+    subgraph Indicators["Response Indicators"]
+        ExitCode["exit_code: Option<i32>"]
+        TimedOut["timed_out: bool"]
+        Error["error: Option<String>"]
+    end
+
+    Running --> |"Normal finish"| Completed
+    Running --> |"Cancel called"| Cancelled
+    Running --> |"Error occurred"| Failed
+    Running --> |"Timeout"| Completed
+
+    Completed --- ExitCode
+    Completed --- TimedOut
+    Cancelled --- ExitCode
+    Failed --- Error
+
+    style Running fill:#fff8e1
+    style Completed fill:#e8f5e9
+    style Cancelled fill:#e3f2fd
+    style Failed fill:#ffebee
+```
+
+### Output Collection Flow
+
+```mermaid
+flowchart TD
+    subgraph BackgroundTask["Background Task"]
+        OpenCh["Open channel"]
+        ExecCmd["Execute command"]
+        SelectLoop["tokio select loop"]
+
+        subgraph SelectBranches["Select Branches - Biased"]
+            CancelBranch["1. cancel_token.cancelled"]
+            TimeoutBranch["2. tokio time sleep"]
+            OutputBranch["3. collect_async_output"]
+        end
+    end
+
+    subgraph SharedState["Shared State Arc Mutex"]
+        OutputBuf["OutputBuffer stdout stderr"]
+        ExitCode["exit_code Option i32"]
+        ErrorMsg["error Option String"]
+        TimedOutFlag["timed_out AtomicBool"]
+        StatusTx["status_tx watch Sender"]
+    end
+
+    OpenCh --> ExecCmd
+    ExecCmd --> SelectLoop
+    SelectLoop --> SelectBranches
+
+    CancelBranch --> |"Set"| StatusTx
+    TimeoutBranch --> |"Set true"| TimedOutFlag
+    TimeoutBranch --> |"Set"| StatusTx
+    OutputBranch --> |"Append"| OutputBuf
+    OutputBranch --> |"Set"| ExitCode
+    OutputBranch --> |"Set"| StatusTx
+
+    style BackgroundTask fill:#e3f2fd
+    style SharedState fill:#f3e5f5
+    style SelectBranches fill:#fff8e1
+```
+
+---
+
+## Command Cancellation Flow
+
+Flow of the `ssh_cancel_command` operation to stop a running async command.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant AsyncStore as ASYNC_COMMANDS
+    participant Task as Background Task
+    participant Channel as SSH Channel
+
+    Client->>Cmd: ssh_cancel_command request
+
+    Note over Cmd,AsyncStore: Get command state
+    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Get command by ID
+    Cmd->>Cmd: Check current status
+
+    alt Status not Running
+        Cmd-->>Client: Error command not running
+    end
+
+    Cmd->>Cmd: Clone cancel_token output status_rx
+    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+
+    Note over Cmd,Task: Signal cancellation
+    Cmd->>Task: cancel_token.cancel
+
+    Note over Cmd: Wait briefly for effect
+    Cmd->>Cmd: status_rx.changed with 2s timeout
+
+    Note over Task: Background task receives signal
+    Task->>Task: cancel_token.cancelled returns
+    Task->>Channel: close
+    Task->>Task: status_tx.send Cancelled
+
+    Note over Cmd: Get final output
+    Cmd->>Cmd: output.lock
+    Cmd->>Cmd: Convert bytes to strings
+
+    Cmd-->>Client: SshCancelCommandResponse with partial output
+```
+
+### Cancellation Signal Flow
+
+```mermaid
+flowchart TD
+    subgraph ClientSide["Client Side"]
+        CancelCall["ssh_cancel_command called"]
+        GetToken["Get cancel_token from store"]
+        SignalCancel["cancel_token.cancel"]
+        WaitStatus["Wait for status change 2s"]
+        ReturnOutput["Return partial output"]
+    end
+
+    subgraph BackgroundTask["Background Task - tokio select"]
+        SelectWait["select biased wait"]
+        CancelCheck["cancel_token.cancelled - Branch 1"]
+        TimeoutCheck["sleep timeout - Branch 2"]
+        OutputCheck["collect_async_output - Branch 3"]
+    end
+
+    subgraph Cleanup["Cleanup Actions"]
+        CloseChannel["Close SSH channel"]
+        UpdateStatus["status_tx.send Cancelled"]
+        LogCancel["Log cancellation"]
+    end
+
+    CancelCall --> GetToken
+    GetToken --> SignalCancel
+    SignalCancel -.->|"Token signaled"| CancelCheck
+    SignalCancel --> WaitStatus
+
+    SelectWait --> CancelCheck
+    CancelCheck -->|"Token cancelled"| CloseChannel
+    CloseChannel --> UpdateStatus
+    UpdateStatus --> LogCancel
+
+    WaitStatus -->|"Status changed"| ReturnOutput
+
+    style ClientSide fill:#e3f2fd
+    style BackgroundTask fill:#fff8e1
+    style Cleanup fill:#e8f5e9
+```
+
+### Cancellation State Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running: Command executing
+
+    Running --> CancelRequested: ssh_cancel_command called
+
+    CancelRequested --> TokenSignaled: cancel_token.cancel
+
+    TokenSignaled --> SelectDetects: tokio select biased
+
+    SelectDetects --> ChannelClosing: cancel branch wins
+
+    ChannelClosing --> StatusUpdated: status_tx.send Cancelled
+
+    StatusUpdated --> Cancelled: Final state
+
+    Cancelled --> [*]
+
+    note right of CancelRequested
+        Client sends cancel request
+        Gets partial output back
+    end note
+
+    note right of TokenSignaled
+        CancellationToken is shared
+        between client and task
+    end note
+
+    note right of SelectDetects
+        Biased select checks cancel
+        token first before other branches
+    end note
+```
+
+### Partial Output Recovery
+
+When a command is cancelled, the client receives all output collected up to that point.
+
+```mermaid
+flowchart LR
+    subgraph BeforeCancel["Before Cancellation"]
+        Stdout1["stdout: partial data"]
+        Stderr1["stderr: partial data"]
+        Status1["status: Running"]
+    end
+
+    subgraph CancelAction["Cancel Action"]
+        Signal["cancel_token.cancel"]
+        Wait["Wait up to 2s"]
+    end
+
+    subgraph AfterCancel["After Cancellation"]
+        Stdout2["stdout: preserved"]
+        Stderr2["stderr: preserved"]
+        Status2["status: Cancelled"]
+        Cancelled2["cancelled: true"]
+    end
+
+    BeforeCancel --> CancelAction
+    CancelAction --> AfterCancel
+
+    Stdout1 -.->|"Preserved"| Stdout2
+    Stderr1 -.->|"Preserved"| Stderr2
+
+    style BeforeCancel fill:#fff8e1
+    style CancelAction fill:#ffebee
+    style AfterCancel fill:#e8f5e9
+```
+
+### Cancel Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command_id` | String | The cancelled command's ID |
+| `cancelled` | bool | Always `true` on success |
+| `message` | String | Confirmation message |
+| `stdout` | String | Output collected before cancellation |
+| `stderr` | String | Error output collected before cancellation |
 
 ---
 
