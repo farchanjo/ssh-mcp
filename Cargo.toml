@@ -36,6 +36,7 @@ serde_json = "1.0"
 schemars = "1.0"                                   # Required by poem-mcpserver
 
 # Utilities
+backon = "1"                                                            # Retry with backoff
 chrono = "0.4"                                                          # For timestamps
 dotenv = "0.15"                                                         # For environment variables
 thiserror = "1.0"                                                       # Error handling
