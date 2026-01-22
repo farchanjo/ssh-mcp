@@ -1,16 +1,19 @@
+use std::env;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use backon::{ExponentialBuilder, Retryable};
 use once_cell::sync::Lazy;
 use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Session metadata for tracking connection information
@@ -20,6 +23,10 @@ pub struct SessionInfo {
     pub host: String,
     pub username: String,
     pub connected_at: String,
+    /// Default timeout in seconds used for this session's connection
+    pub default_timeout_secs: u64,
+    /// Number of retry attempts needed to establish the connection
+    pub retry_attempts: u32,
 }
 
 /// Stored session data combining metadata with the actual session
@@ -37,6 +44,8 @@ pub struct SshConnectResponse {
     session_id: String,
     message: String,
     authenticated: bool,
+    /// Number of retry attempts needed to establish the connection
+    retry_attempts: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -58,24 +67,38 @@ pub struct McpSSHCommands;
 #[Tools]
 impl McpSSHCommands {
     /// Connect to an SSH server and store the session
+    #[allow(clippy::too_many_arguments)]
     async fn ssh_connect(
         &self,
         address: String,
         username: String,
         password: Option<String>,
         key_path: Option<String>,
+        timeout_secs: Option<u64>,
+        max_retries: Option<u32>,
+        retry_delay_ms: Option<u64>,
     ) -> Result<StructuredContent<SshConnectResponse>, String> {
-        info!("Attempting SSH connection to {}@{}", username, address);
+        let timeout = resolve_connect_timeout(timeout_secs);
+        let max_retries = resolve_max_retries(max_retries);
+        let retry_delay_ms = resolve_retry_delay_ms(retry_delay_ms);
 
-        match connect_to_ssh(
+        info!(
+            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay_ms={}",
+            username, address, timeout, max_retries, retry_delay_ms
+        );
+
+        match connect_to_ssh_with_retry(
             &address,
             &username,
             password.as_deref(),
             key_path.as_deref(),
+            timeout,
+            max_retries,
+            retry_delay_ms,
         )
         .await
         {
-            Ok(session) => {
+            Ok((session, retry_attempts)) => {
                 let session_id = Uuid::new_v4().to_string();
                 let connected_at = chrono::Utc::now().to_rfc3339();
 
@@ -84,6 +107,8 @@ impl McpSSHCommands {
                     host: address.clone(),
                     username: username.clone(),
                     connected_at,
+                    default_timeout_secs: timeout,
+                    retry_attempts,
                 };
 
                 // Minimize lock scope: only hold the lock while inserting
@@ -98,10 +123,20 @@ impl McpSSHCommands {
                     );
                 }
 
+                let message = if retry_attempts > 0 {
+                    format!(
+                        "Successfully connected to {}@{} after {} retry attempt(s)",
+                        username, address, retry_attempts
+                    )
+                } else {
+                    format!("Successfully connected to {}@{}", username, address)
+                };
+
                 Ok(StructuredContent(SshConnectResponse {
                     session_id,
-                    message: format!("Successfully connected to {}@{}", username, address),
+                    message,
                     authenticated: true,
+                    retry_attempts,
                 }))
             }
             Err(e) => {
@@ -116,10 +151,12 @@ impl McpSSHCommands {
         &self,
         session_id: String,
         command: String,
+        timeout_secs: Option<u64>,
     ) -> Result<StructuredContent<SshCommandResponse>, String> {
+        let timeout = resolve_command_timeout(timeout_secs);
         info!(
-            "Executing command on SSH session {}: {}",
-            session_id, command
+            "Executing command on SSH session {} with timeout {}s: {}",
+            session_id, timeout, command
         );
 
         // Clone Arc and release global lock immediately to avoid double mutex contention
@@ -133,13 +170,29 @@ impl McpSSHCommands {
 
         // Now hold only the session-specific lock
         let session = session_arc.lock().await;
-        execute_ssh_command(&session, &command)
-            .await
-            .map(StructuredContent)
-            .map_err(|e| {
+
+        // Wrap command execution with timeout
+        match tokio::time::timeout(
+            Duration::from_secs(timeout),
+            execute_ssh_command(&session, &command),
+        )
+        .await
+        {
+            Ok(result) => result.map(StructuredContent).map_err(|e| {
                 error!("Command execution failed: {}", e);
                 e
-            })
+            }),
+            Err(_) => {
+                error!(
+                    "Command execution timed out after {}s: {}",
+                    timeout, command
+                );
+                Err(format!(
+                    "Command execution timed out after {} seconds",
+                    timeout
+                ))
+            }
+        }
     }
 
     /// Setup port forwarding on an existing SSH session
@@ -206,13 +259,252 @@ impl McpSSHCommands {
     }
 }
 
+/// Default SSH connection timeout in seconds
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default SSH command execution timeout in seconds
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 60;
+
+/// Default maximum retry attempts for SSH connection
+const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Default retry delay in milliseconds
+const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
+
+/// Maximum retry delay cap in seconds (10 seconds)
+const MAX_RETRY_DELAY_SECS: u64 = 10;
+
+/// Environment variable name for SSH connection timeout
+const CONNECT_TIMEOUT_ENV_VAR: &str = "SSH_CONNECT_TIMEOUT";
+
+/// Environment variable name for SSH command execution timeout
+const COMMAND_TIMEOUT_ENV_VAR: &str = "SSH_COMMAND_TIMEOUT";
+
+/// Environment variable name for SSH max retries
+const MAX_RETRIES_ENV_VAR: &str = "SSH_MAX_RETRIES";
+
+/// Environment variable name for SSH retry delay in milliseconds
+const RETRY_DELAY_MS_ENV_VAR: &str = "SSH_RETRY_DELAY_MS";
+
+/// Resolve the connection timeout value with priority: parameter -> env var -> default
+fn resolve_connect_timeout(timeout_param: Option<u64>) -> u64 {
+    // Priority 1: Use parameter if provided
+    if let Some(timeout) = timeout_param {
+        return timeout;
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_timeout) = env::var(CONNECT_TIMEOUT_ENV_VAR)
+        && let Ok(timeout) = env_timeout.parse::<u64>()
+    {
+        return timeout;
+    }
+
+    // Priority 3: Default value
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+/// Resolve the command execution timeout value with priority: parameter -> env var -> default
+fn resolve_command_timeout(timeout_param: Option<u64>) -> u64 {
+    // Priority 1: Use parameter if provided
+    if let Some(timeout) = timeout_param {
+        return timeout;
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_timeout) = env::var(COMMAND_TIMEOUT_ENV_VAR)
+        && let Ok(timeout) = env_timeout.parse::<u64>()
+    {
+        return timeout;
+    }
+
+    // Priority 3: Default value
+    DEFAULT_COMMAND_TIMEOUT_SECS
+}
+
+/// Resolve the max retries value with priority: parameter -> env var -> default
+fn resolve_max_retries(max_retries_param: Option<u32>) -> u32 {
+    // Priority 1: Use parameter if provided
+    if let Some(max_retries) = max_retries_param {
+        return max_retries;
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_retries) = env::var(MAX_RETRIES_ENV_VAR)
+        && let Ok(retries) = env_retries.parse::<u32>()
+    {
+        return retries;
+    }
+
+    // Priority 3: Default value
+    DEFAULT_MAX_RETRIES
+}
+
+/// Resolve the retry delay value with priority: parameter -> env var -> default
+fn resolve_retry_delay_ms(retry_delay_param: Option<u64>) -> u64 {
+    // Priority 1: Use parameter if provided
+    if let Some(delay) = retry_delay_param {
+        return delay;
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_delay) = env::var(RETRY_DELAY_MS_ENV_VAR)
+        && let Ok(delay) = env_delay.parse::<u64>()
+    {
+        return delay;
+    }
+
+    // Priority 3: Default value
+    DEFAULT_RETRY_DELAY_MS
+}
+
+/// Check if an error is retryable (transient connection errors, not authentication failures)
+fn is_retryable_error(error: &str) -> bool {
+    let error_lower = error.to_lowercase();
+
+    // Authentication failures are NOT retryable
+    let auth_errors = [
+        "authentication failed",
+        "password authentication failed",
+        "key authentication failed",
+        "agent authentication failed",
+        "permission denied",
+        "publickey",
+        "auth fail",
+    ];
+
+    for auth_err in &auth_errors {
+        if error_lower.contains(auth_err) {
+            return false;
+        }
+    }
+
+    // Connection errors ARE retryable
+    let retryable_errors = [
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "timeout",
+        "network is unreachable",
+        "no route to host",
+        "host is down",
+        "temporary failure",
+        "resource temporarily unavailable",
+        "handshake failed",
+        "failed to connect",
+    ];
+
+    for retryable_err in &retryable_errors {
+        if error_lower.contains(retryable_err) {
+            return true;
+        }
+    }
+
+    // Default: retry on unknown errors (conservative approach for transient issues)
+    // But if it looks like an SSH protocol error, don't retry
+    !error_lower.contains("ssh")
+        || error_lower.contains("timeout")
+        || error_lower.contains("connect")
+}
+
 // Implementation functions for SSH operations
+
+/// Connect to SSH with retry logic using exponential backoff with jitter.
+/// Returns the session and the number of retry attempts that were made.
+async fn connect_to_ssh_with_retry(
+    address: &str,
+    username: &str,
+    password: Option<&str>,
+    key_path: Option<&str>,
+    timeout_secs: u64,
+    max_retries: u32,
+    min_delay_ms: u64,
+) -> Result<(Session, u32), String> {
+    // Track retry attempts using atomic counter
+    let attempt_counter = AtomicU32::new(0);
+
+    // Clone values for the retry closure
+    let address = address.to_string();
+    let username = username.to_string();
+    let password = password.map(|s| s.to_string());
+    let key_path = key_path.map(|s| s.to_string());
+
+    let backoff = ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(min_delay_ms))
+        .with_max_delay(Duration::from_secs(MAX_RETRY_DELAY_SECS))
+        .with_max_times(max_retries as usize)
+        .with_jitter();
+
+    let result = (|| async {
+        let current_attempt = attempt_counter.fetch_add(1, Ordering::SeqCst);
+
+        if current_attempt > 0 {
+            warn!(
+                "SSH connection retry attempt {} to {}@{}",
+                current_attempt, username, address
+            );
+        }
+
+        connect_to_ssh(
+            &address,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
+            timeout_secs,
+        )
+        .await
+    })
+    .retry(backoff)
+    .when(|e| {
+        let retryable = is_retryable_error(e);
+        if !retryable {
+            warn!(
+                "SSH connection to {}@{} failed with non-retryable error: {}",
+                username, address, e
+            );
+        }
+        retryable
+    })
+    .notify(|err, dur| {
+        warn!(
+            "SSH connection failed: {}. Retrying in {:?}",
+            err, dur
+        );
+    })
+    .await;
+
+    let total_attempts = attempt_counter.load(Ordering::SeqCst);
+    let retry_count = total_attempts.saturating_sub(1);
+
+    match result {
+        Ok(session) => {
+            if retry_count > 0 {
+                info!(
+                    "SSH connection to {}@{} succeeded after {} retry attempt(s)",
+                    username, address, retry_count
+                );
+            }
+            Ok((session, retry_count))
+        }
+        Err(e) => {
+            error!(
+                "SSH connection to {}@{} failed after {} attempt(s). Last error: {}",
+                username, address, total_attempts, e
+            );
+            Err(format!(
+                "SSH connection failed after {} attempt(s). Last error: {}",
+                total_attempts, e
+            ))
+        }
+    }
+}
 
 async fn connect_to_ssh(
     address: &str,
     username: &str,
     password: Option<&str>,
     key_path: Option<&str>,
+    timeout_secs: u64,
 ) -> Result<Session, String> {
     // Clone all inputs for moving into spawn_blocking
     let address = address.to_string();
@@ -229,8 +521,8 @@ async fn connect_to_ssh(
             .next()
             .ok_or_else(|| format!("No valid socket address for: {}", address))?;
 
-        let tcp = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(30))
-            .map_err(|e| format!("Failed to connect (timeout 30s): {}", e))?;
+        let tcp = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(timeout_secs))
+            .map_err(|e| format!("Failed to connect (timeout {}s): {}", timeout_secs, e))?;
 
         let mut sess =
             Session::new().map_err(|e| format!("Failed to create SSH session: {}", e))?;
