@@ -219,7 +219,7 @@ src/mcp/
 ├── config.rs     (600 lines)  - Configuration resolution
 ├── error.rs      (359 lines)  - Error classification
 ├── session.rs    (87 lines)   - Session storage
-├── client.rs     (636 lines)  - SSH connection/auth
+├── client.rs     (656 lines)  - SSH connection/auth
 ├── forward.rs    (162 lines)  - Port forwarding
 └── commands.rs   (262 lines)  - MCP tool handlers
 ```
