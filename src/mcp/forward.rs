@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use russh::client;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tracing::{debug, error};
 
 use super::session::SshClientHandler;
@@ -49,7 +48,7 @@ use super::session::SshClientHandler;
 ///
 /// Returns the actual bound socket address on success, or an error message on failure.
 pub(crate) async fn setup_port_forwarding(
-    handle_arc: Arc<Mutex<client::Handle<SshClientHandler>>>,
+    handle_arc: Arc<client::Handle<SshClientHandler>>,
     local_port: u16,
     remote_address: &str,
     remote_port: u16,
@@ -110,16 +109,13 @@ pub(crate) async fn setup_port_forwarding(
 /// bidirectional data forwarding between the local TCP stream and the
 /// SSH channel.
 async fn handle_port_forward_connection(
-    handle_arc: Arc<Mutex<client::Handle<SshClientHandler>>>,
+    handle_arc: Arc<client::Handle<SshClientHandler>>,
     local_stream: tokio::net::TcpStream,
     remote_host: &str,
     remote_port: u16,
 ) -> Result<(), String> {
-    // Lock the handle to open a channel
-    let handle = handle_arc.lock().await;
-
     // Open a direct-tcpip channel to the remote destination
-    let channel = handle
+    let channel = handle_arc
         .channel_open_direct_tcpip(
             remote_host,
             remote_port as u32,
@@ -128,9 +124,6 @@ async fn handle_port_forward_connection(
         )
         .await
         .map_err(|e| format!("Failed to open direct-tcpip channel: {}", e))?;
-
-    // Drop the handle lock so other operations can proceed
-    drop(handle);
 
     // Convert channel to stream for bidirectional I/O
     let channel_stream = channel.into_stream();

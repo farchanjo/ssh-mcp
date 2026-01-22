@@ -66,6 +66,107 @@ pub struct SessionListResponse {
     pub count: usize,
 }
 
+/// Status of an async command execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncCommandStatus {
+    /// Command is currently running
+    Running,
+    /// Command has completed (check exit_code)
+    Completed,
+    /// Command was cancelled by user
+    Cancelled,
+    /// Command failed to start (check error field)
+    Failed,
+}
+
+impl std::fmt::Display for AsyncCommandStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsyncCommandStatus::Running => write!(f, "running"),
+            AsyncCommandStatus::Completed => write!(f, "completed"),
+            AsyncCommandStatus::Cancelled => write!(f, "cancelled"),
+            AsyncCommandStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// Response from ssh_execute_async
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshExecuteAsyncResponse {
+    /// Unique identifier for this async command
+    pub command_id: String,
+    /// Session ID where the command is running
+    pub session_id: String,
+    /// The command that was started
+    pub command: String,
+    /// When the command was started (RFC3339 format)
+    pub started_at: String,
+    /// Human-readable message about the async command
+    pub message: String,
+}
+
+/// Response from ssh_get_command_output
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshAsyncOutputResponse {
+    /// Command ID being queried
+    pub command_id: String,
+    /// Current status of the command
+    pub status: AsyncCommandStatus,
+    /// Standard output collected so far
+    pub stdout: String,
+    /// Standard error collected so far
+    pub stderr: String,
+    /// Exit code (only present when completed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Error message (only present when failed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether the command timed out
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+/// Response from ssh_cancel_command
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshCancelCommandResponse {
+    /// Command ID that was cancelled
+    pub command_id: String,
+    /// Whether cancellation was successful
+    pub cancelled: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Standard output collected before cancellation
+    pub stdout: String,
+    /// Standard error collected before cancellation
+    pub stderr: String,
+}
+
+/// Information about a single async command
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AsyncCommandInfo {
+    /// Unique identifier for this command
+    pub command_id: String,
+    /// Session ID where the command is running
+    pub session_id: String,
+    /// The command being executed
+    pub command: String,
+    /// Current status of the command
+    pub status: AsyncCommandStatus,
+    /// When the command was started (RFC3339 format)
+    pub started_at: String,
+}
+
+/// Response from ssh_list_commands
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshListCommandsResponse {
+    /// List of async commands
+    pub commands: Vec<AsyncCommandInfo>,
+    /// Total number of commands returned
+    pub count: usize,
+}
+
 #[cfg(test)]
 mod response_serialization {
     use super::*;
@@ -378,6 +479,354 @@ mod response_serialization {
             assert_eq!(deserialized.local_address, "127.0.0.1:8080");
             assert_eq!(deserialized.remote_address, "localhost:3306");
             assert!(deserialized.active);
+        }
+    }
+
+    mod async_command_status {
+        use super::*;
+
+        #[test]
+        fn test_serialize_running() {
+            let status = AsyncCommandStatus::Running;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"running\"");
+        }
+
+        #[test]
+        fn test_serialize_completed() {
+            let status = AsyncCommandStatus::Completed;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"completed\"");
+        }
+
+        #[test]
+        fn test_serialize_cancelled() {
+            let status = AsyncCommandStatus::Cancelled;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"cancelled\"");
+        }
+
+        #[test]
+        fn test_serialize_failed() {
+            let status = AsyncCommandStatus::Failed;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"failed\"");
+        }
+
+        #[test]
+        fn test_deserialize_all_variants() {
+            assert_eq!(
+                serde_json::from_str::<AsyncCommandStatus>("\"running\"").unwrap(),
+                AsyncCommandStatus::Running
+            );
+            assert_eq!(
+                serde_json::from_str::<AsyncCommandStatus>("\"completed\"").unwrap(),
+                AsyncCommandStatus::Completed
+            );
+            assert_eq!(
+                serde_json::from_str::<AsyncCommandStatus>("\"cancelled\"").unwrap(),
+                AsyncCommandStatus::Cancelled
+            );
+            assert_eq!(
+                serde_json::from_str::<AsyncCommandStatus>("\"failed\"").unwrap(),
+                AsyncCommandStatus::Failed
+            );
+        }
+
+        #[test]
+        fn test_display_trait() {
+            assert_eq!(format!("{}", AsyncCommandStatus::Running), "running");
+            assert_eq!(format!("{}", AsyncCommandStatus::Completed), "completed");
+            assert_eq!(format!("{}", AsyncCommandStatus::Cancelled), "cancelled");
+            assert_eq!(format!("{}", AsyncCommandStatus::Failed), "failed");
+        }
+
+        #[test]
+        fn test_clone_and_copy() {
+            let status = AsyncCommandStatus::Running;
+            let cloned = status.clone();
+            let copied = status;
+            assert_eq!(status, cloned);
+            assert_eq!(status, copied);
+        }
+
+        #[test]
+        fn test_equality() {
+            assert_eq!(AsyncCommandStatus::Running, AsyncCommandStatus::Running);
+            assert_ne!(AsyncCommandStatus::Running, AsyncCommandStatus::Completed);
+        }
+    }
+
+    mod ssh_execute_async_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshExecuteAsyncResponse {
+                command_id: "cmd-123".to_string(),
+                session_id: "sess-456".to_string(),
+                command: "sleep 10".to_string(),
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+                message: "Command started".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshExecuteAsyncResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.command_id, "cmd-123");
+            assert_eq!(deserialized.session_id, "sess-456");
+            assert_eq!(deserialized.command, "sleep 10");
+            assert_eq!(deserialized.started_at, "2024-01-15T10:30:00Z");
+            assert_eq!(deserialized.message, "Command started");
+        }
+
+        #[test]
+        fn test_json_structure() {
+            let response = SshExecuteAsyncResponse {
+                command_id: "id".to_string(),
+                session_id: "sid".to_string(),
+                command: "cmd".to_string(),
+                started_at: "time".to_string(),
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_value(&response).unwrap();
+            assert!(json.get("command_id").is_some());
+            assert!(json.get("session_id").is_some());
+            assert!(json.get("command").is_some());
+            assert!(json.get("started_at").is_some());
+            assert!(json.get("message").is_some());
+        }
+    }
+
+    mod ssh_async_output_response {
+        use super::*;
+
+        #[test]
+        fn test_running_response() {
+            let response = SshAsyncOutputResponse {
+                command_id: "cmd-123".to_string(),
+                status: AsyncCommandStatus::Running,
+                stdout: "partial output".to_string(),
+                stderr: String::new(),
+                exit_code: None,
+                error: None,
+                timed_out: false,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshAsyncOutputResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.status, AsyncCommandStatus::Running);
+            assert_eq!(deserialized.exit_code, None);
+            assert!(!deserialized.timed_out);
+        }
+
+        #[test]
+        fn test_completed_response() {
+            let response = SshAsyncOutputResponse {
+                command_id: "cmd-123".to_string(),
+                status: AsyncCommandStatus::Completed,
+                stdout: "full output".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                error: None,
+                timed_out: false,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshAsyncOutputResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.status, AsyncCommandStatus::Completed);
+            assert_eq!(deserialized.exit_code, Some(0));
+        }
+
+        #[test]
+        fn test_failed_response() {
+            let response = SshAsyncOutputResponse {
+                command_id: "cmd-123".to_string(),
+                status: AsyncCommandStatus::Failed,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+                error: Some("Failed to open channel".to_string()),
+                timed_out: false,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshAsyncOutputResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.status, AsyncCommandStatus::Failed);
+            assert_eq!(
+                deserialized.error,
+                Some("Failed to open channel".to_string())
+            );
+        }
+
+        #[test]
+        fn test_timed_out_response() {
+            let response = SshAsyncOutputResponse {
+                command_id: "cmd-123".to_string(),
+                status: AsyncCommandStatus::Completed,
+                stdout: "partial".to_string(),
+                stderr: String::new(),
+                exit_code: None,
+                error: None,
+                timed_out: true,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshAsyncOutputResponse = serde_json::from_str(&json).unwrap();
+
+            assert!(deserialized.timed_out);
+        }
+
+        #[test]
+        fn test_optional_fields_omitted_when_none() {
+            let response = SshAsyncOutputResponse {
+                command_id: "cmd-123".to_string(),
+                status: AsyncCommandStatus::Running,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+                error: None,
+                timed_out: false,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            // exit_code and error should be omitted when None
+            assert!(!json.contains("exit_code"));
+            assert!(!json.contains("error"));
+        }
+    }
+
+    mod ssh_cancel_command_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshCancelCommandResponse {
+                command_id: "cmd-123".to_string(),
+                cancelled: true,
+                message: "Command cancelled successfully".to_string(),
+                stdout: "partial output".to_string(),
+                stderr: String::new(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshCancelCommandResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.command_id, "cmd-123");
+            assert!(deserialized.cancelled);
+            assert_eq!(deserialized.message, "Command cancelled successfully");
+        }
+
+        #[test]
+        fn test_cancelled_false() {
+            let response = SshCancelCommandResponse {
+                command_id: "cmd-123".to_string(),
+                cancelled: false,
+                message: "Command was not running".to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshCancelCommandResponse = serde_json::from_str(&json).unwrap();
+
+            assert!(!deserialized.cancelled);
+        }
+    }
+
+    mod async_command_info {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let info = AsyncCommandInfo {
+                command_id: "cmd-123".to_string(),
+                session_id: "sess-456".to_string(),
+                command: "ls -la".to_string(),
+                status: AsyncCommandStatus::Running,
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+
+            let json = serde_json::to_string(&info).unwrap();
+            let deserialized: AsyncCommandInfo = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.command_id, "cmd-123");
+            assert_eq!(deserialized.session_id, "sess-456");
+            assert_eq!(deserialized.command, "ls -la");
+            assert_eq!(deserialized.status, AsyncCommandStatus::Running);
+        }
+
+        #[test]
+        fn test_clone() {
+            let info = AsyncCommandInfo {
+                command_id: "cmd-123".to_string(),
+                session_id: "sess-456".to_string(),
+                command: "echo test".to_string(),
+                status: AsyncCommandStatus::Completed,
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+
+            let cloned = info.clone();
+            assert_eq!(cloned.command_id, info.command_id);
+            assert_eq!(cloned.status, info.status);
+        }
+    }
+
+    mod ssh_list_commands_response {
+        use super::*;
+
+        #[test]
+        fn test_empty_list() {
+            let response = SshListCommandsResponse {
+                commands: vec![],
+                count: 0,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshListCommandsResponse = serde_json::from_str(&json).unwrap();
+
+            assert!(deserialized.commands.is_empty());
+            assert_eq!(deserialized.count, 0);
+        }
+
+        #[test]
+        fn test_multiple_commands() {
+            let cmd1 = AsyncCommandInfo {
+                command_id: "cmd-1".to_string(),
+                session_id: "sess-1".to_string(),
+                command: "sleep 10".to_string(),
+                status: AsyncCommandStatus::Running,
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+            let cmd2 = AsyncCommandInfo {
+                command_id: "cmd-2".to_string(),
+                session_id: "sess-1".to_string(),
+                command: "ls -la".to_string(),
+                status: AsyncCommandStatus::Completed,
+                started_at: "2024-01-15T10:31:00Z".to_string(),
+            };
+
+            let response = SshListCommandsResponse {
+                commands: vec![cmd1, cmd2],
+                count: 2,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshListCommandsResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.commands.len(), 2);
+            assert_eq!(deserialized.count, 2);
+            assert_eq!(deserialized.commands[0].command_id, "cmd-1");
+            assert_eq!(deserialized.commands[0].status, AsyncCommandStatus::Running);
+            assert_eq!(deserialized.commands[1].command_id, "cmd-2");
+            assert_eq!(
+                deserialized.commands[1].status,
+                AsyncCommandStatus::Completed
+            );
         }
     }
 }

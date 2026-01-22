@@ -44,13 +44,16 @@ use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
 use russh::{ChannelMsg, client, keys};
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+use crate::mcp::async_command::OutputBuffer;
 use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
-use crate::mcp::types::SshCommandResponse;
+use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
 
 /// Build russh client configuration with the specified settings.
 ///
@@ -434,15 +437,12 @@ async fn authenticate_with_agent(
 ///
 /// Returns -1 as exit code if the remote server doesn't provide one or on timeout.
 pub(crate) async fn execute_ssh_command(
-    handle_arc: &Arc<Mutex<client::Handle<SshClientHandler>>>,
+    handle_arc: &Arc<client::Handle<SshClientHandler>>,
     command: &str,
     timeout: Duration,
 ) -> Result<SshCommandResponse, String> {
-    // Lock the handle for this operation
-    let handle = handle_arc.lock().await;
-
     // Open a session channel
-    let mut channel = handle
+    let mut channel = handle_arc
         .channel_open_session()
         .await
         .map_err(|e| format!("Failed to open channel: {}", e))?;
@@ -452,9 +452,6 @@ pub(crate) async fn execute_ssh_command(
         .exec(true, command)
         .await
         .map_err(|e| format!("Failed to execute command: {}", e))?;
-
-    // Drop the handle lock so other operations can proceed
-    drop(handle);
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -521,6 +518,133 @@ pub(crate) async fn execute_ssh_command(
         exit_code: exit_code.map(|c| c as i32).unwrap_or(-1),
         timed_out,
     })
+}
+
+/// Execute a command asynchronously on an SSH session.
+///
+/// This function runs in a background task and collects output incrementally.
+/// The caller can poll for output, wait for completion, or cancel the command.
+///
+/// # Arguments
+///
+/// * `handle` - Shared handle to the SSH session
+/// * `command` - Shell command to execute
+/// * `timeout` - Command execution timeout duration
+/// * `output` - Shared buffer for collecting stdout/stderr
+/// * `status_tx` - Channel to send status updates
+/// * `cancel_token` - Token to signal cancellation
+/// * `exit_code` - Shared storage for exit code
+/// * `error` - Shared storage for error message
+/// * `timed_out` - Shared flag for timeout status
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_ssh_command_async(
+    handle: Arc<client::Handle<SshClientHandler>>,
+    command: String,
+    timeout: Duration,
+    output: Arc<tokio::sync::Mutex<OutputBuffer>>,
+    status_tx: watch::Sender<AsyncCommandStatus>,
+    cancel_token: CancellationToken,
+    exit_code: Arc<tokio::sync::Mutex<Option<i32>>>,
+    error: Arc<tokio::sync::Mutex<Option<String>>>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
+) {
+    // Open a session channel
+    let mut channel = match handle.channel_open_session().await {
+        Ok(ch) => ch,
+        Err(e) => {
+            *error.lock().await = Some(format!("Failed to open channel: {}", e));
+            let _ = status_tx.send(AsyncCommandStatus::Failed);
+            return;
+        }
+    };
+
+    // Execute the command
+    if let Err(e) = channel.exec(true, command.as_str()).await {
+        *error.lock().await = Some(format!("Failed to execute command: {}", e));
+        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        return;
+    }
+
+    // Collect output with timeout and cancellation support
+    tokio::select! {
+        biased;
+
+        // Check for cancellation first
+        _ = cancel_token.cancelled() => {
+            warn!("Async command cancelled: {}", command);
+            let _ = channel.close().await;
+            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+        }
+
+        // Check for timeout
+        _ = tokio::time::sleep(timeout) => {
+            warn!(
+                "Async command timed out after {:?}: {}",
+                timeout, command
+            );
+            timed_out.store(true, Ordering::SeqCst);
+            let _ = channel.close().await;
+            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        }
+
+        // Collect output
+        result = collect_async_output(&mut channel, &output) => {
+            *exit_code.lock().await = result;
+            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        }
+    }
+}
+
+/// Collect output from an SSH channel into the shared buffer.
+///
+/// Returns the exit code when the channel closes.
+async fn collect_async_output(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    output: &Arc<tokio::sync::Mutex<OutputBuffer>>,
+) -> Option<i32> {
+    use russh::ChannelMsg;
+
+    let mut exit_code: Option<i32> = None;
+
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                let mut buf = output.lock().await;
+                buf.stdout.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::ExtendedData { data, ext }) => {
+                // ext == 1 is stderr in SSH protocol
+                if ext == 1 {
+                    let mut buf = output.lock().await;
+                    buf.stderr.extend_from_slice(&data);
+                }
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = Some(exit_status as i32);
+            }
+            Some(ChannelMsg::Eof) => {
+                // Continue to wait for exit status if not received yet
+                if exit_code.is_some() {
+                    break;
+                }
+            }
+            Some(ChannelMsg::Close) => {
+                break;
+            }
+            Some(_) => {
+                // Ignore other message types
+            }
+            None => {
+                // Channel closed
+                break;
+            }
+        }
+    }
+
+    // Close channel gracefully
+    let _ = channel.close().await;
+
+    exit_code
 }
 
 #[cfg(test)]

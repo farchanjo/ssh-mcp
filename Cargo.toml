@@ -26,6 +26,7 @@ path = "src/lib.rs"
 poem = "3.1"                                                                # Match version used by poem-mcpserver
 poem-mcpserver = { version = "0.2.9", features = ["streamable-http"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+tokio-util = "0.7"
 
 # SSH client (async)
 russh = "0.55"
