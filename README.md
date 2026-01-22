@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-131%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -18,8 +18,8 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Native async SSH** - No blocking thread pool, true async all the way down
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
-- **Modular codebase** - 8 focused modules instead of 1 monolithic file
-- **Comprehensive tests** - 93 unit tests covering all functionality
+- **Modular codebase** - 9 focused modules instead of 1 monolithic file
+- **Comprehensive tests** - 131 unit tests covering all functionality
 
 ---
 
@@ -34,8 +34,8 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **C Dependencies** | Requires libssh2, openssl | None - pure Rust |
 | **Thread Safety** | `Session` is `!Send` (requires `std::thread`) | `Handle` is `Send + Sync` |
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
-| **Architecture** | Single ~800 line file | 8 modules, 2400+ lines |
-| **Test Coverage** | 0 tests | 93 unit tests |
+| **Architecture** | Single ~800 line file | 9 modules, 3400+ lines |
+| **Test Coverage** | 0 tests | 131 unit tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -52,8 +52,9 @@ REMOVED:
 ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
-- Modular architecture (8 files)
-- Comprehensive test suite (93 tests)
+- Modular architecture (9 files)
+- Comprehensive test suite (131 tests)
+- Async command execution (background commands with polling)
 - Error classification for smart retries
 - Documentation with Mermaid diagrams
 ```
@@ -68,6 +69,7 @@ ADDED:
 - **Session Management** - Track multiple concurrent connections
 - **Named Sessions** - Assign human-readable names for easy LLM identification
 - **Persistent Sessions** - Keep sessions alive indefinitely without inactivity timeout
+- **Async Commands** - Run long-running commands in background with polling
 - **Smart Retry** - Exponential backoff for transient failures only
 - **MCP Protocol** - Full integration with AI/LLM tools
 
@@ -92,7 +94,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 93 tests
+cargo test --all-features  # 131 tests
 ```
 
 ### Install
@@ -221,6 +223,174 @@ Add to Claude Desktop or Cursor MCP config:
 
 ---
 
+## Async Command Execution
+
+For long-running commands (builds, deployments, data processing), use async execution instead of the synchronous `ssh_execute`. Async commands run in the background and can be polled for status and output.
+
+### When to Use Async vs Sync
+
+| Use `ssh_execute` (sync) | Use `ssh_execute_async` |
+|--------------------------|-------------------------|
+| Quick commands (< 30s) | Long-running commands (builds, deployments) |
+| Need immediate result | Want to run multiple commands in parallel |
+| Simple one-off commands | Need to monitor progress or cancel mid-execution |
+
+### Workflow Overview
+
+```
+1. ssh_connect(address, username) → session_id
+2. ssh_execute_async(session_id, command) → command_id
+3. ssh_get_command_output(command_id, wait=false) → status: "running"
+4. ssh_get_command_output(command_id, wait=true) → status: "completed", stdout, exit_code
+5. ssh_disconnect(session_id) → cleans up all async commands
+```
+
+### Start Async Command
+
+```json
+{
+  "tool": "ssh_execute_async",
+  "params": {
+    "session_id": "uuid-from-connect",
+    "command": "npm run build",
+    "timeout_secs": 300
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "command_id": "abc123-def456",
+  "message": "Command started in background"
+}
+```
+
+### Get Command Output
+
+Poll immediately (`wait: false`) or block until completion (`wait: true`):
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "params": {
+    "command_id": "abc123-def456",
+    "wait": true,
+    "wait_timeout_secs": 60
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "status": "completed",
+  "stdout": "Build successful!\n",
+  "stderr": "",
+  "exit_code": 0
+}
+```
+
+### List Async Commands
+
+Filter by session or status:
+
+```json
+{
+  "tool": "ssh_list_commands",
+  "params": {
+    "session_id": "uuid-from-connect",
+    "status": "running"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "commands": [
+    {
+      "command_id": "abc123-def456",
+      "session_id": "uuid-from-connect",
+      "command": "npm run build",
+      "status": "running",
+      "started_at": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+### Cancel Command
+
+Stop a running command and retrieve partial output:
+
+```json
+{
+  "tool": "ssh_cancel_command",
+  "params": {
+    "command_id": "abc123-def456"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "cancelled": true,
+  "stdout": "Partial output collected...",
+  "stderr": ""
+}
+```
+
+### Status Values
+
+| Status | Description | Available Fields |
+|--------|-------------|------------------|
+| `running` | Command still executing | `stdout`, `stderr` (partial) |
+| `completed` | Finished successfully | `stdout`, `stderr`, `exit_code` |
+| `cancelled` | Stopped by user | `stdout`, `stderr` (partial) |
+| `failed` | Failed to start | `error` message |
+
+### Example: Parallel Build and Test
+
+```
+# Start build and tests in parallel
+ssh_execute_async(session_id, "cd /app && npm run build") → build_id
+ssh_execute_async(session_id, "cd /app && npm test") → test_id
+
+# Wait for both to complete
+build_result = ssh_get_command_output(build_id, wait=true, wait_timeout_secs=120)
+test_result = ssh_get_command_output(test_id, wait=true, wait_timeout_secs=60)
+
+# Deploy if both succeeded
+if build_result.exit_code == 0 and test_result.exit_code == 0:
+    ssh_execute(session_id, "cd /app && ./deploy.sh")
+```
+
+### Example: Monitor Long Process
+
+```
+# Start long-running process
+ssh_execute_async(session_id, "python train_model.py") → cmd_id
+
+# Poll periodically to show progress
+while True:
+    result = ssh_get_command_output(cmd_id, wait=false)
+    print(result.stdout)  # Show latest output
+    if result.status != "running":
+        break
+    sleep(5)
+```
+
+### Limits
+
+- Max 10 concurrent async commands per session
+- Commands auto-cleanup when session disconnects
+- Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
+
+---
+
 ## Configuration
 
 Priority: **Parameter > Environment Variable > Default**
@@ -243,14 +413,15 @@ Priority: **Parameter > Environment Variable > Default**
 
 ```
 src/mcp/
-├── mod.rs        (22 lines)   - Module declarations
-├── types.rs      (283 lines)  - Response types
-├── config.rs     (600 lines)  - Configuration resolution
-├── error.rs      (359 lines)  - Error classification
-├── session.rs    (87 lines)   - Session storage
-├── client.rs     (656 lines)  - SSH connection/auth
-├── forward.rs    (162 lines)  - Port forwarding
-└── commands.rs   (262 lines)  - MCP tool handlers
+├── mod.rs           (23 lines)   - Module declarations
+├── types.rs         (832 lines)  - Response types (sync + async)
+├── config.rs        (601 lines)  - Configuration resolution
+├── error.rs         (359 lines)  - Error classification
+├── session.rs       (87 lines)   - Session storage
+├── client.rs        (836 lines)  - SSH connection/auth/execution
+├── async_command.rs (313 lines)  - Async command tracking
+├── forward.rs       (155 lines)  - Port forwarding
+└── commands.rs      (702 lines)  - MCP tool handlers
 ```
 
 ### Module Dependencies
@@ -263,6 +434,7 @@ flowchart TB
 
     subgraph Core["Core Modules"]
         Client["client.rs"]
+        AsyncCmd["async_command.rs"]
         Forward["forward.rs"]
         Session["session.rs"]
         Types["types.rs"]
@@ -280,13 +452,16 @@ flowchart TB
     end
 
     Commands --> Client
+    Commands --> AsyncCmd
     Commands --> Forward
     Commands --> Session
     Commands --> Types
     Client --> Session
+    Client --> AsyncCmd
     Client --> Config
     Client --> Error
     Client --> Types
+    AsyncCmd --> Types
     Forward --> Session
     Client --> Russh
     Client --> Backon
@@ -347,7 +522,8 @@ cargo test --all-features -- --nocapture
 | error.rs | 29 | Error classification |
 | client.rs | 17 | Address parsing, client config |
 | types.rs | 13 | Serialization |
-| **Total** | **93** | |
+| async_command.rs | 38 | Async command storage and tracking |
+| **Total** | **131** | |
 
 ---
 
