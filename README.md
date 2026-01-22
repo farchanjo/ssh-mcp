@@ -188,6 +188,43 @@ MCP_PORT=9000 ssh-mcp
 RUST_LOG=debug ssh-mcp
 ```
 
+#### macOS Background Service (launchd)
+
+Install as a system service that starts automatically:
+
+```bash
+# Create log directory
+sudo mkdir -p /usr/local/var/log
+sudo mkdir -p /usr/local/var/ssh-mcp
+
+# Copy the plist file
+sudo cp com.farchanjo.ssh-mcp.plist /Library/LaunchDaemons/
+
+# Load and start the service
+sudo launchctl load /Library/LaunchDaemons/com.farchanjo.ssh-mcp.plist
+
+# Check status
+sudo launchctl list | grep ssh-mcp
+
+# View logs
+tail -f /usr/local/var/log/ssh-mcp.log
+tail -f /usr/local/var/log/ssh-mcp.error.log
+
+# Stop the service
+sudo launchctl unload /Library/LaunchDaemons/com.farchanjo.ssh-mcp.plist
+
+# Restart the service
+sudo launchctl unload /Library/LaunchDaemons/com.farchanjo.ssh-mcp.plist
+sudo launchctl load /Library/LaunchDaemons/com.farchanjo.ssh-mcp.plist
+```
+
+For user-level service (no sudo, runs only when logged in):
+
+```bash
+cp com.farchanjo.ssh-mcp.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.farchanjo.ssh-mcp.plist
+```
+
 #### Claude Code (HTTP/SSE)
 
 Add to `~/.claude/settings.json`:
