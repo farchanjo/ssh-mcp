@@ -150,7 +150,7 @@ The codebase consists of **9 source files** organized into a modular structure:
 **commands.rs** - MCP Tools
 - `McpSSHCommands` struct with `#[Tools]` impl
 - `ssh_connect` - Connect and authenticate (supports `name` and `persistent` options)
-- `ssh_execute` - Run commands with timeout (returns partial output with `timed_out: true` on timeout, session stays alive)
+- `ssh_execute` - Run commands in background (returns `command_id` for polling)
 - `ssh_forward` - Setup port forwarding (feature-gated)
 - `ssh_disconnect` - Graceful session cleanup
 - `ssh_list_sessions` - List active sessions (includes session names when set)
@@ -256,8 +256,7 @@ The following diagram illustrates the relationships between the main components:
 classDiagram
     class McpSSHCommands {
         +ssh_connect() StructuredContent~SshConnectResponse~
-        +ssh_execute() StructuredContent~SshCommandResponse~
-        +ssh_execute_async() StructuredContent~AsyncCommandResponse~
+        +ssh_execute() StructuredContent~SshExecuteResponse~
         +ssh_get_command_output() StructuredContent~SshAsyncOutputResponse~
         +ssh_list_commands() StructuredContent~AsyncCommandListResponse~
         +ssh_cancel_command() StructuredContent~SshCancelCommandResponse~
@@ -598,7 +597,7 @@ flowchart TB
 
 ### Async Command Flow
 
-1. **Start Command** (`ssh_execute_async`):
+1. **Start Command** (`ssh_execute`):
    - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 30`)
    - Create `RunningCommand` with status channel and cancellation token
    - Store in `ASYNC_COMMANDS` global storage
@@ -657,7 +656,7 @@ flowchart TB
         subgraph Tasks["Async Tasks"]
             Connect["ssh_connect<br/>+ Retry Logic"]
             Execute["ssh_execute<br/>+ Timeout"]
-            AsyncExec["ssh_execute_async<br/>Background Task"]
+            AsyncExec["ssh_execute<br/>Background Task"]
             Forward["Port Forward<br/>Listener"]
             Disconnect["ssh_disconnect"]
         end

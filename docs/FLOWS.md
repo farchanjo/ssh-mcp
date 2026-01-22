@@ -8,8 +8,7 @@ This document describes the operational flows of the SSH MCP server, including c
 - [SSH Connection Flow](#ssh-connection-flow)
 - [Authentication Flow](#authentication-flow)
 - [Command Execution Flow](#command-execution-flow)
-- [Async Command Execution Flow](#async-command-execution-flow)
-- [Async Command Lifecycle](#async-command-lifecycle)
+- [Command Lifecycle](#command-lifecycle)
 - [Command Cancellation Flow](#command-cancellation-flow)
 - [Port Forwarding Flow](#port-forwarding-flow)
 - [Error Handling and Retry Logic](#error-handling-and-retry-logic)
@@ -366,167 +365,7 @@ flowchart TD
 
 ## Command Execution Flow
 
-Flow of the `ssh_execute` operation.
-
-```mermaid
-sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as McpSSHCommands
-    participant Config as config.rs
-    participant Store as SSH_SESSIONS
-    participant Exec as execute_ssh_command
-    participant Handle as russh Handle
-    participant Channel as SSH Channel
-    participant Server as Remote Server
-
-    Client->>Cmd: ssh_execute request
-
-    Note over Cmd,Config: Resolve timeout
-    Cmd->>Config: resolve_command_timeout
-    Config-->>Cmd: timeout value
-
-    Note over Cmd,Store: Get session handle
-    Cmd->>Store: Lock SSH_SESSIONS
-    Cmd->>Store: Get session by ID
-    Cmd->>Store: Clone Arc of handle
-    Cmd->>Store: Unlock SSH_SESSIONS
-
-    Note over Cmd: Wrap in tokio timeout
-    Cmd->>Exec: execute_ssh_command with timeout
-
-    Exec->>Handle: Lock handle mutex
-    Exec->>Handle: channel_open_session
-    Handle->>Server: SSH_MSG_CHANNEL_OPEN session
-    Server-->>Handle: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
-    Handle-->>Exec: Channel
-
-    Exec->>Channel: exec with command
-    Channel->>Server: SSH_MSG_CHANNEL_REQUEST exec
-    Server-->>Channel: SSH_MSG_CHANNEL_SUCCESS
-
-    Exec->>Handle: Drop handle lock
-
-    loop Read channel messages
-        Channel->>Channel: wait
-        alt Data message
-            Channel-->>Exec: ChannelMsg Data
-            Exec->>Exec: Append to stdout
-        else ExtendedData with ext equals 1
-            Channel-->>Exec: ChannelMsg ExtendedData
-            Exec->>Exec: Append to stderr
-        else ExitStatus message
-            Channel-->>Exec: ChannelMsg ExitStatus
-            Exec->>Exec: Store exit code
-        else Eof message
-            Channel-->>Exec: ChannelMsg Eof
-            Note over Exec: Check if exit received
-        else Close or None
-            Channel-->>Exec: ChannelMsg Close or None
-            Note over Exec: Break loop
-        end
-    end
-
-    Exec->>Channel: close
-    Exec->>Exec: Convert bytes to strings
-    Exec-->>Cmd: SshCommandResponse
-
-    alt Timeout
-        Note over Cmd: Timeout reached
-        Cmd->>Cmd: Close channel gracefully
-        Cmd->>Cmd: Set timed_out = true
-        Cmd->>Cmd: Set exit_code = -1
-        Note over Cmd: Session stays alive
-        Cmd-->>Client: SshCommandResponse with partial output
-    else Success
-        Cmd-->>Client: SshCommandResponse
-    end
-```
-
-### Channel Message Types
-
-```mermaid
-stateDiagram-v2
-    [*] --> WaitingForData
-
-    WaitingForData --> ProcessData: ChannelMsg Data
-    WaitingForData --> ProcessStderr: ChannelMsg ExtendedData ext=1
-    WaitingForData --> StoreExit: ChannelMsg ExitStatus
-    WaitingForData --> CheckExit: ChannelMsg Eof
-    WaitingForData --> Done: ChannelMsg Close
-    WaitingForData --> Done: None
-    WaitingForData --> Timeout: Timeout reached
-
-    ProcessData --> WaitingForData: Append to stdout
-    ProcessStderr --> WaitingForData: Append to stderr
-    StoreExit --> WaitingForData: Store exit code
-
-    CheckExit --> Done: Exit code received
-    CheckExit --> WaitingForData: Continue waiting
-
-    Timeout --> Done: Close channel gracefully
-
-    Done --> [*]: Return response
-
-    note right of WaitingForData
-        Loop until channel closes
-        or EOF with exit status
-    end note
-
-    note right of Timeout
-        Returns partial output
-        timed_out = true
-        exit_code = -1
-        Session stays alive
-    end note
-```
-
-### Command Timeout Handling
-
-When a command exceeds the configured timeout (`SSH_COMMAND_TIMEOUT`), the system handles it gracefully without disconnecting the session.
-
-```mermaid
-flowchart TD
-    Start([Command Execution]) --> Execute[Execute command with timeout wrapper]
-    Execute --> Wait{Timeout reached?}
-
-    Wait -->|No| Complete[Command completes normally]
-    Wait -->|Yes| Timeout[Timeout triggered]
-
-    Complete --> BuildResponse[Build response with actual exit code]
-    BuildResponse --> ReturnSuccess([Return SshCommandResponse])
-
-    Timeout --> CollectPartial[Collect partial stdout/stderr]
-    CollectPartial --> CloseChannel[Close channel gracefully]
-    CloseChannel --> SetFlags[Set timed_out = true and exit_code = -1]
-    SetFlags --> KeepSession[Session remains in SSH_SESSIONS]
-    KeepSession --> ReturnPartial([Return SshCommandResponse with partial output])
-
-    style Start fill:#e3f2fd
-    style ReturnSuccess fill:#e8f5e9
-    style ReturnPartial fill:#fff8e1
-    style Timeout fill:#fff8e1
-```
-
-**Timeout Response Fields:**
-
-| Field | Value | Description |
-|-------|-------|-------------|
-| `stdout` | Partial output | Any stdout received before timeout |
-| `stderr` | Partial output | Any stderr received before timeout |
-| `exit_code` | `-1` | Indicates abnormal termination |
-| `timed_out` | `true` | Signals timeout occurred |
-
-**Key Behavior:**
-- The SSH session remains connected and can be reused for subsequent commands
-- No error is returned; instead, a valid response with partial output is provided
-- The channel is closed gracefully to avoid resource leaks
-- Clients should check the `timed_out` flag to detect timeout conditions
-
----
-
-## Async Command Execution Flow
-
-Flow of the `ssh_execute_async` operation for long-running commands that return immediately with a command ID for polling.
+Flow of the `ssh_execute` operation for long-running commands that return immediately with a command ID for polling.
 
 ```mermaid
 sequenceDiagram
@@ -539,7 +378,7 @@ sequenceDiagram
     participant Channel as SSH Channel
     participant Server as Remote Server
 
-    Client->>Cmd: ssh_execute_async request
+    Client->>Cmd: ssh_execute request
 
     Note over Cmd,AsyncStore: Check session command limit
     Cmd->>AsyncStore: count_session_commands
@@ -574,7 +413,7 @@ sequenceDiagram
     Cmd->>Task: tokio spawn execute_ssh_command_async
 
     Note over Cmd,Client: Return immediately
-    Cmd-->>Client: SshExecuteAsyncResponse with command_id
+    Cmd-->>Client: SshExecuteResponse with command_id
 
     Note over Task: Background execution begins
 
@@ -657,7 +496,7 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> NotStarted
 
-    NotStarted --> Running: ssh_execute_async called
+    NotStarted --> Running: ssh_execute called
 
     Running --> Collecting: Channel opened
 
@@ -692,7 +531,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    Start([ssh_execute_async]) --> CountCommands[Count session commands]
+    Start([ssh_execute]) --> CountCommands[Count session commands]
     CountCommands --> CheckLimit{count >= 30?}
 
     CheckLimit -->|Yes| RejectError([Error: Max commands reached])
@@ -714,13 +553,13 @@ flowchart TD
 
 ---
 
-## Async Command Lifecycle
+## Command Lifecycle
 
-Complete lifecycle of an async command from creation to cleanup.
+Complete lifecycle of a command from creation to cleanup.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending: Client calls ssh_execute_async
+    [*] --> Pending: Client calls ssh_execute
 
     state Pending {
         [*] --> ValidateSession

@@ -41,7 +41,7 @@ pub struct SshConnectResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SshCommandResponse {
+pub(crate) struct SshCommandResponse {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
@@ -91,10 +91,10 @@ impl std::fmt::Display for AsyncCommandStatus {
     }
 }
 
-/// Response from ssh_execute_async
+/// Response from ssh_execute
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SshExecuteAsyncResponse {
-    /// Unique identifier for this async command
+pub struct SshExecuteResponse {
+    /// Unique identifier for this command
     pub command_id: String,
     /// Session ID where the command is running
     pub session_id: String,
@@ -102,7 +102,7 @@ pub struct SshExecuteAsyncResponse {
     pub command: String,
     /// When the command was started (RFC3339 format)
     pub started_at: String,
-    /// Human-readable message about the async command
+    /// Human-readable message about the command
     pub message: String,
 }
 
@@ -210,13 +210,11 @@ mod response_serialization {
         }
 
         #[test]
-        fn test_message_with_async_suggestion() {
+        fn test_message_format() {
             // Simulate the actual message format from ssh_connect
             let session_id = "test-uuid-123";
             let message = format!(
-                "Connected to user@host. Use session_id '{}' for subsequent commands.\n\
-                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
-                for non-blocking execution with progress monitoring and cancellation support.",
+                "Connected to user@host. Use session_id '{}' with ssh_execute to run commands.",
                 session_id
             );
 
@@ -227,11 +225,8 @@ mod response_serialization {
                 retry_attempts: 0,
             };
 
-            // Verify async mode suggestion is present
-            assert!(response.message.contains("ssh_execute_async"));
-            assert!(response.message.contains("long-running commands"));
-            assert!(response.message.contains("progress monitoring"));
-            assert!(response.message.contains("cancellation support"));
+            // Verify message format
+            assert!(response.message.contains("ssh_execute"));
             assert!(
                 response
                     .message
@@ -248,9 +243,7 @@ mod response_serialization {
 
             let message = format!(
                 "Connected to user@host (name: '{}') after {} retry attempt(s). \
-                Use session_id '{}' for subsequent commands.\n\
-                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
-                for non-blocking execution with progress monitoring and cancellation support.",
+                Use session_id '{}' with ssh_execute to run commands.",
                 name, retry_attempts, session_id
             );
 
@@ -275,9 +268,7 @@ mod response_serialization {
             // Simulate message with persistent suffix
             let session_id = "test-uuid-789";
             let base_message = format!(
-                "Connected to user@host. Use session_id '{}' for subsequent commands.\n\
-                For long-running commands (builds, deployments, data processing), use ssh_execute_async \
-                for non-blocking execution with progress monitoring and cancellation support.",
+                "Connected to user@host. Use session_id '{}' with ssh_execute to run commands.",
                 session_id
             );
             let message = format!("{} [persistent]", base_message);
@@ -641,12 +632,12 @@ mod response_serialization {
         }
     }
 
-    mod ssh_execute_async_response {
+    mod ssh_execute_response {
         use super::*;
 
         #[test]
         fn test_serialize_and_deserialize() {
-            let response = SshExecuteAsyncResponse {
+            let response = SshExecuteResponse {
                 command_id: "cmd-123".to_string(),
                 session_id: "sess-456".to_string(),
                 command: "sleep 10".to_string(),
@@ -655,7 +646,7 @@ mod response_serialization {
             };
 
             let json = serde_json::to_string(&response).unwrap();
-            let deserialized: SshExecuteAsyncResponse = serde_json::from_str(&json).unwrap();
+            let deserialized: SshExecuteResponse = serde_json::from_str(&json).unwrap();
 
             assert_eq!(deserialized.command_id, "cmd-123");
             assert_eq!(deserialized.session_id, "sess-456");
@@ -666,7 +657,7 @@ mod response_serialization {
 
         #[test]
         fn test_json_structure() {
-            let response = SshExecuteAsyncResponse {
+            let response = SshExecuteResponse {
                 command_id: "id".to_string(),
                 session_id: "sid".to_string(),
                 command: "cmd".to_string(),

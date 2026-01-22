@@ -3,7 +3,10 @@
 //! This module provides the main MCP tool implementations for SSH operations:
 //!
 //! - `ssh_connect`: Connect to an SSH server with retry logic
-//! - `ssh_execute`: Execute commands on a connected SSH session
+//! - `ssh_execute`: Execute commands asynchronously (returns command_id for polling)
+//! - `ssh_get_command_output`: Get output and status of a running command
+//! - `ssh_list_commands`: List all async commands
+//! - `ssh_cancel_command`: Cancel a running command
 //! - `ssh_forward`: Setup port forwarding (feature-gated)
 //! - `ssh_disconnect`: Disconnect and cleanup a session
 //! - `ssh_list_sessions`: List all active sessions
@@ -34,8 +37,8 @@ use super::forward::setup_port_forwarding;
 use super::session::{SSH_SESSIONS, StoredSession};
 use super::types::{
     AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse, SessionInfo, SessionListResponse,
-    SshAsyncOutputResponse, SshCancelCommandResponse, SshCommandResponse, SshConnectResponse,
-    SshExecuteAsyncResponse, SshListCommandsResponse,
+    SshAsyncOutputResponse, SshCancelCommandResponse, SshConnectResponse, SshExecuteResponse,
+    SshListCommandsResponse,
 };
 
 /// MCP SSH Commands tool implementation.
@@ -49,8 +52,8 @@ impl McpSSHCommands {
     /// Connect to an SSH server and store the session.
     ///
     /// Returns a session_id for subsequent commands. For long-running operations
-    /// (builds, deployments, batch processing), prefer `ssh_execute_async` over
-    /// `ssh_execute` for non-blocking execution with progress monitoring.
+    /// (builds, deployments, batch processing), `ssh_execute` provides non-blocking
+    /// execution with progress monitoring and cancellation support.
     ///
     /// Use `persistent=true` for sessions that should remain open indefinitely.
     #[allow(clippy::too_many_arguments)]
@@ -197,9 +200,7 @@ impl McpSSHCommands {
                     let persistent_part = if persistent { " [persistent]" } else { "" };
 
                     format!(
-                        "Connected to {}@{}{}{}. Use session_id '{}' for subsequent commands.\n\
-                        For long-running commands (builds, deployments, data processing), use ssh_execute_async \
-                        for non-blocking execution with progress monitoring and cancellation support.",
+                        "Connected to {}@{}{}{}. Use session_id '{}' with ssh_execute to run commands.",
                         username, address, name_part, retry_part, new_session_id
                     ) + persistent_part
                 };
@@ -213,60 +214,6 @@ impl McpSSHCommands {
             }
             Err(e) => {
                 error!("SSH connection failed: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Execute a command synchronously on a connected SSH session.
-    ///
-    /// **When to use:** Quick commands that complete in under 30 seconds.
-    ///
-    /// **When to use ssh_execute_async instead:**
-    /// - Long-running commands (builds, deployments, data processing)
-    /// - Commands where you need progress monitoring
-    /// - Commands you may need to cancel mid-execution
-    /// - Running multiple commands in parallel
-    ///
-    /// On timeout, returns partial output with `timed_out: true` instead of an error.
-    /// The session remains active and can be reused for subsequent commands.
-    async fn ssh_execute(
-        &self,
-        /// Session ID returned from ssh_connect
-        session_id: String,
-        /// Shell command to execute on the remote server
-        command: String,
-        /// Command execution timeout in seconds (default: 180, env: SSH_COMMAND_TIMEOUT)
-        timeout_secs: Option<u64>,
-    ) -> Result<StructuredContent<SshCommandResponse>, String> {
-        let timeout = resolve_command_timeout(timeout_secs);
-        info!(
-            "Executing command on SSH session {} with timeout {}s: {}",
-            session_id,
-            timeout.as_secs(),
-            command
-        );
-
-        // DashMap: direct get, no lock needed
-        let handle_arc = SSH_SESSIONS
-            .get(&session_id)
-            .map(|s| s.handle.clone())
-            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
-
-        // Execute command with timeout - timeout returns partial output, not an error
-        match execute_ssh_command(&handle_arc, &command, timeout).await {
-            Ok(response) => {
-                if response.timed_out {
-                    warn!(
-                        "Command timed out after {}s but returning partial output: {}",
-                        timeout.as_secs(),
-                        command
-                    );
-                }
-                Ok(StructuredContent(response))
-            }
-            Err(e) => {
-                error!("Command execution failed: {}", e);
                 Err(e)
             }
         }
@@ -459,7 +406,7 @@ impl McpSSHCommands {
     /// progress monitoring and cancellation.
     ///
     /// **Workflow:**
-    /// 1. Call `ssh_execute_async` - returns immediately with `command_id`
+    /// 1. Call `ssh_execute` - returns immediately with `command_id`
     /// 2. Poll with `ssh_get_command_output(command_id, wait=false)` to check progress
     /// 3. Or wait with `ssh_get_command_output(command_id, wait=true)` to block until done
     /// 4. Cancel anytime with `ssh_cancel_command(command_id)`
@@ -467,7 +414,7 @@ impl McpSSHCommands {
     /// **Limits:** Up to 30 concurrent async commands per session.
     ///
     /// Returns immediately with a command_id for polling or cancellation.
-    async fn ssh_execute_async(
+    async fn ssh_execute(
         &self,
         /// Session ID returned from ssh_connect
         session_id: String,
@@ -475,7 +422,7 @@ impl McpSSHCommands {
         command: String,
         /// Command execution timeout in seconds (default: 180, env: SSH_COMMAND_TIMEOUT)
         timeout_secs: Option<u64>,
-    ) -> Result<StructuredContent<SshExecuteAsyncResponse>, String> {
+    ) -> Result<StructuredContent<SshExecuteResponse>, String> {
         let timeout = resolve_command_timeout(timeout_secs);
 
         // Check session limit (sync O(1) lookup)
@@ -546,7 +493,7 @@ impl McpSSHCommands {
             timed_out,
         ));
 
-        Ok(StructuredContent(SshExecuteAsyncResponse {
+        Ok(StructuredContent(SshExecuteResponse {
             command_id: command_id.clone(),
             session_id,
             command,

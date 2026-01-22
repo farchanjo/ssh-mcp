@@ -370,31 +370,32 @@ curl -X POST http://localhost:8000/ \
 
 ## Async Command Execution
 
-For long-running commands (builds, deployments, data processing), use async execution instead of the synchronous `ssh_execute`. Async commands run in the background and can be polled for status and output.
+For long-running commands (builds, deployments, data processing), use `ssh_execute` which runs commands in the background and can be polled for status and output.
 
-### When to Use Async vs Sync
+### When to Use Async Execution
 
-| Use `ssh_execute` (sync) | Use `ssh_execute_async` |
-|--------------------------|-------------------------|
-| Quick commands (< 30s) | Long-running commands (builds, deployments) |
-| Need immediate result | Want to run multiple commands in parallel |
-| Simple one-off commands | Need to monitor progress or cancel mid-execution |
+| Scenario | Reason |
+|----------|--------|
+| Long-running commands | Builds, deployments, data processing |
+| Parallel execution | Run multiple commands concurrently |
+| Progress monitoring | Poll for partial output during execution |
+| Cancellation needed | Ability to stop mid-execution |
 
 ### Workflow Overview
 
 ```
 1. ssh_connect(address, username) → session_id
-2. ssh_execute_async(session_id, command) → command_id
+2. ssh_execute(session_id, command) → command_id
 3. ssh_get_command_output(command_id, wait=false) → status: "running"
 4. ssh_get_command_output(command_id, wait=true) → status: "completed", stdout, exit_code
 5. ssh_disconnect(session_id) → cleans up all async commands
 ```
 
-### Start Async Command
+### Start Command
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "params": {
     "session_id": "uuid-from-connect",
     "command": "npm run build",
@@ -501,8 +502,8 @@ Stop a running command and retrieve partial output:
 
 ```
 # Start build and tests in parallel
-ssh_execute_async(session_id, "cd /app && npm run build") → build_id
-ssh_execute_async(session_id, "cd /app && npm test") → test_id
+ssh_execute(session_id, "cd /app && npm run build") → build_id
+ssh_execute(session_id, "cd /app && npm test") → test_id
 
 # Wait for both to complete
 build_result = ssh_get_command_output(build_id, wait=true, wait_timeout_secs=120)
@@ -517,7 +518,7 @@ if build_result.exit_code == 0 and test_result.exit_code == 0:
 
 ```
 # Start long-running process
-ssh_execute_async(session_id, "python train_model.py") → cmd_id
+ssh_execute(session_id, "python train_model.py") → cmd_id
 
 # Poll periodically to show progress
 while True:
@@ -559,7 +560,7 @@ Priority: **Parameter > Environment Variable > Default**
 ```
 src/mcp/
 ├── mod.rs           (23 lines)   - Module declarations
-├── types.rs         (916 lines)  - Response types (sync + async)
+├── types.rs         (916 lines)  - Response types
 ├── config.rs        (601 lines)  - Configuration resolution
 ├── error.rs         (359 lines)  - Error classification
 ├── session.rs       (88 lines)   - Session storage
