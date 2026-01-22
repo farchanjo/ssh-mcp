@@ -100,11 +100,16 @@ cargo test --all-features  # 136 tests
 ### Install
 
 ```bash
+# Stdio transport (for MCP integration)
 sudo cp ./target/release/ssh-mcp-stdio /usr/local/bin/
 sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # macOS only
+
+# HTTP server (optional)
+sudo cp ./target/release/ssh-mcp /usr/local/bin/
+sudo codesign -f -s - /usr/local/bin/ssh-mcp  # macOS only
 ```
 
-### MCP Configuration
+### Option 1: Stdio Transport (Recommended for MCP)
 
 Add to Claude Desktop or Cursor MCP config:
 
@@ -117,6 +122,48 @@ Add to Claude Desktop or Cursor MCP config:
     }
   }
 }
+```
+
+### Option 2: HTTP Server
+
+Run the HTTP server on port 8000 (configurable via `MCP_PORT`):
+
+```bash
+# Start the server
+ssh-mcp
+
+# Or with custom port
+MCP_PORT=9000 ssh-mcp
+
+# With debug logging
+RUST_LOG=debug ssh-mcp
+```
+
+The server exposes MCP tools via HTTP at `http://localhost:8000`. You can use any HTTP client or configure MCP clients that support HTTP transport.
+
+#### MCP Configuration for HTTP
+
+For MCP clients that support SSE/HTTP transport:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "url": "http://localhost:8000/sse"
+    }
+  }
+}
+```
+
+#### Direct HTTP Usage
+
+You can also call the MCP tools directly via HTTP:
+
+```bash
+# List sessions
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ssh_list_sessions","arguments":{}}}'
 ```
 
 ---
