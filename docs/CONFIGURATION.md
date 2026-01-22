@@ -123,6 +123,8 @@ export SSH_COMMAND_TIMEOUT=300
 - Set conservatively for automation
 - Can be overridden per-command via parameter
 
+**Note:** When a command times out, SSH MCP returns any partial output captured up to that point rather than failing with an error. This graceful timeout behavior ensures you receive useful output even from long-running commands that exceed the timeout.
+
 #### SSH_MAX_RETRIES
 
 Number of retry attempts after initial failure.
@@ -642,7 +644,7 @@ flowchart TB
         ResolveConnect["resolve_connect_timeout()"]
         ResolveCommand["resolve_command_timeout()"]
         ResolveRetries["resolve_max_retries()"]
-        ResolveDelay["resolve_retry_delay_ms()"]
+        ResolveDelay["resolve_retry_delay()"]
         ResolveCompress["resolve_compression()"]
     end
 
@@ -699,21 +701,25 @@ flowchart TB
 From `config.rs`:
 
 ```rust
-/// Default SSH connection timeout in seconds
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+use std::time::Duration;
 
-/// Default SSH command execution timeout in seconds
-const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 180;
+/// Default SSH connection timeout (30 seconds)
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default SSH command execution timeout (180 seconds / 3 minutes)
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Default maximum retry attempts for SSH connection
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
-/// Default retry delay in milliseconds
-const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
+/// Default retry delay (1000 milliseconds)
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
-/// Maximum retry delay cap in seconds (10 seconds)
-const MAX_RETRY_DELAY_SECS: u64 = 10;
+/// Maximum retry delay cap (10 seconds)
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 ```
+
+**Note:** While the internal implementation uses `Duration` types for type safety, environment variables still accept integer values (seconds for timeouts, milliseconds for retry delay). The conversion to `Duration` happens internally.
 
 ---
 

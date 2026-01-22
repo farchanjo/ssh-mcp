@@ -37,20 +37,25 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | Module | Lines | Description |
 |--------|-------|-------------|
 | **mod.rs** | 22 | Module declarations and re-exports |
-| **types.rs** | 283 | Response types (`SessionInfo`, `SshConnectResponse`, etc.) |
-| **config.rs** | 600 | Constants and configuration resolution |
+| **types.rs** | 317 | Response types (`SessionInfo`, `SshConnectResponse`, `SshCommandResponse`) |
+| **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
 | **session.rs** | 87 | Session storage and `SshClientHandler` |
-| **client.rs** | 656 | SSH connection, authentication, command execution |
+| **client.rs** | 683 | SSH connection, authentication, command execution |
 | **forward.rs** | 162 | Port forwarding (feature-gated) |
-| **commands.rs** | 262 | `McpSSHCommands` MCP tool implementations |
+| **commands.rs** | 263 | `McpSSHCommands` MCP tool implementations |
 
 ### MCP Tools
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
-- `ssh_execute`: Command execution with timeout
+- `ssh_execute`: Command execution with timeout (returns partial output with `timed_out: true` on timeout)
 - `ssh_forward`: Port forwarding (feature-gated)
 - `ssh_disconnect`: Session cleanup
 - `ssh_list_sessions`: List active sessions
+
+### Key Types
+- **`SshCommandResponse`**: Contains `stdout`, `stderr`, `exit_code`, and `timed_out: bool`
+  - On timeout: returns partial output collected so far with `timed_out: true` (session stays alive)
+  - On success: returns full output with `timed_out: false`
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate
@@ -65,17 +70,17 @@ All settings follow: **Parameter → Environment Variable → Default**
 
 | Env Variable | Default | Description |
 |--------------|---------|-------------|
-| `SSH_CONNECT_TIMEOUT` | 30s | Connection timeout |
-| `SSH_COMMAND_TIMEOUT` | 180s | Command execution timeout |
+| `SSH_CONNECT_TIMEOUT` | 30s | Connection timeout (`DEFAULT_CONNECT_TIMEOUT: Duration`) |
+| `SSH_COMMAND_TIMEOUT` | 180s | Command execution timeout (`DEFAULT_COMMAND_TIMEOUT: Duration`) |
 | `SSH_MAX_RETRIES` | 3 | Retry attempts |
-| `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay |
+| `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay (`DEFAULT_RETRY_DELAY: Duration`) |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
 | `MCP_PORT` | 8000 | HTTP server port |
 
 ### Error Handling Strategy
 - **Retryable errors**: Connection refused, timeout, network unreachable
 - **Non-retryable errors**: Authentication failures, permission denied
-- Exponential backoff with jitter (min: 1s, max: 10s cap)
+- Exponential backoff with jitter (min: 1s, max: `MAX_RETRY_DELAY: Duration` = 10s)
 
 ## Code Standards
 
