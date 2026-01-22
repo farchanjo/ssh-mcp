@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
 
-use super::ssh_commands::SshClientHandler;
+use super::session::SshClientHandler;
 
 /// Sets up port forwarding from a local port to a remote destination via SSH.
 ///
