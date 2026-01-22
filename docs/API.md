@@ -113,7 +113,7 @@ With persistent session:
 ```json
 {
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "message": "Successfully connected to user@192.168.1.1:22 [persistent session]",
+  "message": "Successfully connected to user@192.168.1.1:22 [persistent]",
   "authenticated": true,
   "retry_attempts": 0
 }
@@ -122,7 +122,7 @@ With persistent session:
 | Field | Type | Description |
 |-------|------|-------------|
 | `session_id` | `string` | Unique UUID v4 identifier for the session |
-| `message` | `string` | Human-readable success message. Includes "[persistent session]" suffix when `persistent=true`. |
+| `message` | `string` | Human-readable success message. Includes "[persistent]" suffix when `persistent=true`. |
 | `authenticated` | `bool` | Always `true` on success |
 | `retry_attempts` | `u32` | Number of retry attempts needed |
 
@@ -293,7 +293,7 @@ Returns `SshExecuteAsyncResponse`:
 
 #### Limits
 
-- Maximum 10 concurrent async commands per session
+- Maximum 30 concurrent async commands per session
 - Commands are automatically cancelled when the session is disconnected
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
@@ -776,6 +776,8 @@ Returns `SessionListResponse`:
 | `default_timeout_secs` | `u64` | Connection timeout used |
 | `retry_attempts` | `u32` | Retries needed to connect |
 | `compression_enabled` | `bool` | Whether compression is enabled |
+| `last_health_check` | `string` | Optional ISO 8601 timestamp of last health check (omitted when not set) |
+| `healthy` | `bool` | Optional health status from last check (omitted when not set) |
 
 #### Example Usage
 
@@ -840,6 +842,8 @@ interface SessionInfo {
   default_timeout_secs: number;
   retry_attempts: number;
   compression_enabled: boolean;
+  last_health_check?: string;  // Optional, ISO 8601 timestamp of last health check
+  healthy?: boolean;  // Optional, health status from last check
 }
 
 interface SessionListResponse {
@@ -928,7 +932,7 @@ All errors are returned as string messages. Common error patterns:
 | Error | Cause |
 |-------|-------|
 | `No async command found with ID: xxx` | Command ID not found or already cleaned up |
-| `Maximum concurrent commands (10) reached for session` | Session has too many running commands |
+| `Maximum concurrent commands (30) reached for session` | Session has too many running commands |
 | `No active SSH session with ID: xxx` | Session not found when starting async command |
 | `Wait timeout must be between 1 and 300 seconds` | Invalid `wait_timeout_secs` value |
 
@@ -1451,7 +1455,7 @@ SSH MCP provides two ways to execute commands: synchronous (`ssh_execute`) and a
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Max concurrent per session | 10 | Maximum running commands per SSH session |
+| Max concurrent per session | 30 | Maximum running commands per SSH session |
 | Default timeout | 180s | Configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` |
 | Max wait timeout | 300s | Maximum value for `wait_timeout_secs` parameter |
 | Auto-cleanup | On disconnect | All async commands cancelled when session disconnects |

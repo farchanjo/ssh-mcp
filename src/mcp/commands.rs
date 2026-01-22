@@ -236,7 +236,7 @@ impl McpSSHCommands {
         session_id: String,
         /// Shell command to execute on the remote server
         command: String,
-        /// Command execution timeout in seconds (default: 60, env: SSH_COMMAND_TIMEOUT)
+        /// Command execution timeout in seconds (default: 180, env: SSH_COMMAND_TIMEOUT)
         timeout_secs: Option<u64>,
     ) -> Result<StructuredContent<SshCommandResponse>, String> {
         let timeout = resolve_command_timeout(timeout_secs);
