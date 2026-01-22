@@ -36,6 +36,9 @@ pub struct SshCommandResponse {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// Whether the command timed out (partial output may be available)
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 #[cfg(feature = "port_forward")]
@@ -106,6 +109,7 @@ mod response_serialization {
                 stdout: "Hello, World!".to_string(),
                 stderr: "Warning: something".to_string(),
                 exit_code: 0,
+                timed_out: false,
             };
 
             let json = serde_json::to_string(&response).unwrap();
@@ -114,6 +118,7 @@ mod response_serialization {
             assert_eq!(deserialized.stdout, "Hello, World!");
             assert_eq!(deserialized.stderr, "Warning: something");
             assert_eq!(deserialized.exit_code, 0);
+            assert!(!deserialized.timed_out);
         }
 
         #[test]
@@ -122,6 +127,7 @@ mod response_serialization {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: -1,
+                timed_out: false,
             };
 
             let json = serde_json::to_string(&response).unwrap();
@@ -136,6 +142,7 @@ mod response_serialization {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 127,
+                timed_out: false,
             };
 
             let json = serde_json::to_string(&response).unwrap();
@@ -152,12 +159,39 @@ mod response_serialization {
                 stdout: "Hello, \u{4e16}\u{754c}!".to_string(), // Hello, World! in Chinese
                 stderr: String::new(),
                 exit_code: 0,
+                timed_out: false,
             };
 
             let json = serde_json::to_string(&response).unwrap();
             let deserialized: SshCommandResponse = serde_json::from_str(&json).unwrap();
 
             assert!(deserialized.stdout.contains('\u{4e16}'));
+        }
+
+        #[test]
+        fn test_timed_out_response() {
+            let response = SshCommandResponse {
+                stdout: "partial output".to_string(),
+                stderr: String::new(),
+                exit_code: -1,
+                timed_out: true,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshCommandResponse = serde_json::from_str(&json).unwrap();
+
+            assert!(deserialized.timed_out);
+            assert_eq!(deserialized.stdout, "partial output");
+            assert_eq!(deserialized.exit_code, -1);
+        }
+
+        #[test]
+        fn test_timed_out_defaults_to_false() {
+            // Test that timed_out defaults to false when not present in JSON
+            let json = r#"{"stdout":"test","stderr":"","exit_code":0}"#;
+            let deserialized: SshCommandResponse = serde_json::from_str(json).unwrap();
+
+            assert!(!deserialized.timed_out);
         }
     }
 
