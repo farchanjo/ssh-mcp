@@ -36,7 +36,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 ### Core Modules (`src/mcp/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 29 | Module declarations and re-exports |
+| **mod.rs** | 37 | Module declarations and re-exports |
 | **types.rs** | 1112 | Response types (`SessionInfo`, `SshConnectResponse`, async types) |
 | **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
@@ -54,7 +54,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | **mod.rs** | 18 | Module exports and global storage instances |
 | **traits.rs** | 107 | `SessionStorage` and `CommandStorage` trait definitions |
 | **session.rs** | 491 | `DashMapSessionStorage` with agent index and tests |
-| **command.rs** | 994 | `DashMapCommandStorage` with session index and tests
+| **command.rs** | 996 | `DashMapCommandStorage` with session index and tests |
 
 Storage abstractions enable dependency injection and testability:
 - `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
@@ -142,7 +142,7 @@ impl AuthStrategy for MyCustomAuth {
 | Module | Lines | Description |
 |--------|-------|-------------|
 | **mod.rs** | 9 | Module exports |
-| **builder.rs** | 424 | Fluent message builders with comprehensive tests |
+| **builder.rs** | 820 | Fluent message builders with comprehensive tests |
 
 Message builders construct human-readable responses that help LLMs remember important identifiers:
 
