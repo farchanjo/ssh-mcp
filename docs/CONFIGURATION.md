@@ -6,6 +6,9 @@ This document provides a comprehensive guide to configuring the SSH MCP server, 
 
 - [Configuration Priority](#configuration-priority)
 - [Environment Variables](#environment-variables)
+- [Tracing and Logging](#tracing-and-logging)
+- [SSH Agent Authentication](#ssh-agent-authentication)
+- [RSA Signature Algorithm](#rsa-signature-algorithm)
 - [Feature Flags](#feature-flags)
 - [Example Configurations](#example-configurations)
 - [MCP Client Configuration](#mcp-client-configuration)
@@ -82,7 +85,13 @@ This priority system allows you to:
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `MCP_PORT` | `u16` | `8000` | HTTP server port (only for `ssh-mcp` binary) |
-| `RUST_LOG` | `string` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `RUST_LOG` | `string` | `info` | Log level filter (see [Tracing and Logging](#tracing-and-logging)) |
+
+### SSH Agent Settings
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SSH_AUTH_SOCK` | `string` | (system) | Path to SSH agent socket (see [SSH Agent Authentication](#ssh-agent-authentication)) |
 
 ### Variable Details
 
@@ -170,6 +179,204 @@ export SSH_COMPRESSION=false
 
 ---
 
+## Tracing and Logging
+
+SSH MCP uses the `tracing` crate with `tracing-subscriber` for structured logging. Log output is controlled via the `RUST_LOG` environment variable.
+
+### Log Levels
+
+| Level | Description |
+|-------|-------------|
+| `error` | Critical failures that prevent operation |
+| `warn` | Warning conditions that may indicate problems |
+| `info` | Informational messages about normal operation (default) |
+| `debug` | Detailed information for debugging |
+| `trace` | Very detailed tracing information |
+
+### Setting the Log Level
+
+```bash
+# Set global log level
+export RUST_LOG=debug
+
+# Set module-specific log levels
+export RUST_LOG=ssh_mcp=debug,poem=info
+
+# Enable trace for SSH operations only
+export RUST_LOG=ssh_mcp::mcp=trace
+
+# Minimal logging (errors and warnings only)
+export RUST_LOG=warn
+```
+
+### Log Output Destination
+
+- **ssh-mcp (HTTP server)**: Logs to stdout
+- **ssh-mcp-stdio (MCP stdio transport)**: Logs to stderr (to avoid interfering with JSON-RPC communication over stdout)
+
+### Example Log Output
+
+```
+2024-01-15T10:30:45.123Z  INFO ssh_mcp::mcp::commands: Attempting SSH connection to user@192.168.1.100:22 with timeout 30s, max_retries=3, retry_delay_ms=1000, compress=true
+2024-01-15T10:30:45.456Z  INFO ssh_mcp::mcp::client: Successfully authenticated with SSH agent
+2024-01-15T10:30:46.789Z  INFO ssh_mcp::mcp::commands: Executing command on SSH session abc123 with timeout 180s: ls -la
+```
+
+### Filtering by Component
+
+```bash
+# Only show connection-related logs
+export RUST_LOG=ssh_mcp::mcp::client=debug
+
+# Show all SSH MCP logs at debug, everything else at warn
+export RUST_LOG=warn,ssh_mcp=debug
+
+# Include poem framework logs for HTTP debugging
+export RUST_LOG=ssh_mcp=debug,poem=debug
+```
+
+---
+
+## SSH Agent Authentication
+
+SSH MCP supports authentication via SSH agent, which allows you to use keys stored in your running ssh-agent without providing a password or key path.
+
+### How It Works
+
+1. When no password or key_path is provided to `ssh_connect`, the server attempts agent authentication
+2. The agent is accessed via the `SSH_AUTH_SOCK` environment variable
+3. All identities in the agent are tried sequentially until one succeeds
+
+### Prerequisites
+
+Ensure your SSH agent is running and has keys loaded:
+
+```bash
+# Start the SSH agent (if not already running)
+eval "$(ssh-agent -s)"
+
+# Add your SSH key to the agent
+ssh-add ~/.ssh/id_ed25519
+ssh-add ~/.ssh/id_rsa
+
+# Verify keys are loaded
+ssh-add -l
+```
+
+### SSH_AUTH_SOCK
+
+The `SSH_AUTH_SOCK` environment variable contains the path to the SSH agent socket. This is typically set automatically when you start an SSH agent.
+
+```bash
+# Check if SSH_AUTH_SOCK is set
+echo $SSH_AUTH_SOCK
+# Example output: /tmp/ssh-XXXXXX/agent.12345
+
+# Manually set SSH_AUTH_SOCK (rarely needed)
+export SSH_AUTH_SOCK=/path/to/agent.sock
+```
+
+### MCP Configuration with SSH Agent
+
+When using the MCP stdio transport with Claude Desktop or other clients, ensure the SSH agent socket is accessible:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "/usr/local/bin/ssh-mcp-stdio",
+      "env": {
+        "SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.socket"
+      }
+    }
+  }
+}
+```
+
+**Note:** On macOS, the SSH agent socket is typically at `/private/tmp/com.apple.launchd.*/Listeners`. You may need to pass the current value:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "/usr/local/bin/ssh-mcp-stdio",
+      "env": {
+        "SSH_AUTH_SOCK": "${SSH_AUTH_SOCK}"
+      }
+    }
+  }
+}
+```
+
+### Authentication Priority
+
+When connecting, SSH MCP tries authentication methods in this order:
+
+1. **Password** (if provided via `password` parameter)
+2. **Private key file** (if provided via `key_path` parameter)
+3. **SSH agent** (if neither password nor key_path is provided)
+
+### Troubleshooting Agent Authentication
+
+If agent authentication fails:
+
+```bash
+# Verify the agent is running
+ssh-add -l
+
+# If you see "Could not open connection to your authentication agent"
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+
+# Check SSH_AUTH_SOCK is set correctly
+echo $SSH_AUTH_SOCK
+
+# Test the agent connection manually
+ssh -o PreferredAuthentications=publickey user@host
+```
+
+---
+
+## RSA Signature Algorithm
+
+SSH MCP automatically negotiates the best RSA signature algorithm with the server. No configuration is needed.
+
+### Background
+
+Legacy SSH servers and clients used `ssh-rsa` signatures with SHA-1, which is now considered weak. Modern SSH implementations prefer:
+
+- `rsa-sha2-256` (SHA-256 based signatures)
+- `rsa-sha2-512` (SHA-512 based signatures)
+
+### Automatic Negotiation
+
+When authenticating with RSA keys (via key file or SSH agent), SSH MCP:
+
+1. Queries the server for supported RSA hash algorithms
+2. Selects the best available algorithm (`rsa-sha2-256` or `rsa-sha2-512`)
+3. Falls back to legacy `ssh-rsa` only if the server doesn't support modern algorithms
+
+### Compatibility
+
+This automatic negotiation ensures compatibility with:
+- Modern OpenSSH servers (8.0+) that disable `ssh-rsa` by default
+- Legacy servers that only support `ssh-rsa`
+- Cloud providers that may have specific algorithm requirements
+
+### No Configuration Required
+
+The RSA algorithm selection is fully automatic. You do not need to:
+- Configure any environment variables
+- Specify algorithm preferences
+- Modify SSH configuration files
+
+If you encounter RSA authentication failures, verify:
+1. Your RSA key is valid and not corrupted
+2. The server accepts RSA keys (some may only accept Ed25519)
+3. Your key is properly loaded in the SSH agent (for agent auth)
+
+---
+
 ## Feature Flags
 
 Cargo feature flags control compile-time functionality.
@@ -227,14 +434,14 @@ cargo build --release --features port_forward
 For local development with verbose logging:
 
 ```bash
-# .env file
-SSH_CONNECT_TIMEOUT=10
-SSH_COMMAND_TIMEOUT=60
-SSH_MAX_RETRIES=1
-SSH_RETRY_DELAY_MS=500
-SSH_COMPRESSION=false
-MCP_PORT=8000
-RUST_LOG=debug
+# .env file or shell exports
+export SSH_CONNECT_TIMEOUT=10
+export SSH_COMMAND_TIMEOUT=60
+export SSH_MAX_RETRIES=1
+export SSH_RETRY_DELAY_MS=500
+export SSH_COMPRESSION=false
+export MCP_PORT=8000
+export RUST_LOG=debug
 ```
 
 ### Production Environment
@@ -242,14 +449,14 @@ RUST_LOG=debug
 For production with reliability focus:
 
 ```bash
-# .env file
-SSH_CONNECT_TIMEOUT=30
-SSH_COMMAND_TIMEOUT=300
-SSH_MAX_RETRIES=5
-SSH_RETRY_DELAY_MS=2000
-SSH_COMPRESSION=true
-MCP_PORT=8000
-RUST_LOG=info
+# .env file or shell exports
+export SSH_CONNECT_TIMEOUT=30
+export SSH_COMMAND_TIMEOUT=300
+export SSH_MAX_RETRIES=5
+export SSH_RETRY_DELAY_MS=2000
+export SSH_COMPRESSION=true
+export MCP_PORT=8000
+export RUST_LOG=info
 ```
 
 ### High-Latency Network
@@ -257,12 +464,12 @@ RUST_LOG=info
 For satellite or intercontinental connections:
 
 ```bash
-# .env file
-SSH_CONNECT_TIMEOUT=120
-SSH_COMMAND_TIMEOUT=600
-SSH_MAX_RETRIES=10
-SSH_RETRY_DELAY_MS=5000
-SSH_COMPRESSION=true
+# .env file or shell exports
+export SSH_CONNECT_TIMEOUT=120
+export SSH_COMMAND_TIMEOUT=600
+export SSH_MAX_RETRIES=10
+export SSH_RETRY_DELAY_MS=5000
+export SSH_COMPRESSION=true
 ```
 
 ### Low-Latency Local Network
@@ -270,12 +477,12 @@ SSH_COMPRESSION=true
 For local datacenter or LAN:
 
 ```bash
-# .env file
-SSH_CONNECT_TIMEOUT=5
-SSH_COMMAND_TIMEOUT=60
-SSH_MAX_RETRIES=2
-SSH_RETRY_DELAY_MS=200
-SSH_COMPRESSION=false
+# .env file or shell exports
+export SSH_CONNECT_TIMEOUT=5
+export SSH_COMMAND_TIMEOUT=60
+export SSH_MAX_RETRIES=2
+export SSH_RETRY_DELAY_MS=200
+export SSH_COMPRESSION=false
 ```
 
 ### CI/CD Pipeline
@@ -283,13 +490,38 @@ SSH_COMPRESSION=false
 For automated deployments:
 
 ```bash
-# .env file
-SSH_CONNECT_TIMEOUT=30
-SSH_COMMAND_TIMEOUT=600
-SSH_MAX_RETRIES=3
-SSH_RETRY_DELAY_MS=1000
-SSH_COMPRESSION=true
-RUST_LOG=warn
+# .env file or shell exports
+export SSH_CONNECT_TIMEOUT=30
+export SSH_COMMAND_TIMEOUT=600
+export SSH_MAX_RETRIES=3
+export SSH_RETRY_DELAY_MS=1000
+export SSH_COMPRESSION=true
+export RUST_LOG=warn
+```
+
+### Setting Variables in Different Shells
+
+**Bash/Zsh (Linux/macOS):**
+```bash
+export SSH_CONNECT_TIMEOUT=30
+export RUST_LOG=debug
+```
+
+**Fish:**
+```fish
+set -x SSH_CONNECT_TIMEOUT 30
+set -x RUST_LOG debug
+```
+
+**PowerShell (Windows):**
+```powershell
+$env:SSH_CONNECT_TIMEOUT = "30"
+$env:RUST_LOG = "debug"
+```
+
+**Inline for Single Command:**
+```bash
+SSH_CONNECT_TIMEOUT=60 RUST_LOG=debug ./ssh-mcp-stdio
 ```
 
 ---
@@ -309,12 +541,32 @@ Add to `claude_desktop_config.json`:
         "SSH_CONNECT_TIMEOUT": "30",
         "SSH_COMMAND_TIMEOUT": "180",
         "SSH_MAX_RETRIES": "3",
-        "SSH_COMPRESSION": "true"
+        "SSH_COMPRESSION": "true",
+        "RUST_LOG": "info"
       }
     }
   }
 }
 ```
+
+### Claude Desktop with SSH Agent (macOS)
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "/usr/local/bin/ssh-mcp-stdio",
+      "env": {
+        "SSH_CONNECT_TIMEOUT": "30",
+        "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.XXXXX/Listeners",
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
+```
+
+**Note:** Replace the `SSH_AUTH_SOCK` path with your actual agent socket path. Find it with `echo $SSH_AUTH_SOCK`.
 
 ### Cursor IDE Configuration
 
@@ -327,7 +579,8 @@ Add to MCP settings:
       "command": "/usr/local/bin/ssh-mcp-stdio",
       "args": [],
       "env": {
-        "SSH_CONNECT_TIMEOUT": "60"
+        "SSH_CONNECT_TIMEOUT": "60",
+        "RUST_LOG": "debug"
       }
     }
   }
@@ -347,7 +600,9 @@ COPY --from=builder /app/target/release/ssh-mcp /usr/local/bin/
 ENV SSH_CONNECT_TIMEOUT=30
 ENV SSH_COMMAND_TIMEOUT=180
 ENV SSH_MAX_RETRIES=3
+ENV SSH_COMPRESSION=true
 ENV MCP_PORT=8000
+ENV RUST_LOG=info
 EXPOSE 8000
 CMD ["ssh-mcp"]
 ```
@@ -365,6 +620,7 @@ services:
       - SSH_COMMAND_TIMEOUT=180
       - SSH_MAX_RETRIES=3
       - SSH_COMPRESSION=true
+      - MCP_PORT=8000
       - RUST_LOG=info
 ```
 
@@ -440,7 +696,7 @@ flowchart TB
 
 ### Configuration Constants
 
-From `ssh_commands.rs`:
+From `config.rs`:
 
 ```rust
 /// Default SSH connection timeout in seconds
@@ -483,3 +739,13 @@ const MAX_RETRY_DELAY_SECS: u64 = 10;
    - Development: `debug` or `trace`
    - Production: `info` or `warn`
    - Troubleshooting: `debug`
+
+6. **Use SSH Agent When Possible**
+   - More secure than storing passwords
+   - Supports passphrase-protected keys
+   - Works with hardware tokens (YubiKey, etc.)
+
+7. **Prefer Ed25519 Keys**
+   - Faster and more secure than RSA
+   - Smaller key sizes
+   - No algorithm negotiation complexity
