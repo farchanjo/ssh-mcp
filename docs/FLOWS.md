@@ -110,15 +110,21 @@ sequenceDiagram
         SSH->>Server: client::connect with timeout
         alt Connection Success
             Server-->>SSH: Handle returned
-            Note over SSH: Authenticate
+            Note over SSH: Authenticate with RSA hash negotiation
             alt Password provided
                 SSH->>Server: authenticate_password
             else Key path provided
                 SSH->>SSH: keys::load_secret_key
+                SSH->>Server: best_supported_rsa_hash
+                Server-->>SSH: Preferred RSA hash algorithm
+                SSH->>SSH: PrivateKeyWithHashAlg wrap key
                 SSH->>Server: authenticate_publickey
-            else No credentials
+            else No credentials - Agent auth
                 SSH->>SSH: keys::agent::AgentClient::connect_env
+                SSH->>SSH: request_identities
                 loop For each identity
+                    SSH->>Server: best_supported_rsa_hash
+                    Server-->>SSH: Preferred RSA hash algorithm
                     SSH->>Server: authenticate_publickey_with
                 end
             end
@@ -206,7 +212,9 @@ flowchart LR
 
 ## Authentication Flow
 
-Detailed authentication flow supporting multiple methods.
+Detailed authentication flow supporting multiple methods with RSA hash algorithm negotiation.
+
+For RSA keys, the client negotiates the hash algorithm with the server using `best_supported_rsa_hash()`. This ensures modern algorithms like `rsa-sha2-256` or `rsa-sha2-512` are used instead of the legacy `ssh-rsa` with SHA1.
 
 ```mermaid
 sequenceDiagram
@@ -223,14 +231,23 @@ sequenceDiagram
         Handle->>Server: SSH_MSG_USERAUTH_REQUEST password
         Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
         Handle-->>SSH: AuthResult
+
     else Key File Authentication
         SSH->>Keys: load_secret_key from path
         Keys-->>SSH: KeyPair
-        SSH->>SSH: Wrap key with PrivateKeyWithHashAlg
-        SSH->>Handle: authenticate_publickey with user and key
-        Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey
+
+        Note over SSH,Server: RSA Hash Algorithm Negotiation
+        SSH->>Handle: best_supported_rsa_hash
+        Handle->>Server: Query supported RSA algorithms
+        Server-->>Handle: Supported algorithms list
+        Handle-->>SSH: Preferred hash - rsa-sha2-256 or rsa-sha2-512
+
+        SSH->>SSH: PrivateKeyWithHashAlg wrap key with hash_alg
+        SSH->>Handle: authenticate_publickey with user and wrapped key
+        Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey with negotiated algorithm
         Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
         Handle-->>SSH: AuthResult
+
     else SSH Agent Authentication
         SSH->>Agent: AgentClient::connect_env
         Agent-->>SSH: Connected
@@ -238,8 +255,14 @@ sequenceDiagram
         Agent-->>SSH: List of Keys
 
         loop For each identity
-            SSH->>Handle: authenticate_publickey_with identity and agent
-            Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey
+            Note over SSH,Server: RSA Hash Algorithm Negotiation per identity
+            SSH->>Handle: best_supported_rsa_hash
+            Handle->>Server: Query supported RSA algorithms
+            Server-->>Handle: Supported algorithms list
+            Handle-->>SSH: Preferred hash - rsa-sha2-256 or rsa-sha2-512
+
+            SSH->>Handle: authenticate_publickey_with identity agent and hash_alg
+            Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey with negotiated algorithm
             Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
             alt Success
                 Handle-->>SSH: AuthResult success
@@ -257,6 +280,33 @@ sequenceDiagram
     end
 ```
 
+### RSA Hash Algorithm Negotiation
+
+The `best_supported_rsa_hash()` function queries the server for supported RSA signature algorithms and returns the best available option.
+
+```mermaid
+flowchart TD
+    Start([best_supported_rsa_hash]) --> Query[Query server capabilities]
+    Query --> CheckSupport{Server supports modern RSA?}
+
+    CheckSupport -->|Yes| CheckSHA512{Supports rsa-sha2-512?}
+    CheckSupport -->|No| Legacy[Return None - use legacy ssh-rsa]
+
+    CheckSHA512 -->|Yes| UseSHA512[Return rsa-sha2-512]
+    CheckSHA512 -->|No| CheckSHA256{Supports rsa-sha2-256?}
+
+    CheckSHA256 -->|Yes| UseSHA256[Return rsa-sha2-256]
+    CheckSHA256 -->|No| Legacy
+
+    UseSHA512 --> End([Hash algorithm selected])
+    UseSHA256 --> End
+    Legacy --> End
+
+    style Start fill:#e3f2fd
+    style End fill:#e8f5e9
+    style Legacy fill:#fff8e1
+```
+
 ### Authentication Method Priority
 
 ```mermaid
@@ -269,9 +319,27 @@ flowchart TD
     CheckKey -->|Yes| KeyAuth[authenticate_with_key]
     CheckKey -->|No| AgentAuth[authenticate_with_agent]
 
+    subgraph KeyAuthFlow["Key File Authentication"]
+        KeyAuth --> LoadKey[Load secret key from file]
+        LoadKey --> NegotiateKey[best_supported_rsa_hash]
+        NegotiateKey --> WrapKey[Wrap key with PrivateKeyWithHashAlg]
+        WrapKey --> AuthKey[authenticate_publickey]
+    end
+
+    subgraph AgentAuthFlow["SSH Agent Authentication"]
+        AgentAuth --> ConnectAgent[Connect to SSH agent]
+        ConnectAgent --> GetIdentities[Request identities]
+        GetIdentities --> LoopStart[For each identity]
+        LoopStart --> NegotiateAgent[best_supported_rsa_hash]
+        NegotiateAgent --> AuthAgent[authenticate_publickey_with hash_alg]
+        AuthAgent --> CheckAgentResult{Success?}
+        CheckAgentResult -->|No| LoopStart
+        CheckAgentResult -->|Yes| AgentDone[Authentication complete]
+    end
+
     PasswordAuth --> Result{auth_result.success?}
-    KeyAuth --> Result
-    AgentAuth --> Result
+    AuthKey --> Result
+    AgentDone --> Result
 
     Result -->|Yes| Success([Return handle])
     Result -->|No| Fail([Return error])
@@ -279,6 +347,8 @@ flowchart TD
     style Start fill:#e3f2fd
     style Success fill:#e8f5e9
     style Fail fill:#ffebee
+    style KeyAuthFlow fill:#f3e5f5
+    style AgentAuthFlow fill:#fff8e1
 ```
 
 ---

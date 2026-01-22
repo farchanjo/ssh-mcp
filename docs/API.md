@@ -14,6 +14,10 @@ This document provides a complete API reference for all MCP tools exposed by the
 - [Response Types](#response-types)
 - [Error Responses](#error-responses)
 - [Examples](#examples)
+- [Important Notes](#important-notes)
+  - [Authentication](#authentication)
+  - [Retry Logic](#retry-logic)
+  - [Configuration Priority](#configuration-priority)
 
 ---
 
@@ -47,14 +51,38 @@ Establishes an SSH connection to a remote server with automatic retry logic.
 | `key_path` | `string` | No | `null` | Absolute path to private key file for key-based authentication |
 | `timeout_secs` | `u64` | No | `30` | Connection timeout in seconds. Falls back to `SSH_CONNECT_TIMEOUT` env var. |
 | `max_retries` | `u32` | No | `3` | Maximum retry attempts for transient failures. Falls back to `SSH_MAX_RETRIES` env var. |
-| `retry_delay_ms` | `u64` | No | `1000` | Initial delay between retries in milliseconds. Uses exponential backoff. Falls back to `SSH_RETRY_DELAY_MS` env var. |
+| `retry_delay_ms` | `u64` | No | `1000` | Initial delay between retries in milliseconds. Uses exponential backoff (capped at 10s). Falls back to `SSH_RETRY_DELAY_MS` env var. |
 | `compress` | `bool` | No | `true` | Enable zlib compression. Falls back to `SSH_COMPRESSION` env var. |
 
 #### Authentication Priority
 
-1. **Password** - If `password` is provided
-2. **Key File** - If `key_path` is provided (no password)
-3. **SSH Agent** - If neither password nor key_path provided
+Authentication methods are attempted in this order:
+
+1. **Password** - If `password` is provided, password authentication is used
+2. **Key File** - If `key_path` is provided (and no password), public key authentication is used
+3. **SSH Agent** - If neither password nor key_path is provided, SSH agent authentication is attempted (tries all available identities)
+
+> **Note on RSA Keys**: For RSA keys, the server's preferred hash algorithm is automatically negotiated (`rsa-sha2-256` or `rsa-sha2-512`). The legacy `ssh-rsa` (SHA1) signature algorithm is avoided for security reasons.
+
+#### Retry Behavior
+
+Retry logic with exponential backoff only applies to **transient connection errors**. Authentication failures are **never retried** to avoid account lockouts.
+
+**Retryable errors** (will be retried up to `max_retries` times):
+- Connection refused
+- Connection timeout
+- Network is unreachable
+- No route to host
+- Host is down
+- Temporary DNS failures
+- Broken pipe
+
+**Non-retryable errors** (fail immediately):
+- Authentication failed
+- Permission denied
+- Invalid credentials
+- Key authentication failed
+- No identities in SSH agent
 
 #### Response
 
@@ -116,7 +144,7 @@ Executes a shell command on a connected SSH session.
 |-----------|------|----------|---------|-------------|
 | `session_id` | `string` | Yes | - | Session ID returned from `ssh_connect` |
 | `command` | `string` | Yes | - | Shell command to execute on the remote server |
-| `timeout_secs` | `u64` | No | `180` | Command execution timeout in seconds. Falls back to `SSH_COMMAND_TIMEOUT` env var. |
+| `timeout_secs` | `u64` | No | `180` | Command execution timeout in seconds (default: 180s / 3 minutes). Falls back to `SSH_COMMAND_TIMEOUT` env var. |
 
 #### Response
 
@@ -558,3 +586,97 @@ Response:
 ```
 Session abc-123-def-456 disconnected successfully
 ```
+
+---
+
+## Important Notes
+
+### Authentication
+
+#### Priority Order
+
+Authentication methods are attempted in strict priority order:
+
+1. **Password authentication** - If the `password` parameter is provided
+2. **Key file authentication** - If `key_path` is provided (and no password)
+3. **SSH agent authentication** - If neither password nor key_path is provided
+
+Only one authentication method is attempted per connection. The server is not consulted for which methods are available.
+
+#### RSA Key Signature Algorithm
+
+For RSA keys (both key files and SSH agent identities), the server's preferred hash algorithm is automatically negotiated:
+
+- Preferred: `rsa-sha2-512` or `rsa-sha2-256`
+- Avoided: Legacy `ssh-rsa` (SHA1) for security reasons
+
+This is handled automatically by querying `best_supported_rsa_hash()` from the server during key exchange.
+
+#### SSH Agent
+
+When using SSH agent authentication:
+- The agent is accessed via the `SSH_AUTH_SOCK` environment variable
+- All available identities are tried in sequence until one succeeds
+- If no identities are found, the error "No identities found in SSH agent" is returned
+
+### Retry Logic
+
+#### Retry Behavior
+
+The retry mechanism with exponential backoff **only applies to transient connection errors**. Authentication failures are **never retried** to prevent:
+
+- Account lockouts from repeated failed password attempts
+- Wasting time on permanently invalid credentials
+- Unnecessary load on authentication systems
+
+#### Exponential Backoff Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Initial delay | 1000ms | First retry delay (configurable via `retry_delay_ms`) |
+| Maximum delay | 10s | Backoff is capped at 10 seconds |
+| Jitter | Enabled | Random jitter is added to prevent thundering herd |
+| Maximum retries | 3 | Total retry attempts (configurable via `max_retries`) |
+
+#### Error Classification
+
+**Retryable errors** (transient, will be retried):
+- `connection refused`
+- `connection reset`
+- `connection timed out` / `timeout`
+- `network is unreachable`
+- `no route to host`
+- `host is down`
+- `temporary failure`
+- `resource temporarily unavailable`
+- `handshake failed`
+- `failed to connect`
+- `broken pipe`
+- `would block`
+
+**Non-retryable errors** (permanent, fail immediately):
+- `authentication failed`
+- `password authentication failed`
+- `key authentication failed`
+- `agent authentication failed`
+- `permission denied`
+- `publickey`
+- `auth fail`
+- `no authentication`
+- `all authentication methods failed`
+
+### Configuration Priority
+
+All configuration values follow a three-tier priority system:
+
+1. **Parameter** (highest) - Explicitly provided function parameter
+2. **Environment Variable** - Value from environment variable
+3. **Default** (lowest) - Built-in default value
+
+| Setting | Parameter | Environment Variable | Default |
+|---------|-----------|---------------------|---------|
+| Connection timeout | `timeout_secs` | `SSH_CONNECT_TIMEOUT` | 30s |
+| Command timeout | `timeout_secs` | `SSH_COMMAND_TIMEOUT` | 180s |
+| Max retries | `max_retries` | `SSH_MAX_RETRIES` | 3 |
+| Retry delay | `retry_delay_ms` | `SSH_RETRY_DELAY_MS` | 1000ms |
+| Compression | `compress` | `SSH_COMPRESSION` | true |
