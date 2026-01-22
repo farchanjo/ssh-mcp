@@ -8,6 +8,7 @@ This document describes the system architecture of the SSH Model Context Protoco
 - [Module Structure](#module-structure)
 - [Module Dependency Graph](#module-dependency-graph)
 - [Component Architecture](#component-architecture)
+- [Authentication Flow](#authentication-flow)
 - [Session Storage Architecture](#session-storage-architecture)
 - [Threading and Async Model](#threading-and-async-model)
 - [Binary Targets](#binary-targets)
@@ -70,19 +71,30 @@ flowchart TB
 
 ## Module Structure
 
-The codebase is organized into a modular structure under `src/mcp/`:
+The codebase consists of **8 source files** organized into a modular structure:
 
-| Module | Visibility | Description |
-|--------|------------|-------------|
-| `types.rs` | `pub` | Serializable response types for MCP tools |
-| `config.rs` | `pub(crate)` | Configuration resolution with environment variable support |
-| `error.rs` | `pub(crate)` | Error classification for retry logic |
-| `session.rs` | `pub` | Session storage and SSH client handler |
-| `client.rs` | `pub(crate)` | SSH connection, authentication, and command execution |
-| `forward.rs` | `pub(crate)` | Port forwarding implementation (feature-gated) |
-| `commands.rs` | `pub` | MCP tool implementations via `#[Tools]` macro |
+| File | Location | Visibility | Description |
+|------|----------|------------|-------------|
+| `lib.rs` | `src/` | `pub` | Library crate root, exposes `mcp` module |
+| `mod.rs` | `src/mcp/` | - | Module root, re-exports `McpSSHCommands` |
+| `types.rs` | `src/mcp/` | `pub` | Serializable response types for MCP tools |
+| `config.rs` | `src/mcp/` | `pub(crate)` | Configuration resolution with environment variable support |
+| `error.rs` | `src/mcp/` | `pub(crate)` | Error classification for retry logic |
+| `session.rs` | `src/mcp/` | `pub` | Session storage and SSH client handler |
+| `client.rs` | `src/mcp/` | `pub(crate)` | SSH connection, authentication, and command execution |
+| `forward.rs` | `src/mcp/` | `pub(crate)` | Port forwarding implementation (feature-gated) |
+| `commands.rs` | `src/mcp/` | `pub` | MCP tool implementations via `#[Tools]` macro |
 
 ### Module Responsibilities
+
+**lib.rs** - Library Root
+- Exposes the `mcp` module for external use
+- Entry point for the library crate
+
+**mod.rs** - Module Root
+- Declares and organizes submodules
+- Controls visibility (pub, pub(crate))
+- Re-exports `McpSSHCommands` for convenience
 
 **types.rs** - Response Types
 - `SessionInfo` - Session metadata for tracking connections
@@ -101,17 +113,17 @@ The codebase is organized into a modular structure under `src/mcp/`:
 - Authentication errors (non-retryable) vs connection errors (retryable)
 
 **session.rs** - Session Management
-- `SshClientHandler` - russh client handler (accepts all host keys)
+- `SshClientHandler` - russh client handler that accepts all host keys
 - `StoredSession` - Combines SessionInfo with SSH handle
 - `SSH_SESSIONS` - Global lazy-initialized session storage
 
 **client.rs** - SSH Client Operations
-- `build_client_config()` - Builds russh configuration
+- `build_client_config()` - Builds russh configuration with compression preferences
 - `parse_address()` - Parses host and port from address string
-- `connect_to_ssh_with_retry()` - Connection with exponential backoff
-- `authenticate_with_key()` - Private key authentication
-- `authenticate_with_agent()` - SSH agent authentication
-- `execute_ssh_command()` - Command execution on established session
+- `connect_to_ssh_with_retry()` - Connection with exponential backoff via backon
+- `authenticate_with_key()` - Private key authentication with RSA hash negotiation
+- `authenticate_with_agent()` - SSH agent authentication with RSA hash negotiation
+- `execute_ssh_command()` - Command execution via channel-based async I/O
 
 **forward.rs** - Port Forwarding (feature-gated)
 - `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
@@ -131,6 +143,15 @@ The codebase is organized into a modular structure under `src/mcp/`:
 
 ```mermaid
 flowchart TB
+    subgraph Binaries["Binary Targets"]
+        main["main.rs<br/>HTTP Server"]
+        stdio["ssh_mcp_stdio.rs<br/>Stdio Transport"]
+    end
+
+    subgraph Library["Library - src/lib.rs"]
+        lib["lib.rs"]
+    end
+
     subgraph Public["Public Modules"]
         commands["commands.rs<br/>McpSSHCommands"]
         types["types.rs<br/>Response Types"]
@@ -142,6 +163,7 @@ flowchart TB
         config["config.rs<br/>Configuration"]
         error["error.rs<br/>Error Classification"]
         forward["forward.rs<br/>Port Forwarding"]
+        modrs["mod.rs<br/>Module Root"]
     end
 
     subgraph External["External Crates"]
@@ -149,7 +171,20 @@ flowchart TB
         backon["backon"]
         tokio["tokio"]
         poem_mcp["poem-mcpserver"]
+        tracing["tracing"]
     end
+
+    main --> modrs
+    stdio --> lib
+    lib --> modrs
+
+    modrs --> commands
+    modrs --> types
+    modrs --> session
+    modrs --> client
+    modrs --> config
+    modrs --> error
+    modrs --> forward
 
     commands --> client
     commands --> config
@@ -165,6 +200,7 @@ flowchart TB
     client --> russh
     client --> backon
     client --> tokio
+    client --> tracing
 
     forward --> session
     forward --> russh
@@ -174,6 +210,10 @@ flowchart TB
     session --> russh
     session --> tokio
 
+    stdio --> tracing
+
+    style Binaries fill:#fce4ec
+    style Library fill:#e8f5e9
     style Public fill:#e8f5e9
     style Internal fill:#fff3e0
     style External fill:#e3f2fd
@@ -267,6 +307,110 @@ classDiagram
 
 ---
 
+## Authentication Flow
+
+The client.rs module handles three authentication methods with modern RSA hash negotiation:
+
+```mermaid
+flowchart TB
+    subgraph Entry["Authentication Entry Point"]
+        Start["connect_to_ssh"]
+    end
+
+    subgraph Methods["Authentication Methods"]
+        Password["Password Auth"]
+        KeyFile["Key File Auth"]
+        Agent["SSH Agent Auth"]
+    end
+
+    subgraph KeyAuth["Key File Authentication"]
+        LoadKey["Load key from file"]
+        QueryHash1["Query best_supported_rsa_hash"]
+        WrapKey["Wrap key with PrivateKeyWithHashAlg"]
+        AuthKey["authenticate_publickey"]
+    end
+
+    subgraph AgentAuth["SSH Agent Authentication"]
+        ConnectAgent["Connect to SSH_AUTH_SOCK"]
+        GetIdentities["Request identities from agent"]
+        LoopStart["For each identity"]
+        QueryHash2["Query best_supported_rsa_hash"]
+        TryAuth["authenticate_publickey_with"]
+        CheckResult["Check result"]
+        NextId["Try next identity"]
+        AgentSuccess["Return success"]
+    end
+
+    subgraph RSAHash["RSA Hash Negotiation"]
+        Negotiate["Server negotiates supported hashes"]
+        SelectHash["Select rsa-sha2-512 or rsa-sha2-256"]
+        FallbackSHA1["Fallback to ssh-rsa SHA1 if needed"]
+    end
+
+    Start --> Password
+    Start --> KeyFile
+    Start --> Agent
+
+    Password --> AuthSuccess
+
+    KeyFile --> LoadKey
+    LoadKey --> QueryHash1
+    QueryHash1 --> RSAHash
+    RSAHash --> WrapKey
+    WrapKey --> AuthKey
+    AuthKey --> AuthSuccess
+
+    Agent --> ConnectAgent
+    ConnectAgent --> GetIdentities
+    GetIdentities --> LoopStart
+    LoopStart --> QueryHash2
+    QueryHash2 --> RSAHash
+    RSAHash --> TryAuth
+    TryAuth --> CheckResult
+    CheckResult --> NextId
+    CheckResult --> AgentSuccess
+    NextId --> LoopStart
+    AgentSuccess --> AuthSuccess
+
+    Negotiate --> SelectHash
+    SelectHash --> FallbackSHA1
+
+    AuthSuccess["Authentication Success"]
+
+    style Entry fill:#e3f2fd
+    style Methods fill:#fff3e0
+    style KeyAuth fill:#e8f5e9
+    style AgentAuth fill:#f3e5f5
+    style RSAHash fill:#fce4ec
+```
+
+### RSA Hash Algorithm Negotiation
+
+Modern SSH servers often disable legacy `ssh-rsa` (SHA-1) signatures for security. The client.rs module uses `best_supported_rsa_hash()` to negotiate modern algorithms:
+
+| Priority | Algorithm | Description |
+|----------|-----------|-------------|
+| 1 | `rsa-sha2-512` | RSA with SHA-512 - strongest option |
+| 2 | `rsa-sha2-256` | RSA with SHA-256 - widely supported |
+| 3 | `ssh-rsa` | Legacy RSA with SHA-1 - fallback only |
+
+```rust
+// Query server for best supported RSA hash algorithm
+let hash_alg = handle
+    .best_supported_rsa_hash()
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
+// Wrap the key with the negotiated algorithm
+let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
+```
+
+This negotiation happens automatically for both key file and SSH agent authentication, ensuring compatibility with modern SSH servers while maintaining backward compatibility.
+
+---
+
 ## Session Storage Architecture
 
 SSH sessions are stored in a global, thread-safe data structure that allows concurrent access from multiple async tasks.
@@ -275,18 +419,18 @@ SSH sessions are stored in a global, thread-safe data structure that allows conc
 flowchart LR
     subgraph Storage["SSH_SESSIONS"]
         direction TB
-        Lazy["Lazy<br/>(once_cell)"]
-        Mutex["Mutex<br/>(tokio::sync)"]
-        HashMap["HashMap<br/>String -> StoredSession"]
+        Lazy["Lazy<br/>once_cell"]
+        Mutex["Mutex<br/>tokio sync"]
+        HashMap["HashMap<br/>String to StoredSession"]
 
         Lazy --> Mutex
         Mutex --> HashMap
     end
 
     subgraph Sessions["Active Sessions"]
-        S1["StoredSession 1<br/>uuid: abc-123"]
-        S2["StoredSession 2<br/>uuid: def-456"]
-        S3["StoredSession 3<br/>uuid: ghi-789"]
+        S1["StoredSession 1<br/>uuid abc-123"]
+        S2["StoredSession 2<br/>uuid def-456"]
+        S3["StoredSession 3<br/>uuid ghi-789"]
     end
 
     HashMap --> S1
@@ -294,8 +438,8 @@ flowchart LR
     HashMap --> S3
 
     subgraph SessionDetail["StoredSession Structure"]
-        Info["SessionInfo<br/>(Metadata)"]
-        Handle["Arc Mutex Handle<br/>(SSH Connection)"]
+        Info["SessionInfo<br/>Metadata"]
+        Handle["Arc Mutex Handle<br/>SSH Connection"]
     end
 
     S1 -.-> SessionDetail
@@ -470,6 +614,7 @@ flowchart LR
 - Uses Poem's streamable HTTP transport
 - Includes tracing middleware for debugging
 - Loads environment from `.env` file
+- Initializes tracing with `info` level default
 
 ### Stdio Transport (`ssh-mcp-stdio`)
 
@@ -477,15 +622,19 @@ flowchart LR
 flowchart LR
     subgraph Binary["ssh-mcp-stdio Binary"]
         Main["main.rs"]
+        TracingInit["Tracing Init<br/>stderr output"]
         Stdio["poem_mcpserver stdio"]
     end
 
     subgraph IO["Standard I/O"]
         STDIN["stdin"]
         STDOUT["stdout"]
+        STDERR["stderr - logs"]
     end
 
     STDIN --> Main
+    Main --> TracingInit
+    TracingInit --> STDERR
     Main --> Stdio
     Stdio --> STDOUT
 
@@ -497,6 +646,8 @@ flowchart LR
 - Minimal binary for direct MCP integration
 - No HTTP overhead
 - Ideal for embedding in LLM tools
+- Tracing initialized with `RUST_LOG` environment filter
+- Logs directed to stderr to avoid interfering with MCP protocol on stdout
 
 ---
 
@@ -505,20 +656,20 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph Core["Core Dependencies"]
-        Russh["russh 0.55<br/>(Async SSH Client)"]
-        Tokio["tokio 1.x<br/>(Async Runtime)"]
-        Poem["poem 3.1<br/>(HTTP Framework)"]
+        Russh["russh 0.55<br/>Async SSH Client"]
+        Tokio["tokio 1.x<br/>Async Runtime"]
+        Poem["poem 3.1<br/>HTTP Framework"]
     end
 
     subgraph MCP["MCP Integration"]
-        PoemMCP["poem-mcpserver 0.2.9<br/>(MCP Protocol)"]
+        PoemMCP["poem-mcpserver 0.2.9<br/>MCP Protocol"]
     end
 
     subgraph Utilities["Utility Crates"]
-        Backon["backon 1.x<br/>(Retry Logic)"]
-        Serde["serde 1.0<br/>(Serialization)"]
-        UUID["uuid 1.16<br/>(Session IDs)"]
-        OnceCell["once_cell 1.21<br/>(Lazy Statics)"]
+        Backon["backon 1.x<br/>Retry Logic"]
+        Serde["serde 1.0<br/>Serialization"]
+        UUID["uuid 1.16<br/>Session IDs"]
+        OnceCell["once_cell 1.21<br/>Lazy Statics"]
     end
 
     PoemMCP --> Poem
@@ -541,6 +692,7 @@ flowchart TB
 | `uuid` | 1.16 | UUID v4 generation for session IDs |
 | `once_cell` | 1.21 | Lazy static initialization |
 | `tracing` | 0.1 | Structured logging |
+| `tracing-subscriber` | 0.3 | Tracing output and filtering |
 | `chrono` | 0.4 | Timestamp generation |
 
 ---
