@@ -47,7 +47,7 @@ use russh::{ChannelMsg, client, keys};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::config::MAX_RETRY_DELAY_SECS;
+use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
 use crate::mcp::types::SshCommandResponse;
@@ -55,22 +55,22 @@ use crate::mcp::types::SshCommandResponse;
 /// Build russh client configuration with the specified settings.
 ///
 /// Creates an `Arc<client::Config>` with:
-/// - Inactivity timeout set to `timeout_secs`
+/// - Inactivity timeout set to the provided `timeout`
 /// - Keepalive interval of 30 seconds with max 3 keepalives
 /// - Compression preference based on `compress` flag (ZLIB if enabled, NONE if disabled)
 ///
 /// # Arguments
 ///
-/// * `timeout_secs` - Inactivity timeout in seconds
+/// * `timeout` - Inactivity timeout duration
 /// * `compress` - Whether to enable zlib compression
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let config = build_client_config(30, true);
+/// let config = build_client_config(Duration::from_secs(30), true);
 /// assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(30)));
 /// ```
-pub(crate) fn build_client_config(timeout_secs: u64, compress: bool) -> Arc<client::Config> {
+pub(crate) fn build_client_config(timeout: Duration, compress: bool) -> Arc<client::Config> {
     let compression = if compress {
         (&[russh::compression::ZLIB, russh::compression::NONE][..]).into()
     } else {
@@ -83,7 +83,7 @@ pub(crate) fn build_client_config(timeout_secs: u64, compress: bool) -> Arc<clie
     };
 
     Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(timeout_secs)),
+        inactivity_timeout: Some(timeout),
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         preferred,
@@ -142,9 +142,9 @@ pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
 /// * `username` - SSH username for authentication
 /// * `password` - Optional password for password authentication
 /// * `key_path` - Optional path to private key file
-/// * `timeout_secs` - Connection timeout in seconds
+/// * `timeout` - Connection timeout duration
 /// * `max_retries` - Maximum number of retry attempts
-/// * `min_delay_ms` - Initial delay between retries in milliseconds
+/// * `min_delay` - Initial delay between retries
 /// * `compress` - Whether to enable compression
 ///
 /// # Returns
@@ -154,8 +154,8 @@ pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
 ///
 /// # Retry Behavior
 ///
-/// - Uses exponential backoff starting from `min_delay_ms`
-/// - Caps maximum delay at [`MAX_RETRY_DELAY_SECS`]
+/// - Uses exponential backoff starting from `min_delay`
+/// - Caps maximum delay at [`MAX_RETRY_DELAY`]
 /// - Adds random jitter to prevent thundering herd
 /// - Only retries on transient connection errors (not auth failures)
 #[allow(clippy::too_many_arguments)]
@@ -164,9 +164,9 @@ pub(crate) async fn connect_to_ssh_with_retry(
     username: &str,
     password: Option<&str>,
     key_path: Option<&str>,
-    timeout_secs: u64,
+    timeout: Duration,
     max_retries: u32,
-    min_delay_ms: u64,
+    min_delay: Duration,
     compress: bool,
 ) -> Result<(client::Handle<SshClientHandler>, u32), String> {
     // Track retry attempts using atomic counter
@@ -179,8 +179,8 @@ pub(crate) async fn connect_to_ssh_with_retry(
     let key_path = key_path.map(|s| s.to_string());
 
     let backoff = ExponentialBuilder::default()
-        .with_min_delay(Duration::from_millis(min_delay_ms))
-        .with_max_delay(Duration::from_secs(MAX_RETRY_DELAY_SECS))
+        .with_min_delay(min_delay)
+        .with_max_delay(MAX_RETRY_DELAY)
         .with_max_times(max_retries as usize)
         .with_jitter();
 
@@ -199,7 +199,7 @@ pub(crate) async fn connect_to_ssh_with_retry(
             &username,
             password.as_deref(),
             key_path.as_deref(),
-            timeout_secs,
+            timeout,
             compress,
         )
         .await
@@ -258,10 +258,10 @@ async fn connect_to_ssh(
     username: &str,
     password: Option<&str>,
     key_path: Option<&str>,
-    timeout_secs: u64,
+    timeout: Duration,
     compress: bool,
 ) -> Result<client::Handle<SshClientHandler>, String> {
-    let config = build_client_config(timeout_secs, compress);
+    let config = build_client_config(timeout, compress);
     let handler = SshClientHandler;
 
     // Parse address into host and port
@@ -270,9 +270,9 @@ async fn connect_to_ssh(
     // Connect with timeout
     let connect_future = client::connect(config, (host.as_str(), port), handler);
 
-    let mut handle = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
+    let mut handle = tokio::time::timeout(timeout, connect_future)
         .await
-        .map_err(|_| format!("Connection timed out after {}s", timeout_secs))?
+        .map_err(|_| format!("Connection timed out after {:?}", timeout))?
         .map_err(|e| format!("Failed to connect: {}", e))?;
 
     // Authenticate with either password, key, or agent
@@ -400,7 +400,7 @@ async fn authenticate_with_agent(
 ///
 /// * `handle_arc` - Shared handle to the SSH session
 /// * `command` - Shell command to execute
-/// * `timeout_secs` - Command execution timeout in seconds
+/// * `timeout` - Command execution timeout duration
 ///
 /// # Returns
 ///
@@ -421,7 +421,7 @@ async fn authenticate_with_agent(
 pub(crate) async fn execute_ssh_command(
     handle_arc: &Arc<Mutex<client::Handle<SshClientHandler>>>,
     command: &str,
-    timeout_secs: u64,
+    timeout: Duration,
 ) -> Result<SshCommandResponse, String> {
     // Lock the handle for this operation
     let handle = handle_arc.lock().await;
@@ -446,11 +446,8 @@ pub(crate) async fn execute_ssh_command(
     let mut exit_code: Option<u32> = None;
     let mut timed_out = false;
 
-    // Create timeout future
-    let timeout_duration = Duration::from_secs(timeout_secs);
-
     // Read channel messages with timeout
-    let result = tokio::time::timeout(timeout_duration, async {
+    let result = tokio::time::timeout(timeout, async {
         loop {
             match channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
@@ -490,8 +487,8 @@ pub(crate) async fn execute_ssh_command(
     if result.is_err() {
         timed_out = true;
         warn!(
-            "Command timed out after {}s, returning partial output ({} bytes stdout, {} bytes stderr)",
-            timeout_secs,
+            "Command timed out after {:?}, returning partial output ({} bytes stdout, {} bytes stderr)",
+            timeout,
             stdout.len(),
             stderr.len()
         );
@@ -625,20 +622,20 @@ mod tests {
 
         #[test]
         fn test_builds_config_with_timeout() {
-            let config = build_client_config(45, true);
+            let config = build_client_config(Duration::from_secs(45), true);
             assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(45)));
         }
 
         #[test]
         fn test_builds_config_with_keepalive() {
-            let config = build_client_config(30, true);
+            let config = build_client_config(Duration::from_secs(30), true);
             assert_eq!(config.keepalive_interval, Some(Duration::from_secs(30)));
             assert_eq!(config.keepalive_max, 3);
         }
 
         #[test]
         fn test_compression_enabled_includes_zlib() {
-            let config = build_client_config(30, true);
+            let config = build_client_config(Duration::from_secs(30), true);
             // When compression is enabled, ZLIB should be preferred
             let compression = &config.preferred.compression;
             assert!(!compression.is_empty());
@@ -646,7 +643,7 @@ mod tests {
 
         #[test]
         fn test_compression_disabled() {
-            let config = build_client_config(30, false);
+            let config = build_client_config(Duration::from_secs(30), false);
             // When compression is disabled, only NONE should be available
             let compression = &config.preferred.compression;
             assert!(!compression.is_empty());
@@ -654,8 +651,8 @@ mod tests {
 
         #[test]
         fn test_different_timeouts() {
-            let config1 = build_client_config(10, true);
-            let config2 = build_client_config(120, true);
+            let config1 = build_client_config(Duration::from_secs(10), true);
+            let config2 = build_client_config(Duration::from_secs(120), true);
 
             assert_eq!(config1.inactivity_timeout, Some(Duration::from_secs(10)));
             assert_eq!(config2.inactivity_timeout, Some(Duration::from_secs(120)));
@@ -667,21 +664,20 @@ mod tests {
 
         #[test]
         fn test_max_retry_delay_value() {
-            assert_eq!(MAX_RETRY_DELAY_SECS, 10);
+            assert_eq!(MAX_RETRY_DELAY, Duration::from_secs(10));
         }
 
         #[test]
         fn test_max_retry_delay_is_reasonable() {
             // Ensure the max delay is between 5 and 60 seconds (reasonable bounds)
-            assert!(MAX_RETRY_DELAY_SECS >= 5);
-            assert!(MAX_RETRY_DELAY_SECS <= 60);
+            assert!(MAX_RETRY_DELAY.as_secs() >= 5);
+            assert!(MAX_RETRY_DELAY.as_secs() <= 60);
         }
 
         #[test]
-        fn test_max_retry_delay_duration_conversion() {
-            let duration = Duration::from_secs(MAX_RETRY_DELAY_SECS);
-            assert_eq!(duration.as_secs(), 10);
-            assert_eq!(duration.as_millis(), 10_000);
+        fn test_max_retry_delay_duration_properties() {
+            assert_eq!(MAX_RETRY_DELAY.as_secs(), 10);
+            assert_eq!(MAX_RETRY_DELAY.as_millis(), 10_000);
         }
     }
 }

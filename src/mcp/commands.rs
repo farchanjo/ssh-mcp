@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::client::{connect_to_ssh_with_retry, execute_ssh_command};
 use super::config::{
     resolve_command_timeout, resolve_compression, resolve_connect_timeout, resolve_max_retries,
-    resolve_retry_delay_ms,
+    resolve_retry_delay,
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
@@ -59,12 +59,17 @@ impl McpSSHCommands {
     ) -> Result<StructuredContent<SshConnectResponse>, String> {
         let timeout = resolve_connect_timeout(timeout_secs);
         let max_retries = resolve_max_retries(max_retries);
-        let retry_delay_ms = resolve_retry_delay_ms(retry_delay_ms);
+        let retry_delay = resolve_retry_delay(retry_delay_ms);
         let compress = resolve_compression(compress);
 
         info!(
-            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay_ms={}, compress={}",
-            username, address, timeout, max_retries, retry_delay_ms, compress
+            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay={}ms, compress={}",
+            username,
+            address,
+            timeout.as_secs(),
+            max_retries,
+            retry_delay.as_millis(),
+            compress
         );
 
         match connect_to_ssh_with_retry(
@@ -74,7 +79,7 @@ impl McpSSHCommands {
             key_path.as_deref(),
             timeout,
             max_retries,
-            retry_delay_ms,
+            retry_delay,
             compress,
         )
         .await
@@ -88,7 +93,7 @@ impl McpSSHCommands {
                     host: address.clone(),
                     username: username.clone(),
                     connected_at,
-                    default_timeout_secs: timeout,
+                    default_timeout_secs: timeout.as_secs(),
                     retry_attempts,
                     compression_enabled: compress,
                 };
@@ -141,7 +146,9 @@ impl McpSSHCommands {
         let timeout = resolve_command_timeout(timeout_secs);
         info!(
             "Executing command on SSH session {} with timeout {}s: {}",
-            session_id, timeout, command
+            session_id,
+            timeout.as_secs(),
+            command
         );
 
         // Clone Arc and release global lock immediately
@@ -159,7 +166,8 @@ impl McpSSHCommands {
                 if response.timed_out {
                     warn!(
                         "Command timed out after {}s but returning partial output: {}",
-                        timeout, command
+                        timeout.as_secs(),
+                        command
                     );
                 }
                 Ok(StructuredContent(response))
