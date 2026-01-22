@@ -9,14 +9,21 @@
 //! - `ssh_list_sessions`: List all active sessions
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
 use russh::Disconnect;
+use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::client::{connect_to_ssh_with_retry, execute_ssh_command};
+use super::async_command::{
+    ASYNC_COMMANDS, MAX_ASYNC_COMMANDS_PER_SESSION, OutputBuffer, RunningCommand,
+    count_session_commands, get_session_command_ids,
+};
+use super::client::{connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async};
 use super::config::{
     resolve_command_timeout, resolve_compression, resolve_connect_timeout, resolve_max_retries,
     resolve_retry_delay,
@@ -25,10 +32,10 @@ use super::config::{
 use super::forward::setup_port_forwarding;
 use super::session::{SSH_SESSIONS, StoredSession};
 use super::types::{
-    PortForwardingResponse, SessionInfo, SessionListResponse, SshCommandResponse,
-    SshConnectResponse,
+    AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse, SessionInfo, SessionListResponse,
+    SshAsyncOutputResponse, SshCancelCommandResponse, SshCommandResponse, SshConnectResponse,
+    SshExecuteAsyncResponse, SshListCommandsResponse,
 };
-use tokio::sync::Mutex;
 
 /// MCP SSH Commands tool implementation.
 ///
@@ -174,7 +181,7 @@ impl McpSSHCommands {
                         new_session_id.clone(),
                         StoredSession {
                             info: session_info,
-                            handle: Arc::new(Mutex::new(handle)),
+                            handle: Arc::new(handle),
                         },
                     );
                 }
@@ -268,11 +275,34 @@ impl McpSSHCommands {
     ) -> Result<Text<String>, String> {
         info!("Disconnecting SSH session: {}", session_id);
 
+        // Cancel all async commands for this session
+        let command_ids = get_session_command_ids(&session_id).await;
+        if !command_ids.is_empty() {
+            info!(
+                "Cancelling {} async commands for session {}",
+                command_ids.len(),
+                session_id
+            );
+            let commands = ASYNC_COMMANDS.lock().await;
+            for cmd_id in &command_ids {
+                if let Some(cmd) = commands.get(cmd_id) {
+                    cmd.cancel_token.cancel();
+                }
+            }
+            drop(commands);
+
+            // Remove cancelled commands from storage
+            let mut commands = ASYNC_COMMANDS.lock().await;
+            for cmd_id in command_ids {
+                commands.remove(&cmd_id);
+            }
+        }
+
         let mut sessions = SSH_SESSIONS.lock().await;
         if let Some(stored) = sessions.remove(&session_id) {
             // Gracefully disconnect the session
-            let handle = stored.handle.lock().await;
-            if let Err(e) = handle
+            if let Err(e) = stored
+                .handle
                 .disconnect(Disconnect::ByApplication, "Session closed by user", "en")
                 .await
             {
@@ -398,5 +428,275 @@ impl McpSSHCommands {
                     .to_string(),
             )
         }
+    }
+
+    /// Execute a command asynchronously on a connected SSH session.
+    ///
+    /// Returns immediately with a command_id for polling or cancellation.
+    /// Use ssh_get_command_output to poll for results.
+    async fn ssh_execute_async(
+        &self,
+        /// Session ID returned from ssh_connect
+        session_id: String,
+        /// Shell command to execute on the remote server
+        command: String,
+        /// Command execution timeout in seconds (default: 180, env: SSH_COMMAND_TIMEOUT)
+        timeout_secs: Option<u64>,
+    ) -> Result<StructuredContent<SshExecuteAsyncResponse>, String> {
+        let timeout = resolve_command_timeout(timeout_secs);
+
+        // Check session limit
+        let current_count = count_session_commands(&session_id).await;
+        if current_count >= MAX_ASYNC_COMMANDS_PER_SESSION {
+            return Err(format!(
+                "Maximum async commands per session reached ({}). Cancel or wait for existing commands to complete.",
+                MAX_ASYNC_COMMANDS_PER_SESSION
+            ));
+        }
+
+        // Get session handle
+        let handle_arc = {
+            let sessions = SSH_SESSIONS.lock().await;
+            sessions
+                .get(&session_id)
+                .map(|s| s.handle.clone())
+                .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
+        };
+
+        let command_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        // Create shared state
+        let (status_tx, status_rx) = watch::channel(AsyncCommandStatus::Running);
+        let output = Arc::new(Mutex::new(OutputBuffer::default()));
+        let exit_code = Arc::new(Mutex::new(None));
+        let error = Arc::new(Mutex::new(None));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
+
+        // Create command info
+        let info = AsyncCommandInfo {
+            command_id: command_id.clone(),
+            session_id: session_id.clone(),
+            command: command.clone(),
+            status: AsyncCommandStatus::Running,
+            started_at: started_at.clone(),
+        };
+
+        // Store running command
+        {
+            let mut commands = ASYNC_COMMANDS.lock().await;
+            commands.insert(
+                command_id.clone(),
+                RunningCommand {
+                    info: info.clone(),
+                    cancel_token: cancel_token.clone(),
+                    status_rx,
+                    status_tx: status_tx.clone(),
+                    output: output.clone(),
+                    exit_code: exit_code.clone(),
+                    error: error.clone(),
+                    timed_out: timed_out.clone(),
+                },
+            );
+        }
+
+        info!(
+            "Starting async command {} on session {}: {}",
+            command_id, session_id, command
+        );
+
+        // Spawn background task
+        tokio::spawn(execute_ssh_command_async(
+            handle_arc,
+            command.clone(),
+            timeout,
+            output,
+            status_tx,
+            cancel_token,
+            exit_code,
+            error,
+            timed_out,
+        ));
+
+        Ok(StructuredContent(SshExecuteAsyncResponse {
+            command_id: command_id.clone(),
+            session_id,
+            command,
+            started_at,
+            message: format!(
+                "Command started. Use ssh_get_command_output with command_id '{}' to poll for results, or ssh_cancel_command to cancel.",
+                command_id
+            ),
+        }))
+    }
+
+    /// Get the current output and status of an async command.
+    ///
+    /// Can optionally wait for completion.
+    async fn ssh_get_command_output(
+        &self,
+        /// Command ID returned from ssh_execute_async
+        command_id: String,
+        /// If true, block until command completes or wait_timeout_secs expires
+        wait: Option<bool>,
+        /// Max seconds to wait when wait=true (default: 30, max: 300)
+        wait_timeout_secs: Option<u64>,
+    ) -> Result<StructuredContent<SshAsyncOutputResponse>, String> {
+        let wait = wait.unwrap_or(false);
+        let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
+
+        // Get command state
+        let (status_rx, output, exit_code, error, timed_out) = {
+            let commands = ASYNC_COMMANDS.lock().await;
+            let cmd = commands
+                .get(&command_id)
+                .ok_or_else(|| format!("No async command with ID: {}", command_id))?;
+            (
+                cmd.status_rx.clone(),
+                cmd.output.clone(),
+                cmd.exit_code.clone(),
+                cmd.error.clone(),
+                cmd.timed_out.clone(),
+            )
+        };
+
+        // Optionally wait for completion
+        if wait {
+            let mut rx = status_rx.clone();
+            let _ = tokio::time::timeout(wait_timeout, async {
+                loop {
+                    let status = *rx.borrow();
+                    if status != AsyncCommandStatus::Running {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        // Get current state
+        let status = *status_rx.borrow();
+        let output_buf = output.lock().await;
+        let exit_code_val = *exit_code.lock().await;
+        let error_val = error.lock().await.clone();
+        let timed_out_val = timed_out.load(Ordering::SeqCst);
+
+        Ok(StructuredContent(SshAsyncOutputResponse {
+            command_id,
+            status,
+            stdout: String::from_utf8_lossy(&output_buf.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output_buf.stderr).into_owned(),
+            exit_code: exit_code_val,
+            error: error_val,
+            timed_out: timed_out_val,
+        }))
+    }
+
+    /// List all async commands, optionally filtered by session or status.
+    async fn ssh_list_commands(
+        &self,
+        /// Filter by session ID
+        session_id: Option<String>,
+        /// Filter by status: "running", "completed", "cancelled", "failed"
+        status: Option<String>,
+    ) -> StructuredContent<SshListCommandsResponse> {
+        let status_filter: Option<AsyncCommandStatus> = status.and_then(|s| match s.as_str() {
+            "running" => Some(AsyncCommandStatus::Running),
+            "completed" => Some(AsyncCommandStatus::Completed),
+            "cancelled" => Some(AsyncCommandStatus::Cancelled),
+            "failed" => Some(AsyncCommandStatus::Failed),
+            _ => None,
+        });
+
+        let commands = ASYNC_COMMANDS.lock().await;
+        let filtered: Vec<AsyncCommandInfo> = commands
+            .values()
+            .filter(|cmd| {
+                let session_match = session_id
+                    .as_ref()
+                    .map(|sid| cmd.info.session_id == *sid)
+                    .unwrap_or(true);
+                let status_match = status_filter
+                    .map(|sf| *cmd.status_rx.borrow() == sf)
+                    .unwrap_or(true);
+                session_match && status_match
+            })
+            .map(|cmd| {
+                let mut info = cmd.info.clone();
+                info.status = *cmd.status_rx.borrow();
+                info
+            })
+            .collect();
+
+        let count = filtered.len();
+        StructuredContent(SshListCommandsResponse {
+            commands: filtered,
+            count,
+        })
+    }
+
+    /// Cancel a running async command.
+    ///
+    /// Returns the output collected so far.
+    async fn ssh_cancel_command(
+        &self,
+        /// Command ID to cancel
+        command_id: String,
+    ) -> Result<StructuredContent<SshCancelCommandResponse>, String> {
+        // Get command and cancel it
+        let (cancel_token, output, status_rx) = {
+            let commands = ASYNC_COMMANDS.lock().await;
+            let cmd = commands
+                .get(&command_id)
+                .ok_or_else(|| format!("No async command with ID: {}", command_id))?;
+
+            let current_status = *cmd.status_rx.borrow();
+            if current_status != AsyncCommandStatus::Running {
+                return Err(format!(
+                    "Command is not running (status: {})",
+                    current_status
+                ));
+            }
+
+            (
+                cmd.cancel_token.clone(),
+                cmd.output.clone(),
+                cmd.status_rx.clone(),
+            )
+        };
+
+        // Signal cancellation
+        cancel_token.cancel();
+
+        // Wait briefly for cancellation to take effect
+        let mut rx = status_rx;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if *rx.borrow() != AsyncCommandStatus::Running {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        // Get final output
+        let output_buf = output.lock().await;
+
+        info!("Cancelled async command: {}", command_id);
+
+        Ok(StructuredContent(SshCancelCommandResponse {
+            command_id,
+            cancelled: true,
+            message: "Command cancelled successfully".to_string(),
+            stdout: String::from_utf8_lossy(&output_buf.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output_buf.stderr).into_owned(),
+        }))
     }
 }

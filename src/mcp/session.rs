@@ -11,13 +11,13 @@
 //!   extended to verify against known_hosts.
 //!
 //! - `StoredSession`: Combines session metadata (`SessionInfo`) with the actual russh
-//!   handle wrapped in `Arc<Mutex<>>` for safe sharing across async tasks.
+//!   handle wrapped in `Arc<>` for safe sharing across async tasks.
 //!
 //! - `SSH_SESSIONS`: Global static storage for all active sessions, keyed by UUID.
 //!
 //! # Thread Safety
 //!
-//! The `client::Handle<SshClientHandler>` is wrapped in `Arc<Mutex<>>` because it's not
+//! The `client::Handle<SshClientHandler>` is wrapped in `Arc<>` because it's not
 //! `Clone`, and we need to share it across multiple async operations (execute, forward, etc.).
 
 use std::collections::HashMap;
@@ -55,13 +55,13 @@ impl client::Handler for SshClientHandler {
 
 /// Stored session data combining metadata with the actual session handle.
 ///
-/// The russh `Handle` is not `Clone`, so we wrap it in `Arc<Mutex<>>` to share
+/// The russh `Handle` is not `Clone`, so we wrap it in `Arc<>` to share
 /// across multiple async tasks that need to execute commands or manage the session.
 pub struct StoredSession {
     /// Session metadata including connection info and timing details
     pub info: SessionInfo,
     /// The actual russh client handle for executing commands
-    pub handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
+    pub handle: Arc<client::Handle<SshClientHandler>>,
 }
 
 /// Global storage for active SSH sessions with metadata.

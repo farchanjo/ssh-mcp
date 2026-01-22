@@ -10,6 +10,7 @@
 //! - `forward`: Port forwarding implementation (feature-gated)
 //! - `commands`: MCP tool implementations
 
+pub(crate) mod async_command;
 pub(crate) mod client;
 pub mod commands;
 pub(crate) mod config;
