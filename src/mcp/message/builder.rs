@@ -335,6 +335,104 @@ mod tests {
 
             assert!(!message.contains("persistent"));
         }
+
+        #[test]
+        fn test_with_agent_id_none_explicit() {
+            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+                .with_agent_id(None::<String>)
+                .build();
+
+            assert!(!message.contains("agent_id"));
+            assert!(!message.contains("ssh_disconnect_agent"));
+        }
+
+        #[test]
+        fn test_with_name_none_explicit() {
+            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+                .with_name(None::<String>)
+                .build();
+
+            assert!(!message.contains("name:"));
+        }
+
+        #[test]
+        fn test_all_options_combined() {
+            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+                .with_agent_id(Some("my-agent"))
+                .with_name(Some("production-db"))
+                .with_retry_attempts(3)
+                .with_persistent(true)
+                .reused(false)
+                .build();
+
+            assert!(message.contains("SSH CONNECTION ESTABLISHED"));
+            assert!(message.contains("agent_id: 'my-agent'"));
+            assert!(message.contains("session_id: 'sess-123'"));
+            assert!(message.contains("name: 'production-db'"));
+            assert!(message.contains("host: user@host:22"));
+            assert!(message.contains("retry_attempts: 3"));
+            assert!(message.contains("persistent: true"));
+        }
+
+        #[test]
+        fn test_reused_with_all_options() {
+            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+                .with_agent_id(Some("my-agent"))
+                .with_name(Some("staging"))
+                .with_retry_attempts(1)
+                .with_persistent(true)
+                .reused(true)
+                .build();
+
+            assert!(message.contains("SESSION REUSED"));
+            assert!(!message.contains("SSH CONNECTION ESTABLISHED"));
+            assert!(message.contains("agent_id"));
+            assert!(message.contains("name"));
+        }
+
+        #[test]
+        fn test_from_string_types() {
+            let session_id = String::from("sess-456");
+            let username = String::from("admin");
+            let host = String::from("server:2222");
+
+            let message = ConnectMessageBuilder::new(session_id, username, host).build();
+
+            assert!(message.contains("session_id: 'sess-456'"));
+            assert!(message.contains("host: admin@server:2222"));
+        }
+
+        #[test]
+        fn test_builder_order_independence() {
+            // Order of method calls shouldn't affect output content
+            let msg1 = ConnectMessageBuilder::new("s1", "u", "h:22")
+                .with_agent_id(Some("a"))
+                .with_persistent(true)
+                .build();
+
+            let msg2 = ConnectMessageBuilder::new("s1", "u", "h:22")
+                .with_persistent(true)
+                .with_agent_id(Some("a"))
+                .build();
+
+            // Both should have the same content
+            assert!(msg1.contains("agent_id: 'a'"));
+            assert!(msg2.contains("agent_id: 'a'"));
+            assert!(msg1.contains("persistent: true"));
+            assert!(msg2.contains("persistent: true"));
+        }
+
+        #[test]
+        fn test_message_format_structure() {
+            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+                .with_agent_id(Some("my-agent"))
+                .build();
+
+            // Verify message has proper structure with newlines
+            let lines: Vec<&str> = message.lines().collect();
+            assert!(lines.len() >= 4); // Header, identifiers, empty line, instructions
+            assert!(lines[0].contains("ESTABLISHED"));
+        }
     }
 
     mod execute_message_builder {
@@ -369,6 +467,66 @@ mod tests {
             assert!(message.contains("..."));
             assert!(!message.contains(&long_cmd));
         }
+
+        #[test]
+        fn test_with_agent_id_none_explicit() {
+            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls")
+                .with_agent_id(None::<String>)
+                .build();
+
+            assert!(!message.contains("agent_id"));
+        }
+
+        #[test]
+        fn test_from_string_types() {
+            let cmd_id = String::from("cmd-789");
+            let session_id = String::from("sess-012");
+            let command = String::from("echo hello");
+
+            let message = ExecuteMessageBuilder::new(cmd_id, session_id, command).build();
+
+            assert!(message.contains("command_id: 'cmd-789'"));
+            assert!(message.contains("session_id: 'sess-012'"));
+            assert!(message.contains("command: 'echo hello'"));
+        }
+
+        #[test]
+        fn test_command_with_special_characters() {
+            let message =
+                ExecuteMessageBuilder::new("cmd-1", "sess-1", "echo 'hello world' && ls -la")
+                    .build();
+
+            assert!(message.contains("echo 'hello world' && ls -la"));
+        }
+
+        #[test]
+        fn test_command_at_truncation_boundary() {
+            // Exactly 50 characters
+            let cmd = "a".repeat(50);
+            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", &cmd).build();
+
+            assert!(message.contains(&cmd));
+            assert!(!message.contains("..."));
+        }
+
+        #[test]
+        fn test_command_just_over_truncation() {
+            // 51 characters
+            let cmd = "a".repeat(51);
+            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", &cmd).build();
+
+            assert!(message.contains("..."));
+        }
+
+        #[test]
+        fn test_message_includes_usage_instructions() {
+            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls").build();
+
+            // Check that helpful instructions are included
+            assert!(message.contains("ssh_get_command_output"));
+            assert!(message.contains("ssh_cancel_command"));
+            assert!(message.contains("command_id 'cmd-123'"));
+        }
     }
 
     mod agent_disconnect_message_builder {
@@ -397,6 +555,67 @@ mod tests {
 
             assert!(message.contains("No sessions found"));
         }
+
+        #[test]
+        fn test_from_string_type() {
+            let agent_id = String::from("my-agent-123");
+            let message = AgentDisconnectMessageBuilder::new(agent_id)
+                .with_sessions_disconnected(1)
+                .build();
+
+            assert!(message.contains("agent_id: 'my-agent-123'"));
+        }
+
+        #[test]
+        fn test_default_values() {
+            let message = AgentDisconnectMessageBuilder::new("agent-1").build();
+
+            // Default should be 0 for both
+            assert!(message.contains("sessions_disconnected: 0"));
+            assert!(message.contains("commands_cancelled: 0"));
+            assert!(message.contains("No sessions found"));
+        }
+
+        #[test]
+        fn test_sessions_but_no_commands() {
+            let message = AgentDisconnectMessageBuilder::new("agent-1")
+                .with_sessions_disconnected(2)
+                .with_commands_cancelled(0)
+                .build();
+
+            assert!(message.contains("sessions_disconnected: 2"));
+            assert!(message.contains("commands_cancelled: 0"));
+            assert!(message.contains("have been terminated"));
+        }
+
+        #[test]
+        fn test_large_numbers() {
+            let message = AgentDisconnectMessageBuilder::new("agent-1")
+                .with_sessions_disconnected(100)
+                .with_commands_cancelled(500)
+                .build();
+
+            assert!(message.contains("sessions_disconnected: 100"));
+            assert!(message.contains("commands_cancelled: 500"));
+        }
+
+        #[test]
+        fn test_builder_order_independence() {
+            let msg1 = AgentDisconnectMessageBuilder::new("a")
+                .with_sessions_disconnected(1)
+                .with_commands_cancelled(2)
+                .build();
+
+            let msg2 = AgentDisconnectMessageBuilder::new("a")
+                .with_commands_cancelled(2)
+                .with_sessions_disconnected(1)
+                .build();
+
+            assert!(msg1.contains("sessions_disconnected: 1"));
+            assert!(msg2.contains("sessions_disconnected: 1"));
+            assert!(msg1.contains("commands_cancelled: 2"));
+            assert!(msg2.contains("commands_cancelled: 2"));
+        }
     }
 
     mod truncate_command {
@@ -419,6 +638,183 @@ mod tests {
             let result = truncate_command(&cmd, 50);
             assert!(result.ends_with("..."));
             assert!(result.len() <= 50);
+        }
+
+        #[test]
+        fn test_empty_command() {
+            assert_eq!(truncate_command("", 50), "");
+        }
+
+        #[test]
+        fn test_very_small_max_len() {
+            let cmd = "hello world";
+            let result = truncate_command(cmd, 5);
+            assert_eq!(result, "he...");
+            assert_eq!(result.len(), 5);
+        }
+
+        #[test]
+        fn test_max_len_three() {
+            // Edge case: max_len equals length of "..."
+            let cmd = "hello";
+            let result = truncate_command(cmd, 3);
+            assert_eq!(result, "...");
+        }
+
+        #[test]
+        fn test_max_len_less_than_three() {
+            // Edge case: max_len < 3 (less than "..." length)
+            let cmd = "hello";
+            let result = truncate_command(cmd, 2);
+            // saturating_sub prevents underflow
+            assert_eq!(result, "...");
+        }
+
+        #[test]
+        fn test_max_len_zero() {
+            let cmd = "hello";
+            let result = truncate_command(cmd, 0);
+            // With saturating_sub(3) on 0, we get 0, so empty string + "..."
+            assert_eq!(result, "...");
+        }
+
+        #[test]
+        fn test_unicode_command() {
+            // Unicode characters may be multi-byte
+            let cmd = "echo \u{1F600}"; // emoji
+            let result = truncate_command(cmd, 50);
+            assert_eq!(result, cmd);
+        }
+
+        #[test]
+        fn test_one_over_limit() {
+            let cmd = "a".repeat(51);
+            let result = truncate_command(&cmd, 50);
+            assert!(result.ends_with("..."));
+            assert_eq!(result.len(), 50);
+        }
+
+        #[test]
+        fn test_newlines_in_command() {
+            let cmd = "echo 'line1\nline2'";
+            let result = truncate_command(cmd, 50);
+            assert_eq!(result, cmd);
+        }
+
+        #[test]
+        fn test_tabs_in_command() {
+            let cmd = "echo 'col1\tcol2\tcol3'";
+            let result = truncate_command(cmd, 50);
+            assert_eq!(result, cmd);
+        }
+    }
+
+    mod edge_cases {
+        use super::*;
+
+        #[test]
+        fn test_connect_message_special_chars_in_host() {
+            let message =
+                ConnectMessageBuilder::new("sess-1", "user", "host-name.example.com:2222").build();
+
+            assert!(message.contains("host: user@host-name.example.com:2222"));
+        }
+
+        #[test]
+        fn test_connect_message_ipv6_host() {
+            let message = ConnectMessageBuilder::new("sess-1", "user", "[::1]:22").build();
+
+            assert!(message.contains("host: user@[::1]:22"));
+        }
+
+        #[test]
+        fn test_execute_message_command_with_quotes() {
+            let message =
+                ExecuteMessageBuilder::new("cmd-1", "sess-1", "echo \"hello 'world'\"").build();
+
+            assert!(message.contains("echo \"hello 'world'\""));
+        }
+
+        #[test]
+        fn test_execute_message_empty_command() {
+            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", "").build();
+
+            assert!(message.contains("command: ''"));
+        }
+
+        #[test]
+        fn test_agent_disconnect_unicode_agent_id() {
+            let message = AgentDisconnectMessageBuilder::new("代理-123")
+                .with_sessions_disconnected(1)
+                .build();
+
+            assert!(message.contains("agent_id: '代理-123'"));
+        }
+
+        #[test]
+        fn test_connect_message_empty_values() {
+            let message = ConnectMessageBuilder::new("", "", "").build();
+
+            assert!(message.contains("session_id: ''"));
+            assert!(message.contains("host: @"));
+        }
+
+        #[test]
+        fn test_execute_message_multiline_command() {
+            let multi_cmd = "#!/bin/bash\necho 'hello'\nexit 0";
+            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", multi_cmd).build();
+
+            // Command should be truncated if too long
+            assert!(message.contains("command:"));
+        }
+
+        #[test]
+        fn test_all_builders_produce_non_empty_output() {
+            let connect_msg = ConnectMessageBuilder::new("s", "u", "h").build();
+            let execute_msg = ExecuteMessageBuilder::new("c", "s", "cmd").build();
+            let agent_msg = AgentDisconnectMessageBuilder::new("a").build();
+
+            assert!(!connect_msg.is_empty());
+            assert!(!execute_msg.is_empty());
+            assert!(!agent_msg.is_empty());
+        }
+
+        #[test]
+        fn test_connect_message_contains_proper_instructions() {
+            let message = ConnectMessageBuilder::new("sess-abc", "user", "host:22").build();
+
+            // Verify it contains helpful instructions
+            assert!(message.contains("ssh_execute"));
+            assert!(message.contains("sess-abc")); // Session ID mentioned in instructions
+        }
+
+        #[test]
+        fn test_execute_message_contains_proper_instructions() {
+            let message = ExecuteMessageBuilder::new("cmd-xyz", "sess-abc", "ls").build();
+
+            // Verify it contains helpful instructions
+            assert!(message.contains("ssh_get_command_output"));
+            assert!(message.contains("ssh_cancel_command"));
+            assert!(message.contains("cmd-xyz")); // Command ID mentioned in instructions
+        }
+
+        #[test]
+        fn test_very_long_session_id() {
+            let long_id = "s".repeat(500);
+            let message = ConnectMessageBuilder::new(&long_id, "user", "host:22").build();
+
+            // Should handle long IDs without truncation
+            assert!(message.contains(&long_id));
+        }
+
+        #[test]
+        fn test_very_long_agent_id() {
+            let long_id = "a".repeat(500);
+            let message = ConnectMessageBuilder::new("sess-1", "user", "host:22")
+                .with_agent_id(Some(&long_id))
+                .build();
+
+            assert!(message.contains(&long_id));
         }
     }
 }

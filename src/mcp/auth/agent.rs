@@ -106,4 +106,36 @@ mod tests {
         let auth = AgentAuth::default();
         assert_eq!(auth.name(), "agent");
     }
+
+    #[test]
+    fn test_agent_auth_new_equals_default() {
+        let auth_new = AgentAuth::new();
+        let auth_default = AgentAuth::default();
+        assert_eq!(auth_new.name(), auth_default.name());
+    }
+
+    #[test]
+    fn test_agent_auth_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AgentAuth>();
+    }
+
+    #[test]
+    fn test_agent_auth_multiple_instances() {
+        // Verify we can create multiple independent instances
+        let auth1 = AgentAuth::new();
+        let auth2 = AgentAuth::new();
+        let auth3 = AgentAuth::default();
+
+        assert_eq!(auth1.name(), "agent");
+        assert_eq!(auth2.name(), "agent");
+        assert_eq!(auth3.name(), "agent");
+    }
+
+    #[test]
+    fn test_agent_auth_implements_auth_strategy_trait() {
+        fn requires_auth_strategy(_: &dyn AuthStrategy) {}
+        let auth = AgentAuth::new();
+        requires_auth_strategy(&auth);
+    }
 }

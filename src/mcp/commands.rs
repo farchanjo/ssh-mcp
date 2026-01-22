@@ -410,7 +410,11 @@ impl McpSSHCommands {
         }
     }
 
-    /// Execute a command on a connected SSH session.
+    /// Execute a command asynchronously on a connected SSH session.
+    ///
+    /// **Recommended for:** Long-running commands (builds, deployments, batch jobs,
+    /// data processing) that may exceed the default timeout or benefit from
+    /// progress monitoring and cancellation.
     ///
     /// Returns command_id, session_id, and agent_id that you MUST remember.
     ///
@@ -423,7 +427,9 @@ impl McpSSHCommands {
     /// 1. ssh_execute → get command_id
     /// 2. ssh_get_command_output(command_id, wait=true) → get result
     ///
-    /// **Limits:** Up to 30 concurrent async commands per session.
+    /// **Limits:** Up to 100 concurrent multiplexed commands per session.
+    /// When the limit is reached, you must wait for existing commands to complete
+    /// or cancel them using ssh_cancel_command before starting new ones.
     ///
     /// Returns immediately with a command_id for polling or cancellation.
     async fn ssh_execute(
