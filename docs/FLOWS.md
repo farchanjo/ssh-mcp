@@ -15,11 +15,11 @@ This document describes the operational flows of the SSH MCP server, including c
 
 ## Session Lifecycle
 
-The complete lifecycle of an SSH session from creation to termination:
+The complete lifecycle of an SSH session from creation to termination.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Disconnected: Initial State
+    [*] --> Disconnected
 
     Disconnected --> Connecting: ssh_connect called
 
@@ -45,7 +45,7 @@ stateDiagram-v2
 
     Disconnecting --> Disconnected: Cleanup Complete
 
-    Disconnected --> [*]: Session Removed
+    Disconnected --> [*]
 
     note right of Connected
         Session stored in SSH_SESSIONS
@@ -62,9 +62,9 @@ stateDiagram-v2
 
 | State | Description |
 |-------|-------------|
-| `Disconnected` | No active connection; session not in store |
+| `Disconnected` | No active connection, session not in store |
 | `Connecting` | TCP connection in progress with retry logic |
-| `Authenticating` | Connection established; auth in progress |
+| `Authenticating` | Connection established, auth in progress |
 | `Connected` | Fully connected and ready for operations |
 | `Executing` | Command execution in progress |
 | `Forwarding` | Port forwarding setup in progress |
@@ -74,99 +74,126 @@ stateDiagram-v2
 
 ## SSH Connection Flow
 
-Detailed flow of the `ssh_connect` operation:
+Detailed flow of the `ssh_connect` operation using russh native async.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant Config as config.rs
+    participant Retry as client.rs with backon
+    participant SSH as russh client
+    participant Server as SSH Server
+    participant Store as SSH_SESSIONS
+
+    Client->>Cmd: ssh_connect request
+
+    Note over Cmd,Config: Configuration Resolution Phase
+    Cmd->>Config: resolve_connect_timeout
+    Config-->>Cmd: timeout value
+    Cmd->>Config: resolve_max_retries
+    Config-->>Cmd: max_retries value
+    Cmd->>Config: resolve_retry_delay_ms
+    Config-->>Cmd: retry_delay_ms value
+    Cmd->>Config: resolve_compression
+    Config-->>Cmd: compress value
+
+    Cmd->>Retry: connect_to_ssh_with_retry
+
+    Note over Retry: Build ExponentialBuilder backoff
+    Retry->>Retry: Build backoff with min_delay and max_delay
+
+    loop Retry Loop via backon
+        Retry->>SSH: connect_to_ssh
+        SSH->>SSH: build_client_config
+        SSH->>SSH: parse_address
+        SSH->>Server: client::connect with timeout
+        alt Connection Success
+            Server-->>SSH: Handle returned
+            Note over SSH: Authenticate
+            alt Password provided
+                SSH->>Server: authenticate_password
+            else Key path provided
+                SSH->>SSH: keys::load_secret_key
+                SSH->>Server: authenticate_publickey
+            else No credentials
+                SSH->>SSH: keys::agent::AgentClient::connect_env
+                loop For each identity
+                    SSH->>Server: authenticate_publickey_with
+                end
+            end
+            Server-->>SSH: AuthResult
+            alt Auth Success
+                SSH-->>Retry: Handle
+            else Auth Failed
+                SSH-->>Retry: Error not retryable
+            end
+        else Connection Failed
+            Server-->>SSH: Error
+            SSH-->>Retry: Error
+            Retry->>Retry: is_retryable_error check
+            alt Retryable
+                Note over Retry: Wait with backoff plus jitter
+            else Not Retryable
+                Retry-->>Cmd: Error
+            end
+        end
+    end
+
+    Retry-->>Cmd: Handle and retry_count
+
+    Note over Cmd,Store: Session Storage Phase
+    Cmd->>Cmd: Generate UUID
+    Cmd->>Cmd: Create SessionInfo
+    Cmd->>Cmd: Wrap Handle in Arc Mutex
+    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Insert StoredSession
+    Cmd->>Store: Unlock SSH_SESSIONS
+
+    Cmd-->>Client: SshConnectResponse
+```
+
+### Configuration Resolution Priority
+
+Each configuration value follows the same resolution pattern.
 
 ```mermaid
 flowchart TD
-    Start([ssh_connect called]) --> ResolveConfig
+    Start([Resolve Config Value]) --> CheckParam{Parameter provided?}
 
-    subgraph ConfigResolution["Configuration Resolution"]
-        ResolveConfig[Resolve Configuration]
-        ResolveConfig --> Timeout["timeout_secs<br/>param -> env -> 30s"]
-        ResolveConfig --> Retries["max_retries<br/>param -> env -> 3"]
-        ResolveConfig --> Delay["retry_delay_ms<br/>param -> env -> 1000"]
-        ResolveConfig --> Compress["compress<br/>param -> env -> true"]
-    end
+    CheckParam -->|Yes| UseParam[Use parameter value]
+    CheckParam -->|No| CheckEnv{Environment variable set?}
 
-    Timeout --> BuildBackoff
-    Retries --> BuildBackoff
-    Delay --> BuildBackoff
-    Compress --> BuildConfig
+    CheckEnv -->|Yes| ParseEnv{Parse successful?}
+    CheckEnv -->|No| UseDefault[Use default value]
 
-    BuildBackoff[Build Exponential Backoff]
-    BuildConfig[Build SSH Client Config]
+    ParseEnv -->|Yes| UseEnv[Use environment value]
+    ParseEnv -->|No| UseDefault
 
-    BuildBackoff --> RetryLoop
-    BuildConfig --> RetryLoop
+    UseParam --> Return([Return value])
+    UseEnv --> Return
+    UseDefault --> Return
 
-    subgraph RetryLoop["Retry Loop (backon)"]
-        AttemptConnect[Attempt Connection]
-        AttemptConnect --> ParseAddr[Parse Address]
-        ParseAddr --> TCPConnect["client::connect()"]
-        TCPConnect --> TimeoutCheck{Timeout?}
-
-        TimeoutCheck -->|Yes| HandleError[Handle Error]
-        TimeoutCheck -->|No| ConnectResult{Connected?}
-
-        ConnectResult -->|No| HandleError
-        ConnectResult -->|Yes| Authenticate
-
-        HandleError --> ClassifyError{Retryable?}
-        ClassifyError -->|Yes| WaitBackoff[Wait with Backoff + Jitter]
-        ClassifyError -->|No| Fail
-
-        WaitBackoff --> AttemptConnect
-    end
-
-    subgraph Authentication["Authentication"]
-        Authenticate{Auth Method?}
-        Authenticate -->|Password| PasswordAuth["authenticate_password()"]
-        Authenticate -->|Key File| KeyAuth["authenticate_publickey()"]
-        Authenticate -->|Agent| AgentAuth["authenticate_publickey_with()"]
-
-        PasswordAuth --> AuthResult
-        KeyAuth --> AuthResult
-        AgentAuth --> AuthResult
-
-        AuthResult{Success?}
-        AuthResult -->|No| Fail
-        AuthResult -->|Yes| StoreSession
-    end
-
-    subgraph SessionStorage["Session Storage"]
-        StoreSession[Generate UUID]
-        StoreSession --> CreateInfo["Create SessionInfo<br/>(metadata)"]
-        CreateInfo --> WrapHandle["Wrap Handle in Arc<Mutex>"]
-        WrapHandle --> LockStore["Lock SSH_SESSIONS"]
-        LockStore --> Insert["Insert StoredSession"]
-        Insert --> UnlockStore["Unlock SSH_SESSIONS"]
-    end
-
-    UnlockStore --> Success([Return SshConnectResponse])
-    Fail([Return Error])
-
-    style ConfigResolution fill:#e3f2fd
-    style RetryLoop fill:#fff8e1
-    style Authentication fill:#f3e5f5
-    style SessionStorage fill:#e8f5e9
+    style Start fill:#e3f2fd
+    style Return fill:#e8f5e9
 ```
 
 ### Address Parsing
 
-The address is parsed to extract host and port:
+The address is parsed to extract host and port using rsplit_once.
 
 ```mermaid
 flowchart LR
-    Input["Address String"] --> Check{Contains ':'?}
+    Input["Address String"] --> Check{Contains colon?}
 
-    Check -->|Yes| Split["rsplit_once(':')"]
+    Check -->|Yes| Split["rsplit_once on colon"]
     Check -->|No| Default["Use default port 22"]
 
     Split --> ParsePort["Parse port as u16"]
     ParsePort --> Valid{Valid Port?}
 
-    Valid -->|Yes| Return["(host, port)"]
-    Valid -->|No| Error["Error: Invalid port"]
+    Valid -->|Yes| Return["Return host and port"]
+    Valid -->|No| Error["Error Invalid port"]
 
     Default --> Return
 
@@ -179,41 +206,44 @@ flowchart LR
 
 ## Authentication Flow
 
-Detailed authentication flow supporting multiple methods:
+Detailed authentication flow supporting multiple methods.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant SSH as ssh_connect
-    participant Handle as SSH Handle
-    participant Server as SSH Server
+    participant SSH as connect_to_ssh
+    participant Handle as russh Handle
+    participant Keys as russh keys
     participant Agent as SSH Agent
+    participant Server as SSH Server
 
-    Client->>SSH: ssh_connect(address, user, ...)
+    Note over SSH: Check authentication method
 
     alt Password Authentication
-        SSH->>Handle: authenticate_password(user, pass)
-        Handle->>Server: SSH_MSG_USERAUTH_REQUEST (password)
-        Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS/FAILURE
+        SSH->>Handle: authenticate_password with user and pass
+        Handle->>Server: SSH_MSG_USERAUTH_REQUEST password
+        Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
         Handle-->>SSH: AuthResult
     else Key File Authentication
-        SSH->>SSH: load_secret_key(path)
-        SSH->>Handle: authenticate_publickey(user, key)
-        Handle->>Server: SSH_MSG_USERAUTH_REQUEST (publickey)
-        Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS/FAILURE
+        SSH->>Keys: load_secret_key from path
+        Keys-->>SSH: KeyPair
+        SSH->>SSH: Wrap key with PrivateKeyWithHashAlg
+        SSH->>Handle: authenticate_publickey with user and key
+        Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey
+        Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
         Handle-->>SSH: AuthResult
     else SSH Agent Authentication
-        SSH->>Agent: connect_env()
+        SSH->>Agent: AgentClient::connect_env
         Agent-->>SSH: Connected
-        SSH->>Agent: request_identities()
+        SSH->>Agent: request_identities
         Agent-->>SSH: List of Keys
 
         loop For each identity
-            SSH->>Handle: authenticate_publickey_with(user, identity, agent)
-            Handle->>Server: SSH_MSG_USERAUTH_REQUEST (publickey)
-            Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS/FAILURE
+            SSH->>Handle: authenticate_publickey_with identity and agent
+            Handle->>Server: SSH_MSG_USERAUTH_REQUEST publickey
+            Server-->>Handle: SSH_MSG_USERAUTH_SUCCESS or FAILURE
             alt Success
-                Handle-->>SSH: AuthResult (success)
+                Handle-->>SSH: AuthResult success
+                Note over SSH: Break loop
             else Failure
                 Note over SSH: Try next identity
             end
@@ -221,10 +251,9 @@ sequenceDiagram
     end
 
     alt Auth Success
-        SSH->>SSH: Store session
-        SSH-->>Client: SshConnectResponse
+        SSH-->>SSH: Return handle
     else Auth Failure
-        SSH-->>Client: Error
+        SSH-->>SSH: Return error
     end
 ```
 
@@ -232,20 +261,20 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Start([Authenticate]) --> CheckPassword{Password<br/>provided?}
+    Start([Authenticate]) --> CheckPassword{Password provided?}
 
-    CheckPassword -->|Yes| PasswordAuth[Password Authentication]
-    CheckPassword -->|No| CheckKey{Key path<br/>provided?}
+    CheckPassword -->|Yes| PasswordAuth[authenticate_password]
+    CheckPassword -->|No| CheckKey{Key path provided?}
 
-    CheckKey -->|Yes| KeyAuth[Key File Authentication]
-    CheckKey -->|No| AgentAuth[SSH Agent Authentication]
+    CheckKey -->|Yes| KeyAuth[authenticate_with_key]
+    CheckKey -->|No| AgentAuth[authenticate_with_agent]
 
-    PasswordAuth --> Result{Success?}
+    PasswordAuth --> Result{auth_result.success?}
     KeyAuth --> Result
     AgentAuth --> Result
 
-    Result -->|Yes| Success([Authenticated])
-    Result -->|No| Fail([Authentication Failed])
+    Result -->|Yes| Success([Return handle])
+    Result -->|No| Fail([Return error])
 
     style Start fill:#e3f2fd
     style Success fill:#e8f5e9
@@ -256,185 +285,236 @@ flowchart TD
 
 ## Command Execution Flow
 
-Flow of the `ssh_execute` operation:
+Flow of the `ssh_execute` operation.
 
 ```mermaid
-flowchart TD
-    Start([ssh_execute called]) --> ResolveTimeout
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant Config as config.rs
+    participant Store as SSH_SESSIONS
+    participant Exec as execute_ssh_command
+    participant Handle as russh Handle
+    participant Channel as SSH Channel
+    participant Server as Remote Server
 
-    subgraph Preparation["Preparation"]
-        ResolveTimeout["Resolve timeout<br/>param -> env -> 180s"]
-        ResolveTimeout --> GetSession["Get session from store"]
-        GetSession --> CloneArc["Clone Arc<Handle>"]
-        CloneArc --> ReleaseLock["Release global lock"]
+    Client->>Cmd: ssh_execute request
+
+    Note over Cmd,Config: Resolve timeout
+    Cmd->>Config: resolve_command_timeout
+    Config-->>Cmd: timeout value
+
+    Note over Cmd,Store: Get session handle
+    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Get session by ID
+    Cmd->>Store: Clone Arc of handle
+    Cmd->>Store: Unlock SSH_SESSIONS
+
+    Note over Cmd: Wrap in tokio timeout
+    Cmd->>Exec: execute_ssh_command with timeout
+
+    Exec->>Handle: Lock handle mutex
+    Exec->>Handle: channel_open_session
+    Handle->>Server: SSH_MSG_CHANNEL_OPEN session
+    Server-->>Handle: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+    Handle-->>Exec: Channel
+
+    Exec->>Channel: exec with command
+    Channel->>Server: SSH_MSG_CHANNEL_REQUEST exec
+    Server-->>Channel: SSH_MSG_CHANNEL_SUCCESS
+
+    Exec->>Handle: Drop handle lock
+
+    loop Read channel messages
+        Channel->>Channel: wait
+        alt Data message
+            Channel-->>Exec: ChannelMsg Data
+            Exec->>Exec: Append to stdout
+        else ExtendedData with ext equals 1
+            Channel-->>Exec: ChannelMsg ExtendedData
+            Exec->>Exec: Append to stderr
+        else ExitStatus message
+            Channel-->>Exec: ChannelMsg ExitStatus
+            Exec->>Exec: Store exit code
+        else Eof message
+            Channel-->>Exec: ChannelMsg Eof
+            Note over Exec: Check if exit received
+        else Close or None
+            Channel-->>Exec: ChannelMsg Close or None
+            Note over Exec: Break loop
+        end
     end
 
-    ReleaseLock --> WrapTimeout["Wrap in tokio::timeout"]
+    Exec->>Channel: close
+    Exec->>Exec: Convert bytes to strings
+    Exec-->>Cmd: SshCommandResponse
 
-    subgraph Execution["Command Execution"]
-        WrapTimeout --> LockHandle["Lock session handle"]
-        LockHandle --> OpenChannel["channel_open_session()"]
-        OpenChannel --> ExecCommand["channel.exec(command)"]
-        ExecCommand --> DropLock["Drop handle lock"]
-        DropLock --> ReadLoop["Read channel messages"]
+    alt Timeout
+        Cmd-->>Client: Timeout error
+    else Success
+        Cmd-->>Client: SshCommandResponse
     end
-
-    subgraph MessageLoop["Message Processing Loop"]
-        ReadLoop --> WaitMsg["channel.wait()"]
-        WaitMsg --> MsgType{Message Type?}
-
-        MsgType -->|Data| StoreStdout["Append to stdout"]
-        MsgType -->|ExtendedData ext=1| StoreStderr["Append to stderr"]
-        MsgType -->|ExitStatus| StoreExit["Store exit code"]
-        MsgType -->|Eof| CheckExit{Exit received?}
-        MsgType -->|Close| Done
-        MsgType -->|None| Done
-
-        StoreStdout --> WaitMsg
-        StoreStderr --> WaitMsg
-        StoreExit --> WaitMsg
-        CheckExit -->|Yes| Done
-        CheckExit -->|No| WaitMsg
-    end
-
-    Done --> CloseChannel["Close channel"]
-
-    subgraph Results["Result Handling"]
-        CloseChannel --> BuildResponse["Build SshCommandResponse"]
-        BuildResponse --> Success([Return Response])
-    end
-
-    WrapTimeout -->|Timeout| TimeoutError([Return Timeout Error])
-
-    style Preparation fill:#e3f2fd
-    style Execution fill:#fff8e1
-    style MessageLoop fill:#f3e5f5
-    style Results fill:#e8f5e9
 ```
 
 ### Channel Message Types
 
 ```mermaid
-sequenceDiagram
-    participant Client as ssh_execute
-    participant Channel as SSH Channel
-    participant Server as Remote Server
+stateDiagram-v2
+    [*] --> WaitingForData
 
-    Client->>Channel: exec("ls -la")
-    Channel->>Server: SSH_MSG_CHANNEL_REQUEST (exec)
-    Server-->>Channel: SSH_MSG_CHANNEL_SUCCESS
+    WaitingForData --> ProcessData: ChannelMsg Data
+    WaitingForData --> ProcessStderr: ChannelMsg ExtendedData ext=1
+    WaitingForData --> StoreExit: ChannelMsg ExitStatus
+    WaitingForData --> CheckExit: ChannelMsg Eof
+    WaitingForData --> Done: ChannelMsg Close
+    WaitingForData --> Done: None
 
-    loop Until EOF/Close
-        Server-->>Channel: SSH_MSG_CHANNEL_DATA (stdout)
-        Channel-->>Client: ChannelMsg::Data
+    ProcessData --> WaitingForData: Append to stdout
+    ProcessStderr --> WaitingForData: Append to stderr
+    StoreExit --> WaitingForData: Store exit code
 
-        Server-->>Channel: SSH_MSG_CHANNEL_EXTENDED_DATA (stderr)
-        Channel-->>Client: ChannelMsg::ExtendedData
+    CheckExit --> Done: Exit code received
+    CheckExit --> WaitingForData: Continue waiting
 
-        Server-->>Channel: SSH_MSG_CHANNEL_REQUEST (exit-status)
-        Channel-->>Client: ChannelMsg::ExitStatus
+    Done --> [*]: Close channel and return
 
-        Server-->>Channel: SSH_MSG_CHANNEL_EOF
-        Channel-->>Client: ChannelMsg::Eof
-
-        Server-->>Channel: SSH_MSG_CHANNEL_CLOSE
-        Channel-->>Client: ChannelMsg::Close
-    end
-
-    Client->>Channel: close()
+    note right of WaitingForData
+        Loop until channel closes
+        or EOF with exit status
+    end note
 ```
 
 ---
 
 ## Port Forwarding Flow
 
-Flow of the `ssh_forward` operation (requires `port_forward` feature):
+Flow of the `ssh_forward` operation when port_forward feature is enabled.
 
 ```mermaid
-flowchart TD
-    Start([ssh_forward called]) --> GetSession
+sequenceDiagram
+    participant Client as MCP Client
+    participant Cmd as McpSSHCommands
+    participant Store as SSH_SESSIONS
+    participant Fwd as setup_port_forwarding
+    participant Listener as TCP Listener
+    participant Handler as Connection Handler
+    participant Handle as russh Handle
+    participant Channel as SSH Channel
+    participant Remote as Remote Server
 
-    subgraph Setup["Setup Phase"]
-        GetSession["Get session from store"]
-        GetSession --> CloneArc["Clone Arc<Handle>"]
-        CloneArc --> BindLocal["TcpListener::bind(127.0.0.1:local_port)"]
-        BindLocal --> BindResult{Bind Success?}
-        BindResult -->|No| BindError([Return Bind Error])
-        BindResult -->|Yes| SpawnTask["tokio::spawn(forward_task)"]
+    Client->>Cmd: ssh_forward request
+
+    Note over Cmd,Store: Get session handle
+    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Get session by ID
+    Cmd->>Store: Clone Arc of handle
+    Cmd->>Store: Unlock SSH_SESSIONS
+
+    Cmd->>Fwd: setup_port_forwarding
+
+    Fwd->>Listener: TcpListener bind 127.0.0.1 local_port
+    alt Bind Success
+        Listener-->>Fwd: Listener
+        Fwd->>Fwd: Get local address
+        Fwd->>Fwd: tokio spawn listener task
+        Fwd-->>Cmd: Local address
+        Cmd-->>Client: PortForwardingResponse
+    else Bind Failed
+        Listener-->>Fwd: Error
+        Fwd-->>Cmd: Error
+        Cmd-->>Client: Error
     end
 
-    SpawnTask --> ReturnResponse([Return PortForwardingResponse])
+    Note over Listener: Background listener task
 
-    subgraph ListenerTask["Background Listener Task"]
-        AcceptLoop["Accept Loop"]
-        AcceptLoop --> Accept["listener.accept()"]
-        Accept --> AcceptResult{Connection?}
-        AcceptResult -->|Error| LogBreak["Log error, break"]
-        AcceptResult -->|Ok| SpawnHandler["tokio::spawn(handle_connection)"]
-        SpawnHandler --> AcceptLoop
-    end
-
-    subgraph ConnectionHandler["Connection Handler Task"]
-        HandleConn["handle_port_forward_connection"]
-        HandleConn --> LockHandle["Lock session handle"]
-        LockHandle --> OpenDirect["channel_open_direct_tcpip()<br/>(remote_host, remote_port)"]
-        OpenDirect --> DropLock["Drop handle lock"]
-        DropLock --> ConvertStream["channel.into_stream()"]
-        ConvertStream --> SplitStreams["Split both streams"]
-
-        subgraph Bidirectional["Bidirectional Copy"]
-            SplitStreams --> LocalToRemote["tokio::io::copy<br/>local -> channel"]
-            SplitStreams --> RemoteToLocal["tokio::io::copy<br/>channel -> local"]
-
-            LocalToRemote --> Select["tokio::select!"]
-            RemoteToLocal --> Select
+    loop Accept connections
+        Listener->>Listener: accept
+        alt Connection received
+            Listener->>Handler: tokio spawn handler task
+        else Accept error
+            Note over Listener: Break loop
         end
-
-        Select --> CloseConn["Connection closed"]
     end
 
-    style Setup fill:#e3f2fd
-    style ListenerTask fill:#fff8e1
-    style ConnectionHandler fill:#f3e5f5
-    style Bidirectional fill:#e8f5e9
+    Note over Handler: Per-connection handler
+
+    Handler->>Handle: Lock handle mutex
+    Handler->>Handle: channel_open_direct_tcpip
+    Handle->>Remote: SSH_MSG_CHANNEL_OPEN direct-tcpip
+    Remote-->>Handle: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+    Handle-->>Handler: Channel
+    Handler->>Handle: Drop handle lock
+
+    Handler->>Channel: into_stream
+    Handler->>Handler: Split local and channel streams
+
+    par Bidirectional copy
+        Handler->>Handler: tokio io copy local to channel
+    and
+        Handler->>Handler: tokio io copy channel to local
+    end
+
+    Note over Handler: tokio select completes when either direction ends
 ```
 
 ### Port Forwarding Data Flow
 
 ```mermaid
-sequenceDiagram
-    participant LocalApp as Local Application
-    participant Listener as TCP Listener<br/>(127.0.0.1:local_port)
-    participant Handler as Connection Handler
-    participant Channel as SSH Channel
-    participant Remote as Remote Server<br/>(remote_host:remote_port)
-
-    Note over Listener: ssh_forward spawns background task
-
-    LocalApp->>Listener: TCP Connect
-    Listener->>Handler: Spawn new task
-
-    Handler->>Channel: channel_open_direct_tcpip()
-    Channel->>Remote: SSH_MSG_CHANNEL_OPEN (direct-tcpip)
-    Remote-->>Channel: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
-
-    Note over Handler,Channel: Bidirectional forwarding active
-
-    loop Data Transfer
-        LocalApp->>Listener: Send data
-        Listener->>Handler: Forward to handler
-        Handler->>Channel: Write to channel stream
-        Channel->>Remote: SSH_MSG_CHANNEL_DATA
-
-        Remote->>Channel: SSH_MSG_CHANNEL_DATA
-        Channel->>Handler: Read from channel stream
-        Handler->>Listener: Forward to listener
-        Listener->>LocalApp: Receive data
+flowchart TD
+    subgraph Setup["Setup Phase"]
+        GetSession["Get session from store"]
+        CloneArc["Clone Arc of Handle"]
+        BindLocal["TcpListener bind 127.0.0.1 local_port"]
+        SpawnTask["tokio spawn forward_task"]
     end
 
-    LocalApp->>Listener: Close connection
-    Handler->>Channel: Close channel
-    Channel->>Remote: SSH_MSG_CHANNEL_CLOSE
+    GetSession --> CloneArc
+    CloneArc --> BindLocal
+    BindLocal --> BindResult{Bind Success?}
+    BindResult -->|No| BindError([Return Bind Error])
+    BindResult -->|Yes| SpawnTask
+    SpawnTask --> ReturnResponse([Return PortForwardingResponse])
+
+    subgraph ListenerTask["Background Listener Task"]
+        AcceptLoop["Accept Loop"]
+        Accept["listener.accept"]
+        SpawnHandler["tokio spawn handle_connection"]
+    end
+
+    AcceptLoop --> Accept
+    Accept --> AcceptResult{Connection?}
+    AcceptResult -->|Error| LogBreak["Log error and break"]
+    AcceptResult -->|Ok| SpawnHandler
+    SpawnHandler --> AcceptLoop
+
+    subgraph ConnectionHandler["Connection Handler Task"]
+        LockHandle["Lock session handle"]
+        OpenDirect["channel_open_direct_tcpip"]
+        DropLock["Drop handle lock"]
+        IntoStream["channel.into_stream"]
+        SplitStreams["Split both streams"]
+
+        subgraph Bidirectional["Bidirectional Copy"]
+            LocalToRemote["tokio io copy local to channel"]
+            RemoteToLocal["tokio io copy channel to local"]
+            Select["tokio select waits for either"]
+        end
+    end
+
+    LockHandle --> OpenDirect
+    OpenDirect --> DropLock
+    DropLock --> IntoStream
+    IntoStream --> SplitStreams
+    SplitStreams --> LocalToRemote
+    SplitStreams --> RemoteToLocal
+    LocalToRemote --> Select
+    RemoteToLocal --> Select
+    Select --> CloseConn["Connection closed"]
+
+    style Setup fill:#e3f2fd
+    style ListenerTask fill:#fff8e1
+    style ConnectionHandler fill:#f3e5f5
+    style Bidirectional fill:#e8f5e9
 ```
 
 ---
@@ -443,11 +523,26 @@ sequenceDiagram
 
 ### Error Classification
 
+The `is_retryable_error` function in error.rs classifies errors.
+
 ```mermaid
 flowchart TD
-    Error["Error Message"] --> Classify{Classify Error}
+    Error["Error Message"] --> ToLower["Convert to lowercase"]
+    ToLower --> CheckAuth{Contains auth keyword?}
 
-    subgraph NonRetryable["Non-Retryable Errors"]
+    CheckAuth -->|Yes| NonRetryable([Not Retryable])
+    CheckAuth -->|No| CheckConn{Contains connection keyword?}
+
+    CheckConn -->|Yes| Retryable([Retryable])
+    CheckConn -->|No| CheckSSH{Contains ssh?}
+
+    CheckSSH -->|No| DefaultRetry([Retryable - conservative default])
+    CheckSSH -->|Yes| CheckTimeout{Contains timeout or connect?}
+
+    CheckTimeout -->|Yes| Retryable
+    CheckTimeout -->|No| NonRetryable
+
+    subgraph AuthKeywords["Authentication Error Keywords"]
         Auth1["authentication failed"]
         Auth2["password authentication failed"]
         Auth3["key authentication failed"]
@@ -459,7 +554,7 @@ flowchart TD
         Auth9["all authentication methods failed"]
     end
 
-    subgraph Retryable["Retryable Errors"]
+    subgraph ConnKeywords["Connection Error Keywords"]
         Conn1["connection refused"]
         Conn2["connection reset"]
         Conn3["connection timed out"]
@@ -475,41 +570,72 @@ flowchart TD
         Conn13["would block"]
     end
 
-    Classify --> CheckAuth{Contains auth<br/>keyword?}
-    CheckAuth -->|Yes| NonRetryable
-    CheckAuth -->|No| CheckConn{Contains conn<br/>keyword?}
-    CheckConn -->|Yes| Retryable
-    CheckConn -->|No| CheckSSH{Contains 'ssh'?}
-    CheckSSH -->|No| DefaultRetry["Default: Retryable"]
-    CheckSSH -->|Yes| CheckTimeout{Contains 'timeout'<br/>or 'connect'?}
-    CheckTimeout -->|Yes| Retryable
-    CheckTimeout -->|No| NonRetryable
-
-    NonRetryable --> Fail([Fail Immediately])
-    Retryable --> Retry([Retry with Backoff])
-    DefaultRetry --> Retry
-
     style NonRetryable fill:#ffebee
     style Retryable fill:#e8f5e9
+    style DefaultRetry fill:#e8f5e9
+    style AuthKeywords fill:#ffebee
+    style ConnKeywords fill:#e8f5e9
 ```
 
 ### Exponential Backoff with Jitter
 
+The retry logic uses backon ExponentialBuilder.
+
+```mermaid
+sequenceDiagram
+    participant Client as connect_to_ssh_with_retry
+    participant Backoff as backon Retryable
+    participant SSH as connect_to_ssh
+    participant Error as is_retryable_error
+
+    Client->>Client: Build ExponentialBuilder
+    Note over Client: min_delay from retry_delay_ms
+    Note over Client: max_delay MAX_RETRY_DELAY_SECS 10s
+    Note over Client: max_times from max_retries
+    Note over Client: with_jitter enabled
+
+    Client->>Backoff: Wrap connect_fn in retry
+
+    loop Until success or max retries
+        Backoff->>SSH: Attempt connection
+        alt Success
+            SSH-->>Backoff: Handle
+            Backoff-->>Client: Handle and retry_count
+        else Failure
+            SSH-->>Backoff: Error
+            Backoff->>Error: when callback
+            Error-->>Backoff: is_retryable result
+            alt Retryable
+                Backoff->>Backoff: notify callback logs retry
+                Note over Backoff: Wait with exponential delay plus jitter
+                Note over Backoff: Delay doubles each attempt
+                Note over Backoff: Capped at 10 seconds
+            else Not Retryable
+                Backoff-->>Client: Error immediately
+            end
+        end
+    end
+
+    Note over Client: Return handle with retry_count or final error
+```
+
+### Retry Timeline Example
+
 ```mermaid
 flowchart LR
     subgraph Backoff["Backoff Configuration"]
-        Min["min_delay: 1000ms"]
-        Max["max_delay: 10s (cap)"]
-        MaxRetries["max_times: 3"]
-        Jitter["jitter: enabled"]
+        Min["min_delay 1000ms"]
+        Max["max_delay 10s cap"]
+        MaxRetries["max_times 3"]
+        Jitter["jitter enabled"]
     end
 
-    subgraph Timeline["Retry Timeline"]
-        T0["Attempt 1"] --> D1["Delay: ~1s"]
+    subgraph Timeline["Retry Timeline Example"]
+        T0["Attempt 1"] --> D1["Delay approx 1s"]
         D1 --> T1["Attempt 2"]
-        T1 --> D2["Delay: ~2s"]
+        T1 --> D2["Delay approx 2s"]
         D2 --> T2["Attempt 3"]
-        T2 --> D3["Delay: ~4s"]
+        T2 --> D3["Delay approx 4s"]
         D3 --> T3["Attempt 4"]
         T3 --> End["Max retries exceeded"]
     end
@@ -528,29 +654,29 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant Client as ssh_connect
-    participant Backon as backon::Retryable
+    participant Backon as backon Retryable
     participant SSH as connect_to_ssh
     participant Server as SSH Server
 
-    Client->>Backon: retry(connect_fn)
+    Client->>Backon: retry connect_fn
 
     Backon->>SSH: Attempt 1
     SSH->>Server: Connect
     Server-->>SSH: Connection refused
     SSH-->>Backon: Error
 
-    Backon->>Backon: when(is_retryable) = true
-    Backon->>Backon: notify("Connection refused, retrying in 1.2s")
-    Note over Backon: Wait 1.2s (with jitter)
+    Backon->>Backon: when is_retryable returns true
+    Backon->>Backon: notify logs retry with delay
+    Note over Backon: Wait approximately 1.2s with jitter
 
     Backon->>SSH: Attempt 2
     SSH->>Server: Connect
     Server-->>SSH: Timeout
     SSH-->>Backon: Error
 
-    Backon->>Backon: when(is_retryable) = true
-    Backon->>Backon: notify("Timeout, retrying in 2.5s")
-    Note over Backon: Wait 2.5s (with jitter)
+    Backon->>Backon: when is_retryable returns true
+    Backon->>Backon: notify logs retry with delay
+    Note over Backon: Wait approximately 2.5s with jitter
 
     Backon->>SSH: Attempt 3
     SSH->>Server: Connect
@@ -559,5 +685,18 @@ sequenceDiagram
     Server-->>SSH: Auth Success
     SSH-->>Backon: Success
 
-    Backon-->>Client: (handle, retry_count=2)
+    Backon-->>Client: Handle with retry_count equals 2
 ```
+
+---
+
+## Module Responsibilities
+
+| Module | Responsibility |
+|--------|----------------|
+| `commands.rs` | MCP tool entry points and response building |
+| `client.rs` | SSH connection, authentication, and command execution |
+| `session.rs` | Global session storage and russh handler |
+| `config.rs` | Configuration resolution with priority chain |
+| `error.rs` | Error classification for retry decisions |
+| `forward.rs` | Port forwarding with bidirectional IO |
