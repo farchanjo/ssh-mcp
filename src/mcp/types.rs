@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     pub session_id: String,
+    /// Optional human-readable name for the session (useful for LLM identification)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub host: String,
     pub username: String,
     pub connected_at: String,
@@ -202,6 +205,7 @@ mod response_serialization {
         fn test_serialize_and_deserialize() {
             let info = SessionInfo {
                 session_id: "uuid-123".to_string(),
+                name: Some("production-db".to_string()),
                 host: "192.168.1.1:22".to_string(),
                 username: "testuser".to_string(),
                 connected_at: "2024-01-15T10:30:00Z".to_string(),
@@ -214,6 +218,7 @@ mod response_serialization {
             let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
 
             assert_eq!(deserialized.session_id, "uuid-123");
+            assert_eq!(deserialized.name, Some("production-db".to_string()));
             assert_eq!(deserialized.host, "192.168.1.1:22");
             assert_eq!(deserialized.username, "testuser");
             assert_eq!(deserialized.connected_at, "2024-01-15T10:30:00Z");
@@ -223,9 +228,32 @@ mod response_serialization {
         }
 
         #[test]
+        fn test_serialize_without_name() {
+            let info = SessionInfo {
+                session_id: "uuid-456".to_string(),
+                name: None,
+                host: "192.168.1.1:22".to_string(),
+                username: "testuser".to_string(),
+                connected_at: "2024-01-15T10:30:00Z".to_string(),
+                default_timeout_secs: 30,
+                retry_attempts: 0,
+                compression_enabled: true,
+            };
+
+            let json = serde_json::to_string(&info).unwrap();
+            // When name is None, it should not appear in JSON due to skip_serializing_if
+            // Check for "name": pattern to avoid matching "username"
+            assert!(!json.contains("\"name\":"));
+
+            let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.name, None);
+        }
+
+        #[test]
         fn test_clone() {
             let info = SessionInfo {
                 session_id: "clone-test".to_string(),
+                name: Some("test-session".to_string()),
                 host: "host".to_string(),
                 username: "user".to_string(),
                 connected_at: "now".to_string(),
@@ -237,6 +265,7 @@ mod response_serialization {
             let cloned = info.clone();
 
             assert_eq!(cloned.session_id, info.session_id);
+            assert_eq!(cloned.name, info.name);
             assert_eq!(cloned.compression_enabled, info.compression_enabled);
         }
     }
@@ -262,6 +291,7 @@ mod response_serialization {
         fn test_multiple_sessions() {
             let session1 = SessionInfo {
                 session_id: "s1".to_string(),
+                name: Some("production".to_string()),
                 host: "host1".to_string(),
                 username: "user1".to_string(),
                 connected_at: "t1".to_string(),
@@ -271,6 +301,7 @@ mod response_serialization {
             };
             let session2 = SessionInfo {
                 session_id: "s2".to_string(),
+                name: None,
                 host: "host2".to_string(),
                 username: "user2".to_string(),
                 connected_at: "t2".to_string(),
@@ -290,7 +321,12 @@ mod response_serialization {
             assert_eq!(deserialized.sessions.len(), 2);
             assert_eq!(deserialized.count, 2);
             assert_eq!(deserialized.sessions[0].session_id, "s1");
+            assert_eq!(
+                deserialized.sessions[0].name,
+                Some("production".to_string())
+            );
             assert_eq!(deserialized.sessions[1].session_id, "s2");
+            assert_eq!(deserialized.sessions[1].name, None);
         }
     }
 

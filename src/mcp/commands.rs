@@ -56,20 +56,27 @@ impl McpSSHCommands {
         retry_delay_ms: Option<u64>,
         /// Enable zlib compression for the SSH connection (default: true, env: SSH_COMPRESSION)
         compress: Option<bool>,
+        /// Optional human-readable name for the session (helps identify sessions, e.g., "production-db", "staging-server")
+        name: Option<String>,
+        /// Keep session open indefinitely until explicitly disconnected (disables inactivity timeout, default: false)
+        persistent: Option<bool>,
     ) -> Result<StructuredContent<SshConnectResponse>, String> {
         let timeout = resolve_connect_timeout(timeout_secs);
         let max_retries = resolve_max_retries(max_retries);
         let retry_delay = resolve_retry_delay(retry_delay_ms);
         let compress = resolve_compression(compress);
+        let persistent = persistent.unwrap_or(false);
 
         info!(
-            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay={}ms, compress={}",
+            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay={}ms, compress={}, persistent={}, name={:?}",
             username,
             address,
             timeout.as_secs(),
             max_retries,
             retry_delay.as_millis(),
-            compress
+            compress,
+            persistent,
+            name
         );
 
         match connect_to_ssh_with_retry(
@@ -81,6 +88,7 @@ impl McpSSHCommands {
             max_retries,
             retry_delay,
             compress,
+            persistent,
         )
         .await
         {
@@ -90,6 +98,7 @@ impl McpSSHCommands {
 
                 let session_info = SessionInfo {
                     session_id: session_id.clone(),
+                    name: name.clone(),
                     host: address.clone(),
                     username: username.clone(),
                     connected_at,
@@ -110,13 +119,31 @@ impl McpSSHCommands {
                     );
                 }
 
-                let message = if retry_attempts > 0 {
-                    format!(
-                        "Successfully connected to {}@{} after {} retry attempt(s)",
-                        username, address, retry_attempts
-                    )
-                } else {
-                    format!("Successfully connected to {}@{}", username, address)
+                let message = {
+                    let base_msg = match (&name, retry_attempts > 0) {
+                        (Some(n), true) => format!(
+                            "Successfully connected to {}@{} (name: '{}') after {} retry attempt(s)",
+                            username, address, n, retry_attempts
+                        ),
+                        (Some(n), false) => {
+                            format!(
+                                "Successfully connected to {}@{} (name: '{}')",
+                                username, address, n
+                            )
+                        }
+                        (None, true) => format!(
+                            "Successfully connected to {}@{} after {} retry attempt(s)",
+                            username, address, retry_attempts
+                        ),
+                        (None, false) => {
+                            format!("Successfully connected to {}@{}", username, address)
+                        }
+                    };
+                    if persistent {
+                        format!("{} [persistent session]", base_msg)
+                    } else {
+                        base_msg
+                    }
                 };
 
                 Ok(StructuredContent(SshConnectResponse {
