@@ -12,7 +12,7 @@
 //!
 //! # Limits
 //!
-//! - Maximum 10 concurrent async commands per session
+//! - Maximum 30 concurrent async commands per session
 //! - Completed commands are automatically cleaned up after 5 minutes
 
 use std::collections::HashSet;
@@ -73,7 +73,7 @@ pub static ASYNC_COMMANDS: Lazy<DashMap<String, RunningCommand>> = Lazy::new(Das
 pub static COMMANDS_BY_SESSION: Lazy<DashMap<String, HashSet<String>>> = Lazy::new(DashMap::new);
 
 /// Maximum number of concurrent async commands per session
-pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 10;
+pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 30;
 
 /// Count async commands for a specific session (O(1) lookup).
 pub fn count_session_commands(session_id: &str) -> usize {
@@ -170,7 +170,7 @@ mod tests {
 
         #[test]
         fn test_max_async_commands_per_session() {
-            assert_eq!(MAX_ASYNC_COMMANDS_PER_SESSION, 10);
+            assert_eq!(MAX_ASYNC_COMMANDS_PER_SESSION, 30);
         }
 
         #[test]
