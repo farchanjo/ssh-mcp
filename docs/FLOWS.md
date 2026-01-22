@@ -28,7 +28,7 @@ stateDiagram-v2
 
     RetryLogic --> Connecting: Retryable Error
     RetryLogic --> Disconnected: Max Retries Exceeded
-    RetryLogic --> Disconnected: Auth Error (Non-retryable)
+    RetryLogic --> Disconnected: Auth Error
 
     Authenticating --> Connected: Auth Success
     Authenticating --> Disconnected: Auth Failed

@@ -282,9 +282,9 @@ stateDiagram-v2
     Attempt1 --> CheckRetry1: Failed
 
     CheckRetry1 --> Delay1: Retryable Error
-    CheckRetry1 --> [*]: Auth Error (Non-retryable)
+    CheckRetry1 --> [*]: Auth Error
 
-    Delay1 --> Attempt2: Wait (min_delay * 2^0)
+    Delay1 --> Attempt2: Wait with backoff
 
     Attempt2 --> Success: Connected
     Attempt2 --> CheckRetry2: Failed
@@ -292,7 +292,7 @@ stateDiagram-v2
     CheckRetry2 --> Delay2: Retryable Error
     CheckRetry2 --> [*]: Auth Error
 
-    Delay2 --> Attempt3: Wait (min_delay * 2^1)
+    Delay2 --> Attempt3: Wait with backoff
 
     Attempt3 --> Success: Connected
     Attempt3 --> CheckRetry3: Failed
@@ -300,7 +300,7 @@ stateDiagram-v2
     CheckRetry3 --> Delay3: Retryable Error
     CheckRetry3 --> [*]: Auth Error
 
-    Delay3 --> Attempt4: Wait (min_delay * 2^2, capped at 10s)
+    Delay3 --> Attempt4: Wait with backoff, max 10s
 
     Attempt4 --> Success: Connected
     Attempt4 --> [*]: Max Retries Exceeded
@@ -308,7 +308,7 @@ stateDiagram-v2
     Success --> [*]
 
     note right of Delay1: Jitter added to prevent thundering herd
-    note right of CheckRetry1: Non-retryable: auth failures, permission denied
+    note right of CheckRetry1: Non-retryable errors include auth failures
 ```
 
 ---
