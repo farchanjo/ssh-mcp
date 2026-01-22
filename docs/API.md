@@ -8,7 +8,6 @@ This document provides a complete API reference for all MCP tools exposed by the
 - [Tools](#tools)
   - [ssh_connect](#ssh_connect)
   - [ssh_execute](#ssh_execute)
-  - [ssh_execute_async](#ssh_execute_async)
   - [ssh_get_command_output](#ssh_get_command_output)
   - [ssh_list_commands](#ssh_list_commands)
   - [ssh_cancel_command](#ssh_cancel_command)
@@ -22,22 +21,21 @@ This document provides a complete API reference for all MCP tools exposed by the
   - [Authentication](#authentication)
   - [Retry Logic](#retry-logic)
   - [Configuration Priority](#configuration-priority)
-  - [Async vs Sync Command Execution](#async-vs-sync-command-execution)
+  - [Async Command Execution](#async-command-execution)
 
 ---
 
 ## Overview
 
-SSH MCP exposes 9 tools for managing SSH connections and operations:
+SSH MCP exposes 8 tools for managing SSH connections and operations:
 
 | Tool | Description | Feature Flag |
 |------|-------------|--------------|
 | `ssh_connect` | Establish SSH connection | - |
-| `ssh_execute` | Execute remote command (synchronous) | - |
-| `ssh_execute_async` | Start command in background | - |
-| `ssh_get_command_output` | Poll or wait for async command output | - |
-| `ssh_list_commands` | List all async commands | - |
-| `ssh_cancel_command` | Cancel a running async command | - |
+| `ssh_execute` | Execute command in background (returns command_id for polling) | - |
+| `ssh_get_command_output` | Poll or wait for command output | - |
+| `ssh_list_commands` | List all commands | - |
+| `ssh_cancel_command` | Cancel a running command | - |
 | `ssh_forward` | Setup port forwarding | `port_forward` |
 | `ssh_disconnect` | Close SSH session | - |
 | `ssh_list_sessions` | List active sessions | - |
@@ -185,81 +183,7 @@ With persistent session (no inactivity timeout):
 
 ### ssh_execute
 
-Executes a shell command on a connected SSH session.
-
-#### Parameters
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `session_id` | `string` | Yes | - | Session ID returned from `ssh_connect` |
-| `command` | `string` | Yes | - | Shell command to execute on the remote server |
-| `timeout_secs` | `u64` | No | `180` | Command execution timeout in seconds (default: 180s / 3 minutes). Falls back to `SSH_COMMAND_TIMEOUT` env var. |
-
-#### Response
-
-Returns `SshCommandResponse`:
-
-```json
-{
-  "stdout": "total 48\ndrwxr-xr-x  12 user user 4096 Jan 15 10:30 .\n...",
-  "stderr": "",
-  "exit_code": 0,
-  "timed_out": false
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `stdout` | `string` | Standard output from the command |
-| `stderr` | `string` | Standard error output from the command |
-| `exit_code` | `i32` | Command exit code. `-1` if the command timed out or exit status was not received. |
-| `timed_out` | `bool` | `true` if the command exceeded `timeout_secs` and was terminated |
-
-#### Timeout Behavior
-
-When a command exceeds the configured `timeout_secs`:
-
-- `timed_out` is set to `true`
-- `exit_code` is set to `-1`
-- `stdout` and `stderr` contain any partial output collected before the timeout
-- The SSH session **remains connected** and can be reused for subsequent commands
-- No error is returned; the response is a successful result with timeout indication
-
-This graceful timeout handling allows you to:
-- Detect long-running commands without losing the session
-- Retrieve partial output for debugging
-- Continue using the same session for other commands
-
-#### Example Usage
-
-```json
-{
-  "tool": "ssh_execute",
-  "arguments": {
-    "session_id": "550e8400-e29b-41d4-a716-446655440000",
-    "command": "ls -la /var/log",
-    "timeout_secs": 30
-  }
-}
-```
-
-Multiple commands:
-
-```json
-{
-  "tool": "ssh_execute",
-  "arguments": {
-    "session_id": "550e8400-e29b-41d4-a716-446655440000",
-    "command": "cd /app && git pull && npm install && npm run build"
-  }
-}
-```
-
----
-
-### ssh_execute_async
-
-Starts a shell command in the background on a connected SSH session and returns immediately with a `command_id` for tracking. Use this for long-running commands (builds, deployments, data processing) or when you want to run multiple commands concurrently.
+Starts a shell command in the background on a connected SSH session and returns immediately with a `command_id` for tracking. Use `ssh_get_command_output` to poll for status and retrieve output.
 
 #### Parameters
 
@@ -271,7 +195,7 @@ Starts a shell command in the background on a connected SSH session and returns 
 
 #### Response
 
-Returns `SshExecuteAsyncResponse`:
+Returns `SshExecuteResponse`:
 
 ```json
 {
@@ -279,7 +203,7 @@ Returns `SshExecuteAsyncResponse`:
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "command": "npm run build",
   "started_at": "2024-01-15T14:30:00.000Z",
-  "message": "Command started in background. Use ssh_get_command_output to poll for results."
+  "message": "Command started. Use ssh_get_command_output with command_id 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' to poll for results, or ssh_cancel_command to cancel."
 }
 ```
 
@@ -293,7 +217,7 @@ Returns `SshExecuteAsyncResponse`:
 
 #### Limits
 
-- Maximum 30 concurrent async commands per session
+- Maximum 30 concurrent commands per session
 - Commands are automatically cancelled when the session is disconnected
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
@@ -303,7 +227,7 @@ Start a build process:
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
     "command": "cd /app && npm run build",
@@ -316,7 +240,7 @@ Start multiple commands in parallel:
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
     "command": "npm run build"
@@ -326,7 +250,7 @@ Start multiple commands in parallel:
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
     "command": "npm test"
@@ -338,13 +262,13 @@ Start multiple commands in parallel:
 
 ### ssh_get_command_output
 
-Retrieves the output and status of an async command started with `ssh_execute_async`. Supports both polling (immediate return) and blocking (wait until complete) modes.
+Retrieves the output and status of a command started with `ssh_execute`. Supports both polling (immediate return) and blocking (wait until complete) modes.
 
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `command_id` | `string` | Yes | - | Command ID returned from `ssh_execute_async` |
+| `command_id` | `string` | Yes | - | Command ID returned from `ssh_execute` |
 | `wait` | `bool` | No | `false` | If `false`, returns immediately with current status. If `true`, blocks until the command completes or `wait_timeout_secs` is reached. |
 | `wait_timeout_secs` | `u64` | No | `30` | Maximum time to wait when `wait=true`. Range: 1-300 seconds. |
 
@@ -820,12 +744,7 @@ interface SshConnectResponse {
   retry_attempts: number;
 }
 
-interface SshCommandResponse {
-  stdout: string;
-  stderr: string;
-  exit_code: number;
-  timed_out: boolean;
-}
+// SshCommandResponse is internal - not exposed via MCP tools
 
 interface PortForwardingResponse {
   local_address: string;
@@ -851,7 +770,7 @@ interface SessionListResponse {
   count: number;
 }
 
-interface SshExecuteAsyncResponse {
+interface SshExecuteResponse {
   command_id: string;
   session_id: string;
   command: string;
@@ -1103,7 +1022,7 @@ Response:
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "build-session-123",
     "command": "cd /app && npm run build",
@@ -1125,7 +1044,7 @@ Response:
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "build-session-123",
     "command": "cd /app && npm test",
@@ -1254,7 +1173,7 @@ Session build-session-123 disconnected successfully
 
 ```json
 {
-  "tool": "ssh_execute_async",
+  "tool": "ssh_execute",
   "arguments": {
     "session_id": "abc-123-def-456",
     "command": "find / -name '*.log' -type f"
@@ -1414,35 +1333,26 @@ All configuration values follow a three-tier priority system:
 | Retry delay | `retry_delay_ms` | `SSH_RETRY_DELAY_MS` | 1000ms |
 | Compression | `compress` | `SSH_COMPRESSION` | true |
 
-### Async vs Sync Command Execution
+### Async Command Execution
 
-SSH MCP provides two ways to execute commands: synchronous (`ssh_execute`) and asynchronous (`ssh_execute_async`).
+SSH MCP executes commands asynchronously, returning a `command_id` immediately that can be polled for status and output.
 
-#### When to Use `ssh_execute` (Synchronous)
+#### When to Use Different Patterns
 
-| Scenario | Reason |
-|----------|--------|
-| Quick commands (< 30s) | No need for background execution overhead |
-| Need immediate result | Blocks until command completes |
-| Simple one-off commands | Simpler workflow without polling |
-| Interactive debugging | Direct feedback loop |
+| Scenario | Recommended Pattern |
+|----------|---------------------|
+| Quick commands | `ssh_execute` → `ssh_get_command_output(wait=true)` |
+| Long-running commands | `ssh_execute` → poll with `ssh_get_command_output(wait=false)` |
+| Parallel execution | Multiple `ssh_execute` calls → poll each command |
+| Progress monitoring | Poll with `ssh_get_command_output(wait=false)` periodically |
+| Cancellation needed | Use `ssh_cancel_command` to stop mid-execution |
 
-#### When to Use `ssh_execute_async` (Asynchronous)
-
-| Scenario | Reason |
-|----------|--------|
-| Long-running commands | Builds, deployments, data processing |
-| Parallel execution | Run multiple commands concurrently |
-| Progress monitoring | Poll for partial output during execution |
-| Cancellation needed | Ability to stop mid-execution |
-| Timeout management | Monitor and cancel commands that exceed expectations |
-
-#### Async Command Lifecycle
+#### Command Lifecycle
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ ssh_execute_    │     │ ssh_get_command │     │ ssh_cancel_     │
-│ async           │────>│ _output         │────>│ command         │
+│ ssh_execute     │     │ ssh_get_command │     │ ssh_cancel_     │
+│                 │────>│ _output         │────>│ command         │
 │                 │     │ (poll/wait)     │     │ (optional)      │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
         │                       │                       │
@@ -1451,11 +1361,11 @@ SSH MCP provides two ways to execute commands: synchronous (`ssh_execute`) and a
    returned               returned                 partial output
 ```
 
-#### Async Command Limits
+#### Command Limits
 
 | Limit | Value | Description |
 |-------|-------|-------------|
 | Max concurrent per session | 30 | Maximum running commands per SSH session |
 | Default timeout | 180s | Configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` |
 | Max wait timeout | 300s | Maximum value for `wait_timeout_secs` parameter |
-| Auto-cleanup | On disconnect | All async commands cancelled when session disconnects |
+| Auto-cleanup | On disconnect | All commands cancelled when session disconnects |

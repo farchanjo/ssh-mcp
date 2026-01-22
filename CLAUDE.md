@@ -51,7 +51,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
   - `name: Option<String>` - Human-readable session name for LLM identification
   - `persistent: Option<bool>` - When true, disables inactivity timeout (keepalive still active)
 - `ssh_execute`: Synchronous command execution with timeout (returns partial output with `timed_out: true` on timeout)
-- `ssh_execute_async`: Start command in background, returns `command_id` for polling
+- `ssh_execute`: Start command in background, returns `command_id` for polling
 - `ssh_get_command_output`: Poll for async command output/status (supports `wait` for blocking)
 - `ssh_list_commands`: List all async commands (filterable by session/status)
 - `ssh_cancel_command`: Cancel a running async command
@@ -67,7 +67,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 - **`SshConnectResponse`**: Message includes "[persistent]" suffix when `persistent=true`
 - **`AsyncCommandInfo`**: Metadata for async commands including `command_id`, `session_id`, `command`, `status`, `started_at`
 - **`AsyncCommandStatus`**: Enum with `Running`, `Completed`, `Cancelled`, `Failed`
-- **`SshExecuteAsyncResponse`**: Response from `ssh_execute_async` with `command_id` and `message`
+- **`SshExecuteResponse`**: Response from `ssh_execute` with `command_id` and `message`
 - **`SshAsyncOutputResponse`**: Output from async command including `status`, `stdout`, `stderr`, `exit_code`
 
 ### Async Command Execution
@@ -76,7 +76,7 @@ Use async execution for long-running commands (builds, deployments, data process
 
 #### When to Use Async vs Sync
 
-| Use `ssh_execute` (sync) | Use `ssh_execute_async` |
+| Use `ssh_execute` (sync) | Use `ssh_execute` |
 |--------------------------|-------------------------|
 | Quick commands (< 30s) | Long-running commands (builds, deployments) |
 | Need immediate result | Want to run multiple commands in parallel |
@@ -86,7 +86,7 @@ Use async execution for long-running commands (builds, deployments, data process
 
 ```
 1. ssh_connect(address, username) → session_id
-2. ssh_execute_async(session_id, command) → command_id
+2. ssh_execute(session_id, command) → command_id
 3. ssh_get_command_output(command_id, wait=false) → status: "running"
 4. ssh_get_command_output(command_id, wait=true) → status: "completed", stdout, exit_code
 5. ssh_disconnect(session_id) → cleans up all async commands
@@ -94,7 +94,7 @@ Use async execution for long-running commands (builds, deployments, data process
 
 #### Tool Reference
 
-**`ssh_execute_async`** - Start a background command
+**`ssh_execute`** - Start a background command
 ```json
 {
   "session_id": "uuid-from-connect",
@@ -144,10 +144,10 @@ Returns: `{ "cancelled": true, "stdout": "partial output...", "stderr": "" }`
 
 ```
 # Start build in background
-ssh_execute_async(session_id, "cd /app && npm run build") → build_cmd_id
+ssh_execute(session_id, "cd /app && npm run build") → build_cmd_id
 
 # Start tests in parallel
-ssh_execute_async(session_id, "cd /app && npm test") → test_cmd_id
+ssh_execute(session_id, "cd /app && npm test") → test_cmd_id
 
 # Wait for both to complete
 ssh_get_command_output(build_cmd_id, wait=true, wait_timeout_secs=120)
@@ -160,7 +160,7 @@ ssh_get_command_output(test_cmd_id, wait=true, wait_timeout_secs=60)
 
 ```
 # Start long-running process
-ssh_execute_async(session_id, "python train_model.py") → cmd_id
+ssh_execute(session_id, "python train_model.py") → cmd_id
 
 # Poll periodically to show progress
 while True:
@@ -175,7 +175,7 @@ while True:
 
 ```
 # Start potentially slow command
-ssh_execute_async(session_id, "find / -name '*.log'") → cmd_id
+ssh_execute(session_id, "find / -name '*.log'") → cmd_id
 
 # Wait with timeout
 result = ssh_get_command_output(cmd_id, wait=true, wait_timeout_secs=10)
