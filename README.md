@@ -109,9 +109,13 @@ sudo cp ./target/release/ssh-mcp /usr/local/bin/
 sudo codesign -f -s - /usr/local/bin/ssh-mcp  # macOS only
 ```
 
-### Option 1: Stdio Transport (Recommended for MCP)
+### Option 1: Stdio Transport (ssh-mcp-stdio)
 
-Add to Claude Desktop or Cursor MCP config:
+Uses stdin/stdout for communication. Recommended for most MCP integrations.
+
+#### Claude Code
+
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -124,26 +128,83 @@ Add to Claude Desktop or Cursor MCP config:
 }
 ```
 
-### Option 2: HTTP Server
+Or add to your project's `.mcp.json`:
 
-Run the HTTP server on port 8000 (configurable via `MCP_PORT`):
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "ssh-mcp-stdio",
+      "args": []
+    }
+  }
+}
+```
+
+#### OpenCode
+
+Add to `~/.config/opencode/opencode.json` (or `opencode.json` in project root):
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "ssh-mcp-stdio",
+      "args": []
+    }
+  }
+}
+```
+
+#### Claude Desktop / Cursor
+
+Add to the MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "ssh-mcp-stdio",
+      "args": []
+    }
+  }
+}
+```
+
+### Option 2: HTTP Server (ssh-mcp)
+
+Runs as a standalone HTTP server. Useful for shared access or non-stdio clients.
+
+#### Start the Server
 
 ```bash
-# Start the server
+# Start on default port 8000
 ssh-mcp
 
-# Or with custom port
+# Custom port
 MCP_PORT=9000 ssh-mcp
 
 # With debug logging
 RUST_LOG=debug ssh-mcp
 ```
 
-The server exposes MCP tools via HTTP at `http://localhost:8000`. You can use any HTTP client or configure MCP clients that support HTTP transport.
+#### Claude Code (HTTP/SSE)
 
-#### MCP Configuration for HTTP
+Add to `~/.claude/settings.json`:
 
-For MCP clients that support SSE/HTTP transport:
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "url": "http://localhost:8000/sse"
+    }
+  }
+}
+```
+
+#### OpenCode (HTTP/SSE)
+
+Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -157,7 +218,7 @@ For MCP clients that support SSE/HTTP transport:
 
 #### Direct HTTP Usage
 
-You can also call the MCP tools directly via HTTP:
+Call MCP tools directly via HTTP:
 
 ```bash
 # List sessions
