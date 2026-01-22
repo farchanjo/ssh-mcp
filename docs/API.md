@@ -1,9 +1,12 @@
 # SSH MCP API Reference
 
-This document provides a complete API reference for all MCP tools exposed by the SSH MCP server.
+This document provides a complete API reference for all MCP tools exposed by the SSH MCP server. Designed for LLM consumption with clear identifier relationships and workflow guidance.
 
 ## Table of Contents
 
+- [Quick Reference for LLMs](#quick-reference-for-llms)
+- [Key Identifiers](#key-identifiers)
+- [Tool Workflow](#tool-workflow)
 - [Overview](#overview)
 - [Tools](#tools)
   - [ssh_connect](#ssh_connect)
@@ -14,6 +17,7 @@ This document provides a complete API reference for all MCP tools exposed by the
   - [ssh_forward](#ssh_forward)
   - [ssh_disconnect](#ssh_disconnect)
   - [ssh_list_sessions](#ssh_list_sessions)
+  - [ssh_disconnect_agent](#ssh_disconnect_agent)
 - [Response Types](#response-types)
 - [Error Responses](#error-responses)
 - [Examples](#examples)
@@ -25,26 +29,108 @@ This document provides a complete API reference for all MCP tools exposed by the
 
 ---
 
+## Quick Reference for LLMs
+
+**IMPORTANT RULES:**
+1. **ALWAYS SAVE `session_id`** from `ssh_connect` - required for ALL subsequent operations
+2. **ALWAYS SAVE `command_id`** from `ssh_execute` - required to get output or cancel
+3. **USE `agent_id`** when multiple agents share the server - enables bulk cleanup
+4. **CALL `ssh_disconnect`** when done to release resources
+5. **POLL with `ssh_get_command_output`** for long-running commands (builds, deploys)
+
+**Typical Workflow:**
+```
+ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_output → ssh_disconnect
+```
+
+---
+
+## Key Identifiers
+
+| Identifier | Source | Used By | Purpose |
+|------------|--------|---------|---------|
+| `session_id` | `ssh_connect` returns | `ssh_execute`, `ssh_forward`, `ssh_disconnect`, `ssh_list_commands` | Identifies SSH connection |
+| `command_id` | `ssh_execute` returns | `ssh_get_command_output`, `ssh_cancel_command` | Tracks background command |
+| `agent_id` | You provide to `ssh_connect` | `ssh_list_sessions`, `ssh_disconnect_agent` | Groups sessions for bulk operations |
+
+**Identifier Flow Diagram:**
+```
+┌──────────────┐     session_id      ┌──────────────┐     command_id     ┌─────────────────────┐
+│ ssh_connect  │ ─────────────────── │ ssh_execute  │ ─────────────────  │ ssh_get_command_    │
+│              │                     │              │                    │ output              │
+└──────────────┘                     └──────────────┘                    └─────────────────────┘
+       │                                    │                                     │
+       │ (optional)                         │                                     │
+       ▼                                    │                                     ▼
+   agent_id ─────────────────────────────────────────────────────────────  ssh_cancel_command
+       │
+       ▼
+┌──────────────────────┐
+│ ssh_disconnect_agent │  ← Disconnects ALL sessions with this agent_id
+└──────────────────────┘
+```
+
+---
+
+## Tool Workflow
+
+### Basic Command Execution
+```
+1. ssh_connect(address, username) → SAVE session_id
+2. ssh_execute(session_id, command) → SAVE command_id
+3. ssh_get_command_output(command_id, wait=true) → GET stdout, stderr, exit_code
+4. ssh_disconnect(session_id) → CLEANUP
+```
+
+### Parallel Command Execution
+```
+1. ssh_connect(address, username) → SAVE session_id
+2. ssh_execute(session_id, "npm build") → SAVE build_cmd_id
+3. ssh_execute(session_id, "npm test") → SAVE test_cmd_id
+4. ssh_get_command_output(build_cmd_id, wait=true) → GET build result
+5. ssh_get_command_output(test_cmd_id, wait=true) → GET test result
+6. ssh_disconnect(session_id) → CLEANUP
+```
+
+### Multi-Agent Cleanup
+```
+1. ssh_connect(address, username, agent_id="my-agent") → SAVE session_id
+2. ssh_connect(address2, username, agent_id="my-agent") → SAVE session_id2
+3. ... do work ...
+4. ssh_disconnect_agent(agent_id="my-agent") → CLEANUP ALL sessions at once
+```
+
+---
+
 ## Overview
 
-SSH MCP exposes 8 tools for managing SSH connections and operations:
+SSH MCP exposes 10 tools for managing SSH connections and operations:
 
-| Tool | Description | Feature Flag |
-|------|-------------|--------------|
-| `ssh_connect` | Establish SSH connection | - |
-| `ssh_execute` | Execute command in background (returns command_id for polling) | - |
-| `ssh_get_command_output` | Poll or wait for command output | - |
-| `ssh_list_commands` | List all commands | - |
-| `ssh_cancel_command` | Cancel a running command | - |
-| `ssh_forward` | Setup port forwarding | `port_forward` |
-| `ssh_disconnect` | Close SSH session | - |
-| `ssh_list_sessions` | List active sessions | - |
+| Tool | Action | Returns | Feature Flag |
+|------|--------|---------|--------------|
+| `ssh_connect` | **CREATES** SSH connection | `session_id` to SAVE | - |
+| `ssh_execute` | **STARTS** background command | `command_id` to SAVE | - |
+| `ssh_get_command_output` | **RETRIEVES** command output/status | stdout, stderr, exit_code | - |
+| `ssh_list_commands` | **LISTS** all commands | command metadata array | - |
+| `ssh_cancel_command` | **STOPS** running command | partial output | - |
+| `ssh_forward` | **CREATES** port forwarding tunnel | local/remote addresses | `port_forward` |
+| `ssh_disconnect` | **CLOSES** single session | confirmation | - |
+| `ssh_list_sessions` | **LISTS** active sessions | session metadata array | - |
+| `ssh_disconnect_agent` | **CLOSES ALL** sessions for agent | cleanup summary | - |
 
 ---
 
 ## Tools
 
 ### ssh_connect
+
+**ACTION:** Creates a new SSH connection and returns a `session_id` that you MUST SAVE.
+
+**LLM GUIDANCE:**
+- **SAVE the `session_id`** from the response - you need it for ALL other operations
+- **OPTIONALLY provide `agent_id`** if multiple agents share the server (enables `ssh_disconnect_agent`)
+- **OPTIONALLY provide `name`** for human-readable session identification
+- **USE `persistent: true`** for long-running sessions that shouldn't timeout
 
 Establishes an SSH connection to a remote server with automatic retry logic.
 
@@ -62,6 +148,8 @@ Establishes an SSH connection to a remote server with automatic retry logic.
 | `max_retries` | `u32` | No | `3` | Maximum retry attempts for transient failures. Falls back to `SSH_MAX_RETRIES` env var. |
 | `retry_delay_ms` | `u64` | No | `1000` | Initial delay between retries in milliseconds. Uses exponential backoff (capped at 10s). Falls back to `SSH_RETRY_DELAY_MS` env var. |
 | `compress` | `bool` | No | `true` | Enable zlib compression. Falls back to `SSH_COMPRESSION` env var. |
+| `session_id` | `string` | No | `null` | Reuse existing session ID. If valid and connected, returns that session instead of creating new one. |
+| `agent_id` | `string` | No | `null` | Agent identifier for grouping sessions. **USE THIS** when multiple agents share the server. Enables `ssh_disconnect_agent` for bulk cleanup. |
 
 #### Authentication Priority
 
@@ -97,21 +185,25 @@ Retry logic with exponential backoff only applies to **transient connection erro
 
 Returns `SshConnectResponse`:
 
+**⚠️ IMPORTANT: SAVE `session_id` - you need it for ssh_execute, ssh_forward, and ssh_disconnect**
+
 ```json
 {
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "message": "Successfully connected to user@192.168.1.1:22",
+  "agent_id": "my-agent-id",
+  "message": "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n• session_id: '550e8400-...'\n• agent_id: 'my-agent-id'\n• host: user@192.168.1.1:22",
   "authenticated": true,
   "retry_attempts": 0
 }
 ```
 
-With persistent session:
+With persistent session and name:
 
 ```json
 {
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "message": "Successfully connected to user@192.168.1.1:22 [persistent]",
+  "agent_id": "my-agent-id",
+  "message": "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n• session_id: '550e8400-...'\n• agent_id: 'my-agent-id'\n• name: 'production-db'\n• host: user@192.168.1.1:22\n• persistent: true",
   "authenticated": true,
   "retry_attempts": 0
 }
@@ -119,8 +211,9 @@ With persistent session:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `session_id` | `string` | Unique UUID v4 identifier for the session |
-| `message` | `string` | Human-readable success message. Includes "[persistent]" suffix when `persistent=true`. |
+| `session_id` | `string` | **SAVE THIS** - Unique UUID v4 identifier required for all session operations |
+| `agent_id` | `string \| null` | Agent ID if provided (for bulk operations via `ssh_disconnect_agent`) |
+| `message` | `string` | Human-readable message with all identifiers to remember |
 | `authenticated` | `bool` | Always `true` on success |
 | `retry_attempts` | `u32` | Number of retry attempts needed |
 
@@ -183,6 +276,14 @@ With persistent session (no inactivity timeout):
 
 ### ssh_execute
 
+**ACTION:** Starts a command in background and returns a `command_id` that you MUST SAVE.
+
+**LLM GUIDANCE:**
+- **REQUIRES `session_id`** from `ssh_connect` - pass it as parameter
+- **SAVE the `command_id`** from the response - you need it for `ssh_get_command_output` or `ssh_cancel_command`
+- **USE for long-running commands** (builds, deployments, data processing)
+- **RUN MULTIPLE in parallel** on same session - each gets unique `command_id`
+
 Starts a shell command in the background on a connected SSH session and returns immediately with a `command_id` for tracking. Use `ssh_get_command_output` to poll for status and retrieve output.
 
 #### Parameters
@@ -197,20 +298,24 @@ Starts a shell command in the background on a connected SSH session and returns 
 
 Returns `SshExecuteResponse`:
 
+**⚠️ IMPORTANT: SAVE `command_id` - you need it for ssh_get_command_output or ssh_cancel_command**
+
 ```json
 {
   "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "my-agent-id",
   "command": "npm run build",
   "started_at": "2024-01-15T14:30:00.000Z",
-  "message": "Command started. Use ssh_get_command_output with command_id 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' to poll for results, or ssh_cancel_command to cancel."
+  "message": "COMMAND STARTED. REMEMBER: command_id='a1b2c3d4-...' Use ssh_get_command_output to poll for results."
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `command_id` | `string` | Unique UUID v4 identifier for tracking this command |
+| `command_id` | `string` | **SAVE THIS** - Unique UUID v4 required for `ssh_get_command_output` and `ssh_cancel_command` |
 | `session_id` | `string` | Session ID where the command is running |
+| `agent_id` | `string \| null` | Agent ID if the session was created with one |
 | `command` | `string` | The command that was started |
 | `started_at` | `string` | ISO 8601 timestamp when the command started |
 | `message` | `string` | Human-readable message with next steps |
@@ -261,6 +366,15 @@ Start multiple commands in parallel:
 ---
 
 ### ssh_get_command_output
+
+**ACTION:** Retrieves output and status of a background command.
+
+**LLM GUIDANCE:**
+- **REQUIRES `command_id`** from `ssh_execute` - pass it as parameter
+- **USE `wait=false`** to poll immediately (check progress without blocking)
+- **USE `wait=true`** to block until command completes (simplest approach)
+- **CHECK `status` field**: `running` (still working), `completed` (done), `cancelled`, `failed`
+- **CHECK `timed_out` field**: if `true`, command exceeded timeout but partial output is available
 
 Retrieves the output and status of a command started with `ssh_execute`. Supports both polling (immediate return) and blocking (wait until complete) modes.
 
@@ -396,6 +510,14 @@ Wait for completion (blocking):
 
 ### ssh_list_commands
 
+**ACTION:** Lists all background commands, optionally filtered by session or status.
+
+**LLM GUIDANCE:**
+- **USE to find command_ids** if you lost track of running commands
+- **FILTER by `session_id`** to see commands for a specific session
+- **FILTER by `status`** to find only `running`, `completed`, `cancelled`, or `failed` commands
+- **RETURNS array** of command metadata (not output - use `ssh_get_command_output` for that)
+
 Lists all async commands across all sessions or filtered by session and/or status.
 
 #### Parameters
@@ -484,6 +606,14 @@ List all completed commands:
 
 ### ssh_cancel_command
 
+**ACTION:** Stops a running command and returns partial output collected so far.
+
+**LLM GUIDANCE:**
+- **REQUIRES `command_id`** from `ssh_execute` - pass it as parameter
+- **USE to stop** commands that are taking too long or no longer needed
+- **RETURNS partial stdout/stderr** collected before cancellation
+- **ONLY works on `running` commands** - returns `cancelled: false` for already completed commands
+
 Cancels a running async command and returns any partial output collected before cancellation.
 
 #### Parameters
@@ -542,6 +672,14 @@ When command was not running (already completed/cancelled/failed):
 ---
 
 ### ssh_forward
+
+**ACTION:** Creates a local port forwarding tunnel through SSH.
+
+**LLM GUIDANCE:**
+- **REQUIRES `session_id`** from `ssh_connect` - pass it as parameter
+- **USE to access** databases, internal APIs, or other services behind SSH
+- **LOCAL PORT** is on your machine - connect your tools to `localhost:local_port`
+- **REMOTE ADDRESS** is from the SSH server's perspective (often `localhost` for local services)
 
 Sets up local port forwarding through an SSH tunnel. Only available when compiled with the `port_forward` feature (enabled by default).
 
@@ -615,6 +753,14 @@ Access internal service through bastion:
 
 ### ssh_disconnect
 
+**ACTION:** Closes a single SSH session and releases all resources.
+
+**LLM GUIDANCE:**
+- **REQUIRES `session_id`** from `ssh_connect` - pass it as parameter
+- **ALWAYS CALL when done** with a session to free resources
+- **AUTOMATICALLY CANCELS** all running commands for that session
+- **USE `ssh_disconnect_agent`** instead to disconnect ALL sessions for an agent at once
+
 Gracefully disconnects an SSH session and releases all resources.
 
 #### Parameters
@@ -646,11 +792,21 @@ Session 550e8400-e29b-41d4-a716-446655440000 disconnected successfully
 
 ### ssh_list_sessions
 
+**ACTION:** Lists all active SSH sessions with their metadata.
+
+**LLM GUIDANCE:**
+- **USE to find session_ids** if you lost track of active sessions
+- **FILTER by `agent_id`** to see only your sessions (when multiple agents share server)
+- **CHECK `healthy` field** to see if sessions are still responsive
+- **RETURNS array** of session metadata including host, username, connected_at
+
 Lists all active SSH sessions with their metadata.
 
 #### Parameters
 
-No parameters required.
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `agent_id` | `string` | No | `null` | Filter sessions by agent ID. If omitted, returns all sessions. |
 
 #### Response
 
@@ -712,6 +868,79 @@ Returns `SessionListResponse`:
 }
 ```
 
+Filter by agent:
+
+```json
+{
+  "tool": "ssh_list_sessions",
+  "arguments": {
+    "agent_id": "my-unique-agent-id"
+  }
+}
+```
+
+---
+
+### ssh_disconnect_agent
+
+**ACTION:** Disconnects ALL sessions belonging to a specific agent in one call.
+
+**LLM GUIDANCE:**
+- **REQUIRES `agent_id`** that you provided to `ssh_connect` - pass it as parameter
+- **USE for bulk cleanup** when you have multiple sessions to close
+- **AUTOMATICALLY CANCELS** all running commands across all disconnected sessions
+- **BEST PRACTICE:** Always use `agent_id` when creating sessions, then call this for cleanup
+
+Disconnects all SSH sessions associated with a specific agent identifier. This is a bulk cleanup operation that:
+1. Finds all sessions with the matching `agent_id`
+2. Cancels all running commands on those sessions
+3. Disconnects all sessions
+4. Returns a summary of what was cleaned up
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `agent_id` | `string` | Yes | - | The agent identifier used when creating sessions via `ssh_connect`. All sessions with this `agent_id` will be disconnected. |
+
+#### Response
+
+Returns `AgentDisconnectResponse`:
+
+```json
+{
+  "agent_id": "my-unique-agent-id",
+  "sessions_disconnected": 3,
+  "commands_cancelled": 5,
+  "message": "AGENT CLEANUP COMPLETE. SUMMARY:\n• agent_id: 'my-unique-agent-id'\n• sessions_disconnected: 3\n• commands_cancelled: 5\n\nAll sessions and commands for agent 'my-unique-agent-id' have been terminated."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_id` | `string` | The agent identifier that was cleaned up |
+| `sessions_disconnected` | `usize` | Number of sessions that were disconnected |
+| `commands_cancelled` | `usize` | Number of running commands that were cancelled |
+| `message` | `string` | Human-readable summary of the cleanup |
+
+#### Example Usage
+
+```json
+{
+  "tool": "ssh_disconnect_agent",
+  "arguments": {
+    "agent_id": "my-unique-agent-id"
+  }
+}
+```
+
+#### Best Practices
+
+1. **Always use `agent_id`** when calling `ssh_connect` if you might create multiple sessions
+2. **Use a unique identifier** like your project folder path, UUID, or agent name
+3. **Call `ssh_disconnect_agent`** at the end of your task instead of multiple `ssh_disconnect` calls
+4. **Handles edge cases gracefully**: Returns `sessions_disconnected: 0` if no sessions found (not an error)
+
 ---
 
 ## Response Types
@@ -738,8 +967,9 @@ All tools return responses wrapped in MCP's structured content format:
 
 ```typescript
 interface SshConnectResponse {
-  session_id: string;
-  message: string;
+  session_id: string;      // SAVE THIS - required for all session operations
+  agent_id?: string;       // Present if agent_id was provided to ssh_connect
+  message: string;         // Human-readable message with identifiers to remember
   authenticated: boolean;
   retry_attempts: number;
 }
@@ -771,8 +1001,9 @@ interface SessionListResponse {
 }
 
 interface SshExecuteResponse {
-  command_id: string;
+  command_id: string;      // SAVE THIS - required for ssh_get_command_output and ssh_cancel_command
   session_id: string;
+  agent_id?: string;       // Present if session was created with agent_id
   command: string;
   started_at: string;
   message: string;
@@ -807,6 +1038,13 @@ interface SshCancelCommandResponse {
   message: string;
   stdout: string;
   stderr: string;
+}
+
+interface AgentDisconnectResponse {
+  agent_id: string;                // The agent that was cleaned up
+  sessions_disconnected: number;   // Number of sessions closed
+  commands_cancelled: number;      // Number of commands stopped
+  message: string;                 // Human-readable summary
 }
 ```
 
