@@ -51,45 +51,145 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 #### Storage Layer (`src/mcp/storage/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 18 | Module exports and global storage instances |
-| **traits.rs** | 100 | `SessionStorage` and `CommandStorage` traits |
-| **session.rs** | 217 | `DashMapSessionStorage` with agent index |
-| **command.rs** | 246 | `DashMapCommandStorage` with session index |
+| **mod.rs** | 19 | Module exports and global storage instances |
+| **traits.rs** | 101 | `SessionStorage` and `CommandStorage` trait definitions |
+| **session.rs** | 340 | `DashMapSessionStorage` with agent index and tests |
+| **command.rs** | 528 | `DashMapCommandStorage` with session index and tests |
 
 Storage abstractions enable dependency injection and testability:
-- `SessionStorage`: CRUD for SSH sessions with agent grouping
-- `CommandStorage`: CRUD for async commands with session lookups
+- `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
+- `CommandStorage`: CRUD for async commands with O(1) session lookups
 - Both use `DashMap` for lock-free concurrent access
+
+**Key types:**
+- `SessionRef`: Read-only reference containing `SessionInfo` and `Handle`
+- `CommandRef`: Read-only reference containing `AsyncCommandInfo` and `RunningCommand`
+- `StoredSession`: Internal storage struct combining metadata with session handle
+
+**Usage example:**
+```rust
+use ssh_mcp::mcp::storage::{SESSION_STORAGE, COMMAND_STORAGE};
+
+// Insert a session
+SESSION_STORAGE.insert(session_id, info, handle);
+
+// Register with agent for bulk operations
+SESSION_STORAGE.register_agent(&agent_id, &session_id);
+
+// Get all sessions for an agent
+let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
+```
 
 #### Authentication Layer (`src/mcp/auth/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 38 | Module exports and usage examples |
-| **traits.rs** | 41 | `AuthStrategy` trait definition |
-| **password.rs** | 69 | `PasswordAuth` strategy |
-| **key.rs** | 97 | `KeyAuth` strategy (private key file) |
-| **agent.rs** | 109 | `AgentAuth` strategy (SSH agent) |
-| **chain.rs** | 175 | `AuthChain` for trying multiple strategies |
+| **mod.rs** | 39 | Module exports and usage examples |
+| **traits.rs** | 42 | `AuthStrategy` trait definition |
+| **password.rs** | 101 | `PasswordAuth` strategy with tests |
+| **key.rs** | 140 | `KeyAuth` strategy (RSA, Ed25519) with tests |
+| **agent.rs** | 110 | `AgentAuth` strategy (SSH agent) |
+| **chain.rs** | 246 | `AuthChain` for trying multiple strategies with tests |
 
 Authentication uses the Strategy pattern (Open-Closed Principle):
+
+**`AuthStrategy` trait:**
 ```rust
+#[async_trait]
+pub trait AuthStrategy: Send + Sync {
+    async fn authenticate(
+        &self,
+        handle: &mut client::Handle<SshClientHandler>,
+        username: &str,
+    ) -> Result<bool, String>;
+
+    fn name(&self) -> &'static str;
+}
+```
+
+**Available strategies:**
+- `PasswordAuth`: Username/password authentication
+- `KeyAuth`: Private key file authentication (supports RSA with `rsa-sha2-256`/`rsa-sha2-512`, Ed25519, ECDSA)
+- `AgentAuth`: SSH agent authentication via `SSH_AUTH_SOCK`
+- `AuthChain`: Composite strategy that tries multiple methods in order
+
+**Usage example:**
+```rust
+use ssh_mcp::mcp::auth::{AuthChain, PasswordAuth, KeyAuth, AgentAuth};
+
+// Chain multiple strategies (tried in order)
 let chain = AuthChain::new()
     .with_password("secret")
     .with_key("/path/to/key")
     .with_agent();
+
 let result = chain.authenticate(&mut handle, "username").await?;
+```
+
+**Adding new strategies (Open-Closed Principle):**
+```rust
+pub struct MyCustomAuth { /* ... */ }
+
+#[async_trait]
+impl AuthStrategy for MyCustomAuth {
+    async fn authenticate(&self, handle: &mut Handle, username: &str) -> Result<bool, String> {
+        // Custom authentication logic
+    }
+    fn name(&self) -> &'static str { "custom" }
+}
 ```
 
 #### Message Layer (`src/mcp/message/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 9 | Module exports |
-| **builder.rs** | 424 | Fluent message builders for LLM-friendly responses |
+| **mod.rs** | 10 | Module exports |
+| **builder.rs** | 698 | Fluent message builders with comprehensive tests |
 
-Message builders construct human-readable responses:
-- `ConnectMessageBuilder`: Connection success with identifiers
+Message builders construct human-readable responses that help LLMs remember important identifiers:
+
+**Available builders:**
+- `ConnectMessageBuilder`: Connection success with session identifiers
 - `ExecuteMessageBuilder`: Command start with polling instructions
-- `AgentDisconnectMessageBuilder`: Cleanup summary
+- `AgentDisconnectMessageBuilder`: Agent cleanup summary
+
+**Usage examples:**
+
+```rust
+use ssh_mcp::mcp::message::{ConnectMessageBuilder, ExecuteMessageBuilder, AgentDisconnectMessageBuilder};
+
+// Connection message
+let message = ConnectMessageBuilder::new("session-123", "user", "host:22")
+    .with_agent_id(Some("my-agent"))
+    .with_name(Some("production-db"))
+    .with_retry_attempts(2)
+    .with_persistent(true)
+    .reused(false)
+    .build();
+
+// Command execution message
+let message = ExecuteMessageBuilder::new("cmd-123", "session-456", "ls -la")
+    .with_agent_id(Some("my-agent"))
+    .build();
+
+// Agent disconnect message
+let message = AgentDisconnectMessageBuilder::new("my-agent")
+    .with_sessions_disconnected(3)
+    .with_commands_cancelled(5)
+    .build();
+```
+
+**Example output (ConnectMessageBuilder):**
+```
+SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:
+- agent_id: 'my-agent'
+- session_id: 'session-123'
+- name: 'production-db'
+- host: user@host:22
+- retry_attempts: 2
+- persistent: true
+
+Use ssh_execute with session_id 'session-123' to run commands.
+Use ssh_disconnect_agent with agent_id 'my-agent' to disconnect all sessions for this agent.
+```
 
 ### MCP Tools
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
