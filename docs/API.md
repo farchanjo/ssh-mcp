@@ -154,7 +154,8 @@ Returns `SshCommandResponse`:
 {
   "stdout": "total 48\ndrwxr-xr-x  12 user user 4096 Jan 15 10:30 .\n...",
   "stderr": "",
-  "exit_code": 0
+  "exit_code": 0,
+  "timed_out": false
 }
 ```
 
@@ -162,7 +163,23 @@ Returns `SshCommandResponse`:
 |-------|------|-------------|
 | `stdout` | `string` | Standard output from the command |
 | `stderr` | `string` | Standard error output from the command |
-| `exit_code` | `i32` | Command exit code. `-1` if exit status was not received. |
+| `exit_code` | `i32` | Command exit code. `-1` if the command timed out or exit status was not received. |
+| `timed_out` | `bool` | `true` if the command exceeded `timeout_secs` and was terminated |
+
+#### Timeout Behavior
+
+When a command exceeds the configured `timeout_secs`:
+
+- `timed_out` is set to `true`
+- `exit_code` is set to `-1`
+- `stdout` and `stderr` contain any partial output collected before the timeout
+- The SSH session **remains connected** and can be reused for subsequent commands
+- No error is returned; the response is a successful result with timeout indication
+
+This graceful timeout handling allows you to:
+- Detect long-running commands without losing the session
+- Retrieve partial output for debugging
+- Continue using the same session for other commands
 
 #### Example Usage
 
@@ -394,6 +411,7 @@ interface SshCommandResponse {
   stdout: string;
   stderr: string;
   exit_code: number;
+  timed_out: boolean;
 }
 
 interface PortForwardingResponse {
@@ -451,7 +469,8 @@ All errors are returned as string messages. Common error patterns:
 |-------|-------|
 | `No active SSH session with ID: xxx` | Session not found or already disconnected |
 | `Failed to open channel` | SSH session corrupted |
-| `Command execution timed out after Xs` | Command exceeded timeout |
+
+> **Note**: Command timeouts are **not errors**. When a command times out, `ssh_execute` returns a successful response with `timed_out: true`, `exit_code: -1`, and any partial output collected. The session remains connected.
 
 ### Port Forwarding Errors
 
@@ -517,7 +536,8 @@ Response:
 {
   "stdout": "Already up to date.\n",
   "stderr": "",
-  "exit_code": 0
+  "exit_code": 0,
+  "timed_out": false
 }
 ```
 

@@ -99,14 +99,14 @@ The codebase consists of **8 source files** organized into a modular structure:
 **types.rs** - Response Types
 - `SessionInfo` - Session metadata for tracking connections
 - `SshConnectResponse` - Connection result with retry information
-- `SshCommandResponse` - Command output with stdout, stderr, exit code
+- `SshCommandResponse` - Command output with stdout, stderr, exit code, and `timed_out` flag
 - `PortForwardingResponse` - Port forwarding status (feature-gated)
 - `SessionListResponse` - List of active sessions
 
 **config.rs** - Configuration Management
-- Default constants for timeouts, retries, compression
+- Default constants using `Duration` type (`DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_COMMAND_TIMEOUT`, `DEFAULT_RETRY_DELAY`, `MAX_RETRY_DELAY`)
 - Environment variable names and parsing
-- `resolve_*` functions implementing Parameter -> Env -> Default priority
+- `resolve_*` functions returning `Duration` (except `resolve_max_retries` and `resolve_compression`) implementing Parameter -> Env -> Default priority
 
 **error.rs** - Error Classification
 - `is_retryable_error()` - Classifies errors as transient or permanent
@@ -123,7 +123,7 @@ The codebase consists of **8 source files** organized into a modular structure:
 - `connect_to_ssh_with_retry()` - Connection with exponential backoff via backon
 - `authenticate_with_key()` - Private key authentication with RSA hash negotiation
 - `authenticate_with_agent()` - SSH agent authentication with RSA hash negotiation
-- `execute_ssh_command()` - Command execution via channel-based async I/O
+- `execute_ssh_command()` - Command execution via channel-based async I/O (timeout returns partial output instead of error)
 
 **forward.rs** - Port Forwarding (feature-gated)
 - `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
@@ -132,7 +132,7 @@ The codebase consists of **8 source files** organized into a modular structure:
 **commands.rs** - MCP Tools
 - `McpSSHCommands` struct with `#[Tools]` impl
 - `ssh_connect` - Connect and authenticate
-- `ssh_execute` - Run commands with timeout
+- `ssh_execute` - Run commands with timeout (returns partial output with `timed_out: true` on timeout, session stays alive)
 - `ssh_forward` - Setup port forwarding (feature-gated)
 - `ssh_disconnect` - Graceful session cleanup
 - `ssh_list_sessions` - List active sessions
@@ -261,6 +261,7 @@ classDiagram
         +stdout: String
         +stderr: String
         +exit_code: i32
+        +timed_out: bool
     }
 
     class PortForwardingResponse {
@@ -529,7 +530,7 @@ Unlike implementations using blocking SSH libraries, this system uses **russh** 
 |-----------|---------------|-------|
 | SSH Connect | `tokio::time::timeout` | Wrapped with configurable timeout |
 | Retry Logic | `backon::Retryable` | Exponential backoff with jitter |
-| Command Execution | Channel-based async I/O | Non-blocking read/write via `ChannelMsg` |
+| Command Execution | Channel-based async I/O | Non-blocking read/write via `ChannelMsg`; timeout returns partial output with `timed_out: true` |
 | Port Forwarding | `tokio::spawn` | Background task per listener |
 | Session Lock | `tokio::sync::Mutex` | Async-aware mutex |
 | Bidirectional I/O | `tokio::io::copy` + `select!` | Efficient zero-copy forwarding |
