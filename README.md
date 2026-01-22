@@ -233,7 +233,7 @@ Add to `~/.claude/settings.json`:
 {
   "mcpServers": {
     "ssh": {
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/"
     }
   }
 }
@@ -247,7 +247,7 @@ Add to `~/.config/opencode/opencode.json`:
 {
   "mcpServers": {
     "ssh": {
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/"
     }
   }
 }
@@ -259,7 +259,7 @@ Call MCP tools directly via HTTP:
 
 ```bash
 # List sessions
-curl -X POST http://localhost:8000/mcp \
+curl -X POST http://localhost:8000/ \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ssh_list_sessions","arguments":{}}}'
 ```
