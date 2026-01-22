@@ -50,25 +50,27 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
   - `name: Option<String>` - Human-readable session name for LLM identification
   - `persistent: Option<bool>` - When true, disables inactivity timeout (keepalive still active)
-- `ssh_execute`: Synchronous command execution with timeout (returns partial output with `timed_out: true` on timeout)
-- `ssh_execute`: Start command in background, returns `command_id` for polling
+  - `agent_id: Option<String>` - Agent identifier for grouping sessions (use with `ssh_disconnect_agent`)
+- `ssh_execute`: Execute command, returns `command_id` for polling (includes `agent_id` in response)
 - `ssh_get_command_output`: Poll for async command output/status (supports `wait` for blocking)
 - `ssh_list_commands`: List all async commands (filterable by session/status)
 - `ssh_cancel_command`: Cancel a running async command
 - `ssh_forward`: Port forwarding (feature-gated)
 - `ssh_disconnect`: Session cleanup (also cancels all async commands for the session)
-- `ssh_list_sessions`: List active sessions (includes `name` when set)
+- `ssh_list_sessions`: List active sessions (filterable by `agent_id`)
+- `ssh_disconnect_agent`: Disconnect ALL sessions for a specific agent (bulk cleanup)
 
 ### Key Types
-- **`SessionInfo`**: Session metadata with optional `name` field (omitted from JSON when None)
+- **`SessionInfo`**: Session metadata with optional `name` and `agent_id` fields (omitted from JSON when None)
 - **`SshCommandResponse`**: Contains `stdout`, `stderr`, `exit_code`, and `timed_out: bool`
   - On timeout: returns partial output collected so far with `timed_out: true` (session stays alive)
   - On success: returns full output with `timed_out: false`
-- **`SshConnectResponse`**: Message includes "[persistent]" suffix when `persistent=true`
+- **`SshConnectResponse`**: Contains `session_id`, `agent_id` (if provided), descriptive `message`
+- **`SshExecuteResponse`**: Response from `ssh_execute` with `command_id`, `session_id`, `agent_id`, descriptive `message`
 - **`AsyncCommandInfo`**: Metadata for async commands including `command_id`, `session_id`, `command`, `status`, `started_at`
 - **`AsyncCommandStatus`**: Enum with `Running`, `Completed`, `Cancelled`, `Failed`
-- **`SshExecuteResponse`**: Response from `ssh_execute` with `command_id` and `message`
 - **`SshAsyncOutputResponse`**: Output from async command including `status`, `stdout`, `stderr`, `exit_code`
+- **`AgentDisconnectResponse`**: Response from `ssh_disconnect_agent` with `agent_id`, `sessions_disconnected`, `commands_cancelled`
 
 ### Async Command Execution
 
@@ -189,6 +191,63 @@ if result.status == "running":
 - Max 30 concurrent async commands per session
 - Commands auto-cleanup when session disconnects
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
+
+### Agent ID Support
+
+When multiple LLM agents share an SSH MCP server, use `agent_id` to isolate sessions:
+
+#### Connect with agent_id
+```json
+{
+  "tool": "ssh_connect",
+  "params": {
+    "address": "server:22",
+    "username": "user",
+    "agent_id": "my-unique-agent-id"
+  }
+}
+```
+
+Response includes descriptive message with all identifiers:
+```json
+{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "my-unique-agent-id",
+  "message": "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n• agent_id: 'my-unique-agent-id'\n• session_id: '550e8400-...'\n• host: user@server:22\n\nUse ssh_execute with session_id '550e8400-...' to run commands.\nUse ssh_disconnect_agent with agent_id 'my-unique-agent-id' to disconnect all sessions for this agent."
+}
+```
+
+#### List only your sessions
+```json
+{
+  "tool": "ssh_list_sessions",
+  "params": {
+    "agent_id": "my-unique-agent-id"
+  }
+}
+```
+
+#### Cleanup all your sessions
+```json
+{
+  "tool": "ssh_disconnect_agent",
+  "params": {
+    "agent_id": "my-unique-agent-id"
+  }
+}
+```
+
+Response:
+```json
+{
+  "agent_id": "my-unique-agent-id",
+  "sessions_disconnected": 3,
+  "commands_cancelled": 5,
+  "message": "AGENT CLEANUP COMPLETE. SUMMARY:\n• agent_id: 'my-unique-agent-id'\n• sessions_disconnected: 3\n• commands_cancelled: 5\n\nAll sessions and commands for agent 'my-unique-agent-id' have been terminated."
+}
+```
+
+**Best practice:** Always use `agent_id` when multiple agents might share the MCP server. Use a unique identifier like your project folder path or a UUID.
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate

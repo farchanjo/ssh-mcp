@@ -20,6 +20,7 @@
 //! The `client::Handle<SshClientHandler>` is wrapped in `Arc<>` because it's not
 //! `Clone`, and we need to share it across multiple async operations (execute, forward, etc.).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -86,3 +87,131 @@ pub struct StoredSession {
 /// }
 /// ```
 pub static SSH_SESSIONS: Lazy<DashMap<String, StoredSession>> = Lazy::new(DashMap::new);
+
+/// Secondary index mapping agent IDs to their session IDs.
+///
+/// This enables O(1) lookup of all sessions belonging to an agent,
+/// which is essential for `ssh_disconnect_agent` and filtered `ssh_list_sessions`.
+///
+/// # Thread Safety
+///
+/// Uses `DashMap` with `HashSet` values for lock-free concurrent access.
+/// Operations on this index must be kept in sync with `SSH_SESSIONS`.
+pub static SESSIONS_BY_AGENT: Lazy<DashMap<String, HashSet<String>>> = Lazy::new(DashMap::new);
+
+/// Register a session under an agent ID in the secondary index.
+///
+/// Call this when creating a new session with an `agent_id`.
+pub fn register_session_agent(agent_id: &str, session_id: &str) {
+    SESSIONS_BY_AGENT
+        .entry(agent_id.to_string())
+        .or_default()
+        .insert(session_id.to_string());
+}
+
+/// Unregister a session from an agent ID in the secondary index.
+///
+/// Call this when removing a session that has an `agent_id`.
+pub fn unregister_session_agent(agent_id: &str, session_id: &str) {
+    if let Some(mut sessions) = SESSIONS_BY_AGENT.get_mut(agent_id) {
+        sessions.remove(session_id);
+        // Clean up empty entries
+        if sessions.is_empty() {
+            drop(sessions);
+            SESSIONS_BY_AGENT.remove(agent_id);
+        }
+    }
+}
+
+/// Get all session IDs for a specific agent.
+///
+/// Returns an empty vector if the agent has no sessions.
+pub fn get_agent_session_ids(agent_id: &str) -> Vec<String> {
+    SESSIONS_BY_AGENT
+        .get(agent_id)
+        .map(|sessions| sessions.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Remove all session IDs for a specific agent and return them.
+///
+/// This is used by `ssh_disconnect_agent` to get and clear the index atomically.
+pub fn remove_agent_sessions(agent_id: &str) -> Vec<String> {
+    SESSIONS_BY_AGENT
+        .remove(agent_id)
+        .map(|(_, sessions)| sessions.into_iter().collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_register_and_get_agent_sessions() {
+        let agent_id = "test-agent-register";
+        let session_id_1 = "session-1";
+        let session_id_2 = "session-2";
+
+        register_session_agent(agent_id, session_id_1);
+        register_session_agent(agent_id, session_id_2);
+
+        let sessions = get_agent_session_ids(agent_id);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&session_id_1.to_string()));
+        assert!(sessions.contains(&session_id_2.to_string()));
+
+        // Cleanup
+        SESSIONS_BY_AGENT.remove(agent_id);
+    }
+
+    #[test]
+    fn test_unregister_session_agent() {
+        let agent_id = "test-agent-unregister";
+        let session_id_1 = "session-a";
+        let session_id_2 = "session-b";
+
+        register_session_agent(agent_id, session_id_1);
+        register_session_agent(agent_id, session_id_2);
+
+        unregister_session_agent(agent_id, session_id_1);
+
+        let sessions = get_agent_session_ids(agent_id);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains(&session_id_2.to_string()));
+
+        // Unregister last session should remove the agent entry
+        unregister_session_agent(agent_id, session_id_2);
+        assert!(!SESSIONS_BY_AGENT.contains_key(agent_id));
+    }
+
+    #[test]
+    fn test_get_agent_session_ids_empty() {
+        let sessions = get_agent_session_ids("nonexistent-agent");
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_remove_agent_sessions() {
+        let agent_id = "test-agent-remove";
+        let session_id_1 = "session-x";
+        let session_id_2 = "session-y";
+
+        register_session_agent(agent_id, session_id_1);
+        register_session_agent(agent_id, session_id_2);
+
+        let removed = remove_agent_sessions(agent_id);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&session_id_1.to_string()));
+        assert!(removed.contains(&session_id_2.to_string()));
+
+        // Agent entry should be gone
+        assert!(!SESSIONS_BY_AGENT.contains_key(agent_id));
+    }
+
+    #[test]
+    fn test_remove_agent_sessions_empty() {
+        let removed = remove_agent_sessions("nonexistent-agent-remove");
+        assert!(removed.is_empty());
+    }
+}
