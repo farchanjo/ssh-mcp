@@ -338,12 +338,15 @@ mod tests {
         let cmd = create_test_command(&cmd_id, &session_id);
         storage.register(cmd_id.clone(), cmd);
 
-        let direct = storage.get_direct(&cmd_id);
-        assert!(direct.is_some());
-        let direct = direct.expect("direct ref should exist");
-        assert_eq!(direct.info.command_id, cmd_id);
+        // Scope the reference to release the read lock before unregister
+        {
+            let direct = storage.get_direct(&cmd_id);
+            assert!(direct.is_some());
+            let direct = direct.expect("direct ref should exist");
+            assert_eq!(direct.info.command_id, cmd_id);
+        }
 
-        // Cleanup
+        // Cleanup - now safe since read lock is released
         storage.unregister(&cmd_id);
     }
 
@@ -792,15 +795,18 @@ mod tests {
 
         storage.register(cmd_id.clone(), create_test_command(&cmd_id, &session_id));
 
-        let direct_ref = storage.get_direct(&cmd_id);
-        assert!(direct_ref.is_some());
+        // Scope the reference to release the read lock before unregister
+        {
+            let direct_ref = storage.get_direct(&cmd_id);
+            assert!(direct_ref.is_some());
 
-        if let Some(ref guard) = direct_ref {
-            assert_eq!(guard.info.command_id, cmd_id);
-            assert_eq!(guard.info.session_id, session_id);
+            if let Some(ref guard) = direct_ref {
+                assert_eq!(guard.info.command_id, cmd_id);
+                assert_eq!(guard.info.session_id, session_id);
+            }
         }
 
-        // Cleanup
+        // Cleanup - now safe since read lock is released
         storage.unregister(&cmd_id);
     }
 }

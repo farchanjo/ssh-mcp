@@ -13,7 +13,6 @@ use crate::mcp::session::SshClientHandler;
 /// Implementations must be thread-safe (`Send + Sync`) for use across
 /// async tasks. Each strategy represents a different authentication
 /// method (password, key file, SSH agent, etc.).
-#[allow(dead_code)]
 #[async_trait]
 pub trait AuthStrategy: Send + Sync {
     /// Attempt to authenticate with the SSH server.

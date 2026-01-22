@@ -26,12 +26,10 @@ use super::{AgentAuth, KeyAuth, PasswordAuth};
 ///
 /// let result = chain.authenticate(&mut handle, "username").await?;
 /// ```
-#[allow(dead_code)]
 pub struct AuthChain {
     strategies: Vec<Box<dyn AuthStrategy>>,
 }
 
-#[allow(dead_code)]
 impl AuthChain {
     /// Create a new empty authentication chain.
     pub fn new() -> Self {
@@ -64,6 +62,7 @@ impl AuthChain {
     }
 
     /// Get the number of strategies in the chain.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.strategies.len()
     }
