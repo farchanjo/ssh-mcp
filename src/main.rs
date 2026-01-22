@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("MCP Server with SSH client support is ready");
     info!("Use the ssh_connect command to establish SSH connections");
+    #[cfg(feature = "port_forward")]
     info!("Use the ssh_forward command to set up port forwarding");
 
     // Run the MCP server

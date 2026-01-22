@@ -23,6 +23,12 @@ pub struct SessionInfo {
     pub retry_attempts: u32,
     /// Whether compression is enabled for this session
     pub compression_enabled: bool,
+    /// Timestamp of last health check (RFC3339 format)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_health_check: Option<String>,
+    /// Whether session passed last health check
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthy: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -44,7 +50,7 @@ pub struct SshCommandResponse {
     pub timed_out: bool,
 }
 
-#[cfg(feature = "port_forward")]
+/// Port forwarding response (only functional when port_forward feature is enabled)
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PortForwardingResponse {
     pub local_address: String,
@@ -212,6 +218,8 @@ mod response_serialization {
                 default_timeout_secs: 30,
                 retry_attempts: 1,
                 compression_enabled: true,
+                last_health_check: Some("2024-01-15T10:35:00Z".to_string()),
+                healthy: Some(true),
             };
 
             let json = serde_json::to_string(&info).unwrap();
@@ -225,6 +233,11 @@ mod response_serialization {
             assert_eq!(deserialized.default_timeout_secs, 30);
             assert_eq!(deserialized.retry_attempts, 1);
             assert!(deserialized.compression_enabled);
+            assert_eq!(
+                deserialized.last_health_check,
+                Some("2024-01-15T10:35:00Z".to_string())
+            );
+            assert_eq!(deserialized.healthy, Some(true));
         }
 
         #[test]
@@ -238,15 +251,22 @@ mod response_serialization {
                 default_timeout_secs: 30,
                 retry_attempts: 0,
                 compression_enabled: true,
+                last_health_check: None,
+                healthy: None,
             };
 
             let json = serde_json::to_string(&info).unwrap();
             // When name is None, it should not appear in JSON due to skip_serializing_if
             // Check for "name": pattern to avoid matching "username"
             assert!(!json.contains("\"name\":"));
+            // Health check fields should also be omitted when None
+            assert!(!json.contains("\"last_health_check\":"));
+            assert!(!json.contains("\"healthy\":"));
 
             let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized.name, None);
+            assert_eq!(deserialized.last_health_check, None);
+            assert_eq!(deserialized.healthy, None);
         }
 
         #[test]
@@ -260,6 +280,8 @@ mod response_serialization {
                 default_timeout_secs: 60,
                 retry_attempts: 0,
                 compression_enabled: false,
+                last_health_check: Some("2024-01-15T10:30:00Z".to_string()),
+                healthy: Some(true),
             };
 
             let cloned = info.clone();
@@ -267,6 +289,8 @@ mod response_serialization {
             assert_eq!(cloned.session_id, info.session_id);
             assert_eq!(cloned.name, info.name);
             assert_eq!(cloned.compression_enabled, info.compression_enabled);
+            assert_eq!(cloned.last_health_check, info.last_health_check);
+            assert_eq!(cloned.healthy, info.healthy);
         }
     }
 
@@ -298,6 +322,8 @@ mod response_serialization {
                 default_timeout_secs: 30,
                 retry_attempts: 0,
                 compression_enabled: true,
+                last_health_check: Some("2024-01-15T10:30:00Z".to_string()),
+                healthy: Some(true),
             };
             let session2 = SessionInfo {
                 session_id: "s2".to_string(),
@@ -308,6 +334,8 @@ mod response_serialization {
                 default_timeout_secs: 60,
                 retry_attempts: 2,
                 compression_enabled: false,
+                last_health_check: None,
+                healthy: None,
             };
 
             let response = SessionListResponse {
@@ -325,8 +353,10 @@ mod response_serialization {
                 deserialized.sessions[0].name,
                 Some("production".to_string())
             );
+            assert_eq!(deserialized.sessions[0].healthy, Some(true));
             assert_eq!(deserialized.sessions[1].session_id, "s2");
             assert_eq!(deserialized.sessions[1].name, None);
+            assert_eq!(deserialized.sessions[1].healthy, None);
         }
     }
 
