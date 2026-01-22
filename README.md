@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-131%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-136%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -19,7 +19,7 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
 - **Modular codebase** - 9 focused modules instead of 1 monolithic file
-- **Comprehensive tests** - 131 unit tests covering all functionality
+- **Comprehensive tests** - 136 unit tests covering all functionality
 
 ---
 
@@ -34,8 +34,8 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **C Dependencies** | Requires libssh2, openssl | None - pure Rust |
 | **Thread Safety** | `Session` is `!Send` (requires `std::thread`) | `Handle` is `Send + Sync` |
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
-| **Architecture** | Single ~800 line file | 9 modules, 3400+ lines |
-| **Test Coverage** | 0 tests | 131 unit tests |
+| **Architecture** | Single ~800 line file | 9 modules, 4100+ lines |
+| **Test Coverage** | 0 tests | 136 unit tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -53,7 +53,7 @@ ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
 - Modular architecture (9 files)
-- Comprehensive test suite (131 tests)
+- Comprehensive test suite (136 tests)
 - Async command execution (background commands with polling)
 - Error classification for smart retries
 - Documentation with Mermaid diagrams
@@ -94,7 +94,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 131 tests
+cargo test --all-features  # 136 tests
 ```
 
 ### Install
@@ -385,7 +385,7 @@ while True:
 
 ### Limits
 
-- Max 10 concurrent async commands per session
+- Max 30 concurrent async commands per session
 - Commands auto-cleanup when session disconnects
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
@@ -414,14 +414,14 @@ Priority: **Parameter > Environment Variable > Default**
 ```
 src/mcp/
 ├── mod.rs           (23 lines)   - Module declarations
-├── types.rs         (832 lines)  - Response types (sync + async)
+├── types.rs         (916 lines)  - Response types (sync + async)
 ├── config.rs        (601 lines)  - Configuration resolution
 ├── error.rs         (359 lines)  - Error classification
-├── session.rs       (87 lines)   - Session storage
-├── client.rs        (836 lines)  - SSH connection/auth/execution
-├── async_command.rs (313 lines)  - Async command tracking
+├── session.rs       (88 lines)   - Session storage
+├── client.rs        (862 lines)  - SSH connection/auth/execution
+├── async_command.rs (398 lines)  - Async command tracking
 ├── forward.rs       (155 lines)  - Port forwarding
-└── commands.rs      (702 lines)  - MCP tool handlers
+└── commands.rs      (745 lines)  - MCP tool handlers
 ```
 
 ### Module Dependencies
@@ -518,12 +518,12 @@ cargo test --all-features -- --nocapture
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| config.rs | 34 | Configuration resolution |
+| config.rs | 33 | Configuration resolution |
 | error.rs | 29 | Error classification |
-| client.rs | 17 | Address parsing, client config |
-| types.rs | 13 | Serialization |
-| async_command.rs | 38 | Async command storage and tracking |
-| **Total** | **131** | |
+| client.rs | 22 | Address parsing, client config |
+| types.rs | 38 | Serialization |
+| async_command.rs | 14 | Async command storage and tracking |
+| **Total** | **136** | |
 
 ---
 

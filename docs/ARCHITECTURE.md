@@ -141,8 +141,9 @@ The codebase consists of **9 source files** organized into a modular structure:
   - `error: Arc<Mutex<Option<String>>>` - Error message if failed
   - `timed_out: Arc<AtomicBool>` - Whether the command timed out
 - `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
-- `ASYNC_COMMANDS` - Global storage `Lazy<Mutex<HashMap<String, RunningCommand>>>`
-- `MAX_ASYNC_COMMANDS_PER_SESSION` - Constant limit of 10 concurrent async commands per session
+- `ASYNC_COMMANDS` - Global storage `Lazy<DashMap<String, RunningCommand>>` (lock-free)
+- `COMMANDS_BY_SESSION` - Secondary index `Lazy<DashMap<String, HashSet<String>>>` for O(1) session lookup
+- `MAX_ASYNC_COMMANDS_PER_SESSION` - Constant limit of 30 concurrent async commands per session
 - `count_session_commands()` - Helper to count async commands for a session
 - `get_session_command_ids()` - Helper to get all command IDs for cleanup during disconnect
 
@@ -257,9 +258,9 @@ classDiagram
         +ssh_connect() StructuredContent~SshConnectResponse~
         +ssh_execute() StructuredContent~SshCommandResponse~
         +ssh_execute_async() StructuredContent~AsyncCommandResponse~
-        +ssh_poll_async() StructuredContent~AsyncPollResponse~
-        +ssh_list_async() StructuredContent~AsyncListResponse~
-        +ssh_cancel_async() Text~String~
+        +ssh_get_command_output() StructuredContent~SshAsyncOutputResponse~
+        +ssh_list_commands() StructuredContent~AsyncCommandListResponse~
+        +ssh_cancel_command() StructuredContent~SshCancelCommandResponse~
         +ssh_forward() StructuredContent~PortForwardingResponse~
         +ssh_disconnect() Text~String~
         +ssh_list_sessions() StructuredContent~SessionListResponse~
@@ -344,12 +345,12 @@ classDiagram
 
     class SSH_SESSIONS {
         <<global>>
-        Lazy~Mutex~HashMap~~
+        Lazy~DashMap~~
     }
 
     class ASYNC_COMMANDS {
         <<global>>
-        Lazy~Mutex~HashMap~~
+        Lazy~DashMap~~
     }
 
     McpSSHCommands ..> StoredSession : manages
@@ -366,8 +367,8 @@ classDiagram
     RunningCommand *-- OutputBuffer : contains
     AsyncCommandInfo --> AsyncCommandStatus : has
 
-    note for SSH_SESSIONS "Global session store using\nLazy Mutex HashMap String StoredSession"
-    note for ASYNC_COMMANDS "Global async command store using\nLazy Mutex HashMap String RunningCommand\nMax 10 commands per session"
+    note for SSH_SESSIONS "Global session store using\nLazy DashMap (lock-free)"
+    note for ASYNC_COMMANDS "Global async command store using\nLazy DashMap (lock-free)\nMax 30 commands per session"
 ```
 
 ### Component Descriptions
@@ -383,7 +384,7 @@ classDiagram
 | `OutputBuffer` | async_command.rs | Simple struct for collecting stdout/stderr from async commands |
 | `AsyncCommandInfo` | types.rs | Serializable metadata for async command tracking |
 | `AsyncCommandStatus` | types.rs | Enum representing command states: Running, Completed, Cancelled, Failed |
-| `ASYNC_COMMANDS` | async_command.rs | Global thread-safe storage for running async commands (max 10 per session) |
+| `ASYNC_COMMANDS` | async_command.rs | Global lock-free storage for running async commands (max 30 per session) |
 
 ---
 
@@ -500,11 +501,9 @@ flowchart LR
     subgraph Storage["SSH_SESSIONS"]
         direction TB
         Lazy["Lazy<br/>once_cell"]
-        Mutex["Mutex<br/>tokio sync"]
-        HashMap["HashMap<br/>String to StoredSession"]
+        DashMap["DashMap<br/>lock-free concurrent"]
 
-        Lazy --> Mutex
-        Mutex --> HashMap
+        Lazy --> DashMap
     end
 
     subgraph Sessions["Active Sessions"]
@@ -513,13 +512,13 @@ flowchart LR
         S3["StoredSession 3<br/>uuid ghi-789"]
     end
 
-    HashMap --> S1
-    HashMap --> S2
-    HashMap --> S3
+    DashMap --> S1
+    DashMap --> S2
+    DashMap --> S3
 
     subgraph SessionDetail["StoredSession Structure"]
         Info["SessionInfo<br/>Metadata"]
-        Handle["Arc Mutex Handle<br/>SSH Connection"]
+        Handle["Arc Handle<br/>SSH Connection"]
     end
 
     S1 -.-> SessionDetail
@@ -532,25 +531,22 @@ flowchart LR
 ### Storage Design Decisions
 
 1. **`Lazy` Initialization**: Sessions store is initialized on first access using `once_cell::sync::Lazy`
-2. **`tokio::sync::Mutex`**: Async-aware mutex for non-blocking lock acquisition in async contexts
-3. **`Arc<Mutex<Handle>>`**: Session handles are wrapped in `Arc<Mutex>` to allow sharing across tasks while maintaining exclusive access during operations
+2. **`DashMap`**: Lock-free concurrent hashmap that allows multiple readers/writers without blocking
+3. **`Arc<Handle>`**: Session handles are wrapped in `Arc` for sharing across tasks
 4. **UUID Session IDs**: Each session receives a unique UUID v4 identifier for tracking
 
-### Lock Scope Optimization
+### Lock-Free Access Pattern
 
-The codebase follows a strict pattern of minimizing lock scope:
+The codebase uses DashMap for lock-free concurrent access:
 
 ```rust
-// Clone Arc and release global lock immediately
-let handle_arc = {
-    let sessions = SSH_SESSIONS.lock().await;
-    sessions
-        .get(&session_id)
-        .map(|s| s.handle.clone())
-        .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
-};
+// Direct access without global lock
+let handle_arc = SSH_SESSIONS
+    .get(&session_id)
+    .map(|s| s.handle.clone())
+    .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
 
-// Actual SSH operations happen outside the global lock
+// Actual SSH operations happen with the cloned handle
 // Only the specific session's handle mutex is held
 ```
 
@@ -565,11 +561,11 @@ flowchart TB
     subgraph Storage["ASYNC_COMMANDS Storage"]
         direction TB
         Lazy2["Lazy<br/>once_cell"]
-        Mutex2["Mutex<br/>tokio sync"]
-        HashMap2["HashMap<br/>String to RunningCommand"]
+        DashMap2["DashMap<br/>lock-free concurrent"]
+        SecondaryIdx["COMMANDS_BY_SESSION<br/>DashMap session_id to Set"]
 
-        Lazy2 --> Mutex2
-        Mutex2 --> HashMap2
+        Lazy2 --> DashMap2
+        Lazy2 --> SecondaryIdx
     end
 
     subgraph RunningCmd["RunningCommand Structure"]
@@ -588,7 +584,7 @@ flowchart TB
         SSHChannel["SSH Channel I/O"]
     end
 
-    HashMap2 --> RunningCmd
+    DashMap2 --> RunningCmd
     Spawn --> ExecAsync
     ExecAsync --> SSHChannel
     ExecAsync -.-> OutputBuf
@@ -603,25 +599,25 @@ flowchart TB
 ### Async Command Flow
 
 1. **Start Command** (`ssh_execute_async`):
-   - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 10`)
+   - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 30`)
    - Create `RunningCommand` with status channel and cancellation token
    - Store in `ASYNC_COMMANDS` global storage
    - Spawn background task via `tokio::spawn(execute_ssh_command_async(...))`
    - Return `command_id` immediately to client
 
-2. **Poll for Output** (`ssh_poll_async`):
+2. **Poll for Output** (`ssh_get_command_output`):
    - Look up command by ID in `ASYNC_COMMANDS`
    - Read current output from `OutputBuffer`
    - Check status via `watch::Receiver`
    - Return partial output and current status
 
-3. **Cancel Command** (`ssh_cancel_async`):
+3. **Cancel Command** (`ssh_cancel_command`):
    - Look up command by ID
    - Call `cancel_token.cancel()` to signal cancellation
    - Background task detects cancellation and exits gracefully
    - Status updated to `Cancelled`
 
-4. **List Commands** (`ssh_list_async`):
+4. **List Commands** (`ssh_list_commands`):
    - Filter `ASYNC_COMMANDS` by session ID
    - Optionally filter by status
    - Return list of `AsyncCommandInfo`
@@ -630,7 +626,7 @@ flowchart TB
 
 | Control | Value | Purpose |
 |---------|-------|---------|
-| `MAX_ASYNC_COMMANDS_PER_SESSION` | 10 | Prevents resource exhaustion per session |
+| `MAX_ASYNC_COMMANDS_PER_SESSION` | 30 | Prevents resource exhaustion per session |
 | `Arc<Mutex<OutputBuffer>>` | - | Thread-safe output collection from background task |
 | `Arc<AtomicBool>` for `timed_out` | - | Lock-free timeout flag |
 | `watch::channel` | - | Efficient status broadcasting without locks |

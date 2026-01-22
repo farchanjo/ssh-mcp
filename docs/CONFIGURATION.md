@@ -269,7 +269,7 @@ SSH MCP supports asynchronous command execution, allowing commands to run in the
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Max concurrent async commands per session | 10 | Maximum number of async commands that can run simultaneously on a single SSH session (`MAX_ASYNC_COMMANDS_PER_SESSION`) |
+| Max concurrent async commands per session | 30 | Maximum number of async commands that can run simultaneously on a single SSH session (`MAX_ASYNC_COMMANDS_PER_SESSION`) |
 | Command timeout | 180s (default) | Maximum execution time for async commands, configurable via `SSH_COMMAND_TIMEOUT` |
 | Wait timeout | 30s (default) | Default timeout when polling for command output via `ssh_get_command_output` |
 | Max wait timeout | 300s | Maximum allowed value for `wait_timeout_secs` parameter |
@@ -296,8 +296,8 @@ Use `ssh_get_command_output` to retrieve results from async commands:
 {
   "tool": "ssh_get_command_output",
   "arguments": {
-    "session_id": "abc123",
     "command_id": "cmd-456",
+    "wait": true,
     "wait_timeout_secs": 60
   }
 }
@@ -320,8 +320,8 @@ Async commands are automatically cleaned up in the following scenarios:
 ### Best Practices
 
 1. **Monitor Active Commands**
-   - Use `ssh_list_async_commands` to check running commands before starting new ones
-   - Avoid hitting the 10-command limit by completing or canceling unused commands
+   - Use `ssh_list_commands` to check running commands before starting new ones
+   - Avoid hitting the 30-command limit by completing or canceling unused commands
 
 2. **Set Appropriate Timeouts**
    - For long-running commands, increase `SSH_COMMAND_TIMEOUT` via environment variable

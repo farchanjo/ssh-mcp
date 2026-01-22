@@ -37,14 +37,14 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 | Module | Lines | Description |
 |--------|-------|-------------|
 | **mod.rs** | 23 | Module declarations and re-exports |
-| **types.rs** | 832 | Response types (`SessionInfo`, `SshConnectResponse`, async types) |
+| **types.rs** | 916 | Response types (`SessionInfo`, `SshConnectResponse`, async types) |
 | **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
-| **session.rs** | 87 | Session storage and `SshClientHandler` |
-| **client.rs** | 836 | SSH connection, authentication, sync/async command execution |
-| **async_command.rs** | 313 | Async command storage, tracking, and helper functions |
+| **session.rs** | 88 | Session storage and `SshClientHandler` |
+| **client.rs** | 862 | SSH connection, authentication, sync/async command execution |
+| **async_command.rs** | 398 | Async command storage, tracking, and helper functions |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
-| **commands.rs** | 702 | `McpSSHCommands` MCP tool implementations |
+| **commands.rs** | 745 | `McpSSHCommands` MCP tool implementations |
 
 ### MCP Tools
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
@@ -64,7 +64,7 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 - **`SshCommandResponse`**: Contains `stdout`, `stderr`, `exit_code`, and `timed_out: bool`
   - On timeout: returns partial output collected so far with `timed_out: true` (session stays alive)
   - On success: returns full output with `timed_out: false`
-- **`SshConnectResponse`**: Message includes "[persistent session]" suffix when `persistent=true`
+- **`SshConnectResponse`**: Message includes "[persistent]" suffix when `persistent=true`
 - **`AsyncCommandInfo`**: Metadata for async commands including `command_id`, `session_id`, `command`, `status`, `started_at`
 - **`AsyncCommandStatus`**: Enum with `Running`, `Completed`, `Cancelled`, `Failed`
 - **`SshExecuteAsyncResponse`**: Response from `ssh_execute_async` with `command_id` and `message`

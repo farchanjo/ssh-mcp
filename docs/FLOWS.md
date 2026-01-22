@@ -693,7 +693,7 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     Start([ssh_execute_async]) --> CountCommands[Count session commands]
-    CountCommands --> CheckLimit{count >= 10?}
+    CountCommands --> CheckLimit{count >= 30?}
 
     CheckLimit -->|Yes| RejectError([Error: Max commands reached])
     CheckLimit -->|No| GetSession[Get session handle]
