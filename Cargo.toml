@@ -40,7 +40,9 @@ schemars = "1.0"                                   # Required by poem-mcpserver
 # Utilities
 backon = "1"                                                            # Retry with backoff
 chrono = "0.4"                                                          # For timestamps
+dashmap = "6"                                                           # Lock-free concurrent hashmap
 dotenv = "0.15"                                                         # For environment variables
+futures = "0.3"                                                         # Async utilities (join_all)
 thiserror = "1.0"                                                       # Error handling
 tracing = "0.1"                                                         # Tracing for debugging
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }     # Tracing implementation with env filter

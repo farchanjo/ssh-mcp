@@ -15,10 +15,11 @@
 //! - Maximum 10 concurrent async commands per session
 //! - Completed commands are automatically cleaned up after 5 minutes
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -30,6 +31,18 @@ use super::types::{AsyncCommandInfo, AsyncCommandStatus};
 pub struct OutputBuffer {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+impl OutputBuffer {
+    /// Create a new output buffer with pre-allocated capacity.
+    ///
+    /// Pre-allocating reduces reallocations during output collection.
+    pub fn with_capacity(stdout_cap: usize, stderr_cap: usize) -> Self {
+        Self {
+            stdout: Vec::with_capacity(stdout_cap),
+            stderr: Vec::with_capacity(stderr_cap),
+        }
+    }
 }
 
 /// State for a running async command
@@ -53,30 +66,63 @@ pub struct RunningCommand {
     pub timed_out: Arc<AtomicBool>,
 }
 
-/// Global storage for async commands
-pub static ASYNC_COMMANDS: Lazy<Mutex<HashMap<String, RunningCommand>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Global storage for async commands using lock-free DashMap.
+pub static ASYNC_COMMANDS: Lazy<DashMap<String, RunningCommand>> = Lazy::new(DashMap::new);
+
+/// Secondary index: session_id -> set of command_ids for O(1) session lookup.
+pub static COMMANDS_BY_SESSION: Lazy<DashMap<String, HashSet<String>>> = Lazy::new(DashMap::new);
 
 /// Maximum number of concurrent async commands per session
 pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 10;
 
-/// Count async commands for a specific session
-pub async fn count_session_commands(session_id: &str) -> usize {
-    let commands = ASYNC_COMMANDS.lock().await;
-    commands
-        .values()
-        .filter(|cmd| cmd.info.session_id == session_id)
-        .count()
+/// Count async commands for a specific session (O(1) lookup).
+pub fn count_session_commands(session_id: &str) -> usize {
+    COMMANDS_BY_SESSION
+        .get(session_id)
+        .map(|set| set.len())
+        .unwrap_or(0)
 }
 
-/// Get all command IDs for a session (for cleanup during disconnect)
-pub async fn get_session_command_ids(session_id: &str) -> Vec<String> {
-    let commands = ASYNC_COMMANDS.lock().await;
-    commands
-        .values()
-        .filter(|cmd| cmd.info.session_id == session_id)
-        .map(|cmd| cmd.info.command_id.clone())
-        .collect()
+/// Get all command IDs for a session (for cleanup during disconnect).
+pub fn get_session_command_ids(session_id: &str) -> Vec<String> {
+    COMMANDS_BY_SESSION
+        .get(session_id)
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Register a new async command with proper indexing.
+pub fn register_command(command_id: String, cmd: RunningCommand) {
+    let session_id = cmd.info.session_id.clone();
+
+    // Insert into primary storage
+    ASYNC_COMMANDS.insert(command_id.clone(), cmd);
+
+    // Update secondary index
+    COMMANDS_BY_SESSION
+        .entry(session_id)
+        .or_default()
+        .insert(command_id);
+}
+
+/// Unregister an async command and clean up indexes.
+pub fn unregister_command(command_id: &str) -> Option<RunningCommand> {
+    // Remove from primary storage
+    let removed = ASYNC_COMMANDS.remove(command_id).map(|(_, cmd)| cmd);
+
+    // Update secondary index if command was found
+    if let Some(ref cmd) = removed
+        && let Some(mut set) = COMMANDS_BY_SESSION.get_mut(&cmd.info.session_id)
+    {
+        set.remove(command_id);
+        // Clean up empty sets
+        if set.is_empty() {
+            drop(set);
+            COMMANDS_BY_SESSION.remove(&cmd.info.session_id);
+        }
+    }
+
+    removed
 }
 
 #[cfg(test)]
@@ -91,6 +137,15 @@ mod tests {
             let buffer = OutputBuffer::default();
             assert!(buffer.stdout.is_empty());
             assert!(buffer.stderr.is_empty());
+        }
+
+        #[test]
+        fn test_with_capacity() {
+            let buffer = OutputBuffer::with_capacity(4096, 1024);
+            assert!(buffer.stdout.is_empty());
+            assert!(buffer.stderr.is_empty());
+            assert!(buffer.stdout.capacity() >= 4096);
+            assert!(buffer.stderr.capacity() >= 1024);
         }
 
         #[test]
@@ -128,19 +183,19 @@ mod tests {
     mod helper_functions {
         use super::*;
 
-        #[tokio::test]
-        async fn test_count_session_commands_empty() {
+        #[test]
+        fn test_count_session_commands_empty() {
             // Use unique session ID to avoid interference from parallel tests
             let unique_session = format!("nonexistent-session-{}", uuid::Uuid::new_v4());
-            let count = count_session_commands(&unique_session).await;
+            let count = count_session_commands(&unique_session);
             assert_eq!(count, 0);
         }
 
-        #[tokio::test]
-        async fn test_get_session_command_ids_empty() {
+        #[test]
+        fn test_get_session_command_ids_empty() {
             // Use unique session ID to avoid interference from parallel tests
             let unique_session = format!("nonexistent-session-{}", uuid::Uuid::new_v4());
-            let ids = get_session_command_ids(&unique_session).await;
+            let ids = get_session_command_ids(&unique_session);
             assert!(ids.is_empty());
         }
 
@@ -153,102 +208,132 @@ mod tests {
             let cmd2_id = format!("test-cmd-2-{}", uuid::Uuid::new_v4());
             let cmd3_id = format!("test-cmd-3-{}", uuid::Uuid::new_v4());
 
-            // Setup test data
-            {
-                let mut commands = ASYNC_COMMANDS.lock().await;
-
-                let (tx, rx) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
-
-                // Add a test command
-                commands.insert(
-                    cmd1_id.clone(),
-                    RunningCommand {
-                        info: AsyncCommandInfo {
-                            command_id: cmd1_id.clone(),
-                            session_id: test_session.clone(),
-                            command: "echo test".to_string(),
-                            status: AsyncCommandStatus::Running,
-                            started_at: "2024-01-15T10:30:00Z".to_string(),
-                        },
-                        cancel_token: CancellationToken::new(),
-                        status_rx: rx.clone(),
-                        status_tx: tx.clone(),
-                        output: Arc::new(Mutex::new(OutputBuffer::default())),
-                        exit_code: Arc::new(Mutex::new(None)),
-                        error: Arc::new(Mutex::new(None)),
-                        timed_out: Arc::new(AtomicBool::new(false)),
+            // Setup test data using register_command
+            let (tx1, rx1) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
+            register_command(
+                cmd1_id.clone(),
+                RunningCommand {
+                    info: AsyncCommandInfo {
+                        command_id: cmd1_id.clone(),
+                        session_id: test_session.clone(),
+                        command: "echo test".to_string(),
+                        status: AsyncCommandStatus::Running,
+                        started_at: "2024-01-15T10:30:00Z".to_string(),
                     },
-                );
+                    cancel_token: CancellationToken::new(),
+                    status_rx: rx1,
+                    status_tx: tx1,
+                    output: Arc::new(Mutex::new(OutputBuffer::default())),
+                    exit_code: Arc::new(Mutex::new(None)),
+                    error: Arc::new(Mutex::new(None)),
+                    timed_out: Arc::new(AtomicBool::new(false)),
+                },
+            );
 
-                // Add another command for same session
-                let (tx2, rx2) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
-                commands.insert(
-                    cmd2_id.clone(),
-                    RunningCommand {
-                        info: AsyncCommandInfo {
-                            command_id: cmd2_id.clone(),
-                            session_id: test_session.clone(),
-                            command: "ls -la".to_string(),
-                            status: AsyncCommandStatus::Running,
-                            started_at: "2024-01-15T10:31:00Z".to_string(),
-                        },
-                        cancel_token: CancellationToken::new(),
-                        status_rx: rx2,
-                        status_tx: tx2,
-                        output: Arc::new(Mutex::new(OutputBuffer::default())),
-                        exit_code: Arc::new(Mutex::new(None)),
-                        error: Arc::new(Mutex::new(None)),
-                        timed_out: Arc::new(AtomicBool::new(false)),
+            // Add another command for same session
+            let (tx2, rx2) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
+            register_command(
+                cmd2_id.clone(),
+                RunningCommand {
+                    info: AsyncCommandInfo {
+                        command_id: cmd2_id.clone(),
+                        session_id: test_session.clone(),
+                        command: "ls -la".to_string(),
+                        status: AsyncCommandStatus::Running,
+                        started_at: "2024-01-15T10:31:00Z".to_string(),
                     },
-                );
+                    cancel_token: CancellationToken::new(),
+                    status_rx: rx2,
+                    status_tx: tx2,
+                    output: Arc::new(Mutex::new(OutputBuffer::default())),
+                    exit_code: Arc::new(Mutex::new(None)),
+                    error: Arc::new(Mutex::new(None)),
+                    timed_out: Arc::new(AtomicBool::new(false)),
+                },
+            );
 
-                // Add command for different session
-                let (tx3, rx3) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
-                commands.insert(
-                    cmd3_id.clone(),
-                    RunningCommand {
-                        info: AsyncCommandInfo {
-                            command_id: cmd3_id.clone(),
-                            session_id: other_session.clone(),
-                            command: "pwd".to_string(),
-                            status: AsyncCommandStatus::Running,
-                            started_at: "2024-01-15T10:32:00Z".to_string(),
-                        },
-                        cancel_token: CancellationToken::new(),
-                        status_rx: rx3,
-                        status_tx: tx3,
-                        output: Arc::new(Mutex::new(OutputBuffer::default())),
-                        exit_code: Arc::new(Mutex::new(None)),
-                        error: Arc::new(Mutex::new(None)),
-                        timed_out: Arc::new(AtomicBool::new(false)),
+            // Add command for different session
+            let (tx3, rx3) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
+            register_command(
+                cmd3_id.clone(),
+                RunningCommand {
+                    info: AsyncCommandInfo {
+                        command_id: cmd3_id.clone(),
+                        session_id: other_session.clone(),
+                        command: "pwd".to_string(),
+                        status: AsyncCommandStatus::Running,
+                        started_at: "2024-01-15T10:32:00Z".to_string(),
                     },
-                );
-            }
+                    cancel_token: CancellationToken::new(),
+                    status_rx: rx3,
+                    status_tx: tx3,
+                    output: Arc::new(Mutex::new(OutputBuffer::default())),
+                    exit_code: Arc::new(Mutex::new(None)),
+                    error: Arc::new(Mutex::new(None)),
+                    timed_out: Arc::new(AtomicBool::new(false)),
+                },
+            );
 
-            // Test count_session_commands
-            let count = count_session_commands(&test_session).await;
+            // Test count_session_commands (now sync, O(1))
+            let count = count_session_commands(&test_session);
             assert_eq!(count, 2);
 
-            let other_count = count_session_commands(&other_session).await;
+            let other_count = count_session_commands(&other_session);
             assert_eq!(other_count, 1);
 
-            // Test get_session_command_ids
-            let ids = get_session_command_ids(&test_session).await;
+            // Test get_session_command_ids (now sync, O(1))
+            let ids = get_session_command_ids(&test_session);
             assert_eq!(ids.len(), 2);
             assert!(ids.contains(&cmd1_id));
             assert!(ids.contains(&cmd2_id));
 
-            let other_ids = get_session_command_ids(&other_session).await;
+            let other_ids = get_session_command_ids(&other_session);
             assert_eq!(other_ids.len(), 1);
             assert!(other_ids.contains(&cmd3_id));
 
-            // Cleanup only our test commands
-            {
-                let mut commands = ASYNC_COMMANDS.lock().await;
-                commands.remove(&cmd1_id);
-                commands.remove(&cmd2_id);
-                commands.remove(&cmd3_id);
-            }
+            // Cleanup using unregister_command
+            unregister_command(&cmd1_id);
+            unregister_command(&cmd2_id);
+            unregister_command(&cmd3_id);
+
+            // Verify cleanup
+            assert_eq!(count_session_commands(&test_session), 0);
+            assert_eq!(count_session_commands(&other_session), 0);
+        }
+
+        #[test]
+        fn test_register_and_unregister() {
+            let session_id = format!("test-register-{}", uuid::Uuid::new_v4());
+            let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+            let (tx, rx) = tokio::sync::watch::channel(AsyncCommandStatus::Running);
+            register_command(
+                cmd_id.clone(),
+                RunningCommand {
+                    info: AsyncCommandInfo {
+                        command_id: cmd_id.clone(),
+                        session_id: session_id.clone(),
+                        command: "test".to_string(),
+                        status: AsyncCommandStatus::Running,
+                        started_at: "2024-01-15T10:30:00Z".to_string(),
+                    },
+                    cancel_token: CancellationToken::new(),
+                    status_rx: rx,
+                    status_tx: tx,
+                    output: Arc::new(Mutex::new(OutputBuffer::default())),
+                    exit_code: Arc::new(Mutex::new(None)),
+                    error: Arc::new(Mutex::new(None)),
+                    timed_out: Arc::new(AtomicBool::new(false)),
+                },
+            );
+
+            assert_eq!(count_session_commands(&session_id), 1);
+            assert!(ASYNC_COMMANDS.contains_key(&cmd_id));
+
+            let removed = unregister_command(&cmd_id);
+            assert!(removed.is_some());
+            assert_eq!(count_session_commands(&session_id), 0);
+            assert!(!ASYNC_COMMANDS.contains_key(&cmd_id));
         }
     }
 

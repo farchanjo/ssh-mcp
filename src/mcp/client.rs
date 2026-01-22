@@ -453,8 +453,9 @@ pub(crate) async fn execute_ssh_command(
         .await
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    // Pre-allocate buffers to reduce reallocations during output collection
+    let mut stdout = Vec::with_capacity(4096);
+    let mut stderr = Vec::with_capacity(1024);
     let mut exit_code: Option<u32> = None;
     let mut timed_out = false;
 
@@ -595,7 +596,13 @@ pub(crate) async fn execute_ssh_command_async(
     }
 }
 
+/// Flush threshold for batched output (8KB)
+const FLUSH_THRESHOLD: usize = 8192;
+
 /// Collect output from an SSH channel into the shared buffer.
+///
+/// Uses batched writes to reduce lock contention - data is accumulated
+/// in local buffers and flushed to the shared buffer periodically or on exit.
 ///
 /// Returns the exit code when the channel closes.
 async fn collect_async_output(
@@ -606,17 +613,29 @@ async fn collect_async_output(
 
     let mut exit_code: Option<i32> = None;
 
+    // Local buffers to batch output and reduce lock contention
+    let mut local_stdout = Vec::with_capacity(4096);
+    let mut local_stderr = Vec::with_capacity(1024);
+
     loop {
         match channel.wait().await {
             Some(ChannelMsg::Data { data }) => {
-                let mut buf = output.lock().await;
-                buf.stdout.extend_from_slice(&data);
+                local_stdout.extend_from_slice(&data);
+                // Flush when buffer exceeds threshold
+                if local_stdout.len() >= FLUSH_THRESHOLD {
+                    let mut buf = output.lock().await;
+                    buf.stdout.append(&mut local_stdout);
+                }
             }
             Some(ChannelMsg::ExtendedData { data, ext }) => {
                 // ext == 1 is stderr in SSH protocol
                 if ext == 1 {
-                    let mut buf = output.lock().await;
-                    buf.stderr.extend_from_slice(&data);
+                    local_stderr.extend_from_slice(&data);
+                    // Flush when buffer exceeds threshold
+                    if local_stderr.len() >= FLUSH_THRESHOLD {
+                        let mut buf = output.lock().await;
+                        buf.stderr.append(&mut local_stderr);
+                    }
                 }
             }
             Some(ChannelMsg::ExitStatus { exit_status }) => {
@@ -639,6 +658,13 @@ async fn collect_async_output(
                 break;
             }
         }
+    }
+
+    // Final flush of remaining local data
+    if !local_stdout.is_empty() || !local_stderr.is_empty() {
+        let mut buf = output.lock().await;
+        buf.stdout.append(&mut local_stdout);
+        buf.stderr.append(&mut local_stderr);
     }
 
     // Close channel gracefully
