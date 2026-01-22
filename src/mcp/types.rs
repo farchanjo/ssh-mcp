@@ -14,6 +14,9 @@ pub struct SessionInfo {
     /// Optional human-readable name for the session (useful for LLM identification)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional agent identifier for grouping sessions by agent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub host: String,
     pub username: String,
     pub connected_at: String,
@@ -34,6 +37,9 @@ pub struct SessionInfo {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshConnectResponse {
     pub session_id: String,
+    /// Agent ID echoed back for LLM memory (if provided during connect)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub message: String,
     pub authenticated: bool,
     /// Number of retry attempts needed to establish the connection
@@ -98,6 +104,9 @@ pub struct SshExecuteResponse {
     pub command_id: String,
     /// Session ID where the command is running
     pub session_id: String,
+    /// Agent ID that owns this session (if set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// The command that was started
     pub command: String,
     /// When the command was started (RFC3339 format)
@@ -143,6 +152,19 @@ pub struct SshCancelCommandResponse {
     pub stderr: String,
 }
 
+/// Response from ssh_disconnect_agent
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AgentDisconnectResponse {
+    /// Agent ID that was disconnected
+    pub agent_id: String,
+    /// Number of sessions that were disconnected
+    pub sessions_disconnected: usize,
+    /// Number of async commands that were cancelled
+    pub commands_cancelled: usize,
+    /// Human-readable message
+    pub message: String,
+}
+
 /// Information about a single async command
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AsyncCommandInfo {
@@ -178,6 +200,7 @@ mod response_serialization {
         fn test_serialize_and_deserialize() {
             let response = SshConnectResponse {
                 session_id: "test-uuid-123".to_string(),
+                agent_id: Some("my-agent".to_string()),
                 message: "Connected successfully".to_string(),
                 authenticated: true,
                 retry_attempts: 2,
@@ -187,6 +210,7 @@ mod response_serialization {
             let deserialized: SshConnectResponse = serde_json::from_str(&json).unwrap();
 
             assert_eq!(deserialized.session_id, "test-uuid-123");
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
             assert_eq!(deserialized.message, "Connected successfully");
             assert!(deserialized.authenticated);
             assert_eq!(deserialized.retry_attempts, 2);
@@ -196,6 +220,7 @@ mod response_serialization {
         fn test_json_structure() {
             let response = SshConnectResponse {
                 session_id: "abc".to_string(),
+                agent_id: None,
                 message: "msg".to_string(),
                 authenticated: false,
                 retry_attempts: 0,
@@ -207,6 +232,37 @@ mod response_serialization {
             assert!(json.get("message").is_some());
             assert!(json.get("authenticated").is_some());
             assert!(json.get("retry_attempts").is_some());
+            // agent_id should be omitted when None
+            assert!(json.get("agent_id").is_none());
+        }
+
+        #[test]
+        fn test_agent_id_omitted_when_none() {
+            let response = SshConnectResponse {
+                session_id: "abc".to_string(),
+                agent_id: None,
+                message: "msg".to_string(),
+                authenticated: true,
+                retry_attempts: 0,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("agent_id"));
+        }
+
+        #[test]
+        fn test_agent_id_included_when_some() {
+            let response = SshConnectResponse {
+                session_id: "abc".to_string(),
+                agent_id: Some("my-agent-id".to_string()),
+                message: "msg".to_string(),
+                authenticated: true,
+                retry_attempts: 0,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains("agent_id"));
+            assert!(json.contains("my-agent-id"));
         }
 
         #[test]
@@ -214,12 +270,16 @@ mod response_serialization {
             // Simulate the actual message format from ssh_connect
             let session_id = "test-uuid-123";
             let message = format!(
-                "Connected to user@host. Use session_id '{}' with ssh_execute to run commands.",
-                session_id
+                "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n\
+                • session_id: '{}'\n\
+                • host: user@host:22\n\n\
+                Use ssh_execute with session_id '{}' to run commands.",
+                session_id, session_id
             );
 
             let response = SshConnectResponse {
                 session_id: session_id.to_string(),
+                agent_id: None,
                 message: message.clone(),
                 authenticated: true,
                 retry_attempts: 0,
@@ -230,7 +290,7 @@ mod response_serialization {
             assert!(
                 response
                     .message
-                    .contains(&format!("session_id '{}'", session_id))
+                    .contains(&format!("session_id: '{}'", session_id))
             );
         }
 
@@ -239,16 +299,23 @@ mod response_serialization {
             // Simulate message with optional name and retry parts
             let session_id = "test-uuid-456";
             let name = "production-db";
+            let agent_id = "my-agent";
             let retry_attempts = 2;
 
             let message = format!(
-                "Connected to user@host (name: '{}') after {} retry attempt(s). \
-                Use session_id '{}' with ssh_execute to run commands.",
-                name, retry_attempts, session_id
+                "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n\
+                • agent_id: '{}'\n\
+                • session_id: '{}'\n\
+                • name: '{}'\n\
+                • host: user@host:22\n\
+                • retry_attempts: {}\n\n\
+                Use ssh_execute with session_id '{}' to run commands.",
+                agent_id, session_id, name, retry_attempts, session_id
             );
 
             let response = SshConnectResponse {
                 session_id: session_id.to_string(),
+                agent_id: Some(agent_id.to_string()),
                 message,
                 authenticated: true,
                 retry_attempts: retry_attempts as u32,
@@ -259,7 +326,12 @@ mod response_serialization {
             assert!(
                 response
                     .message
-                    .contains(&format!("{} retry attempt(s)", retry_attempts))
+                    .contains(&format!("retry_attempts: {}", retry_attempts))
+            );
+            assert!(
+                response
+                    .message
+                    .contains(&format!("agent_id: '{}'", agent_id))
             );
         }
 
@@ -267,21 +339,25 @@ mod response_serialization {
         fn test_message_with_persistent_suffix() {
             // Simulate message with persistent suffix
             let session_id = "test-uuid-789";
-            let base_message = format!(
-                "Connected to user@host. Use session_id '{}' with ssh_execute to run commands.",
-                session_id
+            let message = format!(
+                "SSH CONNECTION ESTABLISHED. REMEMBER THESE IDENTIFIERS:\n\
+                • session_id: '{}'\n\
+                • host: user@host:22\n\
+                • persistent: true\n\n\
+                Use ssh_execute with session_id '{}' to run commands.",
+                session_id, session_id
             );
-            let message = format!("{} [persistent]", base_message);
 
             let response = SshConnectResponse {
                 session_id: session_id.to_string(),
+                agent_id: None,
                 message,
                 authenticated: true,
                 retry_attempts: 0,
             };
 
-            // Verify persistent suffix is present
-            assert!(response.message.ends_with("[persistent]"));
+            // Verify persistent is present
+            assert!(response.message.contains("persistent: true"));
         }
     }
 
@@ -388,6 +464,7 @@ mod response_serialization {
             let info = SessionInfo {
                 session_id: "uuid-123".to_string(),
                 name: Some("production-db".to_string()),
+                agent_id: Some("my-agent".to_string()),
                 host: "192.168.1.1:22".to_string(),
                 username: "testuser".to_string(),
                 connected_at: "2024-01-15T10:30:00Z".to_string(),
@@ -403,6 +480,7 @@ mod response_serialization {
 
             assert_eq!(deserialized.session_id, "uuid-123");
             assert_eq!(deserialized.name, Some("production-db".to_string()));
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
             assert_eq!(deserialized.host, "192.168.1.1:22");
             assert_eq!(deserialized.username, "testuser");
             assert_eq!(deserialized.connected_at, "2024-01-15T10:30:00Z");
@@ -417,10 +495,11 @@ mod response_serialization {
         }
 
         #[test]
-        fn test_serialize_without_name() {
+        fn test_serialize_without_name_or_agent_id() {
             let info = SessionInfo {
                 session_id: "uuid-456".to_string(),
                 name: None,
+                agent_id: None,
                 host: "192.168.1.1:22".to_string(),
                 username: "testuser".to_string(),
                 connected_at: "2024-01-15T10:30:00Z".to_string(),
@@ -435,14 +514,41 @@ mod response_serialization {
             // When name is None, it should not appear in JSON due to skip_serializing_if
             // Check for "name": pattern to avoid matching "username"
             assert!(!json.contains("\"name\":"));
+            // agent_id should also be omitted when None
+            assert!(!json.contains("\"agent_id\":"));
             // Health check fields should also be omitted when None
             assert!(!json.contains("\"last_health_check\":"));
             assert!(!json.contains("\"healthy\":"));
 
             let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized.name, None);
+            assert_eq!(deserialized.agent_id, None);
             assert_eq!(deserialized.last_health_check, None);
             assert_eq!(deserialized.healthy, None);
+        }
+
+        #[test]
+        fn test_serialize_with_agent_id() {
+            let info = SessionInfo {
+                session_id: "uuid-789".to_string(),
+                name: None,
+                agent_id: Some("claude-code-agent".to_string()),
+                host: "192.168.1.1:22".to_string(),
+                username: "testuser".to_string(),
+                connected_at: "2024-01-15T10:30:00Z".to_string(),
+                default_timeout_secs: 30,
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: None,
+            };
+
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(json.contains("\"agent_id\":"));
+            assert!(json.contains("claude-code-agent"));
+
+            let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.agent_id, Some("claude-code-agent".to_string()));
         }
 
         #[test]
@@ -450,6 +556,7 @@ mod response_serialization {
             let info = SessionInfo {
                 session_id: "clone-test".to_string(),
                 name: Some("test-session".to_string()),
+                agent_id: Some("agent-1".to_string()),
                 host: "host".to_string(),
                 username: "user".to_string(),
                 connected_at: "now".to_string(),
@@ -464,6 +571,7 @@ mod response_serialization {
 
             assert_eq!(cloned.session_id, info.session_id);
             assert_eq!(cloned.name, info.name);
+            assert_eq!(cloned.agent_id, info.agent_id);
             assert_eq!(cloned.compression_enabled, info.compression_enabled);
             assert_eq!(cloned.last_health_check, info.last_health_check);
             assert_eq!(cloned.healthy, info.healthy);
@@ -492,6 +600,7 @@ mod response_serialization {
             let session1 = SessionInfo {
                 session_id: "s1".to_string(),
                 name: Some("production".to_string()),
+                agent_id: Some("agent-1".to_string()),
                 host: "host1".to_string(),
                 username: "user1".to_string(),
                 connected_at: "t1".to_string(),
@@ -504,6 +613,7 @@ mod response_serialization {
             let session2 = SessionInfo {
                 session_id: "s2".to_string(),
                 name: None,
+                agent_id: None,
                 host: "host2".to_string(),
                 username: "user2".to_string(),
                 connected_at: "t2".to_string(),
@@ -529,9 +639,14 @@ mod response_serialization {
                 deserialized.sessions[0].name,
                 Some("production".to_string())
             );
+            assert_eq!(
+                deserialized.sessions[0].agent_id,
+                Some("agent-1".to_string())
+            );
             assert_eq!(deserialized.sessions[0].healthy, Some(true));
             assert_eq!(deserialized.sessions[1].session_id, "s2");
             assert_eq!(deserialized.sessions[1].name, None);
+            assert_eq!(deserialized.sessions[1].agent_id, None);
             assert_eq!(deserialized.sessions[1].healthy, None);
         }
     }
@@ -640,6 +755,7 @@ mod response_serialization {
             let response = SshExecuteResponse {
                 command_id: "cmd-123".to_string(),
                 session_id: "sess-456".to_string(),
+                agent_id: Some("my-agent".to_string()),
                 command: "sleep 10".to_string(),
                 started_at: "2024-01-15T10:30:00Z".to_string(),
                 message: "Command started".to_string(),
@@ -650,6 +766,7 @@ mod response_serialization {
 
             assert_eq!(deserialized.command_id, "cmd-123");
             assert_eq!(deserialized.session_id, "sess-456");
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
             assert_eq!(deserialized.command, "sleep 10");
             assert_eq!(deserialized.started_at, "2024-01-15T10:30:00Z");
             assert_eq!(deserialized.message, "Command started");
@@ -660,6 +777,7 @@ mod response_serialization {
             let response = SshExecuteResponse {
                 command_id: "id".to_string(),
                 session_id: "sid".to_string(),
+                agent_id: None,
                 command: "cmd".to_string(),
                 started_at: "time".to_string(),
                 message: "msg".to_string(),
@@ -671,6 +789,39 @@ mod response_serialization {
             assert!(json.get("command").is_some());
             assert!(json.get("started_at").is_some());
             assert!(json.get("message").is_some());
+            // agent_id should be omitted when None
+            assert!(json.get("agent_id").is_none());
+        }
+
+        #[test]
+        fn test_agent_id_omitted_when_none() {
+            let response = SshExecuteResponse {
+                command_id: "id".to_string(),
+                session_id: "sid".to_string(),
+                agent_id: None,
+                command: "cmd".to_string(),
+                started_at: "time".to_string(),
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("agent_id"));
+        }
+
+        #[test]
+        fn test_agent_id_included_when_some() {
+            let response = SshExecuteResponse {
+                command_id: "id".to_string(),
+                session_id: "sid".to_string(),
+                agent_id: Some("agent-123".to_string()),
+                command: "cmd".to_string(),
+                started_at: "time".to_string(),
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains("agent_id"));
+            assert!(json.contains("agent-123"));
         }
     }
 
@@ -902,6 +1053,60 @@ mod response_serialization {
                 deserialized.commands[1].status,
                 AsyncCommandStatus::Completed
             );
+        }
+    }
+
+    mod agent_disconnect_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = AgentDisconnectResponse {
+                agent_id: "my-agent-123".to_string(),
+                sessions_disconnected: 3,
+                commands_cancelled: 5,
+                message: "All sessions disconnected".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: AgentDisconnectResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.agent_id, "my-agent-123");
+            assert_eq!(deserialized.sessions_disconnected, 3);
+            assert_eq!(deserialized.commands_cancelled, 5);
+            assert_eq!(deserialized.message, "All sessions disconnected");
+        }
+
+        #[test]
+        fn test_zero_counts() {
+            let response = AgentDisconnectResponse {
+                agent_id: "agent-with-no-sessions".to_string(),
+                sessions_disconnected: 0,
+                commands_cancelled: 0,
+                message: "No sessions found for agent".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: AgentDisconnectResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.sessions_disconnected, 0);
+            assert_eq!(deserialized.commands_cancelled, 0);
+        }
+
+        #[test]
+        fn test_json_structure() {
+            let response = AgentDisconnectResponse {
+                agent_id: "agent".to_string(),
+                sessions_disconnected: 1,
+                commands_cancelled: 2,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_value(&response).unwrap();
+            assert!(json.get("agent_id").is_some());
+            assert!(json.get("sessions_disconnected").is_some());
+            assert!(json.get("commands_cancelled").is_some());
+            assert!(json.get("message").is_some());
         }
     }
 }

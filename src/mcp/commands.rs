@@ -34,11 +34,14 @@ use super::config::{
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
-use super::session::{SSH_SESSIONS, StoredSession};
+use super::session::{
+    SSH_SESSIONS, StoredSession, get_agent_session_ids, register_session_agent,
+    remove_agent_sessions, unregister_session_agent,
+};
 use super::types::{
-    AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse, SessionInfo, SessionListResponse,
-    SshAsyncOutputResponse, SshCancelCommandResponse, SshConnectResponse, SshExecuteResponse,
-    SshListCommandsResponse,
+    AgentDisconnectResponse, AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse,
+    SessionInfo, SessionListResponse, SshAsyncOutputResponse, SshCancelCommandResponse,
+    SshConnectResponse, SshExecuteResponse, SshListCommandsResponse,
 };
 
 /// MCP SSH Commands tool implementation.
@@ -47,13 +50,106 @@ use super::types::{
 /// executing commands, and managing port forwarding.
 pub struct McpSSHCommands;
 
+/// Build a descriptive connection message for LLM memory.
+#[allow(clippy::too_many_arguments)]
+fn build_connect_message(
+    session_id: &str,
+    agent_id: Option<&str>,
+    name: Option<&str>,
+    username: &str,
+    host: &str,
+    retry_attempts: u32,
+    persistent: bool,
+    reused: bool,
+) -> String {
+    let header = if reused {
+        "SESSION REUSED"
+    } else {
+        "SSH CONNECTION ESTABLISHED"
+    };
+
+    let mut lines = vec![format!("{}. REMEMBER THESE IDENTIFIERS:", header)];
+
+    if let Some(aid) = agent_id {
+        lines.push(format!("• agent_id: '{}'", aid));
+    }
+    lines.push(format!("• session_id: '{}'", session_id));
+    if let Some(n) = name {
+        lines.push(format!("• name: '{}'", n));
+    }
+    lines.push(format!("• host: {}@{}", username, host));
+    if retry_attempts > 0 {
+        lines.push(format!("• retry_attempts: {}", retry_attempts));
+    }
+    if persistent {
+        lines.push("• persistent: true".to_string());
+    }
+
+    lines.push(String::new()); // empty line
+    lines.push(format!(
+        "Use ssh_execute with session_id '{}' to run commands.",
+        session_id
+    ));
+    if let Some(aid) = agent_id {
+        lines.push(format!(
+            "Use ssh_disconnect_agent with agent_id '{}' to disconnect all sessions for this agent.",
+            aid
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// Build a descriptive command start message for LLM memory.
+fn build_execute_message(
+    command_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    command: &str,
+) -> String {
+    let mut lines = vec![
+        "COMMAND STARTED. REMEMBER THESE IDENTIFIERS:".to_string(),
+        format!("• command_id: '{}'", command_id),
+        format!("• session_id: '{}'", session_id),
+    ];
+
+    if let Some(aid) = agent_id {
+        lines.push(format!("• agent_id: '{}'", aid));
+    }
+
+    // Truncate command if too long
+    let cmd_display = if command.len() > 50 {
+        format!("{}...", &command[..47])
+    } else {
+        command.to_string()
+    };
+    lines.push(format!("• command: '{}'", cmd_display));
+
+    lines.push(String::new()); // empty line
+    lines.push(format!(
+        "Use ssh_get_command_output with command_id '{}' to poll for results.",
+        command_id
+    ));
+    lines.push(format!(
+        "Use ssh_cancel_command with command_id '{}' to cancel.",
+        command_id
+    ));
+
+    lines.join("\n")
+}
+
 #[Tools]
 impl McpSSHCommands {
     /// Connect to an SSH server and store the session.
     ///
-    /// Returns a session_id for subsequent commands. For long-running operations
-    /// (builds, deployments, batch processing), `ssh_execute` provides non-blocking
-    /// execution with progress monitoring and cancellation support.
+    /// Returns session_id and optional agent_id that you MUST remember for subsequent commands.
+    ///
+    /// **Important identifiers in response:**
+    /// - `session_id`: Use with ssh_execute, ssh_disconnect
+    /// - `agent_id`: Use with ssh_list_sessions (filter), ssh_disconnect_agent (cleanup)
+    ///
+    /// For long-running operations (builds, deployments, batch processing),
+    /// `ssh_execute` provides non-blocking execution with progress monitoring.
     ///
     /// Use `persistent=true` for sessions that should remain open indefinitely.
     #[allow(clippy::too_many_arguments)]
@@ -81,6 +177,8 @@ impl McpSSHCommands {
         name: Option<String>,
         /// Keep session open indefinitely until explicitly disconnected (disables inactivity timeout, default: false)
         persistent: Option<bool>,
+        /// Optional agent identifier for grouping sessions (e.g., "claude-code-instance-abc123"). Use ssh_disconnect_agent to disconnect all sessions for an agent.
+        agent_id: Option<String>,
     ) -> Result<StructuredContent<SshConnectResponse>, String> {
         let timeout = resolve_connect_timeout(timeout_secs);
         let max_retries_val = resolve_max_retries(max_retries);
@@ -109,18 +207,21 @@ impl McpSSHCommands {
                         }
 
                         info!("Reusing healthy session {}", sid);
+                        let reuse_agent_id = info.agent_id.clone();
+                        let message = build_connect_message(
+                            sid,
+                            reuse_agent_id.as_deref(),
+                            info.name.as_deref(),
+                            &info.username,
+                            &info.host,
+                            0,
+                            false,
+                            true, // reused
+                        );
                         return Ok(StructuredContent(SshConnectResponse {
                             session_id: sid.clone(),
-                            message: format!(
-                                "Reused existing session for {}@{}{}. Use session_id '{}' for subsequent commands.",
-                                info.username,
-                                info.host,
-                                info.name
-                                    .as_ref()
-                                    .map(|n| format!(" (name: '{}')", n))
-                                    .unwrap_or_default(),
-                                sid
-                            ),
+                            agent_id: reuse_agent_id,
+                            message,
                             authenticated: true,
                             retry_attempts: 0,
                         }));
@@ -137,7 +238,7 @@ impl McpSSHCommands {
         }
 
         info!(
-            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay={}ms, compress={}, persistent={}, name={:?}",
+            "Attempting SSH connection to {}@{} with timeout {}s, max_retries={}, retry_delay={}ms, compress={}, persistent={}, name={:?}, agent_id={:?}",
             username,
             address,
             timeout.as_secs(),
@@ -145,7 +246,8 @@ impl McpSSHCommands {
             retry_delay.as_millis(),
             compress,
             persistent,
-            name
+            name,
+            agent_id
         );
 
         match connect_to_ssh_with_retry(
@@ -168,6 +270,7 @@ impl McpSSHCommands {
                 let session_info = SessionInfo {
                     session_id: new_session_id.clone(),
                     name: name.clone(),
+                    agent_id: agent_id.clone(),
                     host: address.clone(),
                     username: username.clone(),
                     connected_at,
@@ -187,26 +290,25 @@ impl McpSSHCommands {
                     },
                 );
 
-                let message = {
-                    let name_part = name
-                        .as_ref()
-                        .map(|n| format!(" (name: '{}')", n))
-                        .unwrap_or_default();
-                    let retry_part = if retry_attempts > 0 {
-                        format!(" after {} retry attempt(s)", retry_attempts)
-                    } else {
-                        String::new()
-                    };
-                    let persistent_part = if persistent { " [persistent]" } else { "" };
+                // Register in agent index if agent_id is provided
+                if let Some(ref aid) = agent_id {
+                    register_session_agent(aid, &new_session_id);
+                }
 
-                    format!(
-                        "Connected to {}@{}{}{}. Use session_id '{}' with ssh_execute to run commands.",
-                        username, address, name_part, retry_part, new_session_id
-                    ) + persistent_part
-                };
+                let message = build_connect_message(
+                    &new_session_id,
+                    agent_id.as_deref(),
+                    name.as_deref(),
+                    &username,
+                    &address,
+                    retry_attempts,
+                    persistent,
+                    false, // not reused
+                );
 
                 Ok(StructuredContent(SshConnectResponse {
                     session_id: new_session_id,
+                    agent_id,
                     message,
                     authenticated: true,
                     retry_attempts,
@@ -255,6 +357,11 @@ impl McpSSHCommands {
 
         // DashMap: remove returns Option<(K, V)>
         if let Some((_, stored)) = SSH_SESSIONS.remove(&session_id) {
+            // Unregister from agent index if agent_id exists
+            if let Some(ref agent_id) = stored.info.agent_id {
+                unregister_session_agent(agent_id, &session_id);
+            }
+
             // Gracefully disconnect the session
             if let Err(e) = stored
                 .handle
@@ -277,18 +384,34 @@ impl McpSSHCommands {
     /// Performs a health check on each session and automatically removes
     /// dead/disconnected sessions from the list. Use this to find available
     /// session_ids for command execution.
-    async fn ssh_list_sessions(&self) -> StructuredContent<SessionListResponse> {
+    ///
+    /// **Filtering by agent_id:** When provided, only sessions belonging to that
+    /// agent are returned. This is useful when multiple agents share an MCP server.
+    async fn ssh_list_sessions(
+        &self,
+        /// Filter by agent ID to list only sessions for a specific agent
+        agent_id: Option<String>,
+    ) -> StructuredContent<SessionListResponse> {
         let health_timeout = Duration::from_secs(5);
 
-        // Get all sessions and their handles (DashMap: iterate without lock)
-        let sessions_snapshot: Vec<_> = SSH_SESSIONS
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    entry.value().handle.clone(),
-                    entry.value().info.clone(),
-                )
+        // Get session IDs to check (either all or filtered by agent)
+        let session_ids_to_check: Vec<String> = if let Some(ref aid) = agent_id {
+            get_agent_session_ids(aid)
+        } else {
+            SSH_SESSIONS.iter().map(|e| e.key().clone()).collect()
+        };
+
+        // Get sessions and their handles for health checks
+        let sessions_snapshot: Vec<_> = session_ids_to_check
+            .into_iter()
+            .filter_map(|session_id| {
+                SSH_SESSIONS.get(&session_id).map(|entry| {
+                    (
+                        session_id,
+                        entry.value().handle.clone(),
+                        entry.value().info.clone(),
+                    )
+                })
             })
             .collect();
 
@@ -399,17 +522,18 @@ impl McpSSHCommands {
         }
     }
 
-    /// Execute a command asynchronously on a connected SSH session.
+    /// Execute a command on a connected SSH session.
     ///
-    /// **Recommended for:** Long-running commands (builds, deployments, batch jobs,
-    /// data processing) that may exceed the default timeout or benefit from
-    /// progress monitoring and cancellation.
+    /// Returns command_id, session_id, and agent_id that you MUST remember.
+    ///
+    /// **Important identifiers in response:**
+    /// - `command_id`: Use with ssh_get_command_output (poll), ssh_cancel_command (cancel)
+    /// - `session_id`: The session running this command
+    /// - `agent_id`: The agent that owns this session (if set)
     ///
     /// **Workflow:**
-    /// 1. Call `ssh_execute` - returns immediately with `command_id`
-    /// 2. Poll with `ssh_get_command_output(command_id, wait=false)` to check progress
-    /// 3. Or wait with `ssh_get_command_output(command_id, wait=true)` to block until done
-    /// 4. Cancel anytime with `ssh_cancel_command(command_id)`
+    /// 1. ssh_execute → get command_id
+    /// 2. ssh_get_command_output(command_id, wait=true) → get result
     ///
     /// **Limits:** Up to 30 concurrent async commands per session.
     ///
@@ -434,10 +558,10 @@ impl McpSSHCommands {
             ));
         }
 
-        // DashMap: direct get, no lock needed
-        let handle_arc = SSH_SESSIONS
+        // DashMap: direct get, no lock needed - also get agent_id for response
+        let (handle_arc, agent_id) = SSH_SESSIONS
             .get(&session_id)
-            .map(|s| s.handle.clone())
+            .map(|s| (s.handle.clone(), s.info.agent_id.clone()))
             .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
 
         let command_id = Uuid::new_v4().to_string();
@@ -493,15 +617,16 @@ impl McpSSHCommands {
             timed_out,
         ));
 
+        let message =
+            build_execute_message(&command_id, &session_id, agent_id.as_deref(), &command);
+
         Ok(StructuredContent(SshExecuteResponse {
-            command_id: command_id.clone(),
+            command_id,
             session_id,
+            agent_id,
             command,
             started_at,
-            message: format!(
-                "Command started. Use ssh_get_command_output with command_id '{}' to poll for results, or ssh_cancel_command to cancel.",
-                command_id
-            ),
+            message,
         }))
     }
 
@@ -687,6 +812,92 @@ impl McpSSHCommands {
             message: "Command cancelled successfully".to_string(),
             stdout: String::from_utf8_lossy(&output_buf.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output_buf.stderr).into_owned(),
+        }))
+    }
+
+    /// Disconnect ALL sessions for a specific agent.
+    ///
+    /// Use this for cleanup when an agent is done. This will:
+    /// - Cancel all running commands for the agent's sessions
+    /// - Disconnect all sessions owned by the agent
+    /// - Other agents' sessions are NOT affected
+    ///
+    /// **Required identifier:**
+    /// - `agent_id`: The agent identifier from ssh_connect
+    async fn ssh_disconnect_agent(
+        &self,
+        /// The agent identifier to disconnect all sessions for
+        agent_id: String,
+    ) -> Result<StructuredContent<AgentDisconnectResponse>, String> {
+        info!("Disconnecting all sessions for agent: {}", agent_id);
+
+        // Get and remove all session IDs for this agent atomically
+        let session_ids = remove_agent_sessions(&agent_id);
+
+        if session_ids.is_empty() {
+            return Ok(StructuredContent(AgentDisconnectResponse {
+                agent_id: agent_id.clone(),
+                sessions_disconnected: 0,
+                commands_cancelled: 0,
+                message: format!(
+                    "AGENT CLEANUP COMPLETE. SUMMARY:\n\
+                    • agent_id: '{}'\n\
+                    • sessions_disconnected: 0\n\
+                    • commands_cancelled: 0\n\n\
+                    No sessions found for agent '{}'.",
+                    agent_id, agent_id
+                ),
+            }));
+        }
+
+        let mut total_commands_cancelled = 0;
+
+        // Process each session
+        for session_id in &session_ids {
+            // Cancel all async commands for this session
+            let command_ids = get_session_command_ids(session_id);
+            for cmd_id in &command_ids {
+                if let Some(cmd) = ASYNC_COMMANDS.get(cmd_id) {
+                    cmd.cancel_token.cancel();
+                }
+            }
+            total_commands_cancelled += command_ids.len();
+
+            // Remove cancelled commands
+            for cmd_id in command_ids {
+                unregister_command(&cmd_id);
+            }
+
+            // Disconnect the session
+            if let Some((_, stored)) = SSH_SESSIONS.remove(session_id)
+                && let Err(e) = stored
+                    .handle
+                    .disconnect(Disconnect::ByApplication, "Agent cleanup", "en")
+                    .await
+            {
+                warn!("Error during disconnect of session {}: {}", session_id, e);
+            }
+        }
+
+        let sessions_disconnected = session_ids.len();
+
+        info!(
+            "Disconnected {} sessions and cancelled {} commands for agent {}",
+            sessions_disconnected, total_commands_cancelled, agent_id
+        );
+
+        Ok(StructuredContent(AgentDisconnectResponse {
+            agent_id: agent_id.clone(),
+            sessions_disconnected,
+            commands_cancelled: total_commands_cancelled,
+            message: format!(
+                "AGENT CLEANUP COMPLETE. SUMMARY:\n\
+                • agent_id: '{}'\n\
+                • sessions_disconnected: {}\n\
+                • commands_cancelled: {}\n\n\
+                All sessions and commands for agent '{}' have been terminated.",
+                agent_id, sessions_disconnected, total_commands_cancelled, agent_id
+            ),
         }))
     }
 }
