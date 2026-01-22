@@ -10,6 +10,7 @@ This document describes the system architecture of the SSH Model Context Protoco
 - [Component Architecture](#component-architecture)
 - [Authentication Flow](#authentication-flow)
 - [Session Storage Architecture](#session-storage-architecture)
+- [Async Command Architecture](#async-command-architecture)
 - [Threading and Async Model](#threading-and-async-model)
 - [Binary Targets](#binary-targets)
 - [Key Dependencies](#key-dependencies)
@@ -71,7 +72,7 @@ flowchart TB
 
 ## Module Structure
 
-The codebase consists of **8 source files** organized into a modular structure:
+The codebase consists of **9 source files** organized into a modular structure:
 
 | File | Location | Visibility | Description |
 |------|----------|------------|-------------|
@@ -83,6 +84,7 @@ The codebase consists of **8 source files** organized into a modular structure:
 | `session.rs` | `src/mcp/` | `pub` | Session storage and SSH client handler |
 | `client.rs` | `src/mcp/` | `pub(crate)` | SSH connection, authentication, and command execution |
 | `forward.rs` | `src/mcp/` | `pub(crate)` | Port forwarding implementation (feature-gated) |
+| `async_command.rs` | `src/mcp/` | `pub(crate)` | Async command storage, tracking, and helper functions |
 | `commands.rs` | `src/mcp/` | `pub` | MCP tool implementations via `#[Tools]` macro |
 
 ### Module Responsibilities
@@ -129,6 +131,21 @@ The codebase consists of **8 source files** organized into a modular structure:
 - `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
 - `handle_port_forward_connection()` - Bidirectional I/O via direct-tcpip
 
+**async_command.rs** - Async Command Storage
+- `RunningCommand` - State for a running async command including:
+  - `cancel_token: CancellationToken` - Token to cancel the command via `tokio_util::sync::CancellationToken`
+  - `status_rx: watch::Receiver<AsyncCommandStatus>` - Receiver for status updates
+  - `status_tx: watch::Sender<AsyncCommandStatus>` - Sender for status updates
+  - `output: Arc<Mutex<OutputBuffer>>` - Output buffer for stdout/stderr collection
+  - `exit_code: Arc<Mutex<Option<i32>>>` - Exit code when completed
+  - `error: Arc<Mutex<Option<String>>>` - Error message if failed
+  - `timed_out: Arc<AtomicBool>` - Whether the command timed out
+- `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
+- `ASYNC_COMMANDS` - Global storage `Lazy<Mutex<HashMap<String, RunningCommand>>>`
+- `MAX_ASYNC_COMMANDS_PER_SESSION` - Constant limit of 10 concurrent async commands per session
+- `count_session_commands()` - Helper to count async commands for a session
+- `get_session_command_ids()` - Helper to get all command IDs for cleanup during disconnect
+
 **commands.rs** - MCP Tools
 - `McpSSHCommands` struct with `#[Tools]` impl
 - `ssh_connect` - Connect and authenticate (supports `name` and `persistent` options)
@@ -163,6 +180,7 @@ flowchart TB
         config["config.rs<br/>Configuration"]
         error["error.rs<br/>Error Classification"]
         forward["forward.rs<br/>Port Forwarding"]
+        async_cmd["async_command.rs<br/>Async Command Storage"]
         modrs["mod.rs<br/>Module Root"]
     end
 
@@ -170,6 +188,7 @@ flowchart TB
         russh["russh"]
         backon["backon"]
         tokio["tokio"]
+        tokio_util["tokio-util"]
         poem_mcp["poem-mcpserver"]
         tracing["tracing"]
     end
@@ -185,22 +204,29 @@ flowchart TB
     modrs --> config
     modrs --> error
     modrs --> forward
+    modrs --> async_cmd
 
     commands --> client
     commands --> config
     commands --> session
     commands --> types
     commands --> forward
+    commands --> async_cmd
     commands --> poem_mcp
 
     client --> config
     client --> error
     client --> session
     client --> types
+    client --> async_cmd
     client --> russh
     client --> backon
     client --> tokio
     client --> tracing
+
+    async_cmd --> types
+    async_cmd --> tokio
+    async_cmd --> tokio_util
 
     forward --> session
     forward --> russh
@@ -230,6 +256,10 @@ classDiagram
     class McpSSHCommands {
         +ssh_connect() StructuredContent~SshConnectResponse~
         +ssh_execute() StructuredContent~SshCommandResponse~
+        +ssh_execute_async() StructuredContent~AsyncCommandResponse~
+        +ssh_poll_async() StructuredContent~AsyncPollResponse~
+        +ssh_list_async() StructuredContent~AsyncListResponse~
+        +ssh_cancel_async() Text~String~
         +ssh_forward() StructuredContent~PortForwardingResponse~
         +ssh_disconnect() Text~String~
         +ssh_list_sessions() StructuredContent~SessionListResponse~
@@ -265,6 +295,38 @@ classDiagram
         +timed_out: bool
     }
 
+    class RunningCommand {
+        +info: AsyncCommandInfo
+        +cancel_token: CancellationToken
+        +status_rx: watch~Receiver~
+        +status_tx: watch~Sender~
+        +output: Arc~Mutex~OutputBuffer~~
+        +exit_code: Arc~Mutex~Option~i32~~~
+        +error: Arc~Mutex~Option~String~~~
+        +timed_out: Arc~AtomicBool~
+    }
+
+    class OutputBuffer {
+        +stdout: Vec~u8~
+        +stderr: Vec~u8~
+    }
+
+    class AsyncCommandInfo {
+        +command_id: String
+        +session_id: String
+        +command: String
+        +status: AsyncCommandStatus
+        +started_at: String
+    }
+
+    class AsyncCommandStatus {
+        <<enumeration>>
+        Running
+        Completed
+        Cancelled
+        Failed
+    }
+
     class PortForwardingResponse {
         +local_address: String
         +remote_address: String
@@ -285,16 +347,27 @@ classDiagram
         Lazy~Mutex~HashMap~~
     }
 
+    class ASYNC_COMMANDS {
+        <<global>>
+        Lazy~Mutex~HashMap~~
+    }
+
     McpSSHCommands ..> StoredSession : manages
     McpSSHCommands ..> SshConnectResponse : returns
     McpSSHCommands ..> SshCommandResponse : returns
+    McpSSHCommands ..> RunningCommand : manages async
     McpSSHCommands ..> PortForwardingResponse : returns
     McpSSHCommands ..> SessionListResponse : returns
     StoredSession *-- SessionInfo : contains
     StoredSession --> SshClientHandler : uses
     SSH_SESSIONS --> StoredSession : stores
+    ASYNC_COMMANDS --> RunningCommand : stores
+    RunningCommand *-- AsyncCommandInfo : contains
+    RunningCommand *-- OutputBuffer : contains
+    AsyncCommandInfo --> AsyncCommandStatus : has
 
     note for SSH_SESSIONS "Global session store using\nLazy Mutex HashMap String StoredSession"
+    note for ASYNC_COMMANDS "Global async command store using\nLazy Mutex HashMap String RunningCommand\nMax 10 commands per session"
 ```
 
 ### Component Descriptions
@@ -306,6 +379,11 @@ classDiagram
 | `SessionInfo` | types.rs | Serializable metadata for tracking connection information |
 | `SshClientHandler` | session.rs | Implements `russh::client::Handler` for host key verification |
 | `SSH_SESSIONS` | session.rs | Global thread-safe storage for active SSH sessions |
+| `RunningCommand` | async_command.rs | State container for async commands including output buffers and cancellation |
+| `OutputBuffer` | async_command.rs | Simple struct for collecting stdout/stderr from async commands |
+| `AsyncCommandInfo` | types.rs | Serializable metadata for async command tracking |
+| `AsyncCommandStatus` | types.rs | Enum representing command states: Running, Completed, Cancelled, Failed |
+| `ASYNC_COMMANDS` | async_command.rs | Global thread-safe storage for running async commands (max 10 per session) |
 
 ---
 
@@ -478,6 +556,94 @@ let handle_arc = {
 
 ---
 
+## Async Command Architecture
+
+The async command system enables long-running SSH commands to execute in the background while allowing clients to poll for output, check status, and cancel commands.
+
+```mermaid
+flowchart TB
+    subgraph Storage["ASYNC_COMMANDS Storage"]
+        direction TB
+        Lazy2["Lazy<br/>once_cell"]
+        Mutex2["Mutex<br/>tokio sync"]
+        HashMap2["HashMap<br/>String to RunningCommand"]
+
+        Lazy2 --> Mutex2
+        Mutex2 --> HashMap2
+    end
+
+    subgraph RunningCmd["RunningCommand Structure"]
+        Info["AsyncCommandInfo<br/>Metadata"]
+        CancelToken["CancellationToken<br/>tokio-util"]
+        StatusChan["watch::channel<br/>Status Updates"]
+        OutputBuf["OutputBuffer<br/>stdout/stderr"]
+        ExitCode["exit_code<br/>Arc Mutex Option"]
+        Error["error<br/>Arc Mutex Option"]
+        TimedOut["timed_out<br/>Arc AtomicBool"]
+    end
+
+    subgraph Execution["Background Execution"]
+        Spawn["tokio::spawn"]
+        ExecAsync["execute_ssh_command_async"]
+        SSHChannel["SSH Channel I/O"]
+    end
+
+    HashMap2 --> RunningCmd
+    Spawn --> ExecAsync
+    ExecAsync --> SSHChannel
+    ExecAsync -.-> OutputBuf
+    ExecAsync -.-> StatusChan
+    CancelToken -.-> ExecAsync
+
+    style Storage fill:#e8f5e9
+    style RunningCmd fill:#fff3e0
+    style Execution fill:#e3f2fd
+```
+
+### Async Command Flow
+
+1. **Start Command** (`ssh_execute_async`):
+   - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 10`)
+   - Create `RunningCommand` with status channel and cancellation token
+   - Store in `ASYNC_COMMANDS` global storage
+   - Spawn background task via `tokio::spawn(execute_ssh_command_async(...))`
+   - Return `command_id` immediately to client
+
+2. **Poll for Output** (`ssh_poll_async`):
+   - Look up command by ID in `ASYNC_COMMANDS`
+   - Read current output from `OutputBuffer`
+   - Check status via `watch::Receiver`
+   - Return partial output and current status
+
+3. **Cancel Command** (`ssh_cancel_async`):
+   - Look up command by ID
+   - Call `cancel_token.cancel()` to signal cancellation
+   - Background task detects cancellation and exits gracefully
+   - Status updated to `Cancelled`
+
+4. **List Commands** (`ssh_list_async`):
+   - Filter `ASYNC_COMMANDS` by session ID
+   - Optionally filter by status
+   - Return list of `AsyncCommandInfo`
+
+### Concurrency Controls
+
+| Control | Value | Purpose |
+|---------|-------|---------|
+| `MAX_ASYNC_COMMANDS_PER_SESSION` | 10 | Prevents resource exhaustion per session |
+| `Arc<Mutex<OutputBuffer>>` | - | Thread-safe output collection from background task |
+| `Arc<AtomicBool>` for `timed_out` | - | Lock-free timeout flag |
+| `watch::channel` | - | Efficient status broadcasting without locks |
+
+### Session Cleanup
+
+When `ssh_disconnect` is called, all async commands for that session are automatically cleaned up:
+1. `get_session_command_ids()` retrieves all command IDs for the session
+2. Each command's `cancel_token` is triggered
+3. Commands are removed from `ASYNC_COMMANDS` storage
+
+---
+
 ## Threading and Async Model
 
 The system uses Tokio's multi-threaded async runtime with native async SSH operations via russh.
@@ -495,13 +661,21 @@ flowchart TB
         subgraph Tasks["Async Tasks"]
             Connect["ssh_connect<br/>+ Retry Logic"]
             Execute["ssh_execute<br/>+ Timeout"]
+            AsyncExec["ssh_execute_async<br/>Background Task"]
             Forward["Port Forward<br/>Listener"]
             Disconnect["ssh_disconnect"]
+        end
+
+        subgraph AsyncCommands["Async Command Management"]
+            Spawn["tokio::spawn<br/>Background Execution"]
+            Cancel["CancellationToken<br/>Graceful Cancel"]
+            Status["watch::channel<br/>Status Updates"]
         end
 
         subgraph Channels["SSH Channels"]
             Chan1["Channel 1<br/>Session Command"]
             Chan2["Channel 2<br/>Direct-TCPIP"]
+            ChanAsync["Channel N<br/>Async Command"]
         end
     end
 
@@ -514,13 +688,19 @@ flowchart TB
     STDIO --> Tasks
     Connect --> SSHServer
     Execute --> Chan1
+    AsyncExec --> AsyncCommands
+    Spawn --> ChanAsync
+    Cancel --> Spawn
+    Status --> Spawn
     Forward --> Chan2
     Forward --> LocalPort
     Chan1 --> SSHServer
     Chan2 --> SSHServer
+    ChanAsync --> SSHServer
 
     style Runtime fill:#e8eaf6
     style Tasks fill:#fff8e1
+    style AsyncCommands fill:#e8f5e9
 ```
 
 ### Native Async Architecture
@@ -532,6 +712,9 @@ Unlike implementations using blocking SSH libraries, this system uses **russh** 
 | SSH Connect | `tokio::time::timeout` | Wrapped with configurable timeout |
 | Retry Logic | `backon::Retryable` | Exponential backoff with jitter |
 | Command Execution | Channel-based async I/O | Non-blocking read/write via `ChannelMsg`; timeout returns partial output with `timed_out: true` |
+| Async Command Execution | `tokio::spawn` | Background task via `execute_ssh_command_async()` |
+| Async Command Cancellation | `CancellationToken` | `tokio_util::sync::CancellationToken` for graceful cancellation |
+| Async Status Updates | `watch::channel` | `tokio::sync::watch` for real-time status broadcasting |
 | Port Forwarding | `tokio::spawn` | Background task per listener |
 | Session Lock | `tokio::sync::Mutex` | Async-aware mutex |
 | Bidirectional I/O | `tokio::io::copy` + `select!` | Efficient zero-copy forwarding |
@@ -660,6 +843,7 @@ flowchart TB
     subgraph Core["Core Dependencies"]
         Russh["russh 0.55<br/>Async SSH Client"]
         Tokio["tokio 1.x<br/>Async Runtime"]
+        TokioUtil["tokio-util<br/>Async Utilities"]
         Poem["poem 3.1<br/>HTTP Framework"]
     end
 
@@ -677,6 +861,7 @@ flowchart TB
     PoemMCP --> Poem
     PoemMCP --> Tokio
     Russh --> Tokio
+    TokioUtil --> Tokio
 
     style Core fill:#e1f5fe
     style MCP fill:#f3e5f5
@@ -687,11 +872,12 @@ flowchart TB
 |------------|---------|---------|
 | `russh` | 0.55 | Pure Rust async SSH client implementation |
 | `tokio` | 1.x | Async runtime with full features |
+| `tokio-util` | 0.7 | Async utilities including `CancellationToken` for async command cancellation |
 | `poem` | 3.1 | HTTP framework matching poem-mcpserver |
 | `poem-mcpserver` | 0.2.9 | MCP protocol implementation |
 | `backon` | 1.x | Retry logic with exponential backoff |
 | `serde` | 1.0 | JSON serialization/deserialization |
-| `uuid` | 1.16 | UUID v4 generation for session IDs |
+| `uuid` | 1.16 | UUID v4 generation for session and command IDs |
 | `once_cell` | 1.21 | Lazy static initialization |
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Tracing output and filtering |
