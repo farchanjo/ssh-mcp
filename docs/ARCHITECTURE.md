@@ -143,7 +143,7 @@ The codebase consists of **9 source files** organized into a modular structure:
 - `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
 - `ASYNC_COMMANDS` - Global storage `Lazy<DashMap<String, RunningCommand>>` (lock-free)
 - `COMMANDS_BY_SESSION` - Secondary index `Lazy<DashMap<String, HashSet<String>>>` for O(1) session lookup
-- `MAX_ASYNC_COMMANDS_PER_SESSION` - Constant limit of 30 concurrent async commands per session
+- `MAX_ASYNC_COMMANDS_PER_SESSION` - Constant limit of 100 concurrent multiplexed commands per session
 - `count_session_commands()` - Helper to count async commands for a session
 - `get_session_command_ids()` - Helper to get all command IDs for cleanup during disconnect
 
@@ -598,7 +598,7 @@ flowchart TB
 ### Async Command Flow
 
 1. **Start Command** (`ssh_execute`):
-   - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 30`)
+   - Check session limit (`MAX_ASYNC_COMMANDS_PER_SESSION = 100`)
    - Create `RunningCommand` with status channel and cancellation token
    - Store in `ASYNC_COMMANDS` global storage
    - Spawn background task via `tokio::spawn(execute_ssh_command_async(...))`
@@ -625,7 +625,7 @@ flowchart TB
 
 | Control | Value | Purpose |
 |---------|-------|---------|
-| `MAX_ASYNC_COMMANDS_PER_SESSION` | 30 | Prevents resource exhaustion per session |
+| `MAX_ASYNC_COMMANDS_PER_SESSION` | 100 | Prevents resource exhaustion per session |
 | `Arc<Mutex<OutputBuffer>>` | - | Thread-safe output collection from background task |
 | `Arc<AtomicBool>` for `timed_out` | - | Lock-free timeout flag |
 | `watch::channel` | - | Efficient status broadcasting without locks |

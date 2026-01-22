@@ -269,7 +269,7 @@ SSH MCP supports asynchronous command execution, allowing commands to run in the
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Max concurrent async commands per session | 30 | Maximum number of async commands that can run simultaneously on a single SSH session (`MAX_ASYNC_COMMANDS_PER_SESSION`) |
+| Max concurrent async commands per session | 100 | Maximum number of multiplexed commands that can run simultaneously on a single SSH session (`MAX_ASYNC_COMMANDS_PER_SESSION`) |
 | Command timeout | 180s (default) | Maximum execution time for async commands, configurable via `SSH_COMMAND_TIMEOUT` |
 | Wait timeout | 30s (default) | Default timeout when polling for command output via `ssh_get_command_output` |
 | Max wait timeout | 300s | Maximum allowed value for `wait_timeout_secs` parameter |

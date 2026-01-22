@@ -188,7 +188,7 @@ if result.status == "running":
 ```
 
 #### Limits
-- Max 30 concurrent async commands per session
+- Max 100 concurrent multiplexed commands per session
 - Commands auto-cleanup when session disconnects
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
