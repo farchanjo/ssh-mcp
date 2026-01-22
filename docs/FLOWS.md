@@ -420,7 +420,12 @@ sequenceDiagram
     Exec-->>Cmd: SshCommandResponse
 
     alt Timeout
-        Cmd-->>Client: Timeout error
+        Note over Cmd: Timeout reached
+        Cmd->>Cmd: Close channel gracefully
+        Cmd->>Cmd: Set timed_out = true
+        Cmd->>Cmd: Set exit_code = -1
+        Note over Cmd: Session stays alive
+        Cmd-->>Client: SshCommandResponse with partial output
     else Success
         Cmd-->>Client: SshCommandResponse
     end
@@ -438,6 +443,7 @@ stateDiagram-v2
     WaitingForData --> CheckExit: ChannelMsg Eof
     WaitingForData --> Done: ChannelMsg Close
     WaitingForData --> Done: None
+    WaitingForData --> Timeout: Timeout reached
 
     ProcessData --> WaitingForData: Append to stdout
     ProcessStderr --> WaitingForData: Append to stderr
@@ -446,13 +452,64 @@ stateDiagram-v2
     CheckExit --> Done: Exit code received
     CheckExit --> WaitingForData: Continue waiting
 
-    Done --> [*]: Close channel and return
+    Timeout --> Done: Close channel gracefully
+
+    Done --> [*]: Return response
 
     note right of WaitingForData
         Loop until channel closes
         or EOF with exit status
     end note
+
+    note right of Timeout
+        Returns partial output
+        timed_out = true
+        exit_code = -1
+        Session stays alive
+    end note
 ```
+
+### Command Timeout Handling
+
+When a command exceeds the configured timeout (`SSH_COMMAND_TIMEOUT`), the system handles it gracefully without disconnecting the session.
+
+```mermaid
+flowchart TD
+    Start([Command Execution]) --> Execute[Execute command with timeout wrapper]
+    Execute --> Wait{Timeout reached?}
+
+    Wait -->|No| Complete[Command completes normally]
+    Wait -->|Yes| Timeout[Timeout triggered]
+
+    Complete --> BuildResponse[Build response with actual exit code]
+    BuildResponse --> ReturnSuccess([Return SshCommandResponse])
+
+    Timeout --> CollectPartial[Collect partial stdout/stderr]
+    CollectPartial --> CloseChannel[Close channel gracefully]
+    CloseChannel --> SetFlags[Set timed_out = true and exit_code = -1]
+    SetFlags --> KeepSession[Session remains in SSH_SESSIONS]
+    KeepSession --> ReturnPartial([Return SshCommandResponse with partial output])
+
+    style Start fill:#e3f2fd
+    style ReturnSuccess fill:#e8f5e9
+    style ReturnPartial fill:#fff8e1
+    style Timeout fill:#fff8e1
+```
+
+**Timeout Response Fields:**
+
+| Field | Value | Description |
+|-------|-------|-------------|
+| `stdout` | Partial output | Any stdout received before timeout |
+| `stderr` | Partial output | Any stderr received before timeout |
+| `exit_code` | `-1` | Indicates abnormal termination |
+| `timed_out` | `true` | Signals timeout occurred |
+
+**Key Behavior:**
+- The SSH session remains connected and can be reused for subsequent commands
+- No error is returned; instead, a valid response with partial output is provided
+- The channel is closed gracefully to avoid resource leaks
+- Clients should check the `timed_out` flag to detect timeout conditions
 
 ---
 
