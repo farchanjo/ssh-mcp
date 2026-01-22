@@ -23,8 +23,8 @@ path = "src/lib.rs"
 # Dependencies for SSH features and stateful connections
 [dependencies]
 # Web and MCP
-poem = "=3.1.10"                                                            # Match version used by poem-mcpserver
-poem-mcpserver = { version = "0.2.3", features = ["streamable-http"] }
+poem = "3.1"                                                                # Match version used by poem-mcpserver
+poem-mcpserver = { version = "0.2.9", features = ["streamable-http"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 
 # SSH client
@@ -33,16 +33,16 @@ ssh2 = "0.9" # For SSH functionality
 # Serialization and data handling
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-schemars = "0.8"                                   # Required by poem-mcpserver
+schemars = "1.0"                                   # Required by poem-mcpserver
 
 # Utilities
-dotenv = "0.15"                                         # For environment variables
-thiserror = "1.0"                                       # Error handling
-tracing = "0.1"                                         # Tracing for debugging
-tracing-subscriber = "0.3"                              # Tracing implementation
-uuid = { version = "1.16", features = ["v4", "serde"] } # For unique identifiers
-async-trait = "0.1"                                     # For async trait support
-once_cell = "1.21"                                      # For lazy static initialization
+chrono = "0.4"                                                          # For timestamps
+dotenv = "0.15"                                                         # For environment variables
+thiserror = "1.0"                                                       # Error handling
+tracing = "0.1"                                                         # Tracing for debugging
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }     # Tracing implementation with env filter
+uuid = { version = "1.16", features = ["v4", "serde"] }                 # For unique identifiers
+once_cell = "1.21"                                                      # For lazy static initialization
 
 [features]
 # Default features
