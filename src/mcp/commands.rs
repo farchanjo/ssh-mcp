@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::future::join_all;
 use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
 use russh::Disconnect;
 use tokio::sync::{Mutex, watch};
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 use super::async_command::{
     ASYNC_COMMANDS, MAX_ASYNC_COMMANDS_PER_SESSION, OutputBuffer, RunningCommand,
-    count_session_commands, get_session_command_ids,
+    count_session_commands, get_session_command_ids, register_command, unregister_command,
 };
 use super::client::{connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async};
 use super::config::{
@@ -80,12 +81,10 @@ impl McpSSHCommands {
 
         // Check if session_id was provided for potential reuse
         if let Some(ref sid) = session_id {
-            let handle_and_info = {
-                let sessions = SSH_SESSIONS.lock().await;
-                sessions
-                    .get(sid)
-                    .map(|s| (s.handle.clone(), s.info.clone()))
-            };
+            // DashMap: use .get() which returns Option<Ref<K, V>>
+            let handle_and_info = SSH_SESSIONS
+                .get(sid)
+                .map(|s| (s.handle.clone(), s.info.clone()));
 
             if let Some((handle_arc, info)) = handle_and_info {
                 // Health check with 5 second timeout
@@ -95,12 +94,9 @@ impl McpSSHCommands {
                 match execute_ssh_command(&handle_arc, "echo 1", health_timeout).await {
                     Ok(response) if !response.timed_out && response.exit_code == 0 => {
                         // Update health status in storage
-                        {
-                            let mut sessions = SSH_SESSIONS.lock().await;
-                            if let Some(stored) = sessions.get_mut(sid) {
-                                stored.info.last_health_check = Some(now);
-                                stored.info.healthy = Some(true);
-                            }
+                        if let Some(mut stored) = SSH_SESSIONS.get_mut(sid) {
+                            stored.info.last_health_check = Some(now);
+                            stored.info.healthy = Some(true);
                         }
 
                         info!("Reusing healthy session {}", sid);
@@ -123,8 +119,7 @@ impl McpSSHCommands {
                     _ => {
                         // Session dead - remove it
                         warn!("Session {} is dead, removing", sid);
-                        let mut sessions = SSH_SESSIONS.lock().await;
-                        sessions.remove(sid);
+                        SSH_SESSIONS.remove(sid);
                     }
                 }
             } else {
@@ -174,17 +169,14 @@ impl McpSSHCommands {
                     healthy: None,
                 };
 
-                // Minimize lock scope: only hold the lock while inserting
-                {
-                    let mut sessions = SSH_SESSIONS.lock().await;
-                    sessions.insert(
-                        new_session_id.clone(),
-                        StoredSession {
-                            info: session_info,
-                            handle: Arc::new(handle),
-                        },
-                    );
-                }
+                // DashMap: direct insert, no lock needed
+                SSH_SESSIONS.insert(
+                    new_session_id.clone(),
+                    StoredSession {
+                        info: session_info,
+                        handle: Arc::new(handle),
+                    },
+                );
 
                 let message = {
                     let name_part = name
@@ -239,14 +231,11 @@ impl McpSSHCommands {
             command
         );
 
-        // Clone Arc and release global lock immediately
-        let handle_arc = {
-            let sessions = SSH_SESSIONS.lock().await;
-            sessions
-                .get(&session_id)
-                .map(|s| s.handle.clone())
-                .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
-        };
+        // DashMap: direct get, no lock needed
+        let handle_arc = SSH_SESSIONS
+            .get(&session_id)
+            .map(|s| s.handle.clone())
+            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
 
         // Execute command with timeout - timeout returns partial output, not an error
         match execute_ssh_command(&handle_arc, &command, timeout).await {
@@ -275,31 +264,30 @@ impl McpSSHCommands {
     ) -> Result<Text<String>, String> {
         info!("Disconnecting SSH session: {}", session_id);
 
-        // Cancel all async commands for this session
-        let command_ids = get_session_command_ids(&session_id).await;
+        // Cancel all async commands for this session (sync O(1) lookup)
+        let command_ids = get_session_command_ids(&session_id);
         if !command_ids.is_empty() {
             info!(
                 "Cancelling {} async commands for session {}",
                 command_ids.len(),
                 session_id
             );
-            let commands = ASYNC_COMMANDS.lock().await;
+
+            // Cancel and remove each command using DashMap API
             for cmd_id in &command_ids {
-                if let Some(cmd) = commands.get(cmd_id) {
+                if let Some(cmd) = ASYNC_COMMANDS.get(cmd_id) {
                     cmd.cancel_token.cancel();
                 }
             }
-            drop(commands);
 
-            // Remove cancelled commands from storage
-            let mut commands = ASYNC_COMMANDS.lock().await;
+            // Remove cancelled commands using unregister_command
             for cmd_id in command_ids {
-                commands.remove(&cmd_id);
+                unregister_command(&cmd_id);
             }
         }
 
-        let mut sessions = SSH_SESSIONS.lock().await;
-        if let Some(stored) = sessions.remove(&session_id) {
+        // DashMap: remove returns Option<(K, V)>
+        if let Some((_, stored)) = SSH_SESSIONS.remove(&session_id) {
             // Gracefully disconnect the session
             if let Err(e) = stored
                 .handle
@@ -320,23 +308,37 @@ impl McpSSHCommands {
     /// List all active SSH sessions with their metadata
     async fn ssh_list_sessions(&self) -> StructuredContent<SessionListResponse> {
         let health_timeout = Duration::from_secs(5);
+
+        // Get all sessions and their handles (DashMap: iterate without lock)
+        let sessions_snapshot: Vec<_> = SSH_SESSIONS
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().handle.clone(),
+                    entry.value().info.clone(),
+                )
+            })
+            .collect();
+
+        // Run health checks in PARALLEL using join_all
+        let health_futures: Vec<_> = sessions_snapshot
+            .into_iter()
+            .map(|(session_id, handle_arc, info)| async move {
+                let now = chrono::Utc::now().to_rfc3339();
+                let result = execute_ssh_command(&handle_arc, "echo 1", health_timeout).await;
+                (session_id, info, now, result)
+            })
+            .collect();
+
+        let results = join_all(health_futures).await;
+
+        // Process results
         let mut healthy_sessions = Vec::new();
         let mut dead_session_ids = Vec::new();
 
-        // Get all sessions and their handles
-        let sessions_snapshot: Vec<_> = {
-            let sessions = SSH_SESSIONS.lock().await;
-            sessions
-                .iter()
-                .map(|(id, s)| (id.clone(), s.handle.clone(), s.info.clone()))
-                .collect()
-        };
-
-        // Health check each session
-        for (session_id, handle_arc, mut info) in sessions_snapshot {
-            let now = chrono::Utc::now().to_rfc3339();
-
-            match execute_ssh_command(&handle_arc, "echo 1", health_timeout).await {
+        for (session_id, mut info, now, result) in results {
+            match result {
                 Ok(response) if !response.timed_out && response.exit_code == 0 => {
                     info.last_health_check = Some(now);
                     info.healthy = Some(true);
@@ -350,22 +352,21 @@ impl McpSSHCommands {
             }
         }
 
-        // Update healthy sessions and remove dead ones
-        {
-            let mut sessions = SSH_SESSIONS.lock().await;
-            for (id, info) in &healthy_sessions {
-                if let Some(stored) = sessions.get_mut(id) {
-                    stored
-                        .info
-                        .last_health_check
-                        .clone_from(&info.last_health_check);
-                    stored.info.healthy = info.healthy;
-                }
+        // Update healthy sessions (DashMap: direct get_mut)
+        for (id, info) in &healthy_sessions {
+            if let Some(mut stored) = SSH_SESSIONS.get_mut(id) {
+                stored
+                    .info
+                    .last_health_check
+                    .clone_from(&info.last_health_check);
+                stored.info.healthy = info.healthy;
             }
-            for id in &dead_session_ids {
-                warn!("Removing dead session {} from storage", id);
-                sessions.remove(id);
-            }
+        }
+
+        // Remove dead sessions (DashMap: direct remove)
+        for id in &dead_session_ids {
+            warn!("Removing dead session {} from storage", id);
+            SSH_SESSIONS.remove(id);
         }
 
         let session_infos: Vec<SessionInfo> =
@@ -398,14 +399,11 @@ impl McpSSHCommands {
                 local_port, remote_address, remote_port, session_id
             );
 
-            // Clone Arc and release global lock immediately
-            let handle_arc = {
-                let sessions = SSH_SESSIONS.lock().await;
-                sessions
-                    .get(&session_id)
-                    .map(|s| s.handle.clone())
-                    .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
-            };
+            // DashMap: direct get, no lock needed
+            let handle_arc = SSH_SESSIONS
+                .get(&session_id)
+                .map(|s| s.handle.clone())
+                .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
 
             match setup_port_forwarding(handle_arc, local_port, &remote_address, remote_port).await
             {
@@ -445,8 +443,8 @@ impl McpSSHCommands {
     ) -> Result<StructuredContent<SshExecuteAsyncResponse>, String> {
         let timeout = resolve_command_timeout(timeout_secs);
 
-        // Check session limit
-        let current_count = count_session_commands(&session_id).await;
+        // Check session limit (sync O(1) lookup)
+        let current_count = count_session_commands(&session_id);
         if current_count >= MAX_ASYNC_COMMANDS_PER_SESSION {
             return Err(format!(
                 "Maximum async commands per session reached ({}). Cancel or wait for existing commands to complete.",
@@ -454,21 +452,18 @@ impl McpSSHCommands {
             ));
         }
 
-        // Get session handle
-        let handle_arc = {
-            let sessions = SSH_SESSIONS.lock().await;
-            sessions
-                .get(&session_id)
-                .map(|s| s.handle.clone())
-                .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?
-        };
+        // DashMap: direct get, no lock needed
+        let handle_arc = SSH_SESSIONS
+            .get(&session_id)
+            .map(|s| s.handle.clone())
+            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
 
         let command_id = Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        // Create shared state
+        // Create shared state with pre-allocated buffers
         let (status_tx, status_rx) = watch::channel(AsyncCommandStatus::Running);
-        let output = Arc::new(Mutex::new(OutputBuffer::default()));
+        let output = Arc::new(Mutex::new(OutputBuffer::with_capacity(4096, 1024)));
         let exit_code = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
         let timed_out = Arc::new(AtomicBool::new(false));
@@ -483,23 +478,20 @@ impl McpSSHCommands {
             started_at: started_at.clone(),
         };
 
-        // Store running command
-        {
-            let mut commands = ASYNC_COMMANDS.lock().await;
-            commands.insert(
-                command_id.clone(),
-                RunningCommand {
-                    info: info.clone(),
-                    cancel_token: cancel_token.clone(),
-                    status_rx,
-                    status_tx: status_tx.clone(),
-                    output: output.clone(),
-                    exit_code: exit_code.clone(),
-                    error: error.clone(),
-                    timed_out: timed_out.clone(),
-                },
-            );
-        }
+        // Store running command using register_command for proper indexing
+        register_command(
+            command_id.clone(),
+            RunningCommand {
+                info: info.clone(),
+                cancel_token: cancel_token.clone(),
+                status_rx,
+                status_tx: status_tx.clone(),
+                output: output.clone(),
+                exit_code: exit_code.clone(),
+                error: error.clone(),
+                timed_out: timed_out.clone(),
+            },
+        );
 
         info!(
             "Starting async command {} on session {}: {}",
@@ -546,20 +538,19 @@ impl McpSSHCommands {
         let wait = wait.unwrap_or(false);
         let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
 
-        // Get command state
-        let (status_rx, output, exit_code, error, timed_out) = {
-            let commands = ASYNC_COMMANDS.lock().await;
-            let cmd = commands
-                .get(&command_id)
-                .ok_or_else(|| format!("No async command with ID: {}", command_id))?;
-            (
-                cmd.status_rx.clone(),
-                cmd.output.clone(),
-                cmd.exit_code.clone(),
-                cmd.error.clone(),
-                cmd.timed_out.clone(),
-            )
-        };
+        // DashMap: direct get, no lock needed
+        let (status_rx, output, exit_code, error, timed_out) = ASYNC_COMMANDS
+            .get(&command_id)
+            .map(|cmd| {
+                (
+                    cmd.status_rx.clone(),
+                    cmd.output.clone(),
+                    cmd.exit_code.clone(),
+                    cmd.error.clone(),
+                    cmd.timed_out.clone(),
+                )
+            })
+            .ok_or_else(|| format!("No async command with ID: {}", command_id))?;
 
         // Optionally wait for completion
         if wait {
@@ -612,10 +603,11 @@ impl McpSSHCommands {
             _ => None,
         });
 
-        let commands = ASYNC_COMMANDS.lock().await;
-        let filtered: Vec<AsyncCommandInfo> = commands
-            .values()
-            .filter(|cmd| {
+        // DashMap: iterate without lock
+        let filtered: Vec<AsyncCommandInfo> = ASYNC_COMMANDS
+            .iter()
+            .filter(|entry| {
+                let cmd = entry.value();
                 let session_match = session_id
                     .as_ref()
                     .map(|sid| cmd.info.session_id == *sid)
@@ -625,7 +617,8 @@ impl McpSSHCommands {
                     .unwrap_or(true);
                 session_match && status_match
             })
-            .map(|cmd| {
+            .map(|entry| {
+                let cmd = entry.value();
                 let mut info = cmd.info.clone();
                 info.status = *cmd.status_rx.borrow();
                 info
@@ -647,27 +640,29 @@ impl McpSSHCommands {
         /// Command ID to cancel
         command_id: String,
     ) -> Result<StructuredContent<SshCancelCommandResponse>, String> {
-        // Get command and cancel it
-        let (cancel_token, output, status_rx) = {
-            let commands = ASYNC_COMMANDS.lock().await;
-            let cmd = commands
-                .get(&command_id)
-                .ok_or_else(|| format!("No async command with ID: {}", command_id))?;
-
-            let current_status = *cmd.status_rx.borrow();
-            if current_status != AsyncCommandStatus::Running {
-                return Err(format!(
-                    "Command is not running (status: {})",
-                    current_status
-                ));
-            }
-
-            (
-                cmd.cancel_token.clone(),
-                cmd.output.clone(),
-                cmd.status_rx.clone(),
-            )
-        };
+        // DashMap: direct get, no lock needed
+        let (cancel_token, output, status_rx) = ASYNC_COMMANDS
+            .get(&command_id)
+            .map(|cmd| {
+                let current_status = *cmd.status_rx.borrow();
+                (
+                    current_status,
+                    cmd.cancel_token.clone(),
+                    cmd.output.clone(),
+                    cmd.status_rx.clone(),
+                )
+            })
+            .ok_or_else(|| format!("No async command with ID: {}", command_id))
+            .and_then(|(current_status, cancel_token, output, status_rx)| {
+                if current_status != AsyncCommandStatus::Running {
+                    Err(format!(
+                        "Command is not running (status: {})",
+                        current_status
+                    ))
+                } else {
+                    Ok((cancel_token, output, status_rx))
+                }
+            })?;
 
         // Signal cancellation
         cancel_token.cancel();

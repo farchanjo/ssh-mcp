@@ -20,12 +20,11 @@
 //! The `client::Handle<SshClientHandler>` is wrapped in `Arc<>` because it's not
 //! `Clone`, and we need to share it across multiple async operations (execute, forward, etc.).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use russh::{client, keys};
-use tokio::sync::Mutex;
 
 use super::types::SessionInfo;
 
@@ -67,21 +66,23 @@ pub struct StoredSession {
 /// Global storage for active SSH sessions with metadata.
 ///
 /// Sessions are keyed by a UUID string generated at connection time.
-/// The `Lazy` initializer ensures thread-safe singleton initialization,
-/// while the outer `Mutex` protects concurrent access to the HashMap.
+/// Uses `DashMap` for lock-free concurrent access, allowing multiple
+/// readers and writers without blocking the entire map.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// // Store a new session
-/// let mut sessions = SSH_SESSIONS.lock().await;
-/// sessions.insert(session_id, stored_session);
+/// SSH_SESSIONS.insert(session_id, stored_session);
 ///
 /// // Retrieve a session
-/// let sessions = SSH_SESSIONS.lock().await;
-/// if let Some(session) = sessions.get(&session_id) {
+/// if let Some(session) = SSH_SESSIONS.get(&session_id) {
 ///     // Use session.handle or session.info
 /// }
+///
+/// // Remove a session
+/// if let Some((_, session)) = SSH_SESSIONS.remove(&session_id) {
+///     // Cleanup session
+/// }
 /// ```
-pub static SSH_SESSIONS: Lazy<Mutex<HashMap<String, StoredSession>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+pub static SSH_SESSIONS: Lazy<DashMap<String, StoredSession>> = Lazy::new(DashMap::new);
