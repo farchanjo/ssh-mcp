@@ -186,13 +186,14 @@ if result.status == "running":
 ```
 
 #### Limits
-- Max 10 concurrent async commands per session
+- Max 30 concurrent async commands per session
 - Commands auto-cleanup when session disconnects
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate
-- Global session store: `Lazy<Mutex<HashMap<String, StoredSession>>>`
+- Lock-free session store using `DashMap` for concurrent access
+- Lock-free async command store with secondary index for O(1) session lookups
 
 ### Authentication
 - RSA keys use `best_supported_rsa_hash()` to negotiate `rsa-sha2-256`/`rsa-sha2-512` instead of legacy `ssh-rsa`
@@ -220,8 +221,8 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(warnings)]` - All warnings are errors
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
-- Minimize lock scope for `SSH_SESSIONS` mutex
-- 131 unit tests (`cargo test --all-features`)
+- Lock-free data structures (`DashMap`) for concurrent access
+- 136 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 
