@@ -14,5 +14,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     poem_mcpserver::stdio::stdio(McpServer::new().tools(McpSSHCommands {})).await?;
+
     Ok(())
 }
