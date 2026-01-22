@@ -47,10 +47,10 @@ use russh::{ChannelMsg, client, keys};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::config::MAX_RETRY_DELAY_SECS;
-use super::error::is_retryable_error;
-use super::session::SshClientHandler;
-use super::types::SshCommandResponse;
+use crate::mcp::config::MAX_RETRY_DELAY_SECS;
+use crate::mcp::error::is_retryable_error;
+use crate::mcp::session::SshClientHandler;
+use crate::mcp::types::SshCommandResponse;
 
 /// Build russh client configuration with the specified settings.
 ///
