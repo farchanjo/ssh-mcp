@@ -100,13 +100,14 @@ impl McpSSHCommands {
                         return Ok(StructuredContent(SshConnectResponse {
                             session_id: sid.clone(),
                             message: format!(
-                                "Reused existing session for {}@{}{}",
+                                "Reused existing session for {}@{}{}. Use session_id '{}' for subsequent commands.",
                                 info.username,
                                 info.host,
                                 info.name
                                     .as_ref()
                                     .map(|n| format!(" (name: '{}')", n))
-                                    .unwrap_or_default()
+                                    .unwrap_or_default(),
+                                sid
                             ),
                             authenticated: true,
                             retry_attempts: 0,
@@ -179,30 +180,21 @@ impl McpSSHCommands {
                 }
 
                 let message = {
-                    let base_msg = match (&name, retry_attempts > 0) {
-                        (Some(n), true) => format!(
-                            "Successfully connected to {}@{} (name: '{}') after {} retry attempt(s)",
-                            username, address, n, retry_attempts
-                        ),
-                        (Some(n), false) => {
-                            format!(
-                                "Successfully connected to {}@{} (name: '{}')",
-                                username, address, n
-                            )
-                        }
-                        (None, true) => format!(
-                            "Successfully connected to {}@{} after {} retry attempt(s)",
-                            username, address, retry_attempts
-                        ),
-                        (None, false) => {
-                            format!("Successfully connected to {}@{}", username, address)
-                        }
-                    };
-                    if persistent {
-                        format!("{} [persistent session]", base_msg)
+                    let name_part = name
+                        .as_ref()
+                        .map(|n| format!(" (name: '{}')", n))
+                        .unwrap_or_default();
+                    let retry_part = if retry_attempts > 0 {
+                        format!(" after {} retry attempt(s)", retry_attempts)
                     } else {
-                        base_msg
-                    }
+                        String::new()
+                    };
+                    let persistent_part = if persistent { " [persistent]" } else { "" };
+
+                    format!(
+                        "Connected to {}@{}{}{}. Use session_id '{}' for subsequent commands.",
+                        username, address, name_part, retry_part, new_session_id
+                    ) + persistent_part
                 };
 
                 Ok(StructuredContent(SshConnectResponse {
