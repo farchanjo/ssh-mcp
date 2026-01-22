@@ -18,6 +18,17 @@ A Rust implementation of an SSH client server with Model Context Protocol (MCP) 
 - **Session Management**: Track and manage multiple SSH sessions
 - **MCP Protocol Support**: Built with poem-mcpserver to enable AI/LLM compatibility
 - **Stateful Connections**: Maintain SSH sessions across multiple commands
+- **Native Async**: Built on `russh` (pure Rust) with full tokio async support
+- **Automatic Retry**: Exponential backoff with jitter for transient failures
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/ARCHITECTURE.md) | System design, components, and async model |
+| [Flows](docs/FLOWS.md) | Connection, execution, and port forwarding flows |
+| [API Reference](docs/API.md) | Complete MCP tools reference with examples |
+| [Configuration](docs/CONFIGURATION.md) | Environment variables and setup guide |
 
 ## Installation and Integration
 
@@ -222,12 +233,17 @@ Response:
 
 ## Configuration
 
-The server can be configured through the following environment variables:
+The server can be configured through environment variables. See [Configuration Guide](docs/CONFIGURATION.md) for detailed documentation.
 
-| Variable | Description             | Default |
-| -------- | ----------------------- | ------- |
-| MCP_PORT | Port for the MCP server | 8000    |
-| RUST_LOG | Logging level           | info    |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SSH_CONNECT_TIMEOUT` | Connection timeout (seconds) | 30 |
+| `SSH_COMMAND_TIMEOUT` | Command execution timeout (seconds) | 180 |
+| `SSH_MAX_RETRIES` | Max retry attempts for transient failures | 3 |
+| `SSH_RETRY_DELAY_MS` | Initial retry delay (milliseconds) | 1000 |
+| `SSH_COMPRESSION` | Enable zlib compression | true |
+| `MCP_PORT` | HTTP server port | 8000 |
+| `RUST_LOG` | Logging level | info |
 
 ## Features Configuration
 
