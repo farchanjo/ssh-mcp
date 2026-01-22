@@ -17,21 +17,22 @@
 //! | `SSH_COMPRESSION` | true | Enable zlib compression |
 
 use std::env;
+use std::time::Duration;
 
-/// Default SSH connection timeout in seconds
-pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Default SSH connection timeout
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default SSH command execution timeout in seconds
-pub(crate) const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 180;
+/// Default SSH command execution timeout
+pub(crate) const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Default maximum retry attempts for SSH connection
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 
-/// Default retry delay in milliseconds
-pub(crate) const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
+/// Default retry delay
+pub(crate) const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
-/// Maximum retry delay cap in seconds (10 seconds)
-pub(crate) const MAX_RETRY_DELAY_SECS: u64 = 10;
+/// Maximum retry delay cap (10 seconds)
+pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Environment variable name for SSH connection timeout
 pub(crate) const CONNECT_TIMEOUT_ENV_VAR: &str = "SSH_CONNECT_TIMEOUT";
@@ -49,39 +50,39 @@ pub(crate) const RETRY_DELAY_MS_ENV_VAR: &str = "SSH_RETRY_DELAY_MS";
 pub(crate) const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
-pub(crate) fn resolve_connect_timeout(timeout_param: Option<u64>) -> u64 {
+pub(crate) fn resolve_connect_timeout(timeout_param: Option<u64>) -> Duration {
     // Priority 1: Use parameter if provided
     if let Some(timeout) = timeout_param {
-        return timeout;
+        return Duration::from_secs(timeout);
     }
 
     // Priority 2: Use environment variable if set
     if let Ok(env_timeout) = env::var(CONNECT_TIMEOUT_ENV_VAR)
         && let Ok(timeout) = env_timeout.parse::<u64>()
     {
-        return timeout;
+        return Duration::from_secs(timeout);
     }
 
     // Priority 3: Default value
-    DEFAULT_CONNECT_TIMEOUT_SECS
+    DEFAULT_CONNECT_TIMEOUT
 }
 
 /// Resolve the command execution timeout value with priority: parameter -> env var -> default
-pub(crate) fn resolve_command_timeout(timeout_param: Option<u64>) -> u64 {
+pub(crate) fn resolve_command_timeout(timeout_param: Option<u64>) -> Duration {
     // Priority 1: Use parameter if provided
     if let Some(timeout) = timeout_param {
-        return timeout;
+        return Duration::from_secs(timeout);
     }
 
     // Priority 2: Use environment variable if set
     if let Ok(env_timeout) = env::var(COMMAND_TIMEOUT_ENV_VAR)
         && let Ok(timeout) = env_timeout.parse::<u64>()
     {
-        return timeout;
+        return Duration::from_secs(timeout);
     }
 
     // Priority 3: Default value
-    DEFAULT_COMMAND_TIMEOUT_SECS
+    DEFAULT_COMMAND_TIMEOUT
 }
 
 /// Resolve the max retries value with priority: parameter -> env var -> default
@@ -103,21 +104,21 @@ pub(crate) fn resolve_max_retries(max_retries_param: Option<u32>) -> u32 {
 }
 
 /// Resolve the retry delay value with priority: parameter -> env var -> default
-pub(crate) fn resolve_retry_delay_ms(retry_delay_param: Option<u64>) -> u64 {
-    // Priority 1: Use parameter if provided
+pub(crate) fn resolve_retry_delay(retry_delay_param: Option<u64>) -> Duration {
+    // Priority 1: Use parameter if provided (milliseconds)
     if let Some(delay) = retry_delay_param {
-        return delay;
+        return Duration::from_millis(delay);
     }
 
-    // Priority 2: Use environment variable if set
+    // Priority 2: Use environment variable if set (milliseconds)
     if let Ok(env_delay) = env::var(RETRY_DELAY_MS_ENV_VAR)
         && let Ok(delay) = env_delay.parse::<u64>()
     {
-        return delay;
+        return Duration::from_millis(delay);
     }
 
     // Priority 3: Default value
-    DEFAULT_RETRY_DELAY_MS
+    DEFAULT_RETRY_DELAY
 }
 
 /// Resolve the compression setting with priority: parameter -> env var -> default (true)
@@ -169,7 +170,7 @@ mod tests {
             #[test]
             fn test_uses_param_when_provided() {
                 let result = resolve_connect_timeout(Some(60));
-                assert_eq!(result, 60);
+                assert_eq!(result, Duration::from_secs(60));
             }
 
             #[test]
@@ -184,7 +185,7 @@ mod tests {
                 unsafe {
                     remove_env(CONNECT_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, 45);
+                assert_eq!(result, Duration::from_secs(45));
             }
 
             #[test]
@@ -199,7 +200,7 @@ mod tests {
                 unsafe {
                     remove_env(CONNECT_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, 90);
+                assert_eq!(result, Duration::from_secs(90));
             }
 
             #[test]
@@ -210,7 +211,7 @@ mod tests {
                     remove_env(CONNECT_TIMEOUT_ENV_VAR);
                 }
                 let result = resolve_connect_timeout(None);
-                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT_SECS);
+                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT);
             }
 
             #[test]
@@ -225,7 +226,7 @@ mod tests {
                 unsafe {
                     remove_env(CONNECT_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT_SECS);
+                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT);
             }
 
             #[test]
@@ -241,7 +242,7 @@ mod tests {
                     remove_env(CONNECT_TIMEOUT_ENV_VAR);
                 }
                 // Parsing fails for negative u64, so default is used
-                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT_SECS);
+                assert_eq!(result, DEFAULT_CONNECT_TIMEOUT);
             }
         }
 
@@ -251,7 +252,7 @@ mod tests {
             #[test]
             fn test_uses_param_when_provided() {
                 let result = resolve_command_timeout(Some(120));
-                assert_eq!(result, 120);
+                assert_eq!(result, Duration::from_secs(120));
             }
 
             #[test]
@@ -266,7 +267,7 @@ mod tests {
                 unsafe {
                     remove_env(COMMAND_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, 60);
+                assert_eq!(result, Duration::from_secs(60));
             }
 
             #[test]
@@ -281,7 +282,7 @@ mod tests {
                 unsafe {
                     remove_env(COMMAND_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, 240);
+                assert_eq!(result, Duration::from_secs(240));
             }
 
             #[test]
@@ -292,7 +293,7 @@ mod tests {
                     remove_env(COMMAND_TIMEOUT_ENV_VAR);
                 }
                 let result = resolve_command_timeout(None);
-                assert_eq!(result, DEFAULT_COMMAND_TIMEOUT_SECS);
+                assert_eq!(result, DEFAULT_COMMAND_TIMEOUT);
             }
 
             #[test]
@@ -307,7 +308,7 @@ mod tests {
                 unsafe {
                     remove_env(COMMAND_TIMEOUT_ENV_VAR);
                 }
-                assert_eq!(result, DEFAULT_COMMAND_TIMEOUT_SECS);
+                assert_eq!(result, DEFAULT_COMMAND_TIMEOUT);
             }
         }
 
@@ -383,13 +384,13 @@ mod tests {
             }
         }
 
-        mod retry_delay_ms {
+        mod retry_delay {
             use super::*;
 
             #[test]
             fn test_uses_param_when_provided() {
-                let result = resolve_retry_delay_ms(Some(2000));
-                assert_eq!(result, 2000);
+                let result = resolve_retry_delay(Some(2000));
+                assert_eq!(result, Duration::from_millis(2000));
             }
 
             #[test]
@@ -399,12 +400,12 @@ mod tests {
                 unsafe {
                     set_env(RETRY_DELAY_MS_ENV_VAR, "5000");
                 }
-                let result = resolve_retry_delay_ms(Some(500));
+                let result = resolve_retry_delay(Some(500));
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe {
                     remove_env(RETRY_DELAY_MS_ENV_VAR);
                 }
-                assert_eq!(result, 500);
+                assert_eq!(result, Duration::from_millis(500));
             }
 
             #[test]
@@ -414,12 +415,12 @@ mod tests {
                 unsafe {
                     set_env(RETRY_DELAY_MS_ENV_VAR, "3000");
                 }
-                let result = resolve_retry_delay_ms(None);
+                let result = resolve_retry_delay(None);
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe {
                     remove_env(RETRY_DELAY_MS_ENV_VAR);
                 }
-                assert_eq!(result, 3000);
+                assert_eq!(result, Duration::from_millis(3000));
             }
 
             #[test]
@@ -429,8 +430,8 @@ mod tests {
                 unsafe {
                     remove_env(RETRY_DELAY_MS_ENV_VAR);
                 }
-                let result = resolve_retry_delay_ms(None);
-                assert_eq!(result, DEFAULT_RETRY_DELAY_MS);
+                let result = resolve_retry_delay(None);
+                assert_eq!(result, DEFAULT_RETRY_DELAY);
             }
 
             #[test]
@@ -440,12 +441,12 @@ mod tests {
                 unsafe {
                     set_env(RETRY_DELAY_MS_ENV_VAR, "xyz");
                 }
-                let result = resolve_retry_delay_ms(None);
+                let result = resolve_retry_delay(None);
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe {
                     remove_env(RETRY_DELAY_MS_ENV_VAR);
                 }
-                assert_eq!(result, DEFAULT_RETRY_DELAY_MS);
+                assert_eq!(result, DEFAULT_RETRY_DELAY);
             }
         }
 
