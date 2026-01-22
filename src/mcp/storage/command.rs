@@ -932,7 +932,8 @@ mod tests {
         );
 
         // Filter by session_id_1 and Running status
-        let filtered = storage.list_filtered(Some(&session_id_1), Some(AsyncCommandStatus::Running));
+        let filtered =
+            storage.list_filtered(Some(&session_id_1), Some(AsyncCommandStatus::Running));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].command_id, cmd_1);
 
@@ -976,7 +977,8 @@ mod tests {
         );
 
         // Filter by Cancelled status (our command is Running)
-        let filtered = storage.list_filtered(Some(&session_id), Some(AsyncCommandStatus::Cancelled));
+        let filtered =
+            storage.list_filtered(Some(&session_id), Some(AsyncCommandStatus::Cancelled));
         assert!(filtered.is_empty());
 
         // Cleanup
