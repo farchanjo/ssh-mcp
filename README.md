@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-136%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-314%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -19,7 +19,7 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
 - **Modular codebase** - 9 focused modules instead of 1 monolithic file
-- **Comprehensive tests** - 136 unit tests covering all functionality
+- **Comprehensive tests** - 314 unit tests covering all functionality
 
 ---
 
@@ -34,8 +34,8 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **C Dependencies** | Requires libssh2, openssl | None - pure Rust |
 | **Thread Safety** | `Session` is `!Send` (requires `std::thread`) | `Handle` is `Send + Sync` |
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
-| **Architecture** | Single ~800 line file | 9 modules, 4100+ lines |
-| **Test Coverage** | 0 tests | 136 unit tests |
+| **Architecture** | Single ~800 line file | 16 modules, 7300+ lines |
+| **Test Coverage** | 0 tests | 314 unit tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -52,8 +52,8 @@ REMOVED:
 ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
-- Modular architecture (9 files)
-- Comprehensive test suite (136 tests)
+- SOLID architecture (16 modules with storage/auth/message abstractions)
+- Comprehensive test suite (314 tests)
 - Async command execution (background commands with polling)
 - Error classification for smart retries
 - Documentation with Mermaid diagrams
@@ -94,7 +94,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 136 tests
+cargo test --all-features  # 314 tests
 ```
 
 ### Install
@@ -559,15 +559,30 @@ Priority: **Parameter > Environment Variable > Default**
 
 ```
 src/mcp/
-├── mod.rs           (23 lines)   - Module declarations
-├── types.rs         (916 lines)  - Response types
-├── config.rs        (601 lines)  - Configuration resolution
-├── error.rs         (359 lines)  - Error classification
-├── session.rs       (88 lines)   - Session storage
-├── client.rs        (862 lines)  - SSH connection/auth/execution
-├── async_command.rs (398 lines)  - Async command tracking
-├── forward.rs       (155 lines)  - Port forwarding
-└── commands.rs      (745 lines)  - MCP tool handlers
+├── mod.rs            (37 lines)    - Module declarations
+├── types.rs          (1112 lines)  - Response types
+├── config.rs         (601 lines)   - Configuration resolution
+├── error.rs          (359 lines)   - Error classification
+├── session.rs        (41 lines)    - SSH client handler
+├── client.rs         (785 lines)   - SSH connection/auth/execution
+├── async_command.rs  (183 lines)   - Async command types
+├── forward.rs        (155 lines)   - Port forwarding
+├── commands.rs       (774 lines)   - MCP tool handlers
+├── storage/
+│   ├── mod.rs        (18 lines)    - Storage exports
+│   ├── traits.rs     (107 lines)   - Storage trait definitions
+│   ├── session.rs    (491 lines)   - Session storage impl + tests
+│   └── command.rs    (996 lines)   - Command storage impl + tests
+├── auth/
+│   ├── mod.rs        (36 lines)    - Auth exports
+│   ├── traits.rs     (40 lines)    - AuthStrategy trait
+│   ├── password.rs   (129 lines)   - Password auth + tests
+│   ├── key.rs        (205 lines)   - Key auth + tests
+│   ├── agent.rs      (139 lines)   - SSH agent auth + tests
+│   └── chain.rs      (323 lines)   - Auth chain + tests
+└── message/
+    ├── mod.rs        (9 lines)     - Message exports
+    └── builder.rs    (820 lines)   - Message builders + tests
 ```
 
 ### Module Dependencies
@@ -668,8 +683,12 @@ cargo test --all-features -- --nocapture
 | error.rs | 29 | Error classification |
 | client.rs | 22 | Address parsing, client config |
 | types.rs | 38 | Serialization |
-| async_command.rs | 14 | Async command storage and tracking |
-| **Total** | **136** | |
+| storage/session.rs | 26 | Session storage operations |
+| storage/command.rs | 36 | Command storage operations |
+| auth/*.rs | 45 | Authentication strategies |
+| message/builder.rs | 71 | Message builders |
+| async_command.rs | 14 | Async command types |
+| **Total** | **314** | |
 
 ---
 
