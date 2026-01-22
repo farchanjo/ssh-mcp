@@ -9,7 +9,7 @@ use russh::client;
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::session::SshClientHandler;
-use crate::mcp::types::{AsyncCommandInfo, SessionInfo};
+use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo};
 
 /// Reference to a stored session for read-only access.
 pub struct SessionRef {
@@ -95,6 +95,13 @@ pub trait CommandStorage: Send + Sync {
     /// Count commands for a session.
     fn count_by_session(&self, session_id: &str) -> usize;
 
-    /// List all commands, optionally filtered by session and/or status.
+    /// List all commands.
     fn list_all(&self) -> Vec<AsyncCommandInfo>;
+
+    /// List commands filtered by optional session ID and/or status.
+    fn list_filtered(
+        &self,
+        session_id: Option<&str>,
+        status: Option<AsyncCommandStatus>,
+    ) -> Vec<AsyncCommandInfo>;
 }

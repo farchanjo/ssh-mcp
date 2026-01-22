@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 use crate::mcp::async_command::RunningCommand;
-use crate::mcp::types::AsyncCommandInfo;
+use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus};
 
 use super::traits::{CommandRef, CommandStorage};
 
@@ -35,8 +35,9 @@ impl DashMapCommandStorage {
 
     /// Get direct access to the underlying DashMap for iteration.
     ///
-    /// This is needed for operations that require iterating over all commands
-    /// with filtering, which the trait interface doesn't expose directly.
+    /// This is available for advanced use cases that require custom iteration logic.
+    /// For standard filtering, prefer `list_filtered()` from the `CommandStorage` trait.
+    #[allow(dead_code)]
     pub fn iter(
         &self,
     ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, String, RunningCommand>> {
@@ -147,6 +148,30 @@ impl CommandStorage for DashMapCommandStorage {
     fn list_all(&self) -> Vec<AsyncCommandInfo> {
         self.commands
             .iter()
+            .map(|entry| {
+                let mut info = entry.info.clone();
+                info.status = *entry.status_rx.borrow();
+                info
+            })
+            .collect()
+    }
+
+    fn list_filtered(
+        &self,
+        session_id: Option<&str>,
+        status: Option<AsyncCommandStatus>,
+    ) -> Vec<AsyncCommandInfo> {
+        self.commands
+            .iter()
+            .filter(|entry| {
+                let session_matches = session_id
+                    .map(|sid| entry.info.session_id == sid)
+                    .unwrap_or(true);
+                let status_matches = status
+                    .map(|s| *entry.status_rx.borrow() == s)
+                    .unwrap_or(true);
+                session_matches && status_matches
+            })
             .map(|entry| {
                 let mut info = entry.info.clone();
                 info.status = *entry.status_rx.borrow();
@@ -808,5 +833,162 @@ mod tests {
 
         // Cleanup - now safe since read lock is released
         storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_list_filtered_by_session() {
+        let storage = DashMapCommandStorage::new();
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
+
+        let cmd_1 = format!("cmd-1-{}", uuid::Uuid::new_v4());
+        let cmd_2 = format!("cmd-2-{}", uuid::Uuid::new_v4());
+        let cmd_3 = format!("cmd-3-{}", uuid::Uuid::new_v4());
+
+        storage.register(cmd_1.clone(), create_test_command(&cmd_1, &session_id_1));
+        storage.register(cmd_2.clone(), create_test_command(&cmd_2, &session_id_1));
+        storage.register(cmd_3.clone(), create_test_command(&cmd_3, &session_id_2));
+
+        // Filter by session_id_1
+        let filtered = storage.list_filtered(Some(&session_id_1), None);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|c| c.command_id == cmd_1));
+        assert!(filtered.iter().any(|c| c.command_id == cmd_2));
+
+        // Filter by session_id_2
+        let filtered = storage.list_filtered(Some(&session_id_2), None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.iter().any(|c| c.command_id == cmd_3));
+
+        // Cleanup
+        storage.unregister(&cmd_1);
+        storage.unregister(&cmd_2);
+        storage.unregister(&cmd_3);
+    }
+
+    #[test]
+    fn test_list_filtered_by_status() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4());
+
+        let running_id = format!("running-{}", uuid::Uuid::new_v4());
+        let completed_id = format!("completed-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            running_id.clone(),
+            create_test_command_with_status(&running_id, &session_id, AsyncCommandStatus::Running),
+        );
+        storage.register(
+            completed_id.clone(),
+            create_test_command_with_status(
+                &completed_id,
+                &session_id,
+                AsyncCommandStatus::Completed,
+            ),
+        );
+
+        // Filter by Running status
+        let running = storage.list_filtered(None, Some(AsyncCommandStatus::Running));
+        let our_running: Vec<_> = running
+            .iter()
+            .filter(|c| c.command_id == running_id)
+            .collect();
+        assert_eq!(our_running.len(), 1);
+
+        // Filter by Completed status
+        let completed = storage.list_filtered(None, Some(AsyncCommandStatus::Completed));
+        let our_completed: Vec<_> = completed
+            .iter()
+            .filter(|c| c.command_id == completed_id)
+            .collect();
+        assert_eq!(our_completed.len(), 1);
+
+        // Cleanup
+        storage.unregister(&running_id);
+        storage.unregister(&completed_id);
+    }
+
+    #[test]
+    fn test_list_filtered_by_session_and_status() {
+        let storage = DashMapCommandStorage::new();
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
+
+        let cmd_1 = format!("cmd-1-{}", uuid::Uuid::new_v4());
+        let cmd_2 = format!("cmd-2-{}", uuid::Uuid::new_v4());
+        let cmd_3 = format!("cmd-3-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd_1.clone(),
+            create_test_command_with_status(&cmd_1, &session_id_1, AsyncCommandStatus::Running),
+        );
+        storage.register(
+            cmd_2.clone(),
+            create_test_command_with_status(&cmd_2, &session_id_1, AsyncCommandStatus::Completed),
+        );
+        storage.register(
+            cmd_3.clone(),
+            create_test_command_with_status(&cmd_3, &session_id_2, AsyncCommandStatus::Running),
+        );
+
+        // Filter by session_id_1 and Running status
+        let filtered = storage.list_filtered(Some(&session_id_1), Some(AsyncCommandStatus::Running));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].command_id, cmd_1);
+
+        // Filter by session_id_1 and Completed status
+        let filtered =
+            storage.list_filtered(Some(&session_id_1), Some(AsyncCommandStatus::Completed));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].command_id, cmd_2);
+
+        // Cleanup
+        storage.unregister(&cmd_1);
+        storage.unregister(&cmd_2);
+        storage.unregister(&cmd_3);
+    }
+
+    #[test]
+    fn test_list_filtered_no_filters() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
+
+        storage.register(cmd_id.clone(), create_test_command(&cmd_id, &session_id));
+
+        // No filters should return all (at least our command)
+        let all = storage.list_filtered(None, None);
+        assert!(all.iter().any(|c| c.command_id == cmd_id));
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_list_filtered_empty_result() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd_id.clone(),
+            create_test_command_with_status(&cmd_id, &session_id, AsyncCommandStatus::Running),
+        );
+
+        // Filter by Cancelled status (our command is Running)
+        let filtered = storage.list_filtered(Some(&session_id), Some(AsyncCommandStatus::Cancelled));
+        assert!(filtered.is_empty());
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_list_filtered_nonexistent_session() {
+        let storage = DashMapCommandStorage::new();
+        let unique_session = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        let filtered = storage.list_filtered(Some(&unique_session), None);
+        assert!(filtered.is_empty());
     }
 }
