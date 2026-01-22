@@ -614,27 +614,8 @@ impl McpSSHCommands {
             _ => None,
         });
 
-        // Use storage abstraction for iteration
-        let filtered: Vec<AsyncCommandInfo> = COMMAND_STORAGE
-            .iter()
-            .filter(|entry| {
-                let cmd = entry.value();
-                let session_match = session_id
-                    .as_ref()
-                    .map(|sid| cmd.info.session_id == *sid)
-                    .unwrap_or(true);
-                let status_match = status_filter
-                    .map(|sf| *cmd.status_rx.borrow() == sf)
-                    .unwrap_or(true);
-                session_match && status_match
-            })
-            .map(|entry| {
-                let cmd = entry.value();
-                let mut info = cmd.info.clone();
-                info.status = *cmd.status_rx.borrow();
-                info
-            })
-            .collect();
+        // Use storage trait method for filtered listing (LSP compliance)
+        let filtered = COMMAND_STORAGE.list_filtered(session_id.as_deref(), status_filter);
 
         let count = filtered.len();
         StructuredContent(SshListCommandsResponse {
