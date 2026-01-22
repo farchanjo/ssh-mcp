@@ -46,7 +46,13 @@ pub struct McpSSHCommands;
 
 #[Tools]
 impl McpSSHCommands {
-    /// Connect to an SSH server and store the session
+    /// Connect to an SSH server and store the session.
+    ///
+    /// Returns a session_id for subsequent commands. For long-running operations
+    /// (builds, deployments, batch processing), prefer `ssh_execute_async` over
+    /// `ssh_execute` for non-blocking execution with progress monitoring.
+    ///
+    /// Use `persistent=true` for sessions that should remain open indefinitely.
     #[allow(clippy::too_many_arguments)]
     async fn ssh_connect(
         &self,
@@ -191,7 +197,9 @@ impl McpSSHCommands {
                     let persistent_part = if persistent { " [persistent]" } else { "" };
 
                     format!(
-                        "Connected to {}@{}{}{}. Use session_id '{}' for subsequent commands.",
+                        "Connected to {}@{}{}{}. Use session_id '{}' for subsequent commands.\n\
+                        For long-running commands (builds, deployments, data processing), use ssh_execute_async \
+                        for non-blocking execution with progress monitoring and cancellation support.",
                         username, address, name_part, retry_part, new_session_id
                     ) + persistent_part
                 };
@@ -210,7 +218,15 @@ impl McpSSHCommands {
         }
     }
 
-    /// Execute a command on a connected SSH session.
+    /// Execute a command synchronously on a connected SSH session.
+    ///
+    /// **When to use:** Quick commands that complete in under 30 seconds.
+    ///
+    /// **When to use ssh_execute_async instead:**
+    /// - Long-running commands (builds, deployments, data processing)
+    /// - Commands where you need progress monitoring
+    /// - Commands you may need to cancel mid-execution
+    /// - Running multiple commands in parallel
     ///
     /// On timeout, returns partial output with `timed_out: true` instead of an error.
     /// The session remains active and can be reused for subsequent commands.
@@ -256,7 +272,11 @@ impl McpSSHCommands {
         }
     }
 
-    /// Disconnect an SSH session and release resources
+    /// Disconnect an SSH session and release resources.
+    ///
+    /// **Important:** This automatically cancels all running async commands
+    /// associated with the session. Check `ssh_list_commands` first if you
+    /// need to preserve running operations.
     async fn ssh_disconnect(
         &self,
         /// Session ID to disconnect
@@ -305,7 +325,11 @@ impl McpSSHCommands {
         }
     }
 
-    /// List all active SSH sessions with their metadata
+    /// List all active SSH sessions with their metadata.
+    ///
+    /// Performs a health check on each session and automatically removes
+    /// dead/disconnected sessions from the list. Use this to find available
+    /// session_ids for command execution.
     async fn ssh_list_sessions(&self) -> StructuredContent<SessionListResponse> {
         let health_timeout = Duration::from_secs(5);
 
@@ -430,8 +454,19 @@ impl McpSSHCommands {
 
     /// Execute a command asynchronously on a connected SSH session.
     ///
+    /// **Recommended for:** Long-running commands (builds, deployments, batch jobs,
+    /// data processing) that may exceed the default timeout or benefit from
+    /// progress monitoring and cancellation.
+    ///
+    /// **Workflow:**
+    /// 1. Call `ssh_execute_async` - returns immediately with `command_id`
+    /// 2. Poll with `ssh_get_command_output(command_id, wait=false)` to check progress
+    /// 3. Or wait with `ssh_get_command_output(command_id, wait=true)` to block until done
+    /// 4. Cancel anytime with `ssh_cancel_command(command_id)`
+    ///
+    /// **Limits:** Up to 30 concurrent async commands per session.
+    ///
     /// Returns immediately with a command_id for polling or cancellation.
-    /// Use ssh_get_command_output to poll for results.
     async fn ssh_execute_async(
         &self,
         /// Session ID returned from ssh_connect
@@ -525,7 +560,13 @@ impl McpSSHCommands {
 
     /// Get the current output and status of an async command.
     ///
-    /// Can optionally wait for completion.
+    /// **Polling mode** (`wait=false`): Returns immediately with current status and partial output.
+    /// Use this for progress monitoring or checking if a command is still running.
+    ///
+    /// **Blocking mode** (`wait=true`): Waits until the command completes or timeout expires.
+    /// Use this when you need the final result and can wait.
+    ///
+    /// **Status values:** `running`, `completed`, `cancelled`, `failed`
     async fn ssh_get_command_output(
         &self,
         /// Command ID returned from ssh_execute_async
@@ -588,6 +629,9 @@ impl McpSSHCommands {
     }
 
     /// List all async commands, optionally filtered by session or status.
+    ///
+    /// Useful for monitoring multiple concurrent operations or checking
+    /// which commands are still running before disconnecting a session.
     async fn ssh_list_commands(
         &self,
         /// Filter by session ID
@@ -634,7 +678,11 @@ impl McpSSHCommands {
 
     /// Cancel a running async command.
     ///
-    /// Returns the output collected so far.
+    /// Returns the output collected so far. Use this to stop long-running commands
+    /// that are no longer needed, or to abort commands that are taking too long.
+    ///
+    /// Note: Only running commands can be cancelled. Completed/failed commands
+    /// will return an error.
     async fn ssh_cancel_command(
         &self,
         /// Command ID to cancel
