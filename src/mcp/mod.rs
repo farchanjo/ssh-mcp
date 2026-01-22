@@ -1,17 +1,25 @@
 //! MCP SSH module providing SSH connection and command execution tools.
 //!
-//! This module is organized into the following submodules:
+//! # Architecture
 //!
-//! - `types`: Serializable response types for MCP tools
-//! - `config`: Configuration resolution with environment variable support
-//! - `error`: Error classification for retry logic
-//! - `session`: Session storage and management
-//! - `storage`: Storage abstractions for sessions and commands (SOLID)
-//! - `auth`: Authentication strategies (Strategy pattern)
-//! - `message`: Message builders for LLM-friendly responses
-//! - `client`: SSH connection and authentication logic
-//! - `forward`: Port forwarding implementation (feature-gated)
-//! - `commands`: MCP tool implementations
+//! This module follows SOLID principles with trait-based abstractions:
+//!
+//! ## Core Modules
+//!
+//! - [`types`]: Serializable response types for MCP tools
+//! - [`config`]: Configuration resolution with environment variable support
+//! - [`error`]: Error classification for retry logic
+//! - [`session`]: `SshClientHandler` for russh callbacks
+//! - [`client`]: SSH connection and command execution logic
+//! - [`async_command`]: Async command tracking and state management
+//! - [`forward`]: Port forwarding implementation (feature-gated)
+//! - [`commands`]: `McpSSHCommands` MCP tool implementations
+//!
+//! ## SOLID Architecture Modules
+//!
+//! - [`storage`]: Storage traits (`SessionStorage`, `CommandStorage`) with DashMap implementations
+//! - [`auth`]: Authentication strategies (`PasswordAuth`, `KeyAuth`, `AgentAuth`, `AuthChain`)
+//! - [`message`]: Message builders for LLM-friendly responses
 
 pub(crate) mod async_command;
 pub mod auth;

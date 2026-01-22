@@ -36,15 +36,60 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 ### Core Modules (`src/mcp/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 23 | Module declarations and re-exports |
+| **mod.rs** | 30 | Module declarations and re-exports |
 | **types.rs** | 916 | Response types (`SessionInfo`, `SshConnectResponse`, async types) |
 | **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
 | **session.rs** | 88 | Session storage and `SshClientHandler` |
-| **client.rs** | 862 | SSH connection, authentication, sync/async command execution |
-| **async_command.rs** | 398 | Async command storage, tracking, and helper functions |
+| **client.rs** | 862 | SSH connection, authentication, command execution |
+| **async_command.rs** | 398 | Async command tracking and helper functions |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
 | **commands.rs** | 745 | `McpSSHCommands` MCP tool implementations |
+
+### SOLID Architecture Modules
+
+#### Storage Layer (`src/mcp/storage/`)
+| Module | Lines | Description |
+|--------|-------|-------------|
+| **mod.rs** | 18 | Module exports and global storage instances |
+| **traits.rs** | 100 | `SessionStorage` and `CommandStorage` traits |
+| **session.rs** | 217 | `DashMapSessionStorage` with agent index |
+| **command.rs** | 246 | `DashMapCommandStorage` with session index |
+
+Storage abstractions enable dependency injection and testability:
+- `SessionStorage`: CRUD for SSH sessions with agent grouping
+- `CommandStorage`: CRUD for async commands with session lookups
+- Both use `DashMap` for lock-free concurrent access
+
+#### Authentication Layer (`src/mcp/auth/`)
+| Module | Lines | Description |
+|--------|-------|-------------|
+| **mod.rs** | 38 | Module exports and usage examples |
+| **traits.rs** | 41 | `AuthStrategy` trait definition |
+| **password.rs** | 69 | `PasswordAuth` strategy |
+| **key.rs** | 97 | `KeyAuth` strategy (private key file) |
+| **agent.rs** | 109 | `AgentAuth` strategy (SSH agent) |
+| **chain.rs** | 175 | `AuthChain` for trying multiple strategies |
+
+Authentication uses the Strategy pattern (Open-Closed Principle):
+```rust
+let chain = AuthChain::new()
+    .with_password("secret")
+    .with_key("/path/to/key")
+    .with_agent();
+let result = chain.authenticate(&mut handle, "username").await?;
+```
+
+#### Message Layer (`src/mcp/message/`)
+| Module | Lines | Description |
+|--------|-------|-------------|
+| **mod.rs** | 9 | Module exports |
+| **builder.rs** | 424 | Fluent message builders for LLM-friendly responses |
+
+Message builders construct human-readable responses:
+- `ConnectMessageBuilder`: Connection success with identifiers
+- `ExecuteMessageBuilder`: Command start with polling instructions
+- `AgentDisconnectMessageBuilder`: Cleanup summary
 
 ### MCP Tools
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
@@ -251,12 +296,13 @@ Response:
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate
-- Lock-free session store using `DashMap` for concurrent access
-- Lock-free async command store with secondary index for O(1) session lookups
+- Lock-free storage via `DashMap` implementations of `SessionStorage` and `CommandStorage` traits
+- Secondary indices for O(1) lookups: agent-to-sessions, session-to-commands
 
 ### Authentication
-- RSA keys use `best_supported_rsa_hash()` to negotiate `rsa-sha2-256`/`rsa-sha2-512` instead of legacy `ssh-rsa`
-- Supports password, public key (RSA, Ed25519), and SSH agent authentication
+- Strategy pattern via `AuthStrategy` trait with `AuthChain` for fallback
+- RSA keys use `best_supported_rsa_hash()` to negotiate `rsa-sha2-256`/`rsa-sha2-512`
+- Strategies: `PasswordAuth`, `KeyAuth` (RSA, Ed25519), `AgentAuth` (SSH agent)
 
 ### Configuration Priority
 All settings follow: **Parameter → Environment Variable → Default**

@@ -138,69 +138,71 @@ mod tests {
     #[test]
     fn test_agent_registration() {
         let storage = DashMapSessionStorage::new();
-        let agent_id = "test-agent";
-        let session_id_1 = "session-1";
-        let session_id_2 = "session-2";
+        let agent_id = format!("test-agent-{}", uuid::Uuid::new_v4());
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
 
-        storage.register_agent(agent_id, session_id_1);
-        storage.register_agent(agent_id, session_id_2);
+        storage.register_agent(&agent_id, &session_id_1);
+        storage.register_agent(&agent_id, &session_id_2);
 
-        let sessions = storage.get_agent_sessions(agent_id);
+        let sessions = storage.get_agent_sessions(&agent_id);
         assert_eq!(sessions.len(), 2);
-        assert!(sessions.contains(&session_id_1.to_string()));
-        assert!(sessions.contains(&session_id_2.to_string()));
+        assert!(sessions.contains(&session_id_1));
+        assert!(sessions.contains(&session_id_2));
     }
 
     #[test]
     fn test_agent_unregistration() {
         let storage = DashMapSessionStorage::new();
-        let agent_id = "test-agent-unreg";
-        let session_id_1 = "session-a";
-        let session_id_2 = "session-b";
+        let agent_id = format!("test-agent-unreg-{}", uuid::Uuid::new_v4());
+        let session_id_1 = format!("session-a-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-b-{}", uuid::Uuid::new_v4());
 
-        storage.register_agent(agent_id, session_id_1);
-        storage.register_agent(agent_id, session_id_2);
-        storage.unregister_agent(agent_id, session_id_1);
+        storage.register_agent(&agent_id, &session_id_1);
+        storage.register_agent(&agent_id, &session_id_2);
+        storage.unregister_agent(&agent_id, &session_id_1);
 
-        let sessions = storage.get_agent_sessions(agent_id);
+        let sessions = storage.get_agent_sessions(&agent_id);
         assert_eq!(sessions.len(), 1);
-        assert!(sessions.contains(&session_id_2.to_string()));
+        assert!(sessions.contains(&session_id_2));
 
         // Unregister last session removes agent entry
-        storage.unregister_agent(agent_id, session_id_2);
-        assert!(storage.get_agent_sessions(agent_id).is_empty());
+        storage.unregister_agent(&agent_id, &session_id_2);
+        assert!(storage.get_agent_sessions(&agent_id).is_empty());
     }
 
     #[test]
     fn test_remove_agent_sessions() {
         let storage = DashMapSessionStorage::new();
-        let agent_id = "test-agent-remove";
-        let session_id_1 = "session-x";
-        let session_id_2 = "session-y";
+        let agent_id = format!("test-agent-remove-{}", uuid::Uuid::new_v4());
+        let session_id_1 = format!("session-x-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-y-{}", uuid::Uuid::new_v4());
 
-        storage.register_agent(agent_id, session_id_1);
-        storage.register_agent(agent_id, session_id_2);
+        storage.register_agent(&agent_id, &session_id_1);
+        storage.register_agent(&agent_id, &session_id_2);
 
-        let removed = storage.remove_agent_sessions(agent_id);
+        let removed = storage.remove_agent_sessions(&agent_id);
         assert_eq!(removed.len(), 2);
-        assert!(removed.contains(&session_id_1.to_string()));
-        assert!(removed.contains(&session_id_2.to_string()));
+        assert!(removed.contains(&session_id_1));
+        assert!(removed.contains(&session_id_2));
 
         // Agent entry should be gone
-        assert!(storage.get_agent_sessions(agent_id).is_empty());
+        assert!(storage.get_agent_sessions(&agent_id).is_empty());
     }
 
     #[test]
     fn test_get_agent_sessions_empty() {
         let storage = DashMapSessionStorage::new();
-        let sessions = storage.get_agent_sessions("nonexistent-agent");
+        let unique_agent = format!("nonexistent-agent-{}", uuid::Uuid::new_v4());
+        let sessions = storage.get_agent_sessions(&unique_agent);
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn test_contains() {
         let storage = DashMapSessionStorage::new();
-        assert!(!storage.contains("nonexistent"));
+        let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+        assert!(!storage.contains(&unique_id));
     }
 
     #[test]
@@ -213,5 +215,125 @@ mod tests {
     fn test_session_ids_empty() {
         let storage = DashMapSessionStorage::new();
         assert!(storage.session_ids().is_empty());
+    }
+
+    #[test]
+    fn test_default_implementation() {
+        let storage = DashMapSessionStorage::default();
+        assert!(storage.list().is_empty());
+        assert!(storage.session_ids().is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_agent_registration() {
+        let storage = DashMapSessionStorage::new();
+        let agent_id = format!("test-agent-dup-{}", uuid::Uuid::new_v4());
+        let session_id = format!("session-dup-{}", uuid::Uuid::new_v4());
+
+        // Register same session twice under same agent
+        storage.register_agent(&agent_id, &session_id);
+        storage.register_agent(&agent_id, &session_id);
+
+        // Should still only have one entry (HashSet behavior)
+        let sessions = storage.get_agent_sessions(&agent_id);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_unregister_nonexistent_agent() {
+        let storage = DashMapSessionStorage::new();
+        let agent_id = format!("nonexistent-agent-{}", uuid::Uuid::new_v4());
+        let session_id = format!("session-{}", uuid::Uuid::new_v4());
+
+        // Should not panic when unregistering from nonexistent agent
+        storage.unregister_agent(&agent_id, &session_id);
+        assert!(storage.get_agent_sessions(&agent_id).is_empty());
+    }
+
+    #[test]
+    fn test_unregister_nonexistent_session_from_agent() {
+        let storage = DashMapSessionStorage::new();
+        let agent_id = format!("test-agent-{}", uuid::Uuid::new_v4());
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
+
+        storage.register_agent(&agent_id, &session_id_1);
+
+        // Unregister a session that was never registered
+        storage.unregister_agent(&agent_id, &session_id_2);
+
+        // Original session should still be there
+        let sessions = storage.get_agent_sessions(&agent_id);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains(&session_id_1));
+    }
+
+    #[test]
+    fn test_remove_agent_sessions_nonexistent() {
+        let storage = DashMapSessionStorage::new();
+        let agent_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        // Should return empty vec, not panic
+        let removed = storage.remove_agent_sessions(&agent_id);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_agents_same_session() {
+        let storage = DashMapSessionStorage::new();
+        let agent_id_1 = format!("agent-1-{}", uuid::Uuid::new_v4());
+        let agent_id_2 = format!("agent-2-{}", uuid::Uuid::new_v4());
+        let session_id = format!("shared-session-{}", uuid::Uuid::new_v4());
+
+        // Same session registered under different agents
+        storage.register_agent(&agent_id_1, &session_id);
+        storage.register_agent(&agent_id_2, &session_id);
+
+        // Each agent should see the session
+        assert!(
+            storage
+                .get_agent_sessions(&agent_id_1)
+                .contains(&session_id)
+        );
+        assert!(
+            storage
+                .get_agent_sessions(&agent_id_2)
+                .contains(&session_id)
+        );
+
+        // Removing from one agent shouldn't affect the other
+        storage.unregister_agent(&agent_id_1, &session_id);
+        assert!(storage.get_agent_sessions(&agent_id_1).is_empty());
+        assert!(
+            storage
+                .get_agent_sessions(&agent_id_2)
+                .contains(&session_id)
+        );
+    }
+
+    #[test]
+    fn test_update_health_nonexistent_session() {
+        let storage = DashMapSessionStorage::new();
+        let session_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        // Should not panic when updating nonexistent session
+        storage.update_health(&session_id, "2024-01-15T10:30:00Z".to_string(), true);
+    }
+
+    #[test]
+    fn test_get_nonexistent_session() {
+        let storage = DashMapSessionStorage::new();
+        let session_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        assert!(storage.get(&session_id).is_none());
+    }
+
+    #[test]
+    fn test_remove_nonexistent_session() {
+        let storage = DashMapSessionStorage::new();
+        let session_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        // Should return None, not panic
+        assert!(storage.remove(&session_id).is_none());
     }
 }
