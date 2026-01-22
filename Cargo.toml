@@ -27,8 +27,9 @@ poem = "3.1"                                                                # Ma
 poem-mcpserver = { version = "0.2.9", features = ["streamable-http"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 
-# SSH client
-ssh2 = "0.9" # For SSH functionality
+# SSH client (async)
+russh = "0.55"
+async-trait = "0.1"
 
 # Serialization and data handling
 serde = { version = "1.0", features = ["derive"] }
