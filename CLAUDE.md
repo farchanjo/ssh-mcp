@@ -51,10 +51,10 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 #### Storage Layer (`src/mcp/storage/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 19 | Module exports and global storage instances |
-| **traits.rs** | 101 | `SessionStorage` and `CommandStorage` trait definitions |
-| **session.rs** | 340 | `DashMapSessionStorage` with agent index and tests |
-| **command.rs** | 528 | `DashMapCommandStorage` with session index and tests |
+| **mod.rs** | 18 | Module exports and global storage instances |
+| **traits.rs** | 100 | `SessionStorage` and `CommandStorage` trait definitions |
+| **session.rs** | 491 | `DashMapSessionStorage` with agent index and tests |
+| **command.rs** | 806 | `DashMapCommandStorage` with session index and tests |
 
 Storage abstractions enable dependency injection and testability:
 - `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
@@ -83,12 +83,12 @@ let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
 #### Authentication Layer (`src/mcp/auth/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 39 | Module exports and usage examples |
-| **traits.rs** | 42 | `AuthStrategy` trait definition |
-| **password.rs** | 101 | `PasswordAuth` strategy with tests |
-| **key.rs** | 140 | `KeyAuth` strategy (RSA, Ed25519) with tests |
-| **agent.rs** | 110 | `AgentAuth` strategy (SSH agent) |
-| **chain.rs** | 246 | `AuthChain` for trying multiple strategies with tests |
+| **mod.rs** | 38 | Module exports and usage examples |
+| **traits.rs** | 41 | `AuthStrategy` trait definition |
+| **password.rs** | 131 | `PasswordAuth` strategy with tests |
+| **key.rs** | 207 | `KeyAuth` strategy (RSA, Ed25519) with tests |
+| **agent.rs** | 141 | `AgentAuth` strategy (SSH agent) with tests |
+| **chain.rs** | 324 | `AuthChain` for trying multiple strategies with tests |
 
 Authentication uses the Strategy pattern (Open-Closed Principle):
 
@@ -141,8 +141,8 @@ impl AuthStrategy for MyCustomAuth {
 #### Message Layer (`src/mcp/message/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 10 | Module exports |
-| **builder.rs** | 698 | Fluent message builders with comprehensive tests |
+| **mod.rs** | 9 | Module exports |
+| **builder.rs** | 820 | Fluent message builders with comprehensive tests |
 
 Message builders construct human-readable responses that help LLMs remember important identifiers:
 
@@ -427,7 +427,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
 - Lock-free data structures (`DashMap`) for concurrent access
-- 136 unit tests (`cargo test --all-features`)
+- 625 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 
