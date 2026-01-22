@@ -1,25 +1,44 @@
-# SSH-MCP Server
+# SSH-MCP Server (Russh Fork)
 
-![Crates.io Version](https://img.shields.io/crates/v/ssh-mcp)
-![Docker Image Version](https://img.shields.io/docker/v/mingyang91/ssh-mcp)
+> **This is a fork of [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) with a completely rewritten SSH implementation.**
 
-A Rust implementation of an SSH client server with Model Context Protocol (MCP) integration, allowing Large Language Models (LLMs) to connect to a SSH server and utilize SSH features.
+[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Lightweight and Efficient:**
-- 🚀 `ssh-mcp`: only 4.3MB binary size, 1.8MB memory footprint
-- 🔄 `ssh-mcp-stdio`: only 1.5MB binary size, 2.3MB memory usage
-- 🐳 `docker`: only 27.5MB final image size
+A Rust implementation of an SSH client server with Model Context Protocol (MCP) integration, allowing Large Language Models (LLMs) to connect to SSH servers and execute commands remotely.
+
+## What's Different From Original
+
+This fork has been **completely rewritten** with a different SSH backend and architecture:
+
+| Aspect | Original (mingyang91) | This Fork |
+|--------|----------------------|-----------|
+| **SSH Library** | `ssh2` (libssh2 C bindings) | `russh` (pure Rust, async-native) |
+| **Async Model** | `spawn_blocking` wrappers | Native tokio async |
+| **Port Forwarding** | Manual thread polling (10ms sleep) | `tokio::io::copy` + `select!` |
+| **I/O Backend** | Manual implementation | Automatic kqueue/epoll/IOCP via mio |
+| **Dependencies** | Requires C libraries | Pure Rust, no C dependencies |
+| **Thread Safety** | `Session` is `!Send` | `Handle` is `Send + Sync` |
+| **Test Coverage** | None | 96 unit tests |
+| **Documentation** | Basic README | Comprehensive docs with Mermaid diagrams |
+
+### Key Improvements
+
+- **No busy-wait polling** - Port forwarding uses efficient OS-level I/O multiplexing
+- **True async** - All SSH operations are natively async, no blocking thread pool needed
+- **Better error handling** - Retry logic with exponential backoff and jitter
+- **Graceful disconnect** - Proper SSH disconnect messages
+- **Cross-platform** - Pure Rust compiles anywhere without C toolchain
 
 ## Features
 
 - **SSH Client Integration**: Connect to SSH servers via MCP commands
 - **SSH Command Execution**: Run commands on remote SSH servers
-- **Port Forwarding**: Setup SSH tunnels and port forwards (enabled by default via the `port_forward` feature)
+- **Port Forwarding**: Setup SSH tunnels with efficient async I/O
 - **Session Management**: Track and manage multiple SSH sessions
-- **MCP Protocol Support**: Built with poem-mcpserver to enable AI/LLM compatibility
-- **Stateful Connections**: Maintain SSH sessions across multiple commands
-- **Native Async**: Built on `russh` (pure Rust) with full tokio async support
+- **MCP Protocol Support**: Built with poem-mcpserver for AI/LLM compatibility
 - **Automatic Retry**: Exponential backoff with jitter for transient failures
+- **Multiple Auth Methods**: Password, key file, and SSH agent authentication
 
 ## Documentation
 
@@ -30,106 +49,67 @@ A Rust implementation of an SSH client server with Model Context Protocol (MCP) 
 | [API Reference](docs/API.md) | Complete MCP tools reference with examples |
 | [Configuration](docs/CONFIGURATION.md) | Environment variables and setup guide |
 
-## Installation and Integration
+## Quick Start
 
-You have two options for installation:
-
-### Option 1: Using Docker (Recommended)
-
-No Rust toolchain required - just Docker!
+### Build from Source
 
 ```bash
-# Pull the pre-built image from Docker Hub
-docker pull mingyang91/ssh-mcp
+# Clone this fork
+git clone https://github.com/farchanjo/ssh-mcp.git
+cd ssh-mcp
 
-# Run the server
-docker run -p 8000:8000 mingyang91/ssh-mcp
+# Build release binaries
+cargo build --release
+
+# Run tests
+cargo test --all-features
 ```
 
-Or build the image yourself:
+### Install the Binary
 
 ```bash
-# Build the Docker image
-docker build -t ssh-mcp .
+# Copy to PATH
+sudo cp ./target/release/ssh-mcp-stdio /usr/local/bin/
 
-# Run the server
-docker run -p 8000:8000 ssh-mcp
+# On macOS, sign the binary
+sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio
 ```
 
-### Option 2: Installing via Cargo
+### MCP Integration (Claude Desktop / Cursor)
 
-Prerequisites:
-- Rust 1.70.0 or later
-- Cargo package manager
-
-```bash
-cargo install ssh-mcp
-```
-
-## Integration with mcpServers
-
-To use SSH-MCP with mcpServers, add the following configuration to your mcpServers JSON configuration:
-
-### If installed via Cargo:
+Add to your MCP configuration:
 
 ```json
 {
   "mcpServers": {
     "ssh": {
-      "command": "ssh-mcp-stdio", 
+      "command": "ssh-mcp-stdio",
       "args": []
     }
   }
 }
 ```
 
-### If using Docker:
-
-```json
-{
-  "mcpServers": {
-    "ssh": {
-      "command": "docker",
-      "args": ["run", "--entrypoint", "ssh-mcp-stdio", "-i", "--rm", "ssh-mcp"]
-    }
-  }
-}
-```
-
-This will register the SSH handler, allowing LLMs to manage SSH connections through your MCP server.
-
 ## Usage
 
-### Connecting to an SSH Server
+### Connect to SSH Server
 
-#### Using Password Authentication
 ```json
 {
-  "command": "ssh_connect",
+  "tool": "ssh_connect",
   "params": {
     "address": "example.com:22",
     "username": "user",
-    "password": "password"
+    "password": "secret"
   }
 }
 ```
 
-#### Using Key Authentication
-```json
-{
-  "command": "ssh_connect",
-  "params": {
-    "address": "example.com:22",
-    "username": "user",
-    "key_path": "/path/to/private_key"
-  }
-}
-```
+Or with SSH agent (no password/key needed):
 
-#### Using SSH Agent Authentication
 ```json
 {
-  "command": "ssh_connect",
+  "tool": "ssh_connect",
   "params": {
     "address": "example.com:22",
     "username": "user"
@@ -137,103 +117,46 @@ This will register the SSH handler, allowing LLMs to manage SSH connections thro
 }
 ```
 
-Response:
-```json
-{
-  "session_id": "c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b",
-  "message": "Successfully connected to user@example.com:22",
-  "authenticated": true
-}
-```
-
-If connection fails:
-```json
-{
-  "error": "Failed to connect: Connection refused"
-}
-```
-
-### Executing Commands
+### Execute Commands
 
 ```json
 {
-  "command": "ssh_execute",
+  "tool": "ssh_execute",
   "params": {
-    "session_id": "c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b",
+    "session_id": "uuid-from-connect",
     "command": "ls -la"
   }
 }
 ```
 
-Response:
-```json
-{
-  "stdout": "total 32\ndrwxr-xr-x  5 user group 4096 Jan 1 12:00 .\ndrwxr-xr-x 25 user group 4096 Jan 1 12:00 ..\n-rw-r--r--  1 user group  142 Jan 1 12:00 file.txt\n",
-  "stderr": "",
-  "exit_code": 0
-}
-```
-
-### Setting Up Port Forwarding
-
-Note: Port forwarding is enabled by default via the `port_forward` feature flag.
+### Port Forwarding
 
 ```json
 {
-  "command": "ssh_forward",
+  "tool": "ssh_forward",
   "params": {
-    "session_id": "c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b",
+    "session_id": "uuid-from-connect",
     "local_port": 8080,
-    "remote_address": "internal-server",
-    "remote_port": 80
+    "remote_address": "localhost",
+    "remote_port": 3000
   }
 }
 ```
 
-Response:
-```json
-{
-  "local_address": "127.0.0.1:8080",
-  "remote_address": "internal-server:80",
-  "active": true
-}
-```
-
-### Disconnecting a Session
+### Disconnect
 
 ```json
 {
-  "command": "ssh_disconnect",
+  "tool": "ssh_disconnect",
   "params": {
-    "session_id": "c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b"
+    "session_id": "uuid-from-connect"
   }
 }
-```
-
-Response:
-```json
-"Session c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b disconnected successfully"
-```
-
-### Listing All Active Sessions
-
-```json
-{
-  "command": "ssh_list_sessions"
-}
-```
-
-Response:
-```json
-[
-  "c8a3b2e1-4f5d-6e7c-8a9b-0c1d2e3f4a5b",
-  "d9b4c3a2-5e6f-7g8h-9i0j-1k2l3m4n5o6p"
-]
 ```
 
 ## Configuration
 
-The server can be configured through environment variables. See [Configuration Guide](docs/CONFIGURATION.md) for detailed documentation.
+All settings follow priority: **Parameter → Environment Variable → Default**
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -242,38 +165,58 @@ The server can be configured through environment variables. See [Configuration G
 | `SSH_MAX_RETRIES` | Max retry attempts for transient failures | 3 |
 | `SSH_RETRY_DELAY_MS` | Initial retry delay (milliseconds) | 1000 |
 | `SSH_COMPRESSION` | Enable zlib compression | true |
-| `MCP_PORT` | HTTP server port | 8000 |
+| `MCP_PORT` | HTTP server port (ssh-mcp binary only) | 8000 |
 | `RUST_LOG` | Logging level | info |
 
-## Features Configuration
+See [Configuration Guide](docs/CONFIGURATION.md) for detailed documentation.
 
-The project uses Cargo features to enable/disable certain functionality:
+## Architecture
 
-| Feature      | Description                         | Default |
-| ------------ | ----------------------------------- | ------- |
-| port_forward | Enables SSH port forwarding support | Enabled |
+```mermaid
+flowchart TB
+    subgraph MCP["MCP Layer"]
+        Tools["McpSSHCommands"]
+    end
 
-To build without port forwarding:
+    subgraph SSH["SSH Layer (russh)"]
+        Handle["client::Handle"]
+        Channel["Channel"]
+    end
+
+    subgraph Runtime["Tokio Runtime"]
+        Async["Async Tasks"]
+        IO["mio (kqueue/epoll/IOCP)"]
+    end
+
+    Tools --> Handle
+    Handle --> Channel
+    Channel --> Async
+    Async --> IO
 ```
-cargo build --release --no-default-features
+
+## Testing
+
+```bash
+# Run all tests
+cargo test --all-features
+
+# Run with output
+cargo test --all-features -- --nocapture
+
+# Run specific test module
+cargo test config_resolution
 ```
+
+## Original Project
+
+This project is forked from [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp).
+
+The original project uses `ssh2` (libssh2 bindings) while this fork has been completely rewritten to use `russh` for native async support and better performance.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-### CI/CD Pipeline
-
-This project uses GitHub Actions for continuous integration and deployment:
-
-- All PRs and commits to main are automatically tested
-- Tagged releases (starting with 'v') are automatically published to crates.io
-- Docker images are automatically built and pushed to Docker Hub
-  - Latest tag for main branch
-  - Version tags for semantic versioned releases (v1.0.0, v1.0, etc.)
-- To create a new release, ensure version in Cargo.toml matches the tag (e.g., v0.1.0)
-- You'll need to set up the `CARGO_REGISTRY_TOKEN`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` secrets in your GitHub repository settings
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
