@@ -12,11 +12,13 @@ mod mcp;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    // Initialize logging
-    if std::env::var_os("RUST_LOG").is_none() {
-        unsafe { std::env::set_var("RUST_LOG", "info") };
-    }
-    tracing_subscriber::fmt::init();
+    // Initialize logging with proper tracing default
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("info".parse().expect("valid directive")),
+        )
+        .init();
 
     // Setup MCP server
     let mcp_port: u16 = std::env::var("MCP_PORT")
