@@ -5,6 +5,8 @@ This document describes the system architecture of the SSH Model Context Protoco
 ## Table of Contents
 
 - [Overview](#overview)
+- [Module Structure](#module-structure)
+- [Module Dependency Graph](#module-dependency-graph)
 - [Component Architecture](#component-architecture)
 - [Session Storage Architecture](#session-storage-architecture)
 - [Threading and Async Model](#threading-and-async-model)
@@ -62,6 +64,119 @@ flowchart TB
     style Core fill:#e1f5fe
     style Transport fill:#fff3e0
     style SSH fill:#f3e5f5
+```
+
+---
+
+## Module Structure
+
+The codebase is organized into a modular structure under `src/mcp/`:
+
+| Module | Visibility | Description |
+|--------|------------|-------------|
+| `types.rs` | `pub` | Serializable response types for MCP tools |
+| `config.rs` | `pub(crate)` | Configuration resolution with environment variable support |
+| `error.rs` | `pub(crate)` | Error classification for retry logic |
+| `session.rs` | `pub` | Session storage and SSH client handler |
+| `client.rs` | `pub(crate)` | SSH connection, authentication, and command execution |
+| `forward.rs` | `pub(crate)` | Port forwarding implementation (feature-gated) |
+| `commands.rs` | `pub` | MCP tool implementations via `#[Tools]` macro |
+
+### Module Responsibilities
+
+**types.rs** - Response Types
+- `SessionInfo` - Session metadata for tracking connections
+- `SshConnectResponse` - Connection result with retry information
+- `SshCommandResponse` - Command output with stdout, stderr, exit code
+- `PortForwardingResponse` - Port forwarding status (feature-gated)
+- `SessionListResponse` - List of active sessions
+
+**config.rs** - Configuration Management
+- Default constants for timeouts, retries, compression
+- Environment variable names and parsing
+- `resolve_*` functions implementing Parameter -> Env -> Default priority
+
+**error.rs** - Error Classification
+- `is_retryable_error()` - Classifies errors as transient or permanent
+- Authentication errors (non-retryable) vs connection errors (retryable)
+
+**session.rs** - Session Management
+- `SshClientHandler` - russh client handler (accepts all host keys)
+- `StoredSession` - Combines SessionInfo with SSH handle
+- `SSH_SESSIONS` - Global lazy-initialized session storage
+
+**client.rs** - SSH Client Operations
+- `build_client_config()` - Builds russh configuration
+- `parse_address()` - Parses host and port from address string
+- `connect_to_ssh_with_retry()` - Connection with exponential backoff
+- `authenticate_with_key()` - Private key authentication
+- `authenticate_with_agent()` - SSH agent authentication
+- `execute_ssh_command()` - Command execution on established session
+
+**forward.rs** - Port Forwarding (feature-gated)
+- `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
+- `handle_port_forward_connection()` - Bidirectional I/O via direct-tcpip
+
+**commands.rs** - MCP Tools
+- `McpSSHCommands` struct with `#[Tools]` impl
+- `ssh_connect` - Connect and authenticate
+- `ssh_execute` - Run commands with timeout
+- `ssh_forward` - Setup port forwarding (feature-gated)
+- `ssh_disconnect` - Graceful session cleanup
+- `ssh_list_sessions` - List active sessions
+
+---
+
+## Module Dependency Graph
+
+```mermaid
+flowchart TB
+    subgraph Public["Public Modules"]
+        commands["commands.rs<br/>McpSSHCommands"]
+        types["types.rs<br/>Response Types"]
+        session["session.rs<br/>Session Storage"]
+    end
+
+    subgraph Internal["Internal Modules"]
+        client["client.rs<br/>SSH Client Logic"]
+        config["config.rs<br/>Configuration"]
+        error["error.rs<br/>Error Classification"]
+        forward["forward.rs<br/>Port Forwarding"]
+    end
+
+    subgraph External["External Crates"]
+        russh["russh"]
+        backon["backon"]
+        tokio["tokio"]
+        poem_mcp["poem-mcpserver"]
+    end
+
+    commands --> client
+    commands --> config
+    commands --> session
+    commands --> types
+    commands --> forward
+    commands --> poem_mcp
+
+    client --> config
+    client --> error
+    client --> session
+    client --> types
+    client --> russh
+    client --> backon
+    client --> tokio
+
+    forward --> session
+    forward --> russh
+    forward --> tokio
+
+    session --> types
+    session --> russh
+    session --> tokio
+
+    style Public fill:#e8f5e9
+    style Internal fill:#fff3e0
+    style External fill:#e3f2fd
 ```
 
 ---
@@ -137,18 +252,18 @@ classDiagram
     StoredSession --> SshClientHandler : uses
     SSH_SESSIONS --> StoredSession : stores
 
-    note for SSH_SESSIONS "Global session store using\nLazy<Mutex<HashMap<String, StoredSession>>>"
+    note for SSH_SESSIONS "Global session store using\nLazy Mutex HashMap String StoredSession"
 ```
 
 ### Component Descriptions
 
-| Component | Description |
-|-----------|-------------|
-| `McpSSHCommands` | Main struct implementing MCP tools via the `#[Tools]` attribute macro |
-| `StoredSession` | Wraps session metadata with the actual SSH handle |
-| `SessionInfo` | Serializable metadata for tracking connection information |
-| `SshClientHandler` | Implements `russh::client::Handler` for host key verification |
-| `SSH_SESSIONS` | Global thread-safe storage for active SSH sessions |
+| Component | Module | Description |
+|-----------|--------|-------------|
+| `McpSSHCommands` | commands.rs | Main struct implementing MCP tools via the `#[Tools]` attribute macro |
+| `StoredSession` | session.rs | Wraps session metadata with the actual SSH handle |
+| `SessionInfo` | types.rs | Serializable metadata for tracking connection information |
+| `SshClientHandler` | session.rs | Implements `russh::client::Handler` for host key verification |
+| `SSH_SESSIONS` | session.rs | Global thread-safe storage for active SSH sessions |
 
 ---
 
@@ -180,7 +295,7 @@ flowchart LR
 
     subgraph SessionDetail["StoredSession Structure"]
         Info["SessionInfo<br/>(Metadata)"]
-        Handle["Arc<Mutex<Handle>><br/>(SSH Connection)"]
+        Handle["Arc Mutex Handle<br/>(SSH Connection)"]
     end
 
     S1 -.-> SessionDetail
@@ -219,11 +334,11 @@ let handle_arc = {
 
 ## Threading and Async Model
 
-The system uses Tokio's multi-threaded async runtime with careful handling of blocking operations.
+The system uses Tokio's multi-threaded async runtime with native async SSH operations via russh.
 
 ```mermaid
 flowchart TB
-    subgraph Runtime["Tokio Runtime (Multi-threaded)"]
+    subgraph Runtime["Tokio Runtime - Multi-threaded"]
         direction TB
 
         subgraph MainLoop["Main Event Loop"]
@@ -239,8 +354,8 @@ flowchart TB
         end
 
         subgraph Channels["SSH Channels"]
-            Chan1["Channel 1<br/>(Command)"]
-            Chan2["Channel 2<br/>(Direct-TCPIP)"]
+            Chan1["Channel 1<br/>Session Command"]
+            Chan2["Channel 2<br/>Direct-TCPIP"]
         end
     end
 
@@ -262,27 +377,37 @@ flowchart TB
     style Tasks fill:#fff8e1
 ```
 
-### Async Operations
+### Native Async Architecture
+
+Unlike implementations using blocking SSH libraries, this system uses **russh** which provides native async support:
 
 | Operation | Async Pattern | Notes |
 |-----------|---------------|-------|
 | SSH Connect | `tokio::time::timeout` | Wrapped with configurable timeout |
 | Retry Logic | `backon::Retryable` | Exponential backoff with jitter |
-| Command Execution | Channel-based async I/O | Non-blocking read/write |
+| Command Execution | Channel-based async I/O | Non-blocking read/write via `ChannelMsg` |
 | Port Forwarding | `tokio::spawn` | Background task per listener |
 | Session Lock | `tokio::sync::Mutex` | Async-aware mutex |
+| Bidirectional I/O | `tokio::io::copy` + `select!` | Efficient zero-copy forwarding |
+
+### Key Differences from Blocking Libraries
+
+- **No `spawn_blocking`**: All SSH operations are natively async
+- **Channel-based I/O**: Uses russh `ChannelMsg` enum for stdout, stderr, exit status
+- **Direct-TCPIP**: Port forwarding uses `channel_open_direct_tcpip` with `into_stream()`
+- **Graceful disconnect**: Uses `Disconnect::ByApplication` for clean session termination
 
 ### Retry Logic with Backoff
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Attempt1: Initial Connect
+    [*] --> Attempt1
 
     Attempt1 --> Success: Connected
     Attempt1 --> CheckRetry1: Failed
 
     CheckRetry1 --> Delay1: Retryable Error
-    CheckRetry1 --> [*]: Auth Error
+    CheckRetry1 --> [*]: Auth Error - Stop
 
     Delay1 --> Attempt2: Wait with backoff
 
@@ -290,7 +415,7 @@ stateDiagram-v2
     Attempt2 --> CheckRetry2: Failed
 
     CheckRetry2 --> Delay2: Retryable Error
-    CheckRetry2 --> [*]: Auth Error
+    CheckRetry2 --> [*]: Auth Error - Stop
 
     Delay2 --> Attempt3: Wait with backoff
 
@@ -298,18 +423,19 @@ stateDiagram-v2
     Attempt3 --> CheckRetry3: Failed
 
     CheckRetry3 --> Delay3: Retryable Error
-    CheckRetry3 --> [*]: Auth Error
+    CheckRetry3 --> [*]: Auth Error - Stop
 
-    Delay3 --> Attempt4: Wait with backoff, max 10s
+    Delay3 --> Attempt4: Wait with backoff max 10s
 
     Attempt4 --> Success: Connected
     Attempt4 --> [*]: Max Retries Exceeded
 
     Success --> [*]
-
-    note right of Delay1: Jitter added to prevent thundering herd
-    note right of CheckRetry1: Non-retryable errors include auth failures
 ```
+
+**Retry Classification (error.rs)**:
+- **Non-retryable**: Authentication failures, permission denied, publickey errors
+- **Retryable**: Connection refused, timeout, network unreachable, broken pipe
 
 ---
 
@@ -322,7 +448,7 @@ flowchart LR
     subgraph Binary["ssh-mcp Binary"]
         Main["main.rs"]
         Route["Poem Route"]
-        Streamable["streamable_http::endpoint"]
+        Streamable["streamable_http endpoint"]
     end
 
     subgraph Server["HTTP Server"]
@@ -351,7 +477,7 @@ flowchart LR
 flowchart LR
     subgraph Binary["ssh-mcp-stdio Binary"]
         Main["main.rs"]
-        Stdio["poem_mcpserver::stdio"]
+        Stdio["poem_mcpserver stdio"]
     end
 
     subgraph IO["Standard I/O"]
@@ -415,6 +541,7 @@ flowchart TB
 | `uuid` | 1.16 | UUID v4 generation for session IDs |
 | `once_cell` | 1.21 | Lazy static initialization |
 | `tracing` | 0.1 | Structured logging |
+| `chrono` | 0.4 | Timestamp generation |
 
 ---
 
