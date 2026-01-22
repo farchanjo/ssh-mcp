@@ -10,12 +10,10 @@ use super::traits::AuthStrategy;
 /// Password authentication strategy.
 ///
 /// Uses username/password credentials to authenticate with the SSH server.
-#[allow(dead_code)]
 pub struct PasswordAuth {
     password: String,
 }
 
-#[allow(dead_code)]
 impl PasswordAuth {
     /// Create a new password authentication strategy.
     pub fn new(password: impl Into<String>) -> Self {

@@ -15,12 +15,10 @@ use super::traits::AuthStrategy;
 ///
 /// Loads a private key from a file and uses it for public key authentication.
 /// Currently supports passphrase-less keys.
-#[allow(dead_code)]
 pub struct KeyAuth {
     key_path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl KeyAuth {
     /// Create a new key authentication strategy.
     ///

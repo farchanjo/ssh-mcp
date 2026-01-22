@@ -30,9 +30,7 @@ mod password;
 mod traits;
 
 pub use agent::AgentAuth;
-#[allow(unused_imports)]
 pub use chain::AuthChain;
 pub use key::KeyAuth;
 pub use password::PasswordAuth;
-#[allow(unused_imports)]
 pub use traits::AuthStrategy;

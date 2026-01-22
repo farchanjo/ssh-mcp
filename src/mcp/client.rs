@@ -37,19 +37,19 @@
 //!
 //! Authentication failures are never retried to avoid account lockouts.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
-use russh::{ChannelMsg, client, keys};
-use tracing::{debug, error, info, warn};
+use russh::{ChannelMsg, client};
+use tracing::{error, info, warn};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::async_command::OutputBuffer;
+use crate::mcp::auth::{AuthChain, AuthStrategy};
 use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
@@ -269,7 +269,7 @@ pub(crate) async fn connect_to_ssh_with_retry(
 /// 1. Builds client configuration
 /// 2. Parses the address
 /// 3. Connects with timeout
-/// 4. Authenticates using the appropriate method
+/// 4. Authenticates using the appropriate method via [`AuthChain`]
 async fn connect_to_ssh(
     address: &str,
     username: &str,
@@ -293,119 +293,42 @@ async fn connect_to_ssh(
         .map_err(|_| format!("Connection timed out after {:?}", timeout))?
         .map_err(|e| format!("Failed to connect: {}", e))?;
 
-    // Authenticate with either password, key, or agent
-    let auth_result = if let Some(password) = password {
-        // Password authentication
-        handle
-            .authenticate_password(username, password)
-            .await
-            .map_err(|e| format!("Password authentication failed: {}", e))?
-    } else if let Some(key_path) = key_path {
-        // Key-based authentication
-        authenticate_with_key(&mut handle, username, key_path).await?
-    } else {
-        // Try agent authentication
-        authenticate_with_agent(&mut handle, username).await?
-    };
+    // Build authentication chain based on provided credentials
+    let auth_chain = build_auth_chain(password, key_path);
 
-    if !auth_result.success() {
+    // Authenticate using the chain
+    let success = auth_chain.authenticate(&mut handle, username).await?;
+
+    if !success {
         return Err("Authentication failed: no authentication methods succeeded".to_string());
     }
 
     Ok(handle)
 }
 
-/// Authenticate using a private key file.
+/// Build an authentication chain based on the provided credentials.
 ///
-/// Loads the private key from the specified path and attempts public key
-/// authentication. Currently supports passphrase-less keys.
-async fn authenticate_with_key(
-    handle: &mut client::Handle<SshClientHandler>,
-    username: &str,
-    key_path: &str,
-) -> Result<client::AuthResult, String> {
-    let path = Path::new(key_path);
+/// The chain is built with the following priority:
+/// 1. Password authentication (if password is provided)
+/// 2. Key-based authentication (if key_path is provided)
+/// 3. SSH agent authentication (fallback if no explicit credentials)
+fn build_auth_chain(password: Option<&str>, key_path: Option<&str>) -> AuthChain {
+    let mut chain = AuthChain::new();
 
-    // Load the secret key (supports passphrase-less keys or will prompt if needed)
-    let key_pair = keys::load_secret_key(path, None)
-        .map_err(|e| format!("Failed to load private key from {}: {}", key_path, e))?;
-
-    // For RSA keys, we need to use the best supported hash algorithm (rsa-sha2-256 or rsa-sha2-512)
-    // Otherwise, the server may reject the legacy ssh-rsa (SHA1) signature
-    let hash_alg = handle
-        .best_supported_rsa_hash()
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-    debug!("Using RSA hash algorithm for key auth: {:?}", hash_alg);
-
-    // Wrap the key with the preferred hash algorithm
-    let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
-
-    handle
-        .authenticate_publickey(username, key_with_hash)
-        .await
-        .map_err(|e| format!("Key authentication failed: {}", e))
-}
-
-/// Authenticate using SSH agent.
-///
-/// Connects to the SSH agent (via SSH_AUTH_SOCK) and tries each available
-/// identity until one succeeds.
-async fn authenticate_with_agent(
-    handle: &mut client::Handle<SshClientHandler>,
-    username: &str,
-) -> Result<client::AuthResult, String> {
-    // Connect to the SSH agent
-    let mut agent = keys::agent::client::AgentClient::connect_env()
-        .await
-        .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
-
-    // Get identities from the agent
-    let identities = agent
-        .request_identities()
-        .await
-        .map_err(|e| format!("Failed to get identities from SSH agent: {}", e))?;
-
-    if identities.is_empty() {
-        return Err("No identities found in SSH agent".to_string());
+    if let Some(password) = password {
+        chain = chain.with_password(password);
     }
 
-    // Try each identity until one succeeds
-    for identity in identities {
-        debug!("Trying SSH agent identity: {:?}", identity.comment());
-
-        // For RSA keys, we need to use the best supported hash algorithm (rsa-sha2-256 or rsa-sha2-512)
-        // Otherwise, the server may reject the legacy ssh-rsa (SHA1) signature
-        let hash_alg = handle
-            .best_supported_rsa_hash()
-            .await
-            .ok()
-            .flatten()
-            .flatten();
-        debug!("Using RSA hash algorithm: {:?}", hash_alg);
-
-        match handle
-            .authenticate_publickey_with(username, identity.clone(), hash_alg, &mut agent)
-            .await
-        {
-            Ok(result) if result.success() => {
-                info!("Successfully authenticated with SSH agent");
-                return Ok(result);
-            }
-            Ok(_) => {
-                debug!("Agent identity not accepted, trying next...");
-                continue;
-            }
-            Err(e) => {
-                debug!("Agent authentication error: {}, trying next...", e);
-                continue;
-            }
-        }
+    if let Some(key_path) = key_path {
+        chain = chain.with_key(key_path);
     }
 
-    Err("Agent authentication failed: no identities accepted".to_string())
+    // If no explicit credentials, use SSH agent as fallback
+    if chain.is_empty() {
+        chain = chain.with_agent();
+    }
+
+    chain
 }
 
 /// Execute a command on an SSH session with timeout support.

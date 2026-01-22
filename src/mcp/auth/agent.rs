@@ -12,10 +12,8 @@ use super::traits::AuthStrategy;
 ///
 /// Connects to the SSH agent (via SSH_AUTH_SOCK) and tries each available
 /// identity until one succeeds.
-#[allow(dead_code)]
 pub struct AgentAuth;
 
-#[allow(dead_code)]
 impl AgentAuth {
     /// Create a new SSH agent authentication strategy.
     pub fn new() -> Self {
