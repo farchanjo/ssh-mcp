@@ -66,6 +66,8 @@ ADDED:
 - **Multiple Auth Methods** - Password, key file, SSH agent
 - **Port Forwarding** - Efficient bidirectional tunneling
 - **Session Management** - Track multiple concurrent connections
+- **Named Sessions** - Assign human-readable names for easy LLM identification
+- **Persistent Sessions** - Keep sessions alive indefinitely without inactivity timeout
 - **Smart Retry** - Exponential backoff for transient failures only
 - **MCP Protocol** - Full integration with AI/LLM tools
 
@@ -140,6 +142,33 @@ Add to Claude Desktop or Cursor MCP config:
   "params": {
     "address": "example.com:22",
     "username": "user"
+  }
+}
+```
+
+### Connect with Session Name (for LLM identification)
+
+```json
+{
+  "tool": "ssh_connect",
+  "params": {
+    "address": "example.com:22",
+    "username": "user",
+    "name": "production-db"
+  }
+}
+```
+
+### Connect with Persistent Session (no inactivity timeout)
+
+```json
+{
+  "tool": "ssh_connect",
+  "params": {
+    "address": "example.com:22",
+    "username": "user",
+    "name": "long-running-task",
+    "persistent": true
   }
 }
 ```

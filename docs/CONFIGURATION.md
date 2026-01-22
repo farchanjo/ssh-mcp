@@ -66,6 +66,15 @@ This priority system allows you to:
 - Override per-request via function parameters
 - Fall back to sensible defaults when nothing is specified
 
+### Session-Level Options
+
+Some options are only configurable per-session via function parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `string` | `null` | Human-readable session name for LLM identification |
+| `persistent` | `bool` | `false` | Disable inactivity timeout, keep session alive indefinitely |
+
 ---
 
 ## Environment Variables
@@ -178,6 +187,75 @@ export SSH_COMPRESSION=false
 **Trade-offs:**
 - Enable for: High-latency networks, large data transfers
 - Disable for: Low-latency networks, CPU-constrained systems
+
+---
+
+## Session Naming and Persistence
+
+### Session Names
+
+The `name` parameter allows you to assign human-readable names to SSH sessions. This is particularly useful when working with LLMs that need to manage multiple connections.
+
+```json
+{
+  "tool": "ssh_connect",
+  "arguments": {
+    "address": "db.example.com:22",
+    "username": "admin",
+    "name": "production-database"
+  }
+}
+```
+
+**Benefits:**
+- Easier session identification in `ssh_list_sessions` output
+- LLMs can reference sessions by meaningful names
+- Helps organize multiple concurrent connections
+
+**Behavior:**
+- Names are optional and can be any string
+- Names are not required to be unique
+- When not set, the `name` field is omitted from JSON responses
+- Session IDs (UUIDs) remain the authoritative identifier
+
+### Persistent Sessions
+
+The `persistent` parameter disables the inactivity timeout for a session.
+
+```json
+{
+  "tool": "ssh_connect",
+  "arguments": {
+    "address": "worker.example.com:22",
+    "username": "deploy",
+    "persistent": true
+  }
+}
+```
+
+**Behavior:**
+- `persistent: false` (default): Sessions may time out after inactivity
+- `persistent: true`: Sessions stay alive indefinitely until:
+  - Explicitly disconnected via `ssh_disconnect`
+  - The SSH MCP process terminates
+  - The remote server closes the connection
+
+**Keepalive:**
+- Keepalive packets are still sent for persistent sessions
+- Interval: 30 seconds
+- Max failed attempts: 3
+- This prevents network equipment from dropping idle connections
+
+**Response Message:**
+When `persistent=true`, the success message includes a suffix:
+```
+"Successfully connected to user@host:22 [persistent session]"
+```
+
+**Use Cases:**
+- Long-running deployment scripts
+- Background monitoring tasks
+- Sessions that must survive extended idle periods
 
 ---
 

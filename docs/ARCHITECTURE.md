@@ -97,7 +97,7 @@ The codebase consists of **8 source files** organized into a modular structure:
 - Re-exports `McpSSHCommands` for convenience
 
 **types.rs** - Response Types
-- `SessionInfo` - Session metadata for tracking connections
+- `SessionInfo` - Session metadata for tracking connections (includes optional `name` field)
 - `SshConnectResponse` - Connection result with retry information
 - `SshCommandResponse` - Command output with stdout, stderr, exit code, and `timed_out` flag
 - `PortForwardingResponse` - Port forwarding status (feature-gated)
@@ -131,11 +131,11 @@ The codebase consists of **8 source files** organized into a modular structure:
 
 **commands.rs** - MCP Tools
 - `McpSSHCommands` struct with `#[Tools]` impl
-- `ssh_connect` - Connect and authenticate
+- `ssh_connect` - Connect and authenticate (supports `name` and `persistent` options)
 - `ssh_execute` - Run commands with timeout (returns partial output with `timed_out: true` on timeout, session stays alive)
 - `ssh_forward` - Setup port forwarding (feature-gated)
 - `ssh_disconnect` - Graceful session cleanup
-- `ssh_list_sessions` - List active sessions
+- `ssh_list_sessions` - List active sessions (includes session names when set)
 
 ---
 
@@ -242,6 +242,7 @@ classDiagram
 
     class SessionInfo {
         +session_id: String
+        +name: Option~String~
         +host: String
         +username: String
         +connected_at: String

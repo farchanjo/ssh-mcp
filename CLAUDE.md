@@ -47,15 +47,19 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 
 ### MCP Tools
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
+  - `name: Option<String>` - Human-readable session name for LLM identification
+  - `persistent: Option<bool>` - When true, disables inactivity timeout (keepalive still active)
 - `ssh_execute`: Command execution with timeout (returns partial output with `timed_out: true` on timeout)
 - `ssh_forward`: Port forwarding (feature-gated)
 - `ssh_disconnect`: Session cleanup
-- `ssh_list_sessions`: List active sessions
+- `ssh_list_sessions`: List active sessions (includes `name` when set)
 
 ### Key Types
+- **`SessionInfo`**: Session metadata with optional `name` field (omitted from JSON when None)
 - **`SshCommandResponse`**: Contains `stdout`, `stderr`, `exit_code`, and `timed_out: bool`
   - On timeout: returns partial output collected so far with `timed_out: true` (session stays alive)
   - On success: returns full output with `timed_out: false`
+- **`SshConnectResponse`**: Message includes "[persistent session]" suffix when `persistent=true`
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate
