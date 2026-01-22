@@ -13,7 +13,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>MCP_PORT</key>
-        <string>8000</string>
+        <string>45642</string>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>
