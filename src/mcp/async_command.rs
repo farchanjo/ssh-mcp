@@ -72,8 +72,8 @@ pub static ASYNC_COMMANDS: Lazy<DashMap<String, RunningCommand>> = Lazy::new(Das
 /// Secondary index: session_id -> set of command_ids for O(1) session lookup.
 pub static COMMANDS_BY_SESSION: Lazy<DashMap<String, HashSet<String>>> = Lazy::new(DashMap::new);
 
-/// Maximum number of concurrent async commands per session
-pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 30;
+/// Maximum number of concurrent async commands (multiplexed channels) per session
+pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 100;
 
 /// Count async commands for a specific session (O(1) lookup).
 pub fn count_session_commands(session_id: &str) -> usize {
@@ -170,13 +170,15 @@ mod tests {
 
         #[test]
         fn test_max_async_commands_per_session() {
-            assert_eq!(MAX_ASYNC_COMMANDS_PER_SESSION, 30);
+            assert_eq!(MAX_ASYNC_COMMANDS_PER_SESSION, 100);
         }
 
         #[test]
         fn test_max_commands_is_reasonable() {
-            assert!(MAX_ASYNC_COMMANDS_PER_SESSION >= 5);
-            assert!(MAX_ASYNC_COMMANDS_PER_SESSION <= 100);
+            // Should support at least 10 concurrent commands
+            assert!(MAX_ASYNC_COMMANDS_PER_SESSION >= 10);
+            // Should not exceed SSH multiplexing practical limits
+            assert!(MAX_ASYNC_COMMANDS_PER_SESSION <= 256);
         }
     }
 
