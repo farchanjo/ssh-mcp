@@ -188,6 +188,30 @@ mod tests {
         }
     }
 
+    fn create_test_command_with_status(
+        command_id: &str,
+        session_id: &str,
+        status: AsyncCommandStatus,
+    ) -> RunningCommand {
+        let (tx, rx) = watch::channel(status);
+        RunningCommand {
+            info: AsyncCommandInfo {
+                command_id: command_id.to_string(),
+                session_id: session_id.to_string(),
+                command: "test".to_string(),
+                status,
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            },
+            cancel_token: CancellationToken::new(),
+            status_rx: rx,
+            status_tx: tx,
+            output: Arc::new(Mutex::new(OutputBuffer::default())),
+            exit_code: Arc::new(Mutex::new(None)),
+            error: Arc::new(Mutex::new(None)),
+            timed_out: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     #[test]
     fn test_register_and_unregister() {
         let storage = DashMapCommandStorage::new();
@@ -242,5 +266,262 @@ mod tests {
         let storage = DashMapCommandStorage::new();
         let unique_session = format!("nonexistent-{}", uuid::Uuid::new_v4());
         assert!(storage.list_by_session(&unique_session).is_empty());
+    }
+
+    #[test]
+    fn test_default_implementation() {
+        let storage = DashMapCommandStorage::default();
+        let unique_session = format!("nonexistent-{}", uuid::Uuid::new_v4());
+        assert_eq!(storage.count_by_session(&unique_session), 0);
+    }
+
+    #[test]
+    fn test_get_command() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        let cmd = create_test_command(&cmd_id, &session_id);
+        storage.register(cmd_id.clone(), cmd);
+
+        let retrieved = storage.get(&cmd_id);
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.expect("command should exist");
+        assert_eq!(retrieved.info.command_id, cmd_id);
+        assert_eq!(retrieved.info.session_id, session_id);
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_get_nonexistent_command() {
+        let storage = DashMapCommandStorage::new();
+        let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        assert!(storage.get(&unique_id).is_none());
+    }
+
+    #[test]
+    fn test_get_ref() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        let cmd = create_test_command(&cmd_id, &session_id);
+        storage.register(cmd_id.clone(), cmd);
+
+        let cmd_ref = storage.get_ref(&cmd_id);
+        assert!(cmd_ref.is_some());
+        let cmd_ref = cmd_ref.expect("command ref should exist");
+        assert_eq!(cmd_ref.info.command_id, cmd_id);
+        assert_eq!(cmd_ref.info.session_id, session_id);
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_get_ref_nonexistent() {
+        let storage = DashMapCommandStorage::new();
+        let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        assert!(storage.get_ref(&unique_id).is_none());
+    }
+
+    #[test]
+    fn test_get_direct() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        let cmd = create_test_command(&cmd_id, &session_id);
+        storage.register(cmd_id.clone(), cmd);
+
+        let direct = storage.get_direct(&cmd_id);
+        assert!(direct.is_some());
+        let direct = direct.expect("direct ref should exist");
+        assert_eq!(direct.info.command_id, cmd_id);
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_get_direct_nonexistent() {
+        let storage = DashMapCommandStorage::new();
+        let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        assert!(storage.get_direct(&unique_id).is_none());
+    }
+
+    #[test]
+    fn test_list_all() {
+        let storage = DashMapCommandStorage::new();
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
+        let cmd_id_1 = format!("cmd-1-{}", uuid::Uuid::new_v4());
+        let cmd_id_2 = format!("cmd-2-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd_id_1.clone(),
+            create_test_command(&cmd_id_1, &session_id_1),
+        );
+        storage.register(
+            cmd_id_2.clone(),
+            create_test_command(&cmd_id_2, &session_id_2),
+        );
+
+        let all = storage.list_all();
+        // Note: list_all returns ALL commands including from other tests running in parallel
+        // So we just check our commands are present
+        let our_commands: Vec<_> = all
+            .iter()
+            .filter(|info| info.command_id == cmd_id_1 || info.command_id == cmd_id_2)
+            .collect();
+        assert_eq!(our_commands.len(), 2);
+
+        // Cleanup
+        storage.unregister(&cmd_id_1);
+        storage.unregister(&cmd_id_2);
+    }
+
+    #[test]
+    fn test_list_all_empty() {
+        let storage = DashMapCommandStorage::new();
+        // New storage instance should be empty
+        assert!(storage.list_all().is_empty());
+    }
+
+    #[test]
+    fn test_unregister_nonexistent() {
+        let storage = DashMapCommandStorage::new();
+        let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
+
+        // Should return None, not panic
+        assert!(storage.unregister(&unique_id).is_none());
+    }
+
+    #[test]
+    fn test_unregister_cleans_secondary_index() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        let cmd = create_test_command(&cmd_id, &session_id);
+        storage.register(cmd_id.clone(), cmd);
+
+        assert_eq!(storage.count_by_session(&session_id), 1);
+
+        storage.unregister(&cmd_id);
+
+        // Secondary index should be cleaned up
+        assert_eq!(storage.count_by_session(&session_id), 0);
+        assert!(storage.list_by_session(&session_id).is_empty());
+    }
+
+    #[test]
+    fn test_iter() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        let cmd = create_test_command(&cmd_id, &session_id);
+        storage.register(cmd_id.clone(), cmd);
+
+        let count = storage.iter().filter(|e| e.key() == &cmd_id).count();
+        assert_eq!(count, 1);
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_multiple_commands_same_session() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id_1 = format!("cmd-1-{}", uuid::Uuid::new_v4());
+        let cmd_id_2 = format!("cmd-2-{}", uuid::Uuid::new_v4());
+        let cmd_id_3 = format!("cmd-3-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd_id_1.clone(),
+            create_test_command(&cmd_id_1, &session_id),
+        );
+        storage.register(
+            cmd_id_2.clone(),
+            create_test_command(&cmd_id_2, &session_id),
+        );
+        storage.register(
+            cmd_id_3.clone(),
+            create_test_command(&cmd_id_3, &session_id),
+        );
+
+        assert_eq!(storage.count_by_session(&session_id), 3);
+
+        // Unregister one
+        storage.unregister(&cmd_id_2);
+        assert_eq!(storage.count_by_session(&session_id), 2);
+
+        let remaining = storage.list_by_session(&session_id);
+        assert!(remaining.contains(&cmd_id_1));
+        assert!(!remaining.contains(&cmd_id_2));
+        assert!(remaining.contains(&cmd_id_3));
+
+        // Cleanup
+        storage.unregister(&cmd_id_1);
+        storage.unregister(&cmd_id_3);
+    }
+
+    #[test]
+    fn test_list_all_with_status_from_watch_channel() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("test-cmd-{}", uuid::Uuid::new_v4());
+
+        // Create command with Completed status
+        let cmd =
+            create_test_command_with_status(&cmd_id, &session_id, AsyncCommandStatus::Completed);
+        storage.register(cmd_id.clone(), cmd);
+
+        let all = storage.list_all();
+        let our_cmd = all.iter().find(|info| info.command_id == cmd_id);
+        assert!(our_cmd.is_some());
+        let our_cmd = our_cmd.expect("our command should be in list");
+        assert_eq!(our_cmd.status, AsyncCommandStatus::Completed);
+
+        // Cleanup
+        storage.unregister(&cmd_id);
+    }
+
+    #[test]
+    fn test_commands_across_multiple_sessions() {
+        let storage = DashMapCommandStorage::new();
+        let session_id_1 = format!("session-1-{}", uuid::Uuid::new_v4());
+        let session_id_2 = format!("session-2-{}", uuid::Uuid::new_v4());
+        let cmd_id_1a = format!("cmd-1a-{}", uuid::Uuid::new_v4());
+        let cmd_id_1b = format!("cmd-1b-{}", uuid::Uuid::new_v4());
+        let cmd_id_2a = format!("cmd-2a-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd_id_1a.clone(),
+            create_test_command(&cmd_id_1a, &session_id_1),
+        );
+        storage.register(
+            cmd_id_1b.clone(),
+            create_test_command(&cmd_id_1b, &session_id_1),
+        );
+        storage.register(
+            cmd_id_2a.clone(),
+            create_test_command(&cmd_id_2a, &session_id_2),
+        );
+
+        assert_eq!(storage.count_by_session(&session_id_1), 2);
+        assert_eq!(storage.count_by_session(&session_id_2), 1);
+
+        // Cleanup
+        storage.unregister(&cmd_id_1a);
+        storage.unregister(&cmd_id_1b);
+        storage.unregister(&cmd_id_2a);
     }
 }
