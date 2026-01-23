@@ -30,6 +30,7 @@ pub(crate) mod error;
 #[cfg(feature = "port_forward")]
 pub(crate) mod forward;
 pub mod message;
+pub mod schema;
 pub mod session;
 pub mod storage;
 pub mod types;
