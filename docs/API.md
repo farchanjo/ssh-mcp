@@ -104,7 +104,7 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 
 ## Overview
 
-SSH MCP exposes 10 tools for managing SSH connections and operations:
+SSH MCP exposes 9 tools for managing SSH connections and operations:
 
 | Tool | Action | Returns | Feature Flag |
 |------|--------|---------|--------------|
@@ -322,7 +322,7 @@ Returns `SshExecuteResponse`:
 
 #### Limits
 
-- Maximum 30 concurrent commands per session
+- Maximum 100 concurrent commands per session
 - Commands are automatically cancelled when the session is disconnected
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
@@ -1089,7 +1089,7 @@ All errors are returned as string messages. Common error patterns:
 | Error | Cause |
 |-------|-------|
 | `No async command found with ID: xxx` | Command ID not found or already cleaned up |
-| `Maximum concurrent commands (30) reached for session` | Session has too many running commands |
+| `Maximum concurrent commands (100) reached for session` | Session has too many running commands |
 | `No active SSH session with ID: xxx` | Session not found when starting async command |
 | `Wait timeout must be between 1 and 300 seconds` | Invalid `wait_timeout_secs` value |
 
@@ -1155,6 +1155,31 @@ Response:
 Response:
 ```json
 {
+  "command_id": "cmd-789-xyz",
+  "session_id": "abc-123-def-456",
+  "command": "cd /app && git pull origin main",
+  "started_at": "2024-01-15T14:30:00.000Z",
+  "message": "COMMAND STARTED. REMEMBER: command_id='cmd-789-xyz'"
+}
+```
+
+3. **Get command output**
+
+```json
+{
+  "tool": "ssh_get_command_output",
+  "arguments": {
+    "command_id": "cmd-789-xyz",
+    "wait": true
+  }
+}
+```
+
+Response:
+```json
+{
+  "command_id": "cmd-789-xyz",
+  "status": "completed",
   "stdout": "Already up to date.\n",
   "stderr": "",
   "exit_code": 0,
@@ -1162,7 +1187,7 @@ Response:
 }
 ```
 
-3. **Setup database tunnel**
+4. **Setup database tunnel**
 
 ```json
 {
@@ -1185,7 +1210,7 @@ Response:
 }
 ```
 
-4. **Check active sessions**
+5. **Check active sessions**
 
 ```json
 {
@@ -1213,7 +1238,7 @@ Response:
 }
 ```
 
-5. **Disconnect when done**
+6. **Disconnect when done**
 
 ```json
 {
@@ -1603,7 +1628,7 @@ SSH MCP executes commands asynchronously, returning a `command_id` immediately t
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Max concurrent per session | 30 | Maximum running commands per SSH session |
+| Max concurrent per session | 100 | Maximum running commands per SSH session |
 | Default timeout | 180s | Configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` |
 | Max wait timeout | 300s | Maximum value for `wait_timeout_secs` parameter |
 | Auto-cleanup | On disconnect | All commands cancelled when session disconnects |

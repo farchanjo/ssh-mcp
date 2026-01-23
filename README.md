@@ -18,7 +18,7 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Native async SSH** - No blocking thread pool, true async all the way down
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
-- **Modular codebase** - 9 focused modules instead of 1 monolithic file
+- **Modular codebase** - 16 focused modules instead of 1 monolithic file
 - **Comprehensive tests** - 314 unit tests covering all functionality
 
 ---
@@ -531,7 +531,7 @@ while True:
 
 ### Limits
 
-- Max 30 concurrent async commands per session
+- Max 100 concurrent async commands per session
 - Commands auto-cleanup when session disconnects
 - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
