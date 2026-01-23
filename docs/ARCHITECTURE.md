@@ -170,7 +170,7 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
 - `McpSSHCommands` struct with `#[Tools]` impl
 - Uses storage traits (`SessionStorage`, `CommandStorage`) via global instances
 - Uses message builders for LLM-friendly responses
-- `ssh_connect`, `ssh_execute`, `ssh_forward`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
+- `ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_forward`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
 
 ### Storage Layer (storage/)
 
@@ -324,6 +324,7 @@ classDiagram
         +ssh_forward() StructuredContent~PortForwardingResponse~
         +ssh_disconnect() Text~String~
         +ssh_list_sessions() StructuredContent~SessionListResponse~
+        +ssh_disconnect_agent() StructuredContent~AgentDisconnectResponse~
     }
 
     class StoredSession {
@@ -419,6 +420,7 @@ classDiagram
     McpSSHCommands ..> RunningCommand : manages async
     McpSSHCommands ..> PortForwardingResponse : returns
     McpSSHCommands ..> SessionListResponse : returns
+    McpSSHCommands ..> AgentDisconnectResponse : returns
     StoredSession *-- SessionInfo : contains
     StoredSession --> SshClientHandler : uses
     SSH_SESSIONS --> StoredSession : stores

@@ -415,6 +415,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay (`DEFAULT_RETRY_DELAY: Duration`) |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
 | `MCP_PORT` | 8000 | HTTP server port |
+| `RUST_LOG` | info | Log level filter (trace, debug, info, warn, error) |
 
 ### Error Handling Strategy
 - **Retryable errors**: Connection refused, timeout, network unreachable
