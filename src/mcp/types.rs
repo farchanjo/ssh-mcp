@@ -21,8 +21,10 @@ pub struct SessionInfo {
     pub username: String,
     pub connected_at: String,
     /// Default timeout in seconds used for this session's connection
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub default_timeout_secs: u64,
     /// Number of retry attempts needed to establish the connection
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub retry_attempts: u32,
     /// Whether compression is enabled for this session
     pub compression_enabled: bool,
@@ -43,6 +45,7 @@ pub struct SshConnectResponse {
     pub message: String,
     pub authenticated: bool,
     /// Number of retry attempts needed to establish the connection
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub retry_attempts: u32,
 }
 
@@ -69,6 +72,7 @@ pub struct SessionListResponse {
     /// List of active SSH sessions
     pub sessions: Vec<SessionInfo>,
     /// Total number of active sessions
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub count: usize,
 }
 
@@ -158,8 +162,10 @@ pub struct AgentDisconnectResponse {
     /// Agent ID that was disconnected
     pub agent_id: String,
     /// Number of sessions that were disconnected
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub sessions_disconnected: usize,
     /// Number of async commands that were cancelled
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub commands_cancelled: usize,
     /// Human-readable message
     pub message: String,
@@ -186,6 +192,7 @@ pub struct SshListCommandsResponse {
     /// List of async commands
     pub commands: Vec<AsyncCommandInfo>,
     /// Total number of commands returned
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub count: usize,
 }
 
