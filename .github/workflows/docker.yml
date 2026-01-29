@@ -17,7 +17,7 @@ jobs:
         id: metadata
         uses: docker/metadata-action@v4
         with:
-          images: mingyang91/ssh-mcp
+          images: farchanjo/ssh-mcp
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

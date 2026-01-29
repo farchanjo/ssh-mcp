@@ -89,6 +89,7 @@ Some options are only configurable per-session via function parameters:
 | `SSH_COMMAND_TIMEOUT` | `u64` | `180` | Command execution timeout in seconds |
 | `SSH_MAX_RETRIES` | `u32` | `3` | Maximum retry attempts for transient failures |
 | `SSH_RETRY_DELAY_MS` | `u64` | `1000` | Initial delay between retries (milliseconds) |
+| `SSH_INACTIVITY_TIMEOUT` | `u64` | `300` | Session inactivity timeout in seconds |
 | `SSH_COMPRESSION` | `bool` | `true` | Enable zlib compression (`true`, `1`, or `false`, `0`) |
 
 ### Server Settings
@@ -172,6 +173,22 @@ Example timeline with `SSH_RETRY_DELAY_MS=1000`:
 - Retry 3: ~4s delay
 - Retry 4: ~8s delay
 - Retry 5+: ~10s delay (capped)
+
+#### SSH_INACTIVITY_TIMEOUT
+
+Controls how long an idle session can remain open before being automatically closed. This is separate from the connection timeout.
+
+```bash
+# Keep sessions alive for 10 minutes of inactivity
+export SSH_INACTIVITY_TIMEOUT=600
+```
+
+**Considerations:**
+- Only applies to non-persistent sessions (`persistent: false`)
+- Persistent sessions (`persistent: true`) disable this timeout entirely
+- Keepalive packets (30s interval) are sent independently of this timeout
+- Default 300s (5 minutes) is suitable for most interactive use cases
+- Set higher for workflows with long think/compose pauses between commands
 
 #### SSH_COMPRESSION
 
@@ -801,6 +818,7 @@ flowchart TB
         ResolveCommand["resolve_command_timeout()"]
         ResolveRetries["resolve_max_retries()"]
         ResolveDelay["resolve_retry_delay()"]
+        ResolveInactivity["resolve_inactivity_timeout()"]
         ResolveCompress["resolve_compression()"]
     end
 
@@ -809,6 +827,7 @@ flowchart TB
         TimeoutCommand["timeout: 180s"]
         MaxRetries["retries: 3"]
         RetryDelay["delay: 1000ms"]
+        Inactivity["inactivity: 300s"]
         Compression["compress: true"]
     end
 
@@ -816,24 +835,28 @@ flowchart TB
     Param --> ResolveCommand
     Param --> ResolveRetries
     Param --> ResolveDelay
+    Param --> ResolveInactivity
     Param --> ResolveCompress
 
     Env --> ResolveConnect
     Env --> ResolveCommand
     Env --> ResolveRetries
     Env --> ResolveDelay
+    Env --> ResolveInactivity
     Env --> ResolveCompress
 
     Default --> ResolveConnect
     Default --> ResolveCommand
     Default --> ResolveRetries
     Default --> ResolveDelay
+    Default --> ResolveInactivity
     Default --> ResolveCompress
 
     ResolveConnect --> TimeoutConnect
     ResolveCommand --> TimeoutCommand
     ResolveRetries --> MaxRetries
     ResolveDelay --> RetryDelay
+    ResolveInactivity --> Inactivity
     ResolveCompress --> Compression
 
     subgraph Usage["Usage in ssh_connect"]
@@ -870,6 +893,9 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// Default retry delay (1000 milliseconds)
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
+
+/// Default session inactivity timeout (300 seconds / 5 minutes)
+const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum retry delay cap (10 seconds)
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
