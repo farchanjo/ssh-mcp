@@ -29,8 +29,8 @@ use super::client::{
     execute_ssh_command_async_pty, open_pty_shell,
 };
 use super::config::{
-    resolve_command_timeout, resolve_compression, resolve_connect_timeout, resolve_max_retries,
-    resolve_retry_delay,
+    resolve_command_timeout, resolve_compression, resolve_connect_timeout,
+    resolve_inactivity_timeout, resolve_max_retries, resolve_retry_delay,
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
@@ -98,6 +98,7 @@ impl McpSSHCommands {
         agent_id: Option<String>,
     ) -> Result<StructuredContent<SshConnectResponse>, String> {
         let timeout = resolve_connect_timeout(timeout_secs);
+        let inactivity_timeout = resolve_inactivity_timeout();
         let max_retries_val = resolve_max_retries(max_retries);
         let retry_delay = resolve_retry_delay(retry_delay_ms);
         let compress = resolve_compression(compress);
@@ -164,6 +165,7 @@ impl McpSSHCommands {
             password.as_deref(),
             key_path.as_deref(),
             timeout,
+            inactivity_timeout,
             max_retries_val,
             retry_delay,
             compress,
