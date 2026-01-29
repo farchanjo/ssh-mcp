@@ -18,6 +18,10 @@ This document provides a complete API reference for all MCP tools exposed by the
   - [ssh_disconnect](#ssh_disconnect)
   - [ssh_list_sessions](#ssh_list_sessions)
   - [ssh_disconnect_agent](#ssh_disconnect_agent)
+  - [ssh_shell_open](#ssh_shell_open)
+  - [ssh_shell_write](#ssh_shell_write)
+  - [ssh_shell_read](#ssh_shell_read)
+  - [ssh_shell_close](#ssh_shell_close)
 - [Response Types](#response-types)
 - [Error Responses](#error-responses)
 - [Examples](#examples)
@@ -37,10 +41,17 @@ This document provides a complete API reference for all MCP tools exposed by the
 3. **USE `agent_id`** when multiple agents share the server - enables bulk cleanup
 4. **CALL `ssh_disconnect`** when done to release resources
 5. **POLL with `ssh_get_command_output`** for long-running commands (builds, deploys)
+6. **SAVE `shell_id`** from `ssh_shell_open` - required for shell read/write/close
+7. **USE `ssh_shell_*` tools** for interactive PTY sessions (SOL/IPMI/OOB consoles)
 
 **Typical Workflow:**
 ```
 ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_output → ssh_disconnect
+```
+
+**Interactive Shell Workflow:**
+```
+ssh_connect → session_id → ssh_shell_open → shell_id → ssh_shell_write/read → ssh_shell_close
 ```
 
 ---
@@ -49,9 +60,10 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 
 | Identifier | Source | Used By | Purpose |
 |------------|--------|---------|---------|
-| `session_id` | `ssh_connect` returns | `ssh_execute`, `ssh_forward`, `ssh_disconnect`, `ssh_list_commands` | Identifies SSH connection |
+| `session_id` | `ssh_connect` returns | `ssh_execute`, `ssh_forward`, `ssh_disconnect`, `ssh_list_commands`, `ssh_shell_open` | Identifies SSH connection |
 | `command_id` | `ssh_execute` returns | `ssh_get_command_output`, `ssh_cancel_command` | Tracks background command |
 | `agent_id` | You provide to `ssh_connect` | `ssh_list_sessions`, `ssh_disconnect_agent` | Groups sessions for bulk operations |
+| `shell_id` | `ssh_shell_open` returns | `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close` | Identifies interactive shell |
 
 **Identifier Flow Diagram:**
 ```
@@ -60,13 +72,20 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 │              │                     │              │                    │ output              │
 └──────────────┘                     └──────────────┘                    └─────────────────────┘
        │                                    │                                     │
-       │ (optional)                         │                                     │
-       ▼                                    │                                     ▼
-   agent_id ─────────────────────────────────────────────────────────────  ssh_cancel_command
+       │ session_id                         │                                     ▼
+       ▼                                    │                              ssh_cancel_command
+┌──────────────────┐    shell_id     ┌──────────────────┐
+│ ssh_shell_open   │ ─────────────── │ ssh_shell_write  │
+│                  │                 │ ssh_shell_read   │
+└──────────────────┘                 │ ssh_shell_close  │
+       │                             └──────────────────┘
+       │ (optional)
+       ▼
+   agent_id ──────────────────────────────────────────────
        │
        ▼
 ┌──────────────────────┐
-│ ssh_disconnect_agent │  ← Disconnects ALL sessions with this agent_id
+│ ssh_disconnect_agent │  ← Disconnects ALL sessions + shells with this agent_id
 └──────────────────────┘
 ```
 
@@ -92,6 +111,16 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 6. ssh_disconnect(session_id) → CLEANUP
 ```
 
+### Interactive Shell Session
+```
+1. ssh_connect(address, username) → SAVE session_id
+2. ssh_shell_open(session_id, term="xterm", cols=80, rows=24) → SAVE shell_id
+3. ssh_shell_write(shell_id, "ls -la\n") → OK
+4. ssh_shell_read(shell_id) → GET output data
+5. ssh_shell_close(shell_id) → CLEANUP
+6. ssh_disconnect(session_id) → CLEANUP
+```
+
 ### Multi-Agent Cleanup
 ```
 1. ssh_connect(address, username, agent_id="my-agent") → SAVE session_id
@@ -104,7 +133,7 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 
 ## Overview
 
-SSH MCP exposes 9 tools for managing SSH connections and operations:
+SSH MCP exposes 13 tools for managing SSH connections, commands, interactive shells, and port forwarding:
 
 | Tool | Action | Returns | Feature Flag |
 |------|--------|---------|--------------|
@@ -117,6 +146,10 @@ SSH MCP exposes 9 tools for managing SSH connections and operations:
 | `ssh_disconnect` | **CLOSES** single session | confirmation | - |
 | `ssh_list_sessions` | **LISTS** active sessions | session metadata array | - |
 | `ssh_disconnect_agent` | **CLOSES ALL** sessions for agent | cleanup summary | - |
+| `ssh_shell_open` | **OPENS** interactive PTY shell | `shell_id` to SAVE | - |
+| `ssh_shell_write` | **SENDS** input to shell | confirmation | - |
+| `ssh_shell_read` | **READS** shell output | data, status | - |
+| `ssh_shell_close` | **CLOSES** interactive shell | confirmation | - |
 
 ---
 
@@ -943,6 +976,240 @@ Returns `AgentDisconnectResponse`:
 
 ---
 
+### ssh_shell_open
+
+**ACTION:** Opens an interactive PTY shell session and returns a `shell_id` that you MUST SAVE.
+
+**LLM GUIDANCE:**
+- **REQUIRES `session_id`** from `ssh_connect` - pass it as parameter
+- **SAVE the `shell_id`** from the response - you need it for `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close`
+- **USE for interactive sessions** - SOL/IPMI/OOB consoles, serial devices, commands requiring PTY (sudo, top)
+- **USE `term_type: "vt100"`** for Serial Over LAN / IPMI / OOB access
+
+Opens an interactive pseudo-terminal (PTY) shell session on a connected SSH session. The shell runs persistently and accepts input/output via `ssh_shell_write` and `ssh_shell_read`.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `session_id` | `string` | Yes | - | Session ID returned from `ssh_connect` |
+| `term_type` | `string` | No | `xterm` | Terminal type (e.g., `xterm`, `vt100`, `ansi`). Use `vt100` for SOL/IPMI/OOB. |
+| `cols` | `u32` | No | `80` | Terminal width in columns |
+| `rows` | `u32` | No | `24` | Terminal height in rows |
+
+#### Response
+
+Returns `SshShellOpenResponse`:
+
+**⚠️ IMPORTANT: SAVE `shell_id` - you need it for ssh_shell_write, ssh_shell_read, and ssh_shell_close**
+
+```json
+{
+  "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "my-agent-id",
+  "term_type": "xterm",
+  "message": "INTERACTIVE SHELL OPENED. REMEMBER THESE IDENTIFIERS:\n• shell_id: 'a1b2c3d4-...'\n• session_id: '550e8400-...'\n• term: xterm (80x24)\n\nUse ssh_shell_write with shell_id 'a1b2c3d4-...' to send input.\nUse ssh_shell_read with shell_id 'a1b2c3d4-...' to read output.\nUse ssh_shell_close with shell_id 'a1b2c3d4-...' to close the shell."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `shell_id` | `string` | **SAVE THIS** - Unique UUID v4 required for all shell operations |
+| `session_id` | `string` | Session ID where the shell is running |
+| `agent_id` | `string \| null` | Agent ID if the session was created with one |
+| `term_type` | `string` | Terminal type used |
+| `message` | `string` | Human-readable message with identifiers and next steps |
+
+#### Limits
+
+- Maximum 10 concurrent shells per session
+- Shells are automatically closed when the session is disconnected
+
+#### Example Usage
+
+Standard interactive shell:
+
+```json
+{
+  "tool": "ssh_shell_open",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "term_type": "xterm",
+    "cols": 80,
+    "rows": 24
+  }
+}
+```
+
+SOL / IPMI / OOB console:
+
+```json
+{
+  "tool": "ssh_shell_open",
+  "arguments": {
+    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+    "term_type": "vt100",
+    "cols": 80,
+    "rows": 24
+  }
+}
+```
+
+---
+
+### ssh_shell_write
+
+**ACTION:** Sends input data to an interactive shell.
+
+**LLM GUIDANCE:**
+- **REQUIRES `shell_id`** from `ssh_shell_open` - pass it as parameter
+- **SEND text with newlines** to execute commands (e.g., `"ls -la\n"`)
+- **SEND escape sequences** for special keys (e.g., `"\x03"` for Ctrl+C)
+- **DATA is sent as-is** to the shell's stdin
+
+Sends input data (text, keystrokes, escape sequences) to an open interactive shell.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `shell_id` | `string` | Yes | - | Shell ID returned from `ssh_shell_open` |
+| `data` | `string` | Yes | - | Input data to send to the shell (text, commands, escape sequences) |
+
+#### Response
+
+Returns plain text confirmation:
+
+```
+Data sent to shell a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+#### Example Usage
+
+Execute a command:
+
+```json
+{
+  "tool": "ssh_shell_write",
+  "arguments": {
+    "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "data": "ls -la\n"
+  }
+}
+```
+
+Send Ctrl+C:
+
+```json
+{
+  "tool": "ssh_shell_write",
+  "arguments": {
+    "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "data": "\u0003"
+  }
+}
+```
+
+---
+
+### ssh_shell_read
+
+**ACTION:** Reads accumulated output from an interactive shell.
+
+**LLM GUIDANCE:**
+- **REQUIRES `shell_id`** from `ssh_shell_open` - pass it as parameter
+- **RETURNS accumulated output** since the last read
+- **CHECK `status` field**: `open` (shell active) or `closed` (shell terminated)
+- **CALL after `ssh_shell_write`** to read command output
+
+Reads and returns accumulated output from an open interactive shell. Output includes everything written to the shell's PTY since the last read.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `shell_id` | `string` | Yes | - | Shell ID returned from `ssh_shell_open` |
+
+#### Response
+
+Returns `SshShellReadResponse`:
+
+```json
+{
+  "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "data": "total 42\ndrwxr-xr-x  5 user group 160 Jan 15 10:30 .\ndrwxr-xr-x 12 user group 384 Jan 14 09:00 ..\n",
+  "status": "open"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `shell_id` | `string` | The shell identifier |
+| `data` | `string` | Accumulated output from the shell |
+| `status` | `string` | Shell status: `open` (active) or `closed` (terminated) |
+
+#### Example Usage
+
+```json
+{
+  "tool": "ssh_shell_read",
+  "arguments": {
+    "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+}
+```
+
+---
+
+### ssh_shell_close
+
+**ACTION:** Closes an interactive shell session and releases resources.
+
+**LLM GUIDANCE:**
+- **REQUIRES `shell_id`** from `ssh_shell_open` - pass it as parameter
+- **CALL when done** with the interactive session to free resources
+- **SHELLS are also closed** when `ssh_disconnect` is called for the session
+
+Closes an open interactive shell session, terminates the PTY channel, and releases all associated resources.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `shell_id` | `string` | Yes | - | Shell ID to close |
+
+#### Response
+
+Returns `SshShellCloseResponse`:
+
+```json
+{
+  "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "closed": true,
+  "message": "Shell closed successfully"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `shell_id` | `string` | The shell identifier |
+| `closed` | `bool` | `true` if the shell was successfully closed |
+| `message` | `string` | Human-readable status message |
+
+#### Example Usage
+
+```json
+{
+  "tool": "ssh_shell_close",
+  "arguments": {
+    "shell_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+}
+```
+
+---
+
 ## Response Types
 
 ### Common Response Structure
@@ -1045,6 +1312,35 @@ interface AgentDisconnectResponse {
   sessions_disconnected: number;   // Number of sessions closed
   commands_cancelled: number;      // Number of commands stopped
   message: string;                 // Human-readable summary
+}
+
+interface SshShellOpenResponse {
+  shell_id: string;        // SAVE THIS - required for all shell operations
+  session_id: string;
+  agent_id?: string;       // Present if session was created with agent_id
+  term_type: string;       // Terminal type used (e.g., "xterm", "vt100")
+  message: string;         // Human-readable message with identifiers
+}
+
+interface SshShellReadResponse {
+  shell_id: string;
+  data: string;            // Accumulated output from the shell
+  status: "open" | "closed";
+}
+
+interface SshShellCloseResponse {
+  shell_id: string;
+  closed: boolean;
+  message: string;
+}
+
+interface ShellInfo {
+  shell_id: string;
+  session_id: string;
+  term_type: string;
+  cols: number;
+  rows: number;
+  opened_at: string;       // ISO 8601 timestamp
 }
 ```
 

@@ -36,30 +36,34 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 ### Core Modules (`src/mcp/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 37 | Module declarations and re-exports |
-| **types.rs** | 1112 | Response types (`SessionInfo`, `SshConnectResponse`, async types) |
+| **mod.rs** | 40 | Module declarations and re-exports |
+| **types.rs** | 1354 | Response types (`SessionInfo`, `SshConnectResponse`, shell types, async types) |
 | **config.rs** | 601 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
 | **session.rs** | 41 | `SshClientHandler` for russh client |
-| **client.rs** | 785 | SSH connection, authentication, command execution |
+| **client.rs** | 895 | SSH connection, authentication, command execution, PTY channels |
 | **async_command.rs** | 183 | Async command types (`RunningCommand`, `OutputBuffer`) |
+| **shell.rs** | 145 | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
+| **schema.rs** | 118 | JSON schema helpers for LLM-friendly schemas |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
-| **commands.rs** | 774 | `McpSSHCommands` MCP tool implementations |
+| **commands.rs** | 1105 | `McpSSHCommands` MCP tool implementations (13 tools) |
 
 ### SOLID Architecture Modules
 
 #### Storage Layer (`src/mcp/storage/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 18 | Module exports and global storage instances |
+| **mod.rs** | 23 | Module exports and global storage instances |
 | **traits.rs** | 107 | `SessionStorage` and `CommandStorage` trait definitions |
 | **session.rs** | 491 | `DashMapSessionStorage` with agent index and tests |
 | **command.rs** | 996 | `DashMapCommandStorage` with session index and tests |
+| **shell.rs** | 208 | `DashMapShellStorage` with session index and tests |
 
 Storage abstractions enable dependency injection and testability:
 - `SessionStorage`: CRUD for SSH sessions with agent grouping via secondary index
 - `CommandStorage`: CRUD for async commands with O(1) session lookups
-- Both use `DashMap` for lock-free concurrent access
+- `ShellStorage`: CRUD for interactive shell sessions with O(1) session lookups
+- All use `DashMap` for lock-free concurrent access
 
 **Key types:**
 - `SessionRef`: Read-only reference containing `SessionInfo` and `Handle`
@@ -68,7 +72,7 @@ Storage abstractions enable dependency injection and testability:
 
 **Usage example:**
 ```rust
-use ssh_mcp::mcp::storage::{SESSION_STORAGE, COMMAND_STORAGE};
+use ssh_mcp::mcp::storage::{SESSION_STORAGE, COMMAND_STORAGE, SHELL_STORAGE};
 
 // Insert a session
 SESSION_STORAGE.insert(session_id, info, handle);
@@ -78,6 +82,9 @@ SESSION_STORAGE.register_agent(&agent_id, &session_id);
 
 // Get all sessions for an agent
 let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
+
+// Register a shell
+SHELL_STORAGE.register(shell_id, running_shell);
 ```
 
 #### Authentication Layer (`src/mcp/auth/`)
@@ -141,8 +148,8 @@ impl AuthStrategy for MyCustomAuth {
 #### Message Layer (`src/mcp/message/`)
 | Module | Lines | Description |
 |--------|-------|-------------|
-| **mod.rs** | 9 | Module exports |
-| **builder.rs** | 820 | Fluent message builders with comprehensive tests |
+| **mod.rs** | 12 | Module exports |
+| **builder.rs** | 982 | Fluent message builders with comprehensive tests |
 
 Message builders construct human-readable responses that help LLMs remember important identifiers:
 
@@ -150,11 +157,12 @@ Message builders construct human-readable responses that help LLMs remember impo
 - `ConnectMessageBuilder`: Connection success with session identifiers
 - `ExecuteMessageBuilder`: Command start with polling instructions
 - `AgentDisconnectMessageBuilder`: Agent cleanup summary
+- `ShellOpenMessageBuilder`: Interactive shell open with shell identifiers
 
 **Usage examples:**
 
 ```rust
-use ssh_mcp::mcp::message::{ConnectMessageBuilder, ExecuteMessageBuilder, AgentDisconnectMessageBuilder};
+use ssh_mcp::mcp::message::{ConnectMessageBuilder, ExecuteMessageBuilder, AgentDisconnectMessageBuilder, ShellOpenMessageBuilder};
 
 // Connection message
 let message = ConnectMessageBuilder::new("session-123", "user", "host:22")
@@ -175,6 +183,11 @@ let message = AgentDisconnectMessageBuilder::new("my-agent")
     .with_sessions_disconnected(3)
     .with_commands_cancelled(5)
     .build();
+
+// Shell open message
+let message = ShellOpenMessageBuilder::new("shell-123", "session-456", "xterm", 80, 24)
+    .with_agent_id(Some("my-agent"))
+    .build();
 ```
 
 **Example output (ConnectMessageBuilder):**
@@ -191,7 +204,7 @@ Use ssh_execute with session_id 'session-123' to run commands.
 Use ssh_disconnect_agent with agent_id 'my-agent' to disconnect all sessions for this agent.
 ```
 
-### MCP Tools
+### MCP Tools (13 total)
 - `ssh_connect`: Connection with retry logic (exponential backoff via `backon` crate)
   - `name: Option<String>` - Human-readable session name for LLM identification
   - `persistent: Option<bool>` - When true, disables inactivity timeout (keepalive still active)
@@ -201,9 +214,13 @@ Use ssh_disconnect_agent with agent_id 'my-agent' to disconnect all sessions for
 - `ssh_list_commands`: List all async commands (filterable by session/status)
 - `ssh_cancel_command`: Cancel a running async command
 - `ssh_forward`: Port forwarding (feature-gated)
-- `ssh_disconnect`: Session cleanup (also cancels all async commands for the session)
+- `ssh_disconnect`: Session cleanup (also cancels all async commands and shells for the session)
 - `ssh_list_sessions`: List active sessions (filterable by `agent_id`)
-- `ssh_disconnect_agent`: Disconnect ALL sessions for a specific agent (bulk cleanup)
+- `ssh_disconnect_agent`: Disconnect ALL sessions for a specific agent (bulk cleanup, includes shells)
+- `ssh_shell_open`: Open interactive PTY shell session (for SOL/IPMI/OOB access)
+- `ssh_shell_write`: Send input (text, keystrokes) to interactive shell
+- `ssh_shell_read`: Read accumulated output from interactive shell
+- `ssh_shell_close`: Close interactive shell session
 
 ### Key Types
 - **`SessionInfo`**: Session metadata with optional `name` and `agent_id` fields (omitted from JSON when None)
@@ -216,6 +233,11 @@ Use ssh_disconnect_agent with agent_id 'my-agent' to disconnect all sessions for
 - **`AsyncCommandStatus`**: Enum with `Running`, `Completed`, `Cancelled`, `Failed`
 - **`SshAsyncOutputResponse`**: Output from async command including `status`, `stdout`, `stderr`, `exit_code`
 - **`AgentDisconnectResponse`**: Response from `ssh_disconnect_agent` with `agent_id`, `sessions_disconnected`, `commands_cancelled`
+- **`ShellInfo`**: Shell metadata with `shell_id`, `session_id`, `term_type`, `cols`, `rows`, `opened_at`
+- **`ShellStatus`**: Enum with `Open`, `Closed`
+- **`SshShellOpenResponse`**: Response from `ssh_shell_open` with `shell_id`, `session_id`, `agent_id`, `term_type`, `message`
+- **`SshShellReadResponse`**: Response from `ssh_shell_read` with `shell_id`, `data`, `status`
+- **`SshShellCloseResponse`**: Response from `ssh_shell_close` with `shell_id`, `closed`, `message`
 
 ### Async Command Execution
 
@@ -396,8 +418,8 @@ Response:
 
 ### Threading Model
 - Tokio async runtime with native async SSH via `russh` crate
-- Lock-free storage via `DashMap` implementations of `SessionStorage` and `CommandStorage` traits
-- Secondary indices for O(1) lookups: agent-to-sessions, session-to-commands
+- Lock-free storage via `DashMap` implementations of `SessionStorage`, `CommandStorage`, and `ShellStorage` traits
+- Secondary indices for O(1) lookups: agent-to-sessions, session-to-commands, session-to-shells
 
 ### Authentication
 - Strategy pattern via `AuthStrategy` trait with `AuthChain` for fallback
@@ -428,7 +450,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
 - Lock-free data structures (`DashMap`) for concurrent access
-- 314 unit tests (`cargo test --all-features`)
+- 353 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 
