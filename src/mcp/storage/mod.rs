@@ -7,6 +7,7 @@
 
 mod command;
 mod session;
+mod shell;
 mod traits;
 
 pub use command::COMMAND_STORAGE;
@@ -15,4 +16,8 @@ pub use command::DashMapCommandStorage;
 #[allow(unused_imports)]
 pub use session::DashMapSessionStorage;
 pub use session::SESSION_STORAGE;
+#[allow(unused_imports)]
+pub use shell::DashMapShellStorage;
+pub use shell::SHELL_STORAGE;
+pub use shell::ShellStorage;
 pub use traits::{CommandStorage, SessionStorage};
