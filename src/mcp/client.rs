@@ -58,27 +58,27 @@ use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
 /// Build russh client configuration with the specified settings.
 ///
 /// Creates an `Arc<client::Config>` with:
-/// - Inactivity timeout set to the provided `timeout` (or `None` if `persistent` is true)
+/// - Inactivity timeout from dedicated parameter (or `None` if `persistent` is true)
 /// - Keepalive interval of 30 seconds with max 3 keepalives
 /// - Compression preference based on `compress` flag (ZLIB if enabled, NONE if disabled)
 ///
 /// # Arguments
 ///
-/// * `timeout` - Inactivity timeout duration (ignored if `persistent` is true)
+/// * `inactivity_timeout` - Session inactivity timeout (ignored if `persistent` is true)
 /// * `compress` - Whether to enable zlib compression
 /// * `persistent` - If true, disables inactivity timeout to keep the session open indefinitely
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let config = build_client_config(Duration::from_secs(30), true, false);
-/// assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(30)));
+/// let config = build_client_config(Duration::from_secs(300), true, false);
+/// assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(300)));
 ///
-/// let persistent_config = build_client_config(Duration::from_secs(30), true, true);
+/// let persistent_config = build_client_config(Duration::from_secs(300), true, true);
 /// assert_eq!(persistent_config.inactivity_timeout, None);
 /// ```
 pub(crate) fn build_client_config(
-    timeout: Duration,
+    inactivity_timeout: Duration,
     compress: bool,
     persistent: bool,
 ) -> Arc<client::Config> {
@@ -93,11 +93,14 @@ pub(crate) fn build_client_config(
         ..Default::default()
     };
 
-    // When persistent is true, disable inactivity timeout to keep session open indefinitely
-    let inactivity_timeout = if persistent { None } else { Some(timeout) };
+    let timeout = if persistent {
+        None
+    } else {
+        Some(inactivity_timeout)
+    };
 
     Arc::new(client::Config {
-        inactivity_timeout,
+        inactivity_timeout: timeout,
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         preferred,
@@ -157,6 +160,7 @@ pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
 /// * `password` - Optional password for password authentication
 /// * `key_path` - Optional path to private key file
 /// * `timeout` - Connection timeout duration
+/// * `inactivity_timeout` - Session inactivity timeout duration
 /// * `max_retries` - Maximum number of retry attempts
 /// * `min_delay` - Initial delay between retries
 /// * `compress` - Whether to enable compression
@@ -180,6 +184,7 @@ pub(crate) async fn connect_to_ssh_with_retry(
     password: Option<&str>,
     key_path: Option<&str>,
     timeout: Duration,
+    inactivity_timeout: Duration,
     max_retries: u32,
     min_delay: Duration,
     compress: bool,
@@ -216,6 +221,7 @@ pub(crate) async fn connect_to_ssh_with_retry(
             password.as_deref(),
             key_path.as_deref(),
             timeout,
+            inactivity_timeout,
             compress,
             persistent,
         )
@@ -270,16 +276,18 @@ pub(crate) async fn connect_to_ssh_with_retry(
 /// 2. Parses the address
 /// 3. Connects with timeout
 /// 4. Authenticates using the appropriate method via [`AuthChain`]
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_ssh(
     address: &str,
     username: &str,
     password: Option<&str>,
     key_path: Option<&str>,
     timeout: Duration,
+    inactivity_timeout: Duration,
     compress: bool,
     persistent: bool,
 ) -> Result<client::Handle<SshClientHandler>, String> {
-    let config = build_client_config(timeout, compress, persistent);
+    let config = build_client_config(inactivity_timeout, compress, persistent);
     let handler = SshClientHandler;
 
     // Parse address into host and port
@@ -819,55 +827,52 @@ mod tests {
         use super::*;
 
         #[test]
-        fn test_builds_config_with_timeout() {
-            let config = build_client_config(Duration::from_secs(45), true, false);
-            assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(45)));
+        fn test_builds_config_with_inactivity_timeout() {
+            let config = build_client_config(Duration::from_secs(300), true, false);
+            assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(300)));
         }
 
         #[test]
         fn test_builds_config_with_keepalive() {
-            let config = build_client_config(Duration::from_secs(30), true, false);
+            let config = build_client_config(Duration::from_secs(300), true, false);
             assert_eq!(config.keepalive_interval, Some(Duration::from_secs(30)));
             assert_eq!(config.keepalive_max, 3);
         }
 
         #[test]
         fn test_compression_enabled_includes_zlib() {
-            let config = build_client_config(Duration::from_secs(30), true, false);
-            // When compression is enabled, ZLIB should be preferred
+            let config = build_client_config(Duration::from_secs(300), true, false);
             let compression = &config.preferred.compression;
             assert!(!compression.is_empty());
         }
 
         #[test]
         fn test_compression_disabled() {
-            let config = build_client_config(Duration::from_secs(30), false, false);
-            // When compression is disabled, only NONE should be available
+            let config = build_client_config(Duration::from_secs(300), false, false);
             let compression = &config.preferred.compression;
             assert!(!compression.is_empty());
         }
 
         #[test]
-        fn test_different_timeouts() {
-            let config1 = build_client_config(Duration::from_secs(10), true, false);
-            let config2 = build_client_config(Duration::from_secs(120), true, false);
+        fn test_different_inactivity_timeouts() {
+            let config1 = build_client_config(Duration::from_secs(60), true, false);
+            let config2 = build_client_config(Duration::from_secs(600), true, false);
 
-            assert_eq!(config1.inactivity_timeout, Some(Duration::from_secs(10)));
-            assert_eq!(config2.inactivity_timeout, Some(Duration::from_secs(120)));
+            assert_eq!(config1.inactivity_timeout, Some(Duration::from_secs(60)));
+            assert_eq!(config2.inactivity_timeout, Some(Duration::from_secs(600)));
         }
 
         #[test]
         fn test_persistent_disables_inactivity_timeout() {
-            let config = build_client_config(Duration::from_secs(30), true, true);
+            let config = build_client_config(Duration::from_secs(300), true, true);
             assert_eq!(config.inactivity_timeout, None);
-            // Keepalive should still be active for persistent sessions
             assert_eq!(config.keepalive_interval, Some(Duration::from_secs(30)));
         }
 
         #[test]
         fn test_non_persistent_has_inactivity_timeout() {
-            let config = build_client_config(Duration::from_secs(60), true, false);
-            assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(60)));
+            let config = build_client_config(Duration::from_secs(300), true, false);
+            assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(300)));
         }
     }
 

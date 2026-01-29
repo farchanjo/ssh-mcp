@@ -14,6 +14,7 @@
 //! | `SSH_COMMAND_TIMEOUT` | 180s | Command execution timeout in seconds |
 //! | `SSH_MAX_RETRIES` | 3 | Maximum retry attempts |
 //! | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay in milliseconds |
+//! | `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout in seconds |
 //! | `SSH_COMPRESSION` | true | Enable zlib compression |
 
 use std::env;
@@ -31,6 +32,9 @@ pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Default retry delay
 pub(crate) const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
+/// Default session inactivity timeout (separate from connect timeout)
+pub(crate) const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Maximum retry delay cap (10 seconds)
 pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
@@ -45,6 +49,9 @@ pub(crate) const MAX_RETRIES_ENV_VAR: &str = "SSH_MAX_RETRIES";
 
 /// Environment variable name for SSH retry delay in milliseconds
 pub(crate) const RETRY_DELAY_MS_ENV_VAR: &str = "SSH_RETRY_DELAY_MS";
+
+/// Environment variable name for SSH session inactivity timeout
+pub(crate) const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
 
 /// Environment variable name for SSH compression
 pub(crate) const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
@@ -119,6 +126,17 @@ pub(crate) fn resolve_retry_delay(retry_delay_param: Option<u64>) -> Duration {
 
     // Priority 3: Default value
     DEFAULT_RETRY_DELAY
+}
+
+/// Resolve the inactivity timeout with priority: env var -> default (300s)
+pub(crate) fn resolve_inactivity_timeout() -> Duration {
+    if let Ok(env_timeout) = env::var(INACTIVITY_TIMEOUT_ENV_VAR)
+        && let Ok(timeout) = env_timeout.parse::<u64>()
+    {
+        return Duration::from_secs(timeout);
+    }
+
+    DEFAULT_INACTIVITY_TIMEOUT
 }
 
 /// Resolve the compression setting with priority: parameter -> env var -> default (true)
@@ -447,6 +465,56 @@ mod tests {
                     remove_env(RETRY_DELAY_MS_ENV_VAR);
                 }
                 assert_eq!(result, DEFAULT_RETRY_DELAY);
+            }
+        }
+
+        mod inactivity_timeout {
+            use super::*;
+
+            #[test]
+            fn test_uses_default_when_no_env() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe {
+                    remove_env(INACTIVITY_TIMEOUT_ENV_VAR);
+                }
+                let result = resolve_inactivity_timeout();
+                assert_eq!(result, DEFAULT_INACTIVITY_TIMEOUT);
+            }
+
+            #[test]
+            fn test_default_is_300_seconds() {
+                assert_eq!(DEFAULT_INACTIVITY_TIMEOUT, Duration::from_secs(300));
+            }
+
+            #[test]
+            fn test_uses_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe {
+                    set_env(INACTIVITY_TIMEOUT_ENV_VAR, "600");
+                }
+                let result = resolve_inactivity_timeout();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe {
+                    remove_env(INACTIVITY_TIMEOUT_ENV_VAR);
+                }
+                assert_eq!(result, Duration::from_secs(600));
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe {
+                    set_env(INACTIVITY_TIMEOUT_ENV_VAR, "invalid");
+                }
+                let result = resolve_inactivity_timeout();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe {
+                    remove_env(INACTIVITY_TIMEOUT_ENV_VAR);
+                }
+                assert_eq!(result, DEFAULT_INACTIVITY_TIMEOUT);
             }
         }
 
