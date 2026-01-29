@@ -1049,9 +1049,6 @@ async fn shell_reader(
 ) {
     use russh::ChannelMsg;
 
-    let mut local_buf = Vec::with_capacity(4096);
-    const FLUSH_THRESHOLD: usize = 8192;
-
     loop {
         tokio::select! {
             biased;
@@ -1063,18 +1060,12 @@ async fn shell_reader(
             msg = read_half.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        local_buf.extend_from_slice(&data);
-                        if local_buf.len() >= FLUSH_THRESHOLD {
-                            let mut buf = output.lock().await;
-                            buf.append(&mut local_buf);
-                        }
+                        let mut buf = output.lock().await;
+                        buf.extend_from_slice(&data);
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        local_buf.extend_from_slice(&data);
-                        if local_buf.len() >= FLUSH_THRESHOLD {
-                            let mut buf = output.lock().await;
-                            buf.append(&mut local_buf);
-                        }
+                        let mut buf = output.lock().await;
+                        buf.extend_from_slice(&data);
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         break;
@@ -1083,12 +1074,6 @@ async fn shell_reader(
                 }
             }
         }
-    }
-
-    // Final flush
-    if !local_buf.is_empty() {
-        let mut buf = output.lock().await;
-        buf.append(&mut local_buf);
     }
 
     let _ = status_tx.send(ShellStatus::Closed);
