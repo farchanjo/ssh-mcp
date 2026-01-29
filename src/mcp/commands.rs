@@ -24,19 +24,29 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::async_command::{MAX_ASYNC_COMMANDS_PER_SESSION, OutputBuffer, RunningCommand};
-use super::client::{connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async};
+use super::client::{
+    connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async,
+    execute_ssh_command_async_pty, open_pty_shell,
+};
 use super::config::{
     resolve_command_timeout, resolve_compression, resolve_connect_timeout, resolve_max_retries,
     resolve_retry_delay,
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
-use super::message::{AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder};
-use super::storage::{COMMAND_STORAGE, CommandStorage, SESSION_STORAGE, SessionStorage};
+use super::message::{
+    AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder,
+    ShellOpenMessageBuilder,
+};
+use super::shell::{ChannelWriter, MAX_SHELLS_PER_SESSION, RunningShell};
+use super::storage::{
+    COMMAND_STORAGE, CommandStorage, SESSION_STORAGE, SHELL_STORAGE, SessionStorage, ShellStorage,
+};
 use super::types::{
     AgentDisconnectResponse, AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse,
-    SessionInfo, SessionListResponse, SshAsyncOutputResponse, SshCancelCommandResponse,
-    SshConnectResponse, SshExecuteResponse, SshListCommandsResponse,
+    SessionInfo, SessionListResponse, ShellInfo, ShellStatus, SshAsyncOutputResponse,
+    SshCancelCommandResponse, SshConnectResponse, SshExecuteResponse, SshListCommandsResponse,
+    SshShellCloseResponse, SshShellOpenResponse, SshShellReadResponse,
 };
 
 /// MCP SSH Commands tool implementation.
@@ -220,6 +230,23 @@ impl McpSSHCommands {
         session_id: String,
     ) -> Result<Text<String>, String> {
         info!("Disconnecting SSH session: {}", session_id);
+
+        // Close all interactive shells for this session
+        let shell_ids = SHELL_STORAGE.list_by_session(&session_id);
+        if !shell_ids.is_empty() {
+            info!(
+                "Closing {} interactive shells for session {}",
+                shell_ids.len(),
+                session_id
+            );
+            for shell_id in &shell_ids {
+                if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
+                    shell.cancel_token.cancel();
+                    let mut writer = shell.channel_writer.lock().await;
+                    let _ = writer.close().await;
+                }
+            }
+        }
 
         // Cancel all async commands for this session (sync O(1) lookup)
         let command_ids = COMMAND_STORAGE.list_by_session(&session_id);
@@ -440,6 +467,8 @@ impl McpSSHCommands {
         command: String,
         /// Command execution timeout in seconds (default: 180, env: SSH_COMMAND_TIMEOUT)
         timeout_secs: Option<u64>,
+        /// Allocate a pseudo-terminal (PTY) for the command. Use for commands requiring a terminal (sudo, top). All output goes to stdout in PTY mode (no stderr separation).
+        pty: Option<bool>,
     ) -> Result<StructuredContent<SshExecuteResponse>, String> {
         let timeout = resolve_command_timeout(timeout_secs);
 
@@ -498,18 +527,32 @@ impl McpSSHCommands {
             command_id, session_id, command
         );
 
-        // Spawn background task
-        tokio::spawn(execute_ssh_command_async(
-            handle_arc,
-            command.clone(),
-            timeout,
-            output,
-            status_tx,
-            cancel_token,
-            exit_code,
-            error,
-            timed_out,
-        ));
+        // Spawn background task (with or without PTY)
+        if pty.unwrap_or(false) {
+            tokio::spawn(execute_ssh_command_async_pty(
+                handle_arc,
+                command.clone(),
+                timeout,
+                output,
+                status_tx,
+                cancel_token,
+                exit_code,
+                error,
+                timed_out,
+            ));
+        } else {
+            tokio::spawn(execute_ssh_command_async(
+                handle_arc,
+                command.clone(),
+                timeout,
+                output,
+                status_tx,
+                cancel_token,
+                exit_code,
+                error,
+                timed_out,
+            ));
+        }
 
         let message = ExecuteMessageBuilder::new(&command_id, &session_id, &command)
             .with_agent_id(agent_id.as_deref())
@@ -725,8 +768,21 @@ impl McpSSHCommands {
 
         let mut total_commands_cancelled = 0;
 
+        let mut total_shells_closed = 0;
+
         // Process each session
         for session_id in &session_ids {
+            // Close all interactive shells for this session
+            let shell_ids = SHELL_STORAGE.list_by_session(session_id);
+            for shell_id in &shell_ids {
+                if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
+                    shell.cancel_token.cancel();
+                    let mut writer = shell.channel_writer.lock().await;
+                    let _ = writer.close().await;
+                }
+            }
+            total_shells_closed += shell_ids.len();
+
             // Cancel all async commands for this session
             let command_ids = COMMAND_STORAGE.list_by_session(session_id);
             for cmd_id in &command_ids {
@@ -755,8 +811,8 @@ impl McpSSHCommands {
         let sessions_disconnected = session_ids.len();
 
         info!(
-            "Disconnected {} sessions and cancelled {} commands for agent {}",
-            sessions_disconnected, total_commands_cancelled, agent_id
+            "Disconnected {} sessions, cancelled {} commands, and closed {} shells for agent {}",
+            sessions_disconnected, total_commands_cancelled, total_shells_closed, agent_id
         );
 
         let message = AgentDisconnectMessageBuilder::new(&agent_id)
@@ -771,4 +827,279 @@ impl McpSSHCommands {
             message,
         }))
     }
+
+    /// Open an interactive PTY shell on a connected SSH session.
+    ///
+    /// Allocates a pseudo-terminal and starts a shell for interactive use.
+    /// Output is continuously buffered and can be read with `ssh_shell_read`.
+    /// Input can be sent with `ssh_shell_write`.
+    ///
+    /// **Use cases:**
+    /// - Interactive sessions (SOL/IPMI/OOB console access)
+    /// - Multi-step workflows requiring persistent shell state
+    /// - Commands requiring terminal interaction
+    ///
+    /// For Serial Over LAN (SOL) / IPMI / OOB access, use `term="vt100"` with `cols=80`, `rows=24`.
+    ///
+    /// **Limits:** Up to 10 concurrent shells per session.
+    async fn ssh_shell_open(
+        &self,
+        /// Session ID returned from ssh_connect
+        session_id: String,
+        /// Terminal type (default: "xterm"). Use "vt100" or "ansi" for SOL/IPMI/serial consoles.
+        term: Option<String>,
+        /// Terminal width in columns (default: 80)
+        cols: Option<u32>,
+        /// Terminal height in rows (default: 24)
+        rows: Option<u32>,
+    ) -> Result<StructuredContent<SshShellOpenResponse>, String> {
+        let term = term.unwrap_or_else(|| "xterm".to_string());
+        let cols = cols.unwrap_or(80);
+        let rows = rows.unwrap_or(24);
+
+        // Check shell limit
+        let current_count = SHELL_STORAGE.count_by_session(&session_id);
+        if current_count >= MAX_SHELLS_PER_SESSION {
+            return Err(format!(
+                "Maximum shells per session reached ({}). Close existing shells first.",
+                MAX_SHELLS_PER_SESSION
+            ));
+        }
+
+        // Get session handle and agent_id
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (s.handle.clone(), s.info.agent_id.clone()))
+            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
+
+        // Open PTY channel with shell
+        let channel = open_pty_shell(&handle_arc, &term, cols, rows).await?;
+
+        let shell_id = Uuid::new_v4().to_string();
+        let opened_at = chrono::Utc::now().to_rfc3339();
+
+        let shell_info = ShellInfo {
+            shell_id: shell_id.clone(),
+            session_id: session_id.clone(),
+            term_type: term.clone(),
+            cols,
+            rows,
+            opened_at,
+        };
+
+        // Create shared state
+        let (status_tx, status_rx) = watch::channel(ShellStatus::Open);
+        let output = Arc::new(Mutex::new(Vec::with_capacity(4096)));
+        let cancel_token = CancellationToken::new();
+
+        // Wrap channel in Arc<Mutex<ChannelWriter>> for shared read/write access.
+        // The background reader acquires the lock to call wait() for output,
+        // while writes use data() through the same writer.
+        let writer = ChannelWriter::new(channel);
+        let channel_writer = Arc::new(Mutex::new(writer));
+
+        // Spawn background reader task
+        let reader_output = output.clone();
+        let reader_cancel = cancel_token.clone();
+        let reader_status_tx = status_tx.clone();
+        let reader_writer = channel_writer.clone();
+
+        tokio::spawn(async move {
+            shell_reader_with_writer(
+                reader_writer,
+                reader_output,
+                reader_cancel,
+                reader_status_tx,
+            )
+            .await;
+        });
+
+        // Store running shell
+        SHELL_STORAGE.register(
+            shell_id.clone(),
+            RunningShell {
+                info: shell_info,
+                cancel_token,
+                output,
+                channel_writer,
+                status_tx,
+                status_rx,
+            },
+        );
+
+        info!(
+            "Opened interactive shell {} on session {} (term={}, {}x{})",
+            shell_id, session_id, term, cols, rows
+        );
+
+        let message = ShellOpenMessageBuilder::new(&shell_id, &session_id, &term, cols, rows)
+            .with_agent_id(agent_id.as_deref())
+            .build();
+
+        Ok(StructuredContent(SshShellOpenResponse {
+            shell_id,
+            session_id,
+            agent_id,
+            term_type: term,
+            message,
+        }))
+    }
+
+    /// Send input (text, keystrokes, escape sequences) to an interactive shell.
+    ///
+    /// Sends raw input to the shell's PTY channel. Use this for:
+    /// - Typing commands (append `\n` for Enter)
+    /// - Sending control characters (`\x03` for Ctrl+C, `\x04` for Ctrl+D)
+    /// - Sending escape sequences (`\x1b[A` for arrow up)
+    async fn ssh_shell_write(
+        &self,
+        /// Shell ID returned from ssh_shell_open
+        shell_id: String,
+        /// Input to send to the shell (text, control chars, escape sequences). Append \n for Enter.
+        input: String,
+    ) -> Result<Text<String>, String> {
+        let channel_writer = SHELL_STORAGE
+            .get_direct(&shell_id)
+            .map(|shell| shell.channel_writer.clone())
+            .ok_or_else(|| format!("No active shell with ID: {}", shell_id))?;
+
+        let writer = channel_writer.lock().await;
+        writer.write(input.as_bytes()).await?;
+
+        Ok(Text(format!(
+            "Sent {} bytes to shell '{}'",
+            input.len(),
+            shell_id
+        )))
+    }
+
+    /// Read accumulated output from an interactive shell.
+    ///
+    /// Returns all output buffered since the last read (when `clear=true`)
+    /// or all output since shell open (when `clear=false`).
+    ///
+    /// **Recommended workflow:**
+    /// 1. ssh_shell_write to send a command
+    /// 2. Wait briefly (shell needs time to produce output)
+    /// 3. ssh_shell_read with clear=true to get new output
+    async fn ssh_shell_read(
+        &self,
+        /// Shell ID returned from ssh_shell_open
+        shell_id: String,
+        /// Clear the output buffer after reading (default: true). Set to false to peek without consuming.
+        clear: Option<bool>,
+    ) -> Result<StructuredContent<SshShellReadResponse>, String> {
+        let clear = clear.unwrap_or(true);
+
+        let (output_arc, status_rx) = SHELL_STORAGE
+            .get_direct(&shell_id)
+            .map(|shell| (shell.output.clone(), shell.status_rx.clone()))
+            .ok_or_else(|| format!("No active shell with ID: {}", shell_id))?;
+
+        let data = if clear {
+            let mut buf = output_arc.lock().await;
+            let data = std::mem::take(&mut *buf);
+            String::from_utf8_lossy(&data).into_owned()
+        } else {
+            let buf = output_arc.lock().await;
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+
+        let status = *status_rx.borrow();
+
+        Ok(StructuredContent(SshShellReadResponse {
+            shell_id,
+            data,
+            status,
+        }))
+    }
+
+    /// Close an interactive shell session.
+    ///
+    /// Stops the background reader and closes the PTY channel.
+    /// Any buffered output is discarded.
+    async fn ssh_shell_close(
+        &self,
+        /// Shell ID to close
+        shell_id: String,
+    ) -> Result<StructuredContent<SshShellCloseResponse>, String> {
+        let shell = SHELL_STORAGE
+            .unregister(&shell_id)
+            .ok_or_else(|| format!("No active shell with ID: {}", shell_id))?;
+
+        // Cancel the background reader
+        shell.cancel_token.cancel();
+
+        // Close the channel
+        let mut writer = shell.channel_writer.lock().await;
+        let _ = writer.close().await;
+
+        info!("Closed interactive shell: {}", shell_id);
+
+        Ok(StructuredContent(SshShellCloseResponse {
+            shell_id,
+            closed: true,
+            message: "Shell closed successfully".to_string(),
+        }))
+    }
+}
+
+/// Background reader that uses the shared ChannelWriter's channel.
+///
+/// Periodically acquires the writer lock to read from the channel.
+/// Uses short lock durations to avoid blocking writes.
+async fn shell_reader_with_writer(
+    channel_writer: Arc<Mutex<ChannelWriter>>,
+    output: Arc<Mutex<Vec<u8>>>,
+    cancel_token: CancellationToken,
+    status_tx: watch::Sender<ShellStatus>,
+) {
+    use russh::ChannelMsg;
+
+    let mut local_buf = Vec::with_capacity(4096);
+    const FLUSH_THRESHOLD: usize = 8192;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+
+            msg = async {
+                let mut writer = channel_writer.lock().await;
+                writer.channel.wait().await
+            } => {
+                match msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        local_buf.extend_from_slice(&data);
+                        if local_buf.len() >= FLUSH_THRESHOLD {
+                            let mut buf = output.lock().await;
+                            buf.append(&mut local_buf);
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        local_buf.extend_from_slice(&data);
+                        if local_buf.len() >= FLUSH_THRESHOLD {
+                            let mut buf = output.lock().await;
+                            buf.append(&mut local_buf);
+                        }
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
+    // Final flush
+    if !local_buf.is_empty() {
+        let mut buf = output.lock().await;
+        buf.append(&mut local_buf);
+    }
+
+    let _ = status_tx.send(ShellStatus::Closed);
 }
