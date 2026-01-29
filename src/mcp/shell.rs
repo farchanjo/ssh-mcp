@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use russh::ChannelWriteHalf;
 use russh::client;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -26,29 +27,29 @@ use super::types::{ShellInfo, ShellStatus};
 
 /// Write handle for sending input to a shell channel.
 ///
-/// Wraps `russh::Channel<client::Msg>` to provide a `Send + Sync` interface
-/// for writing data to the PTY channel.
+/// Wraps `russh::ChannelWriteHalf` to provide a `Send + Sync` interface
+/// for writing data to the PTY channel without holding a lock on the read half.
 pub struct ChannelWriter {
-    pub(crate) channel: russh::Channel<client::Msg>,
+    pub(crate) write_half: ChannelWriteHalf<client::Msg>,
 }
 
 impl ChannelWriter {
-    /// Create a new channel writer from an SSH channel.
-    pub fn new(channel: russh::Channel<client::Msg>) -> Self {
-        Self { channel }
+    /// Create a new channel writer from a channel write half.
+    pub fn new(write_half: ChannelWriteHalf<client::Msg>) -> Self {
+        Self { write_half }
     }
 
     /// Send data (text, keystrokes, escape sequences) to the shell.
     pub async fn write(&self, data: &[u8]) -> Result<(), String> {
-        self.channel
+        self.write_half
             .data(data)
             .await
             .map_err(|e| format!("Failed to write to shell: {}", e))
     }
 
     /// Close the channel gracefully.
-    pub async fn close(&mut self) -> Result<(), String> {
-        self.channel
+    pub async fn close(&self) -> Result<(), String> {
+        self.write_half
             .close()
             .await
             .map_err(|e| format!("Failed to close shell channel: {}", e))

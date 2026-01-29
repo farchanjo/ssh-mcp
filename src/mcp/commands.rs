@@ -242,7 +242,7 @@ impl McpSSHCommands {
             for shell_id in &shell_ids {
                 if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
                     shell.cancel_token.cancel();
-                    let mut writer = shell.channel_writer.lock().await;
+                    let writer = shell.channel_writer.lock().await;
                     let _ = writer.close().await;
                 }
             }
@@ -777,7 +777,7 @@ impl McpSSHCommands {
             for shell_id in &shell_ids {
                 if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
                     shell.cancel_token.cancel();
-                    let mut writer = shell.channel_writer.lock().await;
+                    let writer = shell.channel_writer.lock().await;
                     let _ = writer.close().await;
                 }
             }
@@ -892,26 +892,19 @@ impl McpSSHCommands {
         let output = Arc::new(Mutex::new(Vec::with_capacity(4096)));
         let cancel_token = CancellationToken::new();
 
-        // Wrap channel in Arc<Mutex<ChannelWriter>> for shared read/write access.
-        // The background reader acquires the lock to call wait() for output,
-        // while writes use data() through the same writer.
-        let writer = ChannelWriter::new(channel);
+        // Split channel into independent read/write halves to avoid mutex contention.
+        // The reader exclusively owns the read half, while writes go through the write half.
+        let (read_half, write_half) = channel.split();
+        let writer = ChannelWriter::new(write_half);
         let channel_writer = Arc::new(Mutex::new(writer));
 
-        // Spawn background reader task
+        // Spawn background reader task (owns read_half exclusively, no mutex needed)
         let reader_output = output.clone();
         let reader_cancel = cancel_token.clone();
         let reader_status_tx = status_tx.clone();
-        let reader_writer = channel_writer.clone();
 
         tokio::spawn(async move {
-            shell_reader_with_writer(
-                reader_writer,
-                reader_output,
-                reader_cancel,
-                reader_status_tx,
-            )
-            .await;
+            shell_reader(read_half, reader_output, reader_cancel, reader_status_tx).await;
         });
 
         // Store running shell
@@ -1031,7 +1024,7 @@ impl McpSSHCommands {
         shell.cancel_token.cancel();
 
         // Close the channel
-        let mut writer = shell.channel_writer.lock().await;
+        let writer = shell.channel_writer.lock().await;
         let _ = writer.close().await;
 
         info!("Closed interactive shell: {}", shell_id);
@@ -1044,12 +1037,12 @@ impl McpSSHCommands {
     }
 }
 
-/// Background reader that uses the shared ChannelWriter's channel.
+/// Background reader that exclusively owns the channel read half.
 ///
-/// Periodically acquires the writer lock to read from the channel.
-/// Uses short lock durations to avoid blocking writes.
-async fn shell_reader_with_writer(
-    channel_writer: Arc<Mutex<ChannelWriter>>,
+/// Reads from the channel without any mutex contention, allowing
+/// concurrent writes through the separate write half.
+async fn shell_reader(
+    mut read_half: russh::ChannelReadHalf,
     output: Arc<Mutex<Vec<u8>>>,
     cancel_token: CancellationToken,
     status_tx: watch::Sender<ShellStatus>,
@@ -1067,10 +1060,7 @@ async fn shell_reader_with_writer(
                 break;
             }
 
-            msg = async {
-                let mut writer = channel_writer.lock().await;
-                writer.channel.wait().await
-            } => {
+            msg = read_half.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
                         local_buf.extend_from_slice(&data);
