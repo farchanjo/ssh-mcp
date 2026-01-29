@@ -196,6 +196,82 @@ pub struct SshListCommandsResponse {
     pub count: usize,
 }
 
+/// Status of an interactive shell session
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellStatus {
+    /// Shell is open and accepting input
+    Open,
+    /// Shell has been closed
+    Closed,
+}
+
+impl std::fmt::Display for ShellStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShellStatus::Open => write!(f, "open"),
+            ShellStatus::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+/// Metadata for an interactive shell session
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShellInfo {
+    /// Unique identifier for this shell
+    pub shell_id: String,
+    /// Session ID where the shell is running
+    pub session_id: String,
+    /// Terminal type (e.g., "xterm", "vt100")
+    pub term_type: String,
+    /// Terminal width in columns
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub cols: u32,
+    /// Terminal height in rows
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub rows: u32,
+    /// When the shell was opened (RFC3339 format)
+    pub opened_at: String,
+}
+
+/// Response from ssh_shell_open
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshShellOpenResponse {
+    /// Unique identifier for this shell
+    pub shell_id: String,
+    /// Session ID where the shell is running
+    pub session_id: String,
+    /// Agent ID that owns this session (if set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Terminal type configured for this shell
+    pub term_type: String,
+    /// Human-readable message with shell identifiers
+    pub message: String,
+}
+
+/// Response from ssh_shell_read
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshShellReadResponse {
+    /// Shell ID being read
+    pub shell_id: String,
+    /// Accumulated output data
+    pub data: String,
+    /// Current shell status
+    pub status: ShellStatus,
+}
+
+/// Response from ssh_shell_close
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshShellCloseResponse {
+    /// Shell ID that was closed
+    pub shell_id: String,
+    /// Whether the close was successful
+    pub closed: bool,
+    /// Human-readable message
+    pub message: String,
+}
+
 #[cfg(test)]
 mod response_serialization {
     use super::*;
@@ -1114,6 +1190,165 @@ mod response_serialization {
             assert!(json.get("sessions_disconnected").is_some());
             assert!(json.get("commands_cancelled").is_some());
             assert!(json.get("message").is_some());
+        }
+    }
+
+    mod shell_status {
+        use super::*;
+
+        #[test]
+        fn test_serialize_open() {
+            let status = ShellStatus::Open;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"open\"");
+        }
+
+        #[test]
+        fn test_serialize_closed() {
+            let status = ShellStatus::Closed;
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, "\"closed\"");
+        }
+
+        #[test]
+        fn test_deserialize_all_variants() {
+            assert_eq!(
+                serde_json::from_str::<ShellStatus>("\"open\"").unwrap(),
+                ShellStatus::Open
+            );
+            assert_eq!(
+                serde_json::from_str::<ShellStatus>("\"closed\"").unwrap(),
+                ShellStatus::Closed
+            );
+        }
+
+        #[test]
+        fn test_display_trait() {
+            assert_eq!(format!("{}", ShellStatus::Open), "open");
+            assert_eq!(format!("{}", ShellStatus::Closed), "closed");
+        }
+
+        #[test]
+        fn test_clone_and_copy() {
+            let status = ShellStatus::Open;
+            let cloned = status.clone();
+            let copied = status;
+            assert_eq!(status, cloned);
+            assert_eq!(status, copied);
+        }
+    }
+
+    mod shell_info {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let info = ShellInfo {
+                shell_id: "shell-123".to_string(),
+                session_id: "sess-456".to_string(),
+                term_type: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                opened_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+
+            let json = serde_json::to_string(&info).unwrap();
+            let deserialized: ShellInfo = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.shell_id, "shell-123");
+            assert_eq!(deserialized.session_id, "sess-456");
+            assert_eq!(deserialized.term_type, "xterm");
+            assert_eq!(deserialized.cols, 80);
+            assert_eq!(deserialized.rows, 24);
+        }
+
+        #[test]
+        fn test_clone() {
+            let info = ShellInfo {
+                shell_id: "shell-123".to_string(),
+                session_id: "sess-456".to_string(),
+                term_type: "vt100".to_string(),
+                cols: 80,
+                rows: 24,
+                opened_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+
+            let cloned = info.clone();
+            assert_eq!(cloned.shell_id, info.shell_id);
+            assert_eq!(cloned.term_type, info.term_type);
+        }
+    }
+
+    mod ssh_shell_open_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshShellOpenResponse {
+                shell_id: "shell-123".to_string(),
+                session_id: "sess-456".to_string(),
+                agent_id: Some("my-agent".to_string()),
+                term_type: "xterm".to_string(),
+                message: "Shell opened".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshShellOpenResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.shell_id, "shell-123");
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
+        }
+
+        #[test]
+        fn test_agent_id_omitted_when_none() {
+            let response = SshShellOpenResponse {
+                shell_id: "shell-123".to_string(),
+                session_id: "sess-456".to_string(),
+                agent_id: None,
+                term_type: "xterm".to_string(),
+                message: "Shell opened".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("agent_id"));
+        }
+    }
+
+    mod ssh_shell_read_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshShellReadResponse {
+                shell_id: "shell-123".to_string(),
+                data: "$ ls\nfile1\nfile2\n".to_string(),
+                status: ShellStatus::Open,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshShellReadResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.shell_id, "shell-123");
+            assert_eq!(deserialized.status, ShellStatus::Open);
+        }
+    }
+
+    mod ssh_shell_close_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshShellCloseResponse {
+                shell_id: "shell-123".to_string(),
+                closed: true,
+                message: "Shell closed".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshShellCloseResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.shell_id, "shell-123");
+            assert!(deserialized.closed);
         }
     }
 }
