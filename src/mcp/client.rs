@@ -519,6 +519,116 @@ pub(crate) async fn execute_ssh_command_async(
     }
 }
 
+/// Open a PTY channel with an interactive shell.
+///
+/// Allocates a pseudo-terminal and starts a shell on the remote server.
+/// Returns a pair of channels: one for reading output, one for writing input.
+///
+/// # Arguments
+///
+/// * `handle` - Shared handle to the SSH session
+/// * `term` - Terminal type (e.g., "xterm", "vt100", "ansi")
+/// * `cols` - Terminal width in columns
+/// * `rows` - Terminal height in rows
+///
+/// # Returns
+///
+/// * `Ok(channel)` - The SSH channel with PTY and shell allocated
+/// * `Err(message)` - Error if PTY or shell request fails
+pub(crate) async fn open_pty_shell(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    term: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<russh::Channel<client::Msg>, String> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed to open channel: {}", e))?;
+
+    channel
+        .request_pty(true, term, cols, rows, 0, 0, &[])
+        .await
+        .map_err(|e| format!("Failed to request PTY: {}", e))?;
+
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|e| format!("Failed to request shell: {}", e))?;
+
+    Ok(channel)
+}
+
+/// Execute a command asynchronously with PTY allocation.
+///
+/// Like `execute_ssh_command_async` but allocates a PTY before executing.
+/// All output goes to the stdout buffer (no stderr separation in PTY mode).
+///
+/// Use this for commands that require a terminal (sudo, top, etc.).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_ssh_command_async_pty(
+    handle: Arc<client::Handle<SshClientHandler>>,
+    command: String,
+    timeout: Duration,
+    output: Arc<tokio::sync::Mutex<OutputBuffer>>,
+    status_tx: watch::Sender<AsyncCommandStatus>,
+    cancel_token: CancellationToken,
+    exit_code: Arc<tokio::sync::Mutex<Option<i32>>>,
+    error: Arc<tokio::sync::Mutex<Option<String>>>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
+) {
+    // Open a session channel
+    let mut channel = match handle.channel_open_session().await {
+        Ok(ch) => ch,
+        Err(e) => {
+            *error.lock().await = Some(format!("Failed to open channel: {}", e));
+            let _ = status_tx.send(AsyncCommandStatus::Failed);
+            return;
+        }
+    };
+
+    // Request PTY before exec (xterm 80x24 default)
+    if let Err(e) = channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await {
+        *error.lock().await = Some(format!("Failed to request PTY: {}", e));
+        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        return;
+    }
+
+    // Execute the command
+    if let Err(e) = channel.exec(true, command.as_str()).await {
+        *error.lock().await = Some(format!("Failed to execute command: {}", e));
+        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        return;
+    }
+
+    // Collect output with timeout and cancellation support
+    // In PTY mode, all output goes to stdout (no stderr separation)
+    tokio::select! {
+        biased;
+
+        _ = cancel_token.cancelled() => {
+            warn!("Async PTY command cancelled: {}", command);
+            let _ = channel.close().await;
+            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+        }
+
+        _ = tokio::time::sleep(timeout) => {
+            warn!(
+                "Async PTY command timed out after {:?}: {}",
+                timeout, command
+            );
+            timed_out.store(true, Ordering::SeqCst);
+            let _ = channel.close().await;
+            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        }
+
+        result = collect_async_output(&mut channel, &output) => {
+            *exit_code.lock().await = result;
+            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        }
+    }
+}
+
 /// Flush threshold for batched output (8KB)
 const FLUSH_THRESHOLD: usize = 8192;
 
