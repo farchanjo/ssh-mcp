@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-353%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-357%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -20,7 +20,7 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
 - **Interactive shells** - PTY support for SOL/IPMI/OOB access
 - **Modular codebase** - 27 focused source files instead of 1 monolithic file
-- **Comprehensive tests** - 353 unit tests covering all functionality
+- **Comprehensive tests** - 357 unit tests covering all functionality
 
 ---
 
@@ -37,7 +37,7 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
 | **Interactive Shells** | Not supported | PTY sessions for SOL/IPMI/OOB access |
 | **Architecture** | Single ~800 line file | 27 source files, 8700+ lines |
-| **Test Coverage** | 0 tests | 353 unit tests |
+| **Test Coverage** | 0 tests | 357 unit tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -55,7 +55,7 @@ ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
 - SOLID architecture (27 source files with storage/auth/message/shell abstractions)
-- Comprehensive test suite (353 tests)
+- Comprehensive test suite (357 tests)
 - Async command execution (background commands with polling)
 - Interactive PTY shell sessions (SOL/IPMI/OOB support)
 - Error classification for smart retries
@@ -98,7 +98,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 353 tests
+cargo test --all-features  # 357 tests
 ```
 
 ### Install
@@ -626,6 +626,7 @@ Priority: **Parameter > Environment Variable > Default**
 | `SSH_COMMAND_TIMEOUT` | 180 | Command execution timeout (seconds) |
 | `SSH_MAX_RETRIES` | 3 | Retry attempts for transient failures |
 | `SSH_RETRY_DELAY_MS` | 1000 | Initial retry delay (milliseconds) |
+| `SSH_INACTIVITY_TIMEOUT` | 300 | Session inactivity timeout (seconds) |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
 | `MCP_PORT` | 8000 | HTTP server port (ssh-mcp binary) |
 | `RUST_LOG` | info | Log level (trace/debug/info/warn/error) |
@@ -640,15 +641,15 @@ Priority: **Parameter > Environment Variable > Default**
 src/mcp/
 ├── mod.rs            (40 lines)    - Module declarations
 ├── types.rs          (1354 lines)  - Response types (session, command, shell)
-├── config.rs         (601 lines)   - Configuration resolution
+├── config.rs         (669 lines)   - Configuration resolution
 ├── error.rs          (359 lines)   - Error classification
 ├── session.rs        (41 lines)    - SSH client handler
-├── client.rs         (895 lines)   - SSH connection/auth/execution/PTY
+├── client.rs         (900 lines)   - SSH connection/auth/execution/PTY
 ├── async_command.rs  (183 lines)   - Async command types
-├── shell.rs          (145 lines)   - Interactive PTY shell types
+├── shell.rs          (147 lines)   - Interactive PTY shell types
 ├── schema.rs         (118 lines)   - JSON schema helpers
 ├── forward.rs        (155 lines)   - Port forwarding
-├── commands.rs       (1105 lines)  - MCP tool handlers (13 tools)
+├── commands.rs       (1082 lines)  - MCP tool handlers (13 tools)
 ├── storage/
 │   ├── mod.rs        (23 lines)    - Storage exports
 │   ├── traits.rs     (107 lines)   - Storage trait definitions
@@ -775,7 +776,7 @@ cargo test --all-features -- --nocapture
 | async_command.rs | 14 | Async command types |
 | shell.rs | 6 | Interactive shell types |
 | schema.rs | 9 | JSON schema helpers |
-| **Total** | **353** | |
+| **Total** | **357** | |
 
 ---
 

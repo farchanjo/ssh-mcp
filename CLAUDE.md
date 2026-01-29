@@ -38,15 +38,15 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp-stdio  # Required on macOS
 |--------|-------|-------------|
 | **mod.rs** | 40 | Module declarations and re-exports |
 | **types.rs** | 1354 | Response types (`SessionInfo`, `SshConnectResponse`, shell types, async types) |
-| **config.rs** | 601 | Duration constants and configuration resolution |
+| **config.rs** | 669 | Duration constants and configuration resolution |
 | **error.rs** | 359 | Error classification for retry logic |
 | **session.rs** | 41 | `SshClientHandler` for russh client |
-| **client.rs** | 895 | SSH connection, authentication, command execution, PTY channels |
+| **client.rs** | 900 | SSH connection, authentication, command execution, PTY channels |
 | **async_command.rs** | 183 | Async command types (`RunningCommand`, `OutputBuffer`) |
-| **shell.rs** | 145 | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
+| **shell.rs** | 147 | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
 | **schema.rs** | 118 | JSON schema helpers for LLM-friendly schemas |
 | **forward.rs** | 155 | Port forwarding (feature-gated) |
-| **commands.rs** | 1105 | `McpSSHCommands` MCP tool implementations (13 tools) |
+| **commands.rs** | 1082 | `McpSSHCommands` MCP tool implementations (13 tools) |
 
 ### SOLID Architecture Modules
 
@@ -245,7 +245,7 @@ Use async execution for long-running commands (builds, deployments, data process
 
 #### When to Use Async vs Sync
 
-| Use `ssh_execute` (sync) | Use `ssh_execute` |
+| Use `ssh_execute` (sync) | Use `ssh_execute` (async) |
 |--------------------------|-------------------------|
 | Quick commands (< 30s) | Long-running commands (builds, deployments) |
 | Need immediate result | Want to run multiple commands in parallel |
@@ -435,6 +435,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 | `SSH_COMMAND_TIMEOUT` | 180s | Command execution timeout (`DEFAULT_COMMAND_TIMEOUT: Duration`) |
 | `SSH_MAX_RETRIES` | 3 | Retry attempts |
 | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay (`DEFAULT_RETRY_DELAY: Duration`) |
+| `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout (`DEFAULT_INACTIVITY_TIMEOUT: Duration`) |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
 | `MCP_PORT` | 8000 | HTTP server port |
 | `RUST_LOG` | info | Log level filter (trace, debug, info, warn, error) |
@@ -450,7 +451,7 @@ All settings follow: **Parameter → Environment Variable → Default**
 - `#![deny(clippy::unwrap_used)]` - No unwrap, use proper error handling
 - Methods should be < 30 lines
 - Lock-free data structures (`DashMap`) for concurrent access
-- 353 unit tests (`cargo test --all-features`)
+- 357 unit tests (`cargo test --all-features`)
 
 ## Feature Flags
 

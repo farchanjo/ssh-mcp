@@ -81,15 +81,15 @@ The codebase consists of **27 source files** organized into a modular SOLID arch
 | `lib.rs` | - | `pub` | Library crate root, exposes `mcp` module |
 | `mod.rs` | 40 | - | Module root, re-exports `McpSSHCommands` |
 | `types.rs` | 1354 | `pub` | Serializable response types for MCP tools (session, command, shell) |
-| `config.rs` | 601 | `pub(crate)` | Configuration resolution with environment variable support |
+| `config.rs` | 669 | `pub(crate)` | Configuration resolution with environment variable support |
 | `error.rs` | 359 | `pub(crate)` | Error classification for retry logic |
 | `session.rs` | 41 | `pub` | SSH client handler |
-| `client.rs` | 895 | `pub(crate)` | SSH connection, authentication, command execution, PTY channels |
+| `client.rs` | 900 | `pub(crate)` | SSH connection, authentication, command execution, PTY channels |
 | `forward.rs` | 155 | `pub(crate)` | Port forwarding implementation (feature-gated) |
 | `async_command.rs` | 183 | `pub(crate)` | Async command types (`RunningCommand`, `OutputBuffer`) |
-| `shell.rs` | 145 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
+| `shell.rs` | 147 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
 | `schema.rs` | 118 | `pub` | JSON schema helpers for LLM-friendly schemas |
-| `commands.rs` | 1105 | `pub` | MCP tool implementations via `#[Tools]` macro (13 tools) |
+| `commands.rs` | 1082 | `pub` | MCP tool implementations via `#[Tools]` macro (13 tools) |
 
 ### Storage Layer (`src/mcp/storage/`) - SOLID: SRP, DIP
 
