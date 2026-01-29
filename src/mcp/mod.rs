@@ -12,6 +12,7 @@
 //! - [`session`]: `SshClientHandler` for russh callbacks
 //! - [`client`]: SSH connection and command execution logic
 //! - [`async_command`]: Async command tracking and state management
+//! - [`shell`]: Interactive PTY shell session management
 //! - [`forward`]: Port forwarding implementation (feature-gated)
 //! - [`commands`]: `McpSSHCommands` MCP tool implementations
 //!
@@ -32,6 +33,7 @@ pub(crate) mod forward;
 pub mod message;
 pub mod schema;
 pub mod session;
+pub(crate) mod shell;
 pub mod storage;
 pub mod types;
 
