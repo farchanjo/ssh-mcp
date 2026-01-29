@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-314%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-353%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -18,8 +18,9 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Native async SSH** - No blocking thread pool, true async all the way down
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
-- **Modular codebase** - 16 focused modules instead of 1 monolithic file
-- **Comprehensive tests** - 314 unit tests covering all functionality
+- **Interactive shells** - PTY support for SOL/IPMI/OOB access
+- **Modular codebase** - 27 focused source files instead of 1 monolithic file
+- **Comprehensive tests** - 353 unit tests covering all functionality
 
 ---
 
@@ -34,8 +35,9 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **C Dependencies** | Requires libssh2, openssl | None - pure Rust |
 | **Thread Safety** | `Session` is `!Send` (requires `std::thread`) | `Handle` is `Send + Sync` |
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
-| **Architecture** | Single ~800 line file | 16 modules, 7300+ lines |
-| **Test Coverage** | 0 tests | 314 unit tests |
+| **Interactive Shells** | Not supported | PTY sessions for SOL/IPMI/OOB access |
+| **Architecture** | Single ~800 line file | 27 source files, 8700+ lines |
+| **Test Coverage** | 0 tests | 353 unit tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -52,9 +54,10 @@ REMOVED:
 ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
-- SOLID architecture (16 modules with storage/auth/message abstractions)
-- Comprehensive test suite (314 tests)
+- SOLID architecture (27 source files with storage/auth/message/shell abstractions)
+- Comprehensive test suite (353 tests)
 - Async command execution (background commands with polling)
+- Interactive PTY shell sessions (SOL/IPMI/OOB support)
 - Error classification for smart retries
 - Documentation with Mermaid diagrams
 ```
@@ -70,8 +73,9 @@ ADDED:
 - **Named Sessions** - Assign human-readable names for easy LLM identification
 - **Persistent Sessions** - Keep sessions alive indefinitely without inactivity timeout
 - **Async Commands** - Run long-running commands in background with polling
+- **Interactive Shells** - PTY sessions for SOL/IPMI/OOB console access
 - **Smart Retry** - Exponential backoff for transient failures only
-- **MCP Protocol** - Full integration with AI/LLM tools
+- **MCP Protocol** - Full integration with AI/LLM tools (13 tools)
 
 ---
 
@@ -94,7 +98,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 314 tests
+cargo test --all-features  # 353 tests
 ```
 
 ### Install
@@ -368,6 +372,81 @@ curl -X POST http://localhost:8000/ \
 
 ---
 
+## Interactive Shell Sessions
+
+For persistent interactive terminals (SOL/IPMI/OOB consoles, serial devices, or commands requiring PTY like `sudo` and `top`).
+
+### Open Shell
+
+```json
+{
+  "tool": "ssh_shell_open",
+  "params": {
+    "session_id": "uuid-from-connect",
+    "term_type": "xterm",
+    "cols": 80,
+    "rows": 24
+  }
+}
+```
+
+### Send Input
+
+```json
+{
+  "tool": "ssh_shell_write",
+  "params": {
+    "shell_id": "uuid-from-shell-open",
+    "data": "ls -la\n"
+  }
+}
+```
+
+### Read Output
+
+```json
+{
+  "tool": "ssh_shell_read",
+  "params": {
+    "shell_id": "uuid-from-shell-open"
+  }
+}
+```
+
+### Close Shell
+
+```json
+{
+  "tool": "ssh_shell_close",
+  "params": {
+    "shell_id": "uuid-from-shell-open"
+  }
+}
+```
+
+### SOL / IPMI / OOB Access
+
+For Serial Over LAN or out-of-band management consoles:
+
+```json
+{
+  "tool": "ssh_shell_open",
+  "params": {
+    "session_id": "uuid-from-connect",
+    "term_type": "vt100",
+    "cols": 80,
+    "rows": 24
+  }
+}
+```
+
+### Limits
+
+- Max 10 concurrent interactive shells per session
+- Shells auto-cleanup when session disconnects
+
+---
+
 ## Async Command Execution
 
 For long-running commands (builds, deployments, data processing), use `ssh_execute` which runs commands in the background and can be polled for status and output.
@@ -559,20 +638,23 @@ Priority: **Parameter > Environment Variable > Default**
 
 ```
 src/mcp/
-├── mod.rs            (37 lines)    - Module declarations
-├── types.rs          (1112 lines)  - Response types
+├── mod.rs            (40 lines)    - Module declarations
+├── types.rs          (1354 lines)  - Response types (session, command, shell)
 ├── config.rs         (601 lines)   - Configuration resolution
 ├── error.rs          (359 lines)   - Error classification
 ├── session.rs        (41 lines)    - SSH client handler
-├── client.rs         (785 lines)   - SSH connection/auth/execution
+├── client.rs         (895 lines)   - SSH connection/auth/execution/PTY
 ├── async_command.rs  (183 lines)   - Async command types
+├── shell.rs          (145 lines)   - Interactive PTY shell types
+├── schema.rs         (118 lines)   - JSON schema helpers
 ├── forward.rs        (155 lines)   - Port forwarding
-├── commands.rs       (774 lines)   - MCP tool handlers
+├── commands.rs       (1105 lines)  - MCP tool handlers (13 tools)
 ├── storage/
-│   ├── mod.rs        (18 lines)    - Storage exports
+│   ├── mod.rs        (23 lines)    - Storage exports
 │   ├── traits.rs     (107 lines)   - Storage trait definitions
 │   ├── session.rs    (491 lines)   - Session storage impl + tests
-│   └── command.rs    (996 lines)   - Command storage impl + tests
+│   ├── command.rs    (996 lines)   - Command storage impl + tests
+│   └── shell.rs      (208 lines)   - Shell storage impl + tests
 ├── auth/
 │   ├── mod.rs        (36 lines)    - Auth exports
 │   ├── traits.rs     (40 lines)    - AuthStrategy trait
@@ -581,8 +663,8 @@ src/mcp/
 │   ├── agent.rs      (139 lines)   - SSH agent auth + tests
 │   └── chain.rs      (323 lines)   - Auth chain + tests
 └── message/
-    ├── mod.rs        (9 lines)     - Message exports
-    └── builder.rs    (820 lines)   - Message builders + tests
+    ├── mod.rs        (12 lines)    - Message exports
+    └── builder.rs    (982 lines)   - Message builders + tests
 ```
 
 ### Module Dependencies
@@ -596,6 +678,7 @@ flowchart TB
     subgraph Core["Core Modules"]
         Client["client.rs"]
         AsyncCmd["async_command.rs"]
+        Shell["shell.rs"]
         Forward["forward.rs"]
         Session["session.rs"]
         Types["types.rs"]
@@ -614,6 +697,7 @@ flowchart TB
 
     Commands --> Client
     Commands --> AsyncCmd
+    Commands --> Shell
     Commands --> Forward
     Commands --> Session
     Commands --> Types
@@ -685,10 +769,13 @@ cargo test --all-features -- --nocapture
 | types.rs | 38 | Serialization |
 | storage/session.rs | 26 | Session storage operations |
 | storage/command.rs | 36 | Command storage operations |
+| storage/shell.rs | 12 | Shell storage operations |
 | auth/*.rs | 45 | Authentication strategies |
-| message/builder.rs | 71 | Message builders |
+| message/builder.rs | 83 | Message builders (incl. ShellOpenMessageBuilder) |
 | async_command.rs | 14 | Async command types |
-| **Total** | **314** | |
+| shell.rs | 6 | Interactive shell types |
+| schema.rs | 9 | JSON schema helpers |
+| **Total** | **353** | |
 
 ---
 

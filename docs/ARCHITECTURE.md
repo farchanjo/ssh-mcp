@@ -72,31 +72,34 @@ flowchart TB
 
 ## Module Structure
 
-The codebase consists of **16 source files** organized into a modular SOLID architecture:
+The codebase consists of **27 source files** organized into a modular SOLID architecture:
 
 ### Core Modules (`src/mcp/`)
 
 | File | Lines | Visibility | Description |
 |------|-------|------------|-------------|
 | `lib.rs` | - | `pub` | Library crate root, exposes `mcp` module |
-| `mod.rs` | 37 | - | Module root, re-exports `McpSSHCommands` |
-| `types.rs` | 1112 | `pub` | Serializable response types for MCP tools |
+| `mod.rs` | 40 | - | Module root, re-exports `McpSSHCommands` |
+| `types.rs` | 1354 | `pub` | Serializable response types for MCP tools (session, command, shell) |
 | `config.rs` | 601 | `pub(crate)` | Configuration resolution with environment variable support |
 | `error.rs` | 359 | `pub(crate)` | Error classification for retry logic |
 | `session.rs` | 41 | `pub` | SSH client handler |
-| `client.rs` | 785 | `pub(crate)` | SSH connection, authentication, and command execution |
+| `client.rs` | 895 | `pub(crate)` | SSH connection, authentication, command execution, PTY channels |
 | `forward.rs` | 155 | `pub(crate)` | Port forwarding implementation (feature-gated) |
 | `async_command.rs` | 183 | `pub(crate)` | Async command types (`RunningCommand`, `OutputBuffer`) |
-| `commands.rs` | 774 | `pub` | MCP tool implementations via `#[Tools]` macro |
+| `shell.rs` | 145 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
+| `schema.rs` | 118 | `pub` | JSON schema helpers for LLM-friendly schemas |
+| `commands.rs` | 1105 | `pub` | MCP tool implementations via `#[Tools]` macro (13 tools) |
 
 ### Storage Layer (`src/mcp/storage/`) - SOLID: SRP, DIP
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 18 | Module exports and global storage instances |
+| `mod.rs` | 23 | Module exports and global storage instances |
 | `traits.rs` | 107 | `SessionStorage` and `CommandStorage` trait definitions |
 | `session.rs` | 491 | `DashMapSessionStorage` with agent index and tests |
 | `command.rs` | 996 | `DashMapCommandStorage` with session index and tests |
+| `shell.rs` | 208 | `DashMapShellStorage` with session index and tests |
 
 ### Authentication Layer (`src/mcp/auth/`) - SOLID: OCP, SRP
 
@@ -113,8 +116,8 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 9 | Module exports |
-| `builder.rs` | 820 | Fluent message builders with comprehensive tests |
+| `mod.rs` | 12 | Module exports |
+| `builder.rs` | 982 | Fluent message builders with comprehensive tests |
 
 ### Module Responsibilities
 
@@ -134,6 +137,8 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
 - `PortForwardingResponse` - Port forwarding status (feature-gated)
 - `SessionListResponse` - List of active sessions
 - `AsyncCommandInfo`, `AsyncCommandStatus` - Async command metadata
+- `ShellInfo`, `ShellStatus` - Interactive shell metadata
+- `SshShellOpenResponse`, `SshShellReadResponse`, `SshShellCloseResponse` - Shell tool responses
 
 **config.rs** - Configuration Management
 - Default constants using `Duration` type (`DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_COMMAND_TIMEOUT`, `DEFAULT_RETRY_DELAY`, `MAX_RETRY_DELAY`)
@@ -153,6 +158,8 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
 - `connect_to_ssh_with_retry()` - Connection with exponential backoff via backon
 - Uses `AuthChain` from auth module for authentication
 - `execute_ssh_command()` - Command execution via channel-based async I/O
+- `open_pty_shell()` - Opens PTY channel with shell for interactive sessions
+- `execute_ssh_command_async_pty()` - Execute command with PTY allocation
 
 **forward.rs** - Port Forwarding (feature-gated)
 - `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
@@ -166,11 +173,14 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
   - `exit_code`, `error`, `timed_out` - Completion state
 - `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
 
-**commands.rs** - MCP Tools
+**commands.rs** - MCP Tools (13 total)
 - `McpSSHCommands` struct with `#[Tools]` impl
-- Uses storage traits (`SessionStorage`, `CommandStorage`) via global instances
+- Uses storage traits (`SessionStorage`, `CommandStorage`, `ShellStorage`) via global instances
 - Uses message builders for LLM-friendly responses
-- `ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_forward`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
+- Session tools: `ssh_connect`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
+- Command tools: `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`
+- Shell tools: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close`
+- Port forwarding: `ssh_forward`
 
 ### Storage Layer (storage/)
 
@@ -189,6 +199,13 @@ The codebase consists of **16 source files** organized into a modular SOLID arch
 - `COMMANDS_BY_SESSION` - Secondary index for O(1) session lookups
 - `COMMAND_STORAGE` - Global instance
 - `MAX_ASYNC_COMMANDS_PER_SESSION = 100`
+
+**storage/shell.rs** - Shell Storage Implementation
+- `ShellStorage` trait - CRUD for interactive shell sessions
+- `DashMapShellStorage` - Lock-free concurrent shell storage
+- `SHELLS_BY_SESSION` - Secondary index for O(1) session lookups
+- `SHELL_STORAGE` - Global instance
+- `MAX_SHELLS_PER_SESSION = 10`
 
 ### Authentication Layer (auth/)
 
@@ -214,6 +231,7 @@ pub trait AuthStrategy: Send + Sync {
 - `ConnectMessageBuilder` - Connection success messages
 - `ExecuteMessageBuilder` - Command start messages
 - `AgentDisconnectMessageBuilder` - Cleanup summary messages
+- `ShellOpenMessageBuilder` - Interactive shell open messages
 - Fluent builder pattern for LLM-friendly formatted responses
 
 ---
@@ -243,6 +261,8 @@ flowchart TB
         error["error.rs<br/>Error Classification"]
         forward["forward.rs<br/>Port Forwarding"]
         async_cmd["async_command.rs<br/>Async Command Storage"]
+        shell["shell.rs<br/>Interactive Shell"]
+        schema["schema.rs<br/>JSON Schema"]
         modrs["mod.rs<br/>Module Root"]
     end
 
@@ -267,6 +287,8 @@ flowchart TB
     modrs --> error
     modrs --> forward
     modrs --> async_cmd
+    modrs --> shell
+    modrs --> schema
 
     commands --> client
     commands --> config
@@ -274,6 +296,7 @@ flowchart TB
     commands --> types
     commands --> forward
     commands --> async_cmd
+    commands --> shell
     commands --> poem_mcp
 
     client --> config
@@ -325,6 +348,10 @@ classDiagram
         +ssh_disconnect() Text~String~
         +ssh_list_sessions() StructuredContent~SessionListResponse~
         +ssh_disconnect_agent() StructuredContent~AgentDisconnectResponse~
+        +ssh_shell_open() StructuredContent~SshShellOpenResponse~
+        +ssh_shell_write() Text~String~
+        +ssh_shell_read() StructuredContent~SshShellReadResponse~
+        +ssh_shell_close() StructuredContent~SshShellCloseResponse~
     }
 
     class StoredSession {
@@ -452,7 +479,15 @@ classDiagram
 | `OutputBuffer` | async_command.rs | Simple struct for collecting stdout/stderr from async commands |
 | `AsyncCommandInfo` | types.rs | Serializable metadata for async command tracking |
 | `AsyncCommandStatus` | types.rs | Enum representing command states: Running, Completed, Cancelled, Failed |
+| `ShellStorage` | storage/traits.rs | Trait for shell CRUD operations (DIP) |
+| `DashMapShellStorage` | storage/shell.rs | Lock-free concurrent shell storage with session index |
+| `SHELL_STORAGE` | storage/shell.rs | Global shell storage instance (implements `ShellStorage`) |
+| `RunningShell` | shell.rs | State container for interactive PTY shell sessions |
+| `ChannelWriter` | shell.rs | Write handle for sending input to shell PTY |
+| `ShellInfo` | types.rs | Serializable metadata for interactive shell sessions |
+| `ShellStatus` | types.rs | Enum representing shell states: Open, Closed |
 | `ConnectMessageBuilder` | message/builder.rs | Fluent builder for connection success messages |
+| `ShellOpenMessageBuilder` | message/builder.rs | Fluent builder for shell open messages |
 
 ---
 

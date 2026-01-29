@@ -321,7 +321,7 @@ Async commands are automatically cleaned up in the following scenarios:
 
 1. **Monitor Active Commands**
    - Use `ssh_list_commands` to check running commands before starting new ones
-   - Avoid hitting the 30-command limit by completing or canceling unused commands
+   - Avoid hitting the 100-command limit by completing or canceling unused commands
 
 2. **Set Appropriate Timeouts**
    - For long-running commands, increase `SSH_COMMAND_TIMEOUT` via environment variable

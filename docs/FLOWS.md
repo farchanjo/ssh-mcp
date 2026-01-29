@@ -532,7 +532,7 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     Start([ssh_execute]) --> CountCommands[Count session commands]
-    CountCommands --> CheckLimit{count >= 30?}
+    CountCommands --> CheckLimit{count >= 100?}
 
     CheckLimit -->|Yes| RejectError([Error: Max commands reached])
     CheckLimit -->|No| GetSession[Get session handle]
@@ -1188,9 +1188,13 @@ sequenceDiagram
 
 | Module | Responsibility |
 |--------|----------------|
-| `commands.rs` | MCP tool entry points and response building |
-| `client.rs` | SSH connection, authentication, and command execution |
-| `session.rs` | Global session storage and russh handler |
+| `commands.rs` | MCP tool entry points and response building (13 tools) |
+| `client.rs` | SSH connection, authentication, command execution, PTY channels |
+| `session.rs` | SSH client handler for russh |
+| `shell.rs` | Interactive PTY shell session types |
 | `config.rs` | Configuration resolution with priority chain |
 | `error.rs` | Error classification for retry decisions |
 | `forward.rs` | Port forwarding with bidirectional IO |
+| `storage/` | Session, command, and shell storage with lock-free DashMap |
+| `auth/` | Authentication strategies (password, key, agent, chain) |
+| `message/` | Fluent message builders for LLM-friendly responses |
