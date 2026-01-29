@@ -245,6 +245,81 @@ impl AgentDisconnectMessageBuilder {
     }
 }
 
+/// Builder for interactive shell open messages.
+///
+/// # Example
+///
+/// ```ignore
+/// let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
+///     .with_agent_id(Some("my-agent"))
+///     .build();
+/// ```
+pub struct ShellOpenMessageBuilder {
+    shell_id: String,
+    session_id: String,
+    agent_id: Option<String>,
+    term: String,
+    cols: u32,
+    rows: u32,
+}
+
+impl ShellOpenMessageBuilder {
+    /// Create a new shell open message builder with required fields.
+    pub fn new(
+        shell_id: impl Into<String>,
+        session_id: impl Into<String>,
+        term: impl Into<String>,
+        cols: u32,
+        rows: u32,
+    ) -> Self {
+        Self {
+            shell_id: shell_id.into(),
+            session_id: session_id.into(),
+            agent_id: None,
+            term: term.into(),
+            cols,
+            rows,
+        }
+    }
+
+    /// Set the agent ID for the message.
+    pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
+        self.agent_id = agent_id.map(Into::into);
+        self
+    }
+
+    /// Build the message string.
+    pub fn build(&self) -> String {
+        let mut lines = vec!["INTERACTIVE SHELL OPENED. REMEMBER THESE IDENTIFIERS:".to_string()];
+
+        if let Some(ref aid) = self.agent_id {
+            lines.push(format!("• agent_id: '{}'", aid));
+        }
+        lines.push(format!("• shell_id: '{}'", self.shell_id));
+        lines.push(format!("• session_id: '{}'", self.session_id));
+        lines.push(format!(
+            "• term: {} ({}x{})",
+            self.term, self.cols, self.rows
+        ));
+
+        lines.push(String::new()); // empty line
+        lines.push(format!(
+            "Use ssh_shell_write with shell_id '{}' to send input.",
+            self.shell_id
+        ));
+        lines.push(format!(
+            "Use ssh_shell_read with shell_id '{}' to read output.",
+            self.shell_id
+        ));
+        lines.push(format!(
+            "Use ssh_shell_close with shell_id '{}' to close the shell.",
+            self.shell_id
+        ));
+
+        lines.join("\n")
+    }
+}
+
 /// Truncate a command string for display purposes.
 fn truncate_command(command: &str, max_len: usize) -> String {
     if command.len() > max_len {
@@ -615,6 +690,93 @@ mod tests {
             assert!(msg2.contains("sessions_disconnected: 1"));
             assert!(msg1.contains("commands_cancelled: 2"));
             assert!(msg2.contains("commands_cancelled: 2"));
+        }
+    }
+
+    mod shell_open_message_builder {
+        use super::*;
+
+        #[test]
+        fn test_basic_message() {
+            let message =
+                ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24).build();
+
+            assert!(message.contains("INTERACTIVE SHELL OPENED"));
+            assert!(message.contains("shell_id: 'shell-123'"));
+            assert!(message.contains("session_id: 'sess-456'"));
+            assert!(message.contains("term: xterm (80x24)"));
+            assert!(message.contains("ssh_shell_write"));
+            assert!(message.contains("ssh_shell_read"));
+            assert!(message.contains("ssh_shell_close"));
+        }
+
+        #[test]
+        fn test_with_agent_id() {
+            let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
+                .with_agent_id(Some("my-agent"))
+                .build();
+
+            assert!(message.contains("agent_id: 'my-agent'"));
+        }
+
+        #[test]
+        fn test_without_agent_id() {
+            let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
+                .with_agent_id(None::<String>)
+                .build();
+
+            assert!(!message.contains("agent_id"));
+        }
+
+        #[test]
+        fn test_vt100_terminal() {
+            let message =
+                ShellOpenMessageBuilder::new("shell-1", "sess-1", "vt100", 80, 24).build();
+
+            assert!(message.contains("term: vt100 (80x24)"));
+        }
+
+        #[test]
+        fn test_custom_dimensions() {
+            let message =
+                ShellOpenMessageBuilder::new("shell-1", "sess-1", "xterm", 132, 43).build();
+
+            assert!(message.contains("term: xterm (132x43)"));
+        }
+
+        #[test]
+        fn test_from_string_types() {
+            let shell_id = String::from("shell-789");
+            let session_id = String::from("sess-012");
+            let term = String::from("ansi");
+
+            let message = ShellOpenMessageBuilder::new(shell_id, session_id, term, 80, 24).build();
+
+            assert!(message.contains("shell_id: 'shell-789'"));
+            assert!(message.contains("session_id: 'sess-012'"));
+            assert!(message.contains("term: ansi"));
+        }
+
+        #[test]
+        fn test_message_contains_proper_instructions() {
+            let message =
+                ShellOpenMessageBuilder::new("shell-abc", "sess-def", "xterm", 80, 24).build();
+
+            assert!(message.contains("ssh_shell_write"));
+            assert!(message.contains("ssh_shell_read"));
+            assert!(message.contains("ssh_shell_close"));
+            assert!(message.contains("shell_id 'shell-abc'"));
+        }
+
+        #[test]
+        fn test_message_format_structure() {
+            let message = ShellOpenMessageBuilder::new("shell-1", "sess-1", "xterm", 80, 24)
+                .with_agent_id(Some("agent-1"))
+                .build();
+
+            let lines: Vec<&str> = message.lines().collect();
+            assert!(lines.len() >= 6); // Header, identifiers, empty line, instructions
+            assert!(lines[0].contains("INTERACTIVE SHELL OPENED"));
         }
     }
 

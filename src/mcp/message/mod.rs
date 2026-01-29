@@ -6,4 +6,7 @@
 
 mod builder;
 
-pub use builder::{AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder};
+pub use builder::{
+    AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder,
+    ShellOpenMessageBuilder,
+};
