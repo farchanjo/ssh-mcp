@@ -93,6 +93,7 @@ Some options are only configurable per-session via function parameters:
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `MCP_HOST` | `string` | `0.0.0.0` | HTTP server bind address (only for `ssh-mcp` binary) |
 | `MCP_PORT` | `u16` | `8000` | HTTP server port (only for `ssh-mcp` binary) |
 | `RUST_LOG` | `string` | `info` | Log level filter (see [Tracing and Logging](#tracing-and-logging)) |
 
@@ -606,6 +607,7 @@ export SSH_COMMAND_TIMEOUT=60
 export SSH_MAX_RETRIES=1
 export SSH_RETRY_DELAY_MS=500
 export SSH_COMPRESSION=false
+export MCP_HOST=0.0.0.0
 export MCP_PORT=8000
 export RUST_LOG=debug
 ```
@@ -624,6 +626,7 @@ export SSH_COMMAND_TIMEOUT=300
 export SSH_MAX_RETRIES=5
 export SSH_RETRY_DELAY_MS=2000
 export SSH_COMPRESSION=true
+export MCP_HOST=127.0.0.1
 export MCP_PORT=8000
 export RUST_LOG=info
 ```
@@ -793,6 +796,7 @@ ENV SSH_CONNECT_TIMEOUT=30
 ENV SSH_COMMAND_TIMEOUT=180
 ENV SSH_MAX_RETRIES=3
 ENV SSH_COMPRESSION=true
+ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8000
 ENV RUST_LOG=info
 EXPOSE 8000
@@ -812,6 +816,7 @@ services:
       - SSH_COMMAND_TIMEOUT=180
       - SSH_MAX_RETRIES=3
       - SSH_COMPRESSION=true
+      - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
       - RUST_LOG=info
 ```

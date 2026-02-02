@@ -192,6 +192,9 @@ ssh-mcp
 # Custom port
 MCP_PORT=9000 ssh-mcp
 
+# Bind to localhost only
+MCP_HOST=127.0.0.1 ssh-mcp
+
 # With debug logging
 RUST_LOG=debug ssh-mcp
 ```
@@ -649,6 +652,7 @@ Priority: **Parameter > Environment Variable > Default**
 | `SSH_RETRY_DELAY_MS` | 1000 | Initial retry delay (milliseconds) |
 | `SSH_INACTIVITY_TIMEOUT` | 300 | Session inactivity timeout (seconds) |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
+| `MCP_HOST` | 0.0.0.0 | HTTP server bind address (ssh-mcp binary) |
 | `MCP_PORT` | 8000 | HTTP server port (ssh-mcp binary) |
 | `RUST_LOG` | info | Log level (trace/debug/info/warn/error) |
 
