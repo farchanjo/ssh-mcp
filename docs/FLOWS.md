@@ -2,22 +2,14 @@
 
 This document describes the operational flows of the SSH MCP server, including connection establishment, command execution, port forwarding, and session lifecycle management.
 
-## Table of Contents
-
-- [Session Lifecycle](#session-lifecycle)
-- [SSH Connection Flow](#ssh-connection-flow)
-- [Authentication Flow](#authentication-flow)
-- [Command Execution Flow](#command-execution-flow)
-- [Command Lifecycle](#command-lifecycle)
-- [Command Cancellation Flow](#command-cancellation-flow)
-- [Port Forwarding Flow](#port-forwarding-flow)
-- [Error Handling and Retry Logic](#error-handling-and-retry-logic)
-
----
+[[_TOC_]]
 
 ## Session Lifecycle
 
 The complete lifecycle of an SSH session from creation to termination.
+
+<details>
+<summary>Session lifecycle state diagram</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -60,6 +52,8 @@ stateDiagram-v2
     end note
 ```
 
+</details>
+
 ### Session States
 
 | State | Description |
@@ -79,11 +73,12 @@ stateDiagram-v2
 | `name` | Optional human-readable identifier for LLM identification |
 | `persistent` | When true, disables inactivity timeout (keepalive still active) |
 
----
-
 ## SSH Connection Flow
 
 Detailed flow of the `ssh_connect` operation using russh native async.
+
+<details>
+<summary>SSH connection sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -169,9 +164,14 @@ sequenceDiagram
     Cmd-->>Client: SshConnectResponse with persistent indicator
 ```
 
+</details>
+
 ### Configuration Resolution Priority
 
 Each configuration value follows the same resolution pattern.
+
+<details>
+<summary>Configuration resolution flowchart</summary>
 
 ```mermaid
 flowchart TD
@@ -194,9 +194,14 @@ flowchart TD
     style Return fill:#e8f5e9
 ```
 
+</details>
+
 ### Address Parsing
 
 The address is parsed to extract host and port using rsplit_once.
+
+<details>
+<summary>Address parsing flowchart</summary>
 
 ```mermaid
 flowchart LR
@@ -218,13 +223,16 @@ flowchart LR
     style Error fill:#ffebee
 ```
 
----
+</details>
 
 ## Authentication Flow
 
 Detailed authentication flow supporting multiple methods with RSA hash algorithm negotiation.
 
 For RSA keys, the client negotiates the hash algorithm with the server using `best_supported_rsa_hash()`. This ensures modern algorithms like `rsa-sha2-256` or `rsa-sha2-512` are used instead of the legacy `ssh-rsa` with SHA1.
+
+<details>
+<summary>Authentication sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -290,9 +298,14 @@ sequenceDiagram
     end
 ```
 
+</details>
+
 ### RSA Hash Algorithm Negotiation
 
 The `best_supported_rsa_hash()` function queries the server for supported RSA signature algorithms and returns the best available option.
+
+<details>
+<summary>RSA hash negotiation flowchart</summary>
 
 ```mermaid
 flowchart TD
@@ -317,7 +330,12 @@ flowchart TD
     style Legacy fill:#fff8e1
 ```
 
+</details>
+
 ### Authentication Method Priority
+
+<details>
+<summary>Authentication method priority flowchart</summary>
 
 ```mermaid
 flowchart TD
@@ -361,11 +379,14 @@ flowchart TD
     style AgentAuthFlow fill:#fff8e1
 ```
 
----
+</details>
 
 ## Command Execution Flow
 
 Flow of the `ssh_execute` operation for long-running commands that return immediately with a command ID for polling.
+
+<details>
+<summary>Command execution sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -448,9 +469,14 @@ sequenceDiagram
     end
 ```
 
+</details>
+
 ### Polling for Output
 
 The `ssh_get_command_output` tool allows clients to poll for command status and output.
+
+<details>
+<summary>Polling sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -490,7 +516,12 @@ sequenceDiagram
     Cmd-->>Client: SshAsyncOutputResponse
 ```
 
+</details>
+
 ### Async Command State Machine
+
+<details>
+<summary>Async command state machine</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -527,7 +558,12 @@ stateDiagram-v2
     end note
 ```
 
+</details>
+
 ### Async Command Limits
+
+<details>
+<summary>Async command limits flowchart</summary>
 
 ```mermaid
 flowchart TD
@@ -551,11 +587,14 @@ flowchart TD
     style SessionError fill:#ffebee
 ```
 
----
+</details>
 
 ## Command Lifecycle
 
 Complete lifecycle of a command from creation to cleanup.
+
+<details>
+<summary>Command lifecycle state diagram</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -627,6 +666,8 @@ stateDiagram-v2
     end note
 ```
 
+</details>
+
 ### Status Transitions
 
 | From | To | Trigger |
@@ -637,6 +678,9 @@ stateDiagram-v2
 | Running | Failed | Channel open error, exec error |
 
 ### AsyncCommandStatus Values
+
+<details>
+<summary>AsyncCommandStatus values diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -669,7 +713,12 @@ flowchart LR
     style Failed fill:#ffebee
 ```
 
+</details>
+
 ### Output Collection Flow
+
+<details>
+<summary>Output collection flow diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -709,11 +758,14 @@ flowchart TD
     style SelectBranches fill:#fff8e1
 ```
 
----
+</details>
 
 ## Command Cancellation Flow
 
 Flow of the `ssh_cancel_command` operation to stop a running async command.
+
+<details>
+<summary>Cancellation sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -755,7 +807,12 @@ sequenceDiagram
     Cmd-->>Client: SshCancelCommandResponse with partial output
 ```
 
+</details>
+
 ### Cancellation Signal Flow
+
+<details>
+<summary>Cancellation signal flow diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -797,7 +854,12 @@ flowchart TD
     style Cleanup fill:#e8f5e9
 ```
 
+</details>
+
 ### Cancellation State Transitions
+
+<details>
+<summary>Cancellation state transitions</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -833,9 +895,14 @@ stateDiagram-v2
     end note
 ```
 
+</details>
+
 ### Partial Output Recovery
 
 When a command is cancelled, the client receives all output collected up to that point.
+
+<details>
+<summary>Partial output recovery diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -868,6 +935,8 @@ flowchart LR
     style AfterCancel fill:#e8f5e9
 ```
 
+</details>
+
 ### Cancel Response Fields
 
 | Field | Type | Description |
@@ -878,11 +947,12 @@ flowchart LR
 | `stdout` | String | Output collected before cancellation |
 | `stderr` | String | Error output collected before cancellation |
 
----
-
 ## Port Forwarding Flow
 
 Flow of the `ssh_forward` operation when port_forward feature is enabled.
+
+<details>
+<summary>Port forwarding sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -951,7 +1021,12 @@ sequenceDiagram
     Note over Handler: tokio select completes when either direction ends
 ```
 
+</details>
+
 ### Port Forwarding Data Flow
+
+<details>
+<summary>Port forwarding data flow diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -1011,13 +1086,16 @@ flowchart TD
     style Bidirectional fill:#e8f5e9
 ```
 
----
+</details>
 
 ## Error Handling and Retry Logic
 
 ### Error Classification
 
 The `is_retryable_error` function in error.rs classifies errors.
+
+<details>
+<summary>Error classification flowchart</summary>
 
 ```mermaid
 flowchart TD
@@ -1071,9 +1149,14 @@ flowchart TD
     style ConnKeywords fill:#e8f5e9
 ```
 
+</details>
+
 ### Exponential Backoff with Jitter
 
 The retry logic uses backon ExponentialBuilder.
+
+<details>
+<summary>Exponential backoff sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -1113,7 +1196,12 @@ sequenceDiagram
     Note over Client: Return handle with retry_count or final error
 ```
 
+</details>
+
 ### Retry Timeline Example
+
+<details>
+<summary>Retry timeline diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -1143,7 +1231,12 @@ flowchart LR
     style Timeline fill:#fff8e1
 ```
 
+</details>
+
 ### Retry Notification Flow
+
+<details>
+<summary>Retry notification sequence diagram</summary>
 
 ```mermaid
 sequenceDiagram
@@ -1182,7 +1275,7 @@ sequenceDiagram
     Backon-->>Client: Handle with retry_count equals 2
 ```
 
----
+</details>
 
 ## Module Responsibilities
 

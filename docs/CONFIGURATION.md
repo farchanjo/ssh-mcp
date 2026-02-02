@@ -4,22 +4,14 @@ This document provides a comprehensive guide to configuring the SSH MCP server, 
 
 ## Table of Contents
 
-- [Configuration Priority](#configuration-priority)
-- [Environment Variables](#environment-variables)
-- [Session Naming and Persistence](#session-naming-and-persistence)
-- [Async Command Limits](#async-command-limits)
-- [Tracing and Logging](#tracing-and-logging)
-- [SSH Agent Authentication](#ssh-agent-authentication)
-- [RSA Signature Algorithm](#rsa-signature-algorithm)
-- [Feature Flags](#feature-flags)
-- [Example Configurations](#example-configurations)
-- [MCP Client Configuration](#mcp-client-configuration)
-
----
+[[_TOC_]]
 
 ## Configuration Priority
 
 All configuration settings follow a consistent priority chain:
+
+<details>
+<summary>Priority resolution diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -38,7 +30,12 @@ flowchart LR
     style P3 fill:#9e9e9e,color:#fff
 ```
 
+</details>
+
 ### Resolution Flow
+
+<details>
+<summary>Resolution flow diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -63,6 +60,8 @@ flowchart TD
     style UseDefault fill:#9e9e9e,color:#fff
 ```
 
+</details>
+
 This priority system allows you to:
 - Set global defaults via environment variables
 - Override per-request via function parameters
@@ -76,8 +75,6 @@ Some options are only configurable per-session via function parameters:
 |-----------|------|---------|-------------|
 | `name` | `string` | `null` | Human-readable session name for LLM identification |
 | `persistent` | `bool` | `false` | Disable inactivity timeout, keep session alive indefinitely |
-
----
 
 ## Environment Variables
 
@@ -116,10 +113,10 @@ Controls how long to wait for the initial TCP connection and SSH handshake.
 export SSH_CONNECT_TIMEOUT=60
 ```
 
-**Considerations:**
-- Too short: Connections fail on high-latency networks
-- Too long: Slow failure detection for unreachable hosts
-- Recommended: 30-60 seconds for most environments
+> [!tip]
+> - Too short: Connections fail on high-latency networks
+> - Too long: Slow failure detection for unreachable hosts
+> - Recommended: 30-60 seconds for most environments
 
 #### SSH_COMMAND_TIMEOUT
 
@@ -130,12 +127,13 @@ Maximum time allowed for command execution.
 export SSH_COMMAND_TIMEOUT=300
 ```
 
-**Considerations:**
-- Should be longer than your longest expected command
-- Set conservatively for automation
-- Can be overridden per-command via parameter
+> [!tip]
+> - Should be longer than your longest expected command
+> - Set conservatively for automation
+> - Can be overridden per-command via parameter
 
-**Note:** When a command times out, SSH MCP returns any partial output captured up to that point rather than failing with an error. This graceful timeout behavior ensures you receive useful output even from long-running commands that exceed the timeout.
+> [!note]
+> When a command times out, SSH MCP returns any partial output captured up to that point rather than failing with an error. This graceful timeout behavior ensures you receive useful output even from long-running commands that exceed the timeout.
 
 #### SSH_MAX_RETRIES
 
@@ -146,11 +144,11 @@ Number of retry attempts after initial failure.
 export SSH_MAX_RETRIES=5
 ```
 
-**Behavior:**
-- `0`: No retries (fail immediately on error)
-- `1-10`: Recommended range
-- Only retries on transient errors (connection refused, timeout, etc.)
-- Authentication failures are never retried
+> [!tip]
+> - `0`: No retries (fail immediately on error)
+> - `1-10`: Recommended range
+> - Only retries on transient errors (connection refused, timeout, etc.)
+> - Authentication failures are never retried
 
 #### SSH_RETRY_DELAY_MS
 
@@ -183,12 +181,12 @@ Controls how long an idle session can remain open before being automatically clo
 export SSH_INACTIVITY_TIMEOUT=600
 ```
 
-**Considerations:**
-- Only applies to non-persistent sessions (`persistent: false`)
-- Persistent sessions (`persistent: true`) disable this timeout entirely
-- Keepalive packets (30s interval) are sent independently of this timeout
-- Default 300s (5 minutes) is suitable for most interactive use cases
-- Set higher for workflows with long think/compose pauses between commands
+> [!tip]
+> - Only applies to non-persistent sessions (`persistent: false`)
+> - Persistent sessions (`persistent: true`) disable this timeout entirely
+> - Keepalive packets (30s interval) are sent independently of this timeout
+> - Default 300s (5 minutes) is suitable for most interactive use cases
+> - Set higher for workflows with long think/compose pauses between commands
 
 #### SSH_COMPRESSION
 
@@ -203,11 +201,9 @@ export SSH_COMPRESSION=false
 - Enable: `true`, `TRUE`, `1`
 - Disable: `false`, `FALSE`, `0`, any other value
 
-**Trade-offs:**
-- Enable for: High-latency networks, large data transfers
-- Disable for: Low-latency networks, CPU-constrained systems
-
----
+> [!tip]
+> - Enable for: High-latency networks, large data transfers
+> - Disable for: Low-latency networks, CPU-constrained systems
 
 ## Session Naming and Persistence
 
@@ -231,11 +227,11 @@ The `name` parameter allows you to assign human-readable names to SSH sessions. 
 - LLMs can reference sessions by meaningful names
 - Helps organize multiple concurrent connections
 
-**Behavior:**
-- Names are optional and can be any string
-- Names are not required to be unique
-- When not set, the `name` field is omitted from JSON responses
-- Session IDs (UUIDs) remain the authoritative identifier
+> [!tip]
+> - Names are optional and can be any string
+> - Names are not required to be unique
+> - When not set, the `name` field is omitted from JSON responses
+> - Session IDs (UUIDs) remain the authoritative identifier
 
 ### Persistent Sessions
 
@@ -252,12 +248,12 @@ The `persistent` parameter disables the inactivity timeout for a session.
 }
 ```
 
-**Behavior:**
-- `persistent: false` (default): Sessions may time out after inactivity
-- `persistent: true`: Sessions stay alive indefinitely until:
-  - Explicitly disconnected via `ssh_disconnect`
-  - The SSH MCP process terminates
-  - The remote server closes the connection
+> [!tip]
+> - `persistent: false` (default): Sessions may time out after inactivity
+> - `persistent: true`: Sessions stay alive indefinitely until:
+>   - Explicitly disconnected via `ssh_disconnect`
+>   - The SSH MCP process terminates
+>   - The remote server closes the connection
 
 **Keepalive:**
 - Keepalive packets are still sent for persistent sessions
@@ -275,8 +271,6 @@ When `persistent=true`, the success message includes a suffix:
 - Long-running deployment scripts
 - Background monitoring tasks
 - Sessions that must survive extended idle periods
-
----
 
 ## Async Command Limits
 
@@ -352,8 +346,6 @@ Async commands are automatically cleaned up in the following scenarios:
    - Cancel unneeded async commands rather than waiting for automatic cleanup
    - Disconnect sessions when work is complete
 
----
-
 ## Tracing and Logging
 
 SSH MCP uses the `tracing` crate with `tracing-subscriber` for structured logging. Log output is controlled via the `RUST_LOG` environment variable.
@@ -409,8 +401,6 @@ export RUST_LOG=warn,ssh_mcp=debug
 # Include poem framework logs for HTTP debugging
 export RUST_LOG=ssh_mcp=debug,poem=debug
 ```
-
----
 
 ## SSH Agent Authentication
 
@@ -468,7 +458,8 @@ When using the MCP stdio transport with Claude Desktop or other clients, ensure 
 }
 ```
 
-**Note:** On macOS, the SSH agent socket is typically at `/private/tmp/com.apple.launchd.*/Listeners`. You may need to pass the current value:
+> [!note]
+> On macOS, the SSH agent socket is typically at `/private/tmp/com.apple.launchd.*/Listeners`. You may need to pass the current value:
 
 ```json
 {
@@ -510,8 +501,6 @@ echo $SSH_AUTH_SOCK
 ssh -o PreferredAuthentications=publickey user@host
 ```
 
----
-
 ## RSA Signature Algorithm
 
 SSH MCP automatically negotiates the best RSA signature algorithm with the server. No configuration is needed.
@@ -550,11 +539,12 @@ If you encounter RSA authentication failures, verify:
 2. The server accepts RSA keys (some may only accept Ed25519)
 3. Your key is properly loaded in the SSH agent (for agent auth)
 
----
-
 ## Feature Flags
 
 Cargo feature flags control compile-time functionality.
+
+<details>
+<summary>Feature flags diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -586,6 +576,8 @@ flowchart TB
     style Conditional fill:#fff3e0
 ```
 
+</details>
+
 ### Building Without Port Forwarding
 
 ```bash
@@ -600,11 +592,10 @@ cargo build --release --no-default-features
 cargo build --release --features port_forward
 ```
 
----
-
 ## Example Configurations
 
-### Development Environment
+<details>
+<summary>Development environment config</summary>
 
 For local development with verbose logging:
 
@@ -619,7 +610,10 @@ export MCP_PORT=8000
 export RUST_LOG=debug
 ```
 
-### Production Environment
+</details>
+
+<details>
+<summary>Production environment config</summary>
 
 For production with reliability focus:
 
@@ -634,7 +628,10 @@ export MCP_PORT=8000
 export RUST_LOG=info
 ```
 
-### High-Latency Network
+</details>
+
+<details>
+<summary>High-latency network config</summary>
 
 For satellite or intercontinental connections:
 
@@ -647,7 +644,10 @@ export SSH_RETRY_DELAY_MS=5000
 export SSH_COMPRESSION=true
 ```
 
-### Low-Latency Local Network
+</details>
+
+<details>
+<summary>Low-latency local network config</summary>
 
 For local datacenter or LAN:
 
@@ -660,7 +660,10 @@ export SSH_RETRY_DELAY_MS=200
 export SSH_COMPRESSION=false
 ```
 
-### CI/CD Pipeline
+</details>
+
+<details>
+<summary>CI/CD pipeline config</summary>
 
 For automated deployments:
 
@@ -674,7 +677,10 @@ export SSH_COMPRESSION=true
 export RUST_LOG=warn
 ```
 
-### Setting Variables in Different Shells
+</details>
+
+<details>
+<summary>Shell-specific syntax examples</summary>
 
 **Bash/Zsh (Linux/macOS):**
 ```bash
@@ -699,11 +705,12 @@ $env:RUST_LOG = "debug"
 SSH_CONNECT_TIMEOUT=60 RUST_LOG=debug ./ssh-mcp-stdio
 ```
 
----
+</details>
 
 ## MCP Client Configuration
 
-### Claude Desktop Configuration
+<details>
+<summary>Claude Desktop configuration</summary>
 
 Add to `claude_desktop_config.json`:
 
@@ -724,7 +731,10 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Claude Desktop with SSH Agent (macOS)
+</details>
+
+<details>
+<summary>Claude Desktop with SSH Agent (macOS)</summary>
 
 ```json
 {
@@ -741,9 +751,13 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-**Note:** Replace the `SSH_AUTH_SOCK` path with your actual agent socket path. Find it with `echo $SSH_AUTH_SOCK`.
+> [!note]
+> Replace the `SSH_AUTH_SOCK` path with your actual agent socket path. Find it with `echo $SSH_AUTH_SOCK`.
 
-### Cursor IDE Configuration
+</details>
+
+<details>
+<summary>Cursor IDE configuration</summary>
 
 Add to MCP settings:
 
@@ -762,7 +776,10 @@ Add to MCP settings:
 }
 ```
 
-### HTTP Server with Docker
+</details>
+
+<details>
+<summary>Docker deployment configuration</summary>
 
 ```dockerfile
 FROM rust:latest AS builder
@@ -799,11 +816,14 @@ services:
       - RUST_LOG=info
 ```
 
----
+</details>
 
 ## Configuration Diagram
 
 Complete configuration flow:
+
+<details>
+<summary>Complete configuration flow diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -875,6 +895,8 @@ flowchart TB
     style Usage fill:#f3e5f5
 ```
 
+</details>
+
 ### Configuration Constants
 
 From `config.rs`:
@@ -901,9 +923,8 @@ const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 ```
 
-**Note:** While the internal implementation uses `Duration` types for type safety, environment variables still accept integer values (seconds for timeouts, milliseconds for retry delay). The conversion to `Duration` happens internally.
-
----
+> [!note]
+> While the internal implementation uses `Duration` types for type safety, environment variables still accept integer values (seconds for timeouts, milliseconds for retry delay). The conversion to `Duration` happens internally.
 
 ## Best Practices
 

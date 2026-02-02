@@ -1,6 +1,7 @@
 # SSH-MCP Server (Complete Rewrite)
 
-> **This is NOT the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp).**
+> [!caution]
+> This is **NOT** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp).
 > **Everything has been rewritten from scratch** - different SSH library, different architecture, different threading model.
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
@@ -9,7 +10,7 @@
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
----
+[[_TOC_]]
 
 ## Why This Fork Exists
 
@@ -22,8 +23,6 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **SFTP file transfer** - Streaming upload/download with progress tracking
 - **Modular codebase** - 30 focused source files instead of 1 monolithic file
 - **Comprehensive tests** - 435 unit tests + integration chaos tests
-
----
 
 ## Complete Comparison
 
@@ -43,7 +42,8 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
-### What Changed
+<details>
+<summary>What Changed</summary>
 
 ```
 REMOVED:
@@ -64,7 +64,7 @@ ADDED:
 - Documentation with Mermaid diagrams
 ```
 
----
+</details>
 
 ## Features
 
@@ -80,8 +80,6 @@ ADDED:
 - **SFTP Transfers** - Streaming upload/download with progress tracking and error classification
 - **MCP Protocol** - Full integration with AI/LLM tools (16 tools)
 
----
-
 ## Documentation
 
 | Document | Description |
@@ -90,8 +88,6 @@ ADDED:
 | [Flows](docs/FLOWS.md) | Connection, execution, port forwarding sequences |
 | [API Reference](docs/API.md) | Complete MCP tools reference |
 | [Configuration](docs/CONFIGURATION.md) | Environment variables and setup |
-
----
 
 ## Quick Start
 
@@ -119,6 +115,9 @@ sudo codesign -f -s - /usr/local/bin/ssh-mcp  # macOS only
 ### Option 1: Stdio Transport (ssh-mcp-stdio)
 
 Uses stdin/stdout for communication. Recommended for most MCP integrations.
+
+<details>
+<summary>Client configuration examples</summary>
 
 #### Claude Code
 
@@ -178,6 +177,8 @@ Add to the MCP config file:
 }
 ```
 
+</details>
+
 ### Option 2: HTTP Server (ssh-mcp)
 
 Runs as a standalone HTTP server. Useful for shared access or non-stdio clients.
@@ -195,7 +196,8 @@ MCP_PORT=9000 ssh-mcp
 RUST_LOG=debug ssh-mcp
 ```
 
-#### macOS Background Service (launchd)
+<details>
+<summary>macOS Background Service (launchd)</summary>
 
 Install as a system service that starts automatically:
 
@@ -231,6 +233,11 @@ For user-level service (no sudo, runs only when logged in):
 cp com.farchanjo.ssh-mcp.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.farchanjo.ssh-mcp.plist
 ```
+
+</details>
+
+<details>
+<summary>Client configuration examples</summary>
 
 #### Claude Code (HTTP/SSE)
 
@@ -271,9 +278,12 @@ curl -X POST http://localhost:8000/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ssh_list_sessions","arguments":{}}}'
 ```
 
----
+</details>
 
 ## Usage Examples
+
+<details>
+<summary>Usage examples</summary>
 
 ### Connect with Password
 
@@ -373,11 +383,14 @@ curl -X POST http://localhost:8000/ \
 }
 ```
 
----
+</details>
 
 ## Interactive Shell Sessions
 
 For persistent interactive terminals (SOL/IPMI/OOB consoles, serial devices, or commands requiring PTY like `sudo` and `top`).
+
+<details>
+<summary>Interactive shell examples</summary>
 
 ### Open Shell
 
@@ -443,12 +456,13 @@ For Serial Over LAN or out-of-band management consoles:
 }
 ```
 
+</details>
+
 ### Limits
 
-- Max 10 concurrent interactive shells per session
-- Shells auto-cleanup when session disconnects
-
----
+> [!note]
+> - Max 10 concurrent interactive shells per session
+> - Shells auto-cleanup when session disconnects
 
 ## Async Command Execution
 
@@ -472,6 +486,9 @@ For long-running commands (builds, deployments, data processing), use `ssh_execu
 4. ssh_get_command_output(command_id, wait=true) → status: "completed", stdout, exit_code
 5. ssh_disconnect(session_id) → cleans up all async commands
 ```
+
+<details>
+<summary>Async command examples</summary>
 
 ### Start Command
 
@@ -611,13 +628,14 @@ while True:
     sleep(5)
 ```
 
+</details>
+
 ### Limits
 
-- Max 100 concurrent async commands per session
-- Commands auto-cleanup when session disconnects
-- Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
-
----
+> [!note]
+> - Max 100 concurrent async commands per session
+> - Commands auto-cleanup when session disconnects
+> - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
 ## Configuration
 
@@ -634,11 +652,12 @@ Priority: **Parameter > Environment Variable > Default**
 | `MCP_PORT` | 8000 | HTTP server port (ssh-mcp binary) |
 | `RUST_LOG` | info | Log level (trace/debug/info/warn/error) |
 
----
-
 ## Architecture
 
 ### Module Structure
+
+<details>
+<summary>Module structure</summary>
 
 ```
 src/mcp/
@@ -673,6 +692,8 @@ src/mcp/
     ├── mod.rs        (13 lines)    - Message exports
     └── builder.rs    (1335 lines)  - Message builders + tests
 ```
+
+</details>
 
 ### Module Dependencies
 
@@ -755,8 +776,6 @@ sequenceDiagram
     Cmd-->>MCP: session_id
 ```
 
----
-
 ## Testing
 
 ```bash
@@ -806,9 +825,12 @@ python3 scripts/test_stdio.py  # Stdio transport (uses binary directly)
 | `scripts/test_http.py` | 47 | HTTP transport: all 16 tools + chaos/concurrency |
 | `scripts/test_stdio.py` | 36 | Stdio transport: all 16 tools + chaos/concurrency |
 
+<details>
+<summary>Integration test categories</summary>
+
 Integration test categories: concurrent same-session commands, cross-session routing, shell write+disconnect race, rapid connect/disconnect stress, cancel while polling, multi-session routing verification, invalid ID error handling, mixed valid+invalid concurrent operations.
 
----
+</details>
 
 ## Binary Targets
 
@@ -817,8 +839,6 @@ Integration test categories: concurrent same-session commands, cross-session rou
 | `ssh-mcp` | HTTP server on port 8000 (Poem framework) |
 | `ssh-mcp-stdio` | Stdio transport for MCP integration |
 
----
-
 ## Credits
 
 - Original concept: [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)
@@ -826,13 +846,9 @@ Integration test categories: concurrent same-session commands, cross-session rou
 - Retry logic: [backon](https://github.com/Xuanwo/backon)
 - MCP framework: [poem-mcpserver](https://github.com/poem-web/poem)
 
----
-
 ## License
 
 MIT License - see [LICENSE](LICENSE)
-
----
 
 ## Contributing
 
