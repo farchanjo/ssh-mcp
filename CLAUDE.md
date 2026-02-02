@@ -7,7 +7,7 @@ cargo build --release                              # Build all binaries
 cargo build --release --bin ssh-mcp                # HTTP server only
 cargo build --release --bin ssh-mcp-stdio           # Stdio transport only
 cargo build --release --no-default-features         # Without port forwarding
-cargo test --all-features                           # Run tests (412 tests)
+cargo test --all-features                           # Run tests (435 tests)
 cargo fmt --all -- --check                          # Check formatting
 cargo clippy -- -D warnings                         # Lint
 ```
@@ -89,5 +89,5 @@ All settings follow: **Parameter -> Environment Variable -> Default**
 - `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]`
 - Methods < 30 lines, SOLID principles
 - Lock-free data structures (`DashMap`) for concurrent access
-- 412 unit tests (`cargo test --all-features`)
+- 435 unit tests (`cargo test --all-features`)
 - Feature flag: `port_forward` (default: enabled)

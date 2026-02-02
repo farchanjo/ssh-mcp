@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-357%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-435%20passing-brightgreen.svg)]()
 
 A Rust SSH server with Model Context Protocol (MCP) integration, enabling LLMs to connect to SSH servers and execute commands remotely.
 
@@ -19,8 +19,9 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 - **Pure Rust** - No C dependencies, compiles anywhere
 - **Efficient I/O** - OS-level multiplexing instead of busy-wait polling
 - **Interactive shells** - PTY support for SOL/IPMI/OOB access
-- **Modular codebase** - 27 focused source files instead of 1 monolithic file
-- **Comprehensive tests** - 357 unit tests covering all functionality
+- **SFTP file transfer** - Streaming upload/download with progress tracking
+- **Modular codebase** - 30 focused source files instead of 1 monolithic file
+- **Comprehensive tests** - 435 unit tests + integration chaos tests
 
 ---
 
@@ -36,8 +37,9 @@ The original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp) uses `s
 | **Thread Safety** | `Session` is `!Send` (requires `std::thread`) | `Handle` is `Send + Sync` |
 | **Retry Logic** | None | Exponential backoff with jitter via `backon` |
 | **Interactive Shells** | Not supported | PTY sessions for SOL/IPMI/OOB access |
-| **Architecture** | Single ~800 line file | 27 source files, 8700+ lines |
-| **Test Coverage** | 0 tests | 357 unit tests |
+| **SFTP** | Not supported | Streaming upload/download with progress |
+| **Architecture** | Single ~800 line file | 30 source files, 10500+ lines |
+| **Test Coverage** | 0 tests | 435 unit tests + integration chaos tests |
 | **Documentation** | Basic README | 4 detailed docs + Mermaid diagrams |
 | **Error Classification** | Basic | Smart retry vs non-retry detection |
 
@@ -54,8 +56,8 @@ REMOVED:
 ADDED:
 - russh crate (pure Rust, native async)
 - backon crate (exponential backoff with jitter)
-- SOLID architecture (27 source files with storage/auth/message/shell abstractions)
-- Comprehensive test suite (357 tests)
+- SOLID architecture (30 source files with storage/auth/message/shell/sftp abstractions)
+- Comprehensive test suite (435 unit tests + integration chaos tests)
 - Async command execution (background commands with polling)
 - Interactive PTY shell sessions (SOL/IPMI/OOB support)
 - Error classification for smart retries
@@ -75,7 +77,8 @@ ADDED:
 - **Async Commands** - Run long-running commands in background with polling
 - **Interactive Shells** - PTY sessions for SOL/IPMI/OOB console access
 - **Smart Retry** - Exponential backoff for transient failures only
-- **MCP Protocol** - Full integration with AI/LLM tools (13 tools)
+- **SFTP Transfers** - Streaming upload/download with progress tracking and error classification
+- **MCP Protocol** - Full integration with AI/LLM tools (16 tools)
 
 ---
 
@@ -98,7 +101,7 @@ ADDED:
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --all-features  # 357 tests
+cargo test --all-features  # 435 tests
 ```
 
 ### Install
@@ -639,23 +642,26 @@ Priority: **Parameter > Environment Variable > Default**
 
 ```
 src/mcp/
-├── mod.rs            (40 lines)    - Module declarations
-├── types.rs          (1354 lines)  - Response types (session, command, shell)
+├── mod.rs            (42 lines)    - Module declarations
+├── types.rs          (1646 lines)  - Response types (session, command, shell, transfer)
 ├── config.rs         (669 lines)   - Configuration resolution
 ├── error.rs          (359 lines)   - Error classification
 ├── session.rs        (41 lines)    - SSH client handler
 ├── client.rs         (900 lines)   - SSH connection/auth/execution/PTY
 ├── async_command.rs  (183 lines)   - Async command types
-├── shell.rs          (147 lines)   - Interactive PTY shell types
+├── shell.rs          (146 lines)   - Interactive PTY shell types
 ├── schema.rs         (118 lines)   - JSON schema helpers
 ├── forward.rs        (155 lines)   - Port forwarding
-├── commands.rs       (1082 lines)  - MCP tool handlers (13 tools)
+├── commands.rs       (1453 lines)  - MCP tool handlers (16 tools)
+├── sftp.rs           (601 lines)   - SFTP session management + streaming transfer
+├── transfer.rs       (341 lines)   - Transfer tracking types + tests
 ├── storage/
-│   ├── mod.rs        (23 lines)    - Storage exports
-│   ├── traits.rs     (107 lines)   - Storage trait definitions
-│   ├── session.rs    (491 lines)   - Session storage impl + tests
-│   ├── command.rs    (996 lines)   - Command storage impl + tests
-│   └── shell.rs      (208 lines)   - Shell storage impl + tests
+│   ├── mod.rs        (26 lines)    - Storage exports
+│   ├── traits.rs     (168 lines)   - Storage trait definitions
+│   ├── session.rs    (493 lines)   - Session storage impl + tests
+│   ├── command.rs    (998 lines)   - Command storage impl + tests
+│   ├── shell.rs      (179 lines)   - Shell storage impl + tests
+│   └── transfer.rs   (179 lines)   - Transfer storage impl + tests
 ├── auth/
 │   ├── mod.rs        (36 lines)    - Auth exports
 │   ├── traits.rs     (40 lines)    - AuthStrategy trait
@@ -664,8 +670,8 @@ src/mcp/
 │   ├── agent.rs      (139 lines)   - SSH agent auth + tests
 │   └── chain.rs      (323 lines)   - Auth chain + tests
 └── message/
-    ├── mod.rs        (12 lines)    - Message exports
-    └── builder.rs    (982 lines)   - Message builders + tests
+    ├── mod.rs        (13 lines)    - Message exports
+    └── builder.rs    (1335 lines)  - Message builders + tests
 ```
 
 ### Module Dependencies
@@ -681,6 +687,8 @@ flowchart TB
         AsyncCmd["async_command.rs"]
         Shell["shell.rs"]
         Forward["forward.rs"]
+        SFTP["sftp.rs"]
+        Transfer["transfer.rs"]
         Session["session.rs"]
         Types["types.rs"]
     end
@@ -700,6 +708,8 @@ flowchart TB
     Commands --> AsyncCmd
     Commands --> Shell
     Commands --> Forward
+    Commands --> SFTP
+    Commands --> Transfer
     Commands --> Session
     Commands --> Types
     Client --> Session
@@ -707,6 +717,8 @@ flowchart TB
     Client --> Config
     Client --> Error
     Client --> Types
+    SFTP --> Session
+    SFTP --> Transfer
     AsyncCmd --> Types
     Forward --> Session
     Client --> Russh
@@ -748,35 +760,53 @@ sequenceDiagram
 ## Testing
 
 ```bash
-# All tests
+# All unit tests
 cargo test --all-features
 
 # Specific module
 cargo test mcp::config
 cargo test mcp::error
 cargo test mcp::client
+cargo test mcp::sftp
+cargo test mcp::transfer
 
 # With output
 cargo test --all-features -- --nocapture
+
+# Integration tests (requires SSH server)
+python3 scripts/test_http.py   # HTTP transport (server must be running)
+python3 scripts/test_stdio.py  # Stdio transport (uses binary directly)
 ```
 
-### Test Coverage
+### Unit Test Coverage
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| config.rs | 33 | Configuration resolution |
-| error.rs | 29 | Error classification |
-| client.rs | 22 | Address parsing, client config |
-| types.rs | 38 | Serialization |
-| storage/session.rs | 26 | Session storage operations |
+| message/builder.rs | 76 | Message builders (connect, execute, shell, transfer) |
+| types.rs | 66 | Response type serialization |
+| auth/*.rs | 58 | Authentication strategies (password, key, agent, chain) |
+| config.rs | 37 | Configuration resolution |
 | storage/command.rs | 36 | Command storage operations |
-| storage/shell.rs | 12 | Shell storage operations |
-| auth/*.rs | 45 | Authentication strategies |
-| message/builder.rs | 83 | Message builders (incl. ShellOpenMessageBuilder) |
-| async_command.rs | 14 | Async command types |
-| shell.rs | 6 | Interactive shell types |
-| schema.rs | 9 | JSON schema helpers |
-| **Total** | **357** | |
+| error.rs | 29 | Error classification |
+| sftp.rs | 28 | SFTP helpers and error classification |
+| storage/session.rs | 25 | Session storage operations |
+| client.rs | 22 | Address parsing, client config |
+| transfer.rs | 20 | Transfer tracking types |
+| async_command.rs | 10 | Async command types |
+| storage/shell.rs | 8 | Shell storage operations |
+| storage/transfer.rs | 8 | Transfer storage operations |
+| schema.rs | 7 | JSON schema helpers |
+| shell.rs | 5 | Interactive shell types |
+| **Total** | **435** | |
+
+### Integration Tests
+
+| Script | Tests | Coverage |
+|--------|-------|----------|
+| `scripts/test_http.py` | 47 | HTTP transport: all 16 tools + chaos/concurrency |
+| `scripts/test_stdio.py` | 36 | Stdio transport: all 16 tools + chaos/concurrency |
+
+Integration test categories: concurrent same-session commands, cross-session routing, shell write+disconnect race, rapid connect/disconnect stress, cancel while polling, multi-session routing verification, invalid ID error handling, mixed valid+invalid concurrent operations.
 
 ---
 
