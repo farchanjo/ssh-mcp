@@ -40,7 +40,8 @@ use super::message::{
     UploadMessageBuilder,
 };
 use super::sftp::{
-    open_sftp_session, resolve_local_path, sftp_download_streaming, sftp_upload_streaming,
+    classify_transfer_error, open_sftp_session, resolve_local_path, sftp_download_streaming,
+    sftp_upload_streaming,
 };
 use super::shell::{ChannelWriter, MAX_SHELLS_PER_SESSION, RunningShell};
 use super::storage::{
@@ -1107,10 +1108,9 @@ impl McpSSHCommands {
         // Resolve and validate local file
         let resolved_path = resolve_local_path(&local_path);
         let metadata = tokio::fs::metadata(&resolved_path).await.map_err(|e| {
-            format!(
-                "Failed to access local file '{}': {}",
-                resolved_path.display(),
-                e
+            classify_transfer_error(
+                &format!("access local file '{}'", resolved_path.display()),
+                &e.to_string(),
             )
         })?;
 
@@ -1238,9 +1238,9 @@ impl McpSSHCommands {
         // Get remote file size via SFTP metadata
         let sftp = open_sftp_session(&handle_arc).await?;
         let remote_metadata = sftp.metadata(&remote_path).await.map_err(|e| {
-            format!(
-                "Failed to get remote file metadata for '{}': {}",
-                remote_path, e
+            classify_transfer_error(
+                &format!("get remote file metadata for '{}'", remote_path),
+                &e.to_string(),
             )
         })?;
 
