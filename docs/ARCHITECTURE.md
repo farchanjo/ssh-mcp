@@ -955,7 +955,7 @@ flowchart LR
 </details>
 
 **Features:**
-- Runs on port 8000 (configurable via `MCP_PORT`)
+- Binds to 0.0.0.0:8000 (configurable via `MCP_HOST` and `MCP_PORT`)
 - Uses Poem's streamable HTTP transport
 - Includes tracing middleware for debugging
 - Loads environment from `.env` file

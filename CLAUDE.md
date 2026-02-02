@@ -76,6 +76,7 @@ All settings follow: **Parameter -> Environment Variable -> Default**
 | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay |
 | `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
+| `MCP_HOST` | 0.0.0.0 | HTTP server bind address |
 | `MCP_PORT` | 8000 | HTTP server port |
 | `RUST_LOG` | info | Log level filter |
 
