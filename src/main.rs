@@ -1,12 +1,11 @@
 #![deny(warnings)]
 #![deny(clippy::unwrap_used)]
 
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use poem::{EndpointExt, Route, Server, listener::TcpListener, middleware::Tracing};
 use poem_mcpserver::{McpServer, streamable_http};
+use ssh_mcp::mcp::McpSSHCommands;
 use tracing::info;
-
-mod mcp;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Route::new()
         .at(
             "/",
-            streamable_http::endpoint(|_| McpServer::new().tools(mcp::McpSSHCommands {})),
+            streamable_http::endpoint(|_| McpServer::new().tools(McpSSHCommands {})),
         )
         .with(Tracing);
 

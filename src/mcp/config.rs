@@ -162,8 +162,8 @@ mod tests {
 
     // Use a mutex to serialize env var tests to avoid race conditions
     // SAFETY: Tests are serialized via ENV_TEST_MUTEX to prevent data races
-    static ENV_TEST_MUTEX: once_cell::sync::Lazy<StdMutex<()>> =
-        once_cell::sync::Lazy::new(|| StdMutex::new(()));
+    static ENV_TEST_MUTEX: std::sync::LazyLock<StdMutex<()>> =
+        std::sync::LazyLock::new(|| StdMutex::new(()));
 
     /// Helper to set an environment variable safely within tests.
     /// SAFETY: Must be called while holding ENV_TEST_MUTEX to prevent data races.

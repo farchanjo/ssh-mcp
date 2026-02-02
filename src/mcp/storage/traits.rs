@@ -1,15 +1,18 @@
-//! Storage trait definitions for session and command management.
+//! Storage trait definitions for session, command, shell, and transfer management.
 //!
 //! These traits define the interface for storage implementations, enabling
 //! dependency injection and testability through mocking.
 
 use std::sync::Arc;
 
+use dashmap::mapref::one::Ref;
 use russh::client;
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::session::SshClientHandler;
-use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo};
+use crate::mcp::shell::RunningShell;
+use crate::mcp::transfer::{RunningTransfer, TransferInfo};
+use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo};
 
 /// Reference to a stored session for read-only access.
 pub struct SessionRef {
@@ -104,4 +107,62 @@ pub trait CommandStorage: Send + Sync {
         session_id: Option<&str>,
         status: Option<AsyncCommandStatus>,
     ) -> Vec<AsyncCommandInfo>;
+}
+
+/// Trait for shell storage operations.
+///
+/// Implementations must be thread-safe (`Send + Sync`) for use across
+/// async tasks. The default implementation uses `DashMap` for lock-free
+/// concurrent access with a secondary index for O(1) session lookups.
+#[allow(dead_code)]
+pub trait ShellStorage: Send + Sync {
+    /// Register a new shell.
+    fn register(&self, shell_id: String, shell: RunningShell);
+
+    /// Unregister a shell by ID, returning it if it existed.
+    fn unregister(&self, shell_id: &str) -> Option<RunningShell>;
+
+    /// Get a direct reference to a shell.
+    fn get_direct(&self, shell_id: &str) -> Option<Ref<'_, String, RunningShell>>;
+
+    /// List all shell IDs for a session.
+    fn list_by_session(&self, session_id: &str) -> Vec<String>;
+
+    /// Count shells for a session.
+    fn count_by_session(&self, session_id: &str) -> usize;
+
+    /// List all shell info entries.
+    fn list_all(&self) -> Vec<ShellInfo>;
+
+    /// List shell info filtered by session.
+    fn list_filtered(&self, session_id: Option<&str>) -> Vec<ShellInfo>;
+}
+
+/// Trait for transfer storage operations.
+///
+/// Implementations must be thread-safe (`Send + Sync`) for use across
+/// async tasks. The default implementation uses `DashMap` for lock-free
+/// concurrent access with a secondary index for O(1) session lookups.
+#[allow(dead_code)]
+pub trait TransferStorage: Send + Sync {
+    /// Register a new transfer.
+    fn register(&self, transfer_id: String, transfer: RunningTransfer);
+
+    /// Unregister a transfer by ID, returning it if it existed.
+    fn unregister(&self, transfer_id: &str) -> Option<RunningTransfer>;
+
+    /// Get a direct reference to a transfer.
+    fn get_direct(&self, transfer_id: &str) -> Option<Ref<'_, String, RunningTransfer>>;
+
+    /// List all transfer IDs for a session.
+    fn list_by_session(&self, session_id: &str) -> Vec<String>;
+
+    /// Count transfers for a session.
+    fn count_by_session(&self, session_id: &str) -> usize;
+
+    /// List all transfer info entries.
+    fn list_all(&self) -> Vec<TransferInfo>;
+
+    /// List transfer info filtered by session.
+    fn list_filtered(&self, session_id: Option<&str>) -> Vec<TransferInfo>;
 }

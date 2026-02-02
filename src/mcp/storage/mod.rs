@@ -20,9 +20,7 @@ pub use session::SESSION_STORAGE;
 #[allow(unused_imports)]
 pub use shell::DashMapShellStorage;
 pub use shell::SHELL_STORAGE;
-pub use shell::ShellStorage;
-pub use traits::{CommandStorage, SessionStorage};
+pub use traits::{CommandStorage, SessionStorage, ShellStorage, TransferStorage};
 #[allow(unused_imports)]
 pub use transfer::DashMapTransferStorage;
 pub use transfer::TRANSFER_STORAGE;
-pub use transfer::TransferStorage;

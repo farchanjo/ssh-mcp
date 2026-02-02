@@ -6,8 +6,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use std::sync::LazyLock;
+
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use russh::client;
 
 use crate::mcp::session::SshClientHandler;
@@ -129,7 +130,8 @@ impl SessionStorage for DashMapSessionStorage {
 }
 
 /// Global session storage instance.
-pub static SESSION_STORAGE: Lazy<DashMapSessionStorage> = Lazy::new(DashMapSessionStorage::new);
+pub static SESSION_STORAGE: LazyLock<DashMapSessionStorage> =
+    LazyLock::new(DashMapSessionStorage::new);
 
 #[cfg(test)]
 mod tests {

@@ -5,42 +5,13 @@
 
 use std::collections::HashSet;
 
+use std::sync::LazyLock;
+
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 
 use crate::mcp::transfer::{RunningTransfer, TransferInfo};
 
-/// Trait for transfer storage operations.
-///
-/// Implementations must be thread-safe (`Send + Sync`) for use across
-/// async tasks. The default implementation uses `DashMap` for lock-free
-/// concurrent access with a secondary index for O(1) session lookups.
-#[allow(dead_code)]
-pub trait TransferStorage: Send + Sync {
-    /// Register a new transfer.
-    fn register(&self, transfer_id: String, transfer: RunningTransfer);
-
-    /// Unregister a transfer by ID, returning it if it existed.
-    fn unregister(&self, transfer_id: &str) -> Option<RunningTransfer>;
-
-    /// Get a direct reference to a transfer.
-    fn get_direct(
-        &self,
-        transfer_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, RunningTransfer>>;
-
-    /// List all transfer IDs for a session.
-    fn list_by_session(&self, session_id: &str) -> Vec<String>;
-
-    /// Count transfers for a session.
-    fn count_by_session(&self, session_id: &str) -> usize;
-
-    /// List all transfer info entries.
-    fn list_all(&self) -> Vec<TransferInfo>;
-
-    /// List transfer info filtered by session.
-    fn list_filtered(&self, session_id: Option<&str>) -> Vec<TransferInfo>;
-}
+use super::traits::TransferStorage;
 
 /// DashMap-based implementation of `TransferStorage`.
 ///
@@ -145,7 +116,8 @@ impl TransferStorage for DashMapTransferStorage {
 }
 
 /// Global transfer storage instance.
-pub static TRANSFER_STORAGE: Lazy<DashMapTransferStorage> = Lazy::new(DashMapTransferStorage::new);
+pub static TRANSFER_STORAGE: LazyLock<DashMapTransferStorage> =
+    LazyLock::new(DashMapTransferStorage::new);
 
 #[cfg(test)]
 mod tests {
