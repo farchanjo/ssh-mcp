@@ -320,6 +320,207 @@ impl ShellOpenMessageBuilder {
     }
 }
 
+/// Builder for upload start messages.
+///
+/// # Example
+///
+/// ```ignore
+/// let message = UploadMessageBuilder::new("xfer-123", "sess-456", "/tmp/file.txt", "/home/user/file.txt", 1048576)
+///     .with_agent_id(Some("my-agent"))
+///     .build();
+/// ```
+pub struct UploadMessageBuilder {
+    transfer_id: String,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+    total_bytes: u64,
+    agent_id: Option<String>,
+}
+
+impl UploadMessageBuilder {
+    /// Create a new upload message builder with required fields.
+    pub fn new(
+        transfer_id: impl Into<String>,
+        session_id: impl Into<String>,
+        local_path: impl Into<String>,
+        remote_path: impl Into<String>,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            transfer_id: transfer_id.into(),
+            session_id: session_id.into(),
+            local_path: local_path.into(),
+            remote_path: remote_path.into(),
+            total_bytes,
+            agent_id: None,
+        }
+    }
+
+    /// Set the agent ID for the message.
+    pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
+        self.agent_id = agent_id.map(Into::into);
+        self
+    }
+
+    /// Build the message string.
+    pub fn build(&self) -> String {
+        let mut lines = vec!["UPLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
+
+        if let Some(ref aid) = self.agent_id {
+            lines.push(format!("• agent_id: '{}'", aid));
+        }
+        lines.push(format!("• transfer_id: '{}'", self.transfer_id));
+        lines.push(format!("• session_id: '{}'", self.session_id));
+        lines.push(format!("• local_path: '{}'", self.local_path));
+        lines.push(format!("• remote_path: '{}'", self.remote_path));
+        lines.push(format!("• total_bytes: {}", self.total_bytes));
+
+        lines.push(String::new());
+        lines.push(format!(
+            "Use ssh_get_transfer_progress with transfer_id '{}' to poll progress.",
+            self.transfer_id
+        ));
+
+        lines.join("\n")
+    }
+}
+
+/// Builder for download start messages.
+///
+/// # Example
+///
+/// ```ignore
+/// let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "/home/user/file.txt", "/tmp/file.txt", 2097152)
+///     .with_agent_id(Some("my-agent"))
+///     .build();
+/// ```
+pub struct DownloadMessageBuilder {
+    transfer_id: String,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+    total_bytes: u64,
+    agent_id: Option<String>,
+}
+
+impl DownloadMessageBuilder {
+    /// Create a new download message builder with required fields.
+    pub fn new(
+        transfer_id: impl Into<String>,
+        session_id: impl Into<String>,
+        remote_path: impl Into<String>,
+        local_path: impl Into<String>,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            transfer_id: transfer_id.into(),
+            session_id: session_id.into(),
+            remote_path: remote_path.into(),
+            local_path: local_path.into(),
+            total_bytes,
+            agent_id: None,
+        }
+    }
+
+    /// Set the agent ID for the message.
+    pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
+        self.agent_id = agent_id.map(Into::into);
+        self
+    }
+
+    /// Build the message string.
+    pub fn build(&self) -> String {
+        let mut lines = vec!["DOWNLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
+
+        if let Some(ref aid) = self.agent_id {
+            lines.push(format!("• agent_id: '{}'", aid));
+        }
+        lines.push(format!("• transfer_id: '{}'", self.transfer_id));
+        lines.push(format!("• session_id: '{}'", self.session_id));
+        lines.push(format!("• remote_path: '{}'", self.remote_path));
+        lines.push(format!("• local_path: '{}'", self.local_path));
+        lines.push(format!("• total_bytes: {}", self.total_bytes));
+
+        lines.push(String::new());
+        lines.push(format!(
+            "Use ssh_get_transfer_progress with transfer_id '{}' to poll progress.",
+            self.transfer_id
+        ));
+
+        lines.join("\n")
+    }
+}
+
+/// Builder for transfer progress messages.
+///
+/// # Example
+///
+/// ```ignore
+/// let message = TransferProgressMessageBuilder::new("xfer-123", "upload", "running", 524288, 1048576)
+///     .build();
+/// ```
+pub struct TransferProgressMessageBuilder {
+    transfer_id: String,
+    direction: String,
+    status: String,
+    bytes_transferred: u64,
+    total_bytes: u64,
+}
+
+impl TransferProgressMessageBuilder {
+    /// Create a new transfer progress message builder.
+    pub fn new(
+        transfer_id: impl Into<String>,
+        direction: impl Into<String>,
+        status: impl Into<String>,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            transfer_id: transfer_id.into(),
+            direction: direction.into(),
+            status: status.into(),
+            bytes_transferred,
+            total_bytes,
+        }
+    }
+
+    /// Build the message string.
+    pub fn build(&self) -> String {
+        let percent = if self.total_bytes > 0 {
+            ((self.bytes_transferred as f64 / self.total_bytes as f64) * 100.0) as u8
+        } else {
+            0
+        };
+
+        let human_transferred = format_bytes(self.bytes_transferred);
+        let human_total = format_bytes(self.total_bytes);
+
+        format!(
+            "TRANSFER {} ({}): {} - {}/{} ({}%)",
+            self.transfer_id, self.direction, self.status, human_transferred, human_total, percent
+        )
+    }
+}
+
+/// Format bytes into human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 /// Truncate a command string for display purposes.
 fn truncate_command(command: &str, max_len: usize) -> String {
     if command.len() > max_len {
@@ -868,6 +1069,158 @@ mod tests {
             let cmd = "echo 'col1\tcol2\tcol3'";
             let result = truncate_command(cmd, 50);
             assert_eq!(result, cmd);
+        }
+    }
+
+    mod upload_message_builder {
+        use super::*;
+
+        #[test]
+        fn test_basic_message() {
+            let message = UploadMessageBuilder::new(
+                "xfer-123",
+                "sess-456",
+                "/tmp/file.txt",
+                "/home/user/file.txt",
+                1048576,
+            )
+            .build();
+
+            assert!(message.contains("UPLOAD STARTED"));
+            assert!(message.contains("transfer_id: 'xfer-123'"));
+            assert!(message.contains("session_id: 'sess-456'"));
+            assert!(message.contains("local_path: '/tmp/file.txt'"));
+            assert!(message.contains("remote_path: '/home/user/file.txt'"));
+            assert!(message.contains("total_bytes: 1048576"));
+            assert!(message.contains("ssh_get_transfer_progress"));
+        }
+
+        #[test]
+        fn test_with_agent_id() {
+            let message = UploadMessageBuilder::new("xfer-123", "sess-456", "a", "b", 0)
+                .with_agent_id(Some("my-agent"))
+                .build();
+
+            assert!(message.contains("agent_id: 'my-agent'"));
+        }
+
+        #[test]
+        fn test_without_agent_id() {
+            let message = UploadMessageBuilder::new("xfer-123", "sess-456", "a", "b", 0)
+                .with_agent_id(None::<String>)
+                .build();
+
+            assert!(!message.contains("agent_id"));
+        }
+    }
+
+    mod download_message_builder {
+        use super::*;
+
+        #[test]
+        fn test_basic_message() {
+            let message = DownloadMessageBuilder::new(
+                "xfer-456",
+                "sess-789",
+                "/home/user/file.txt",
+                "/tmp/file.txt",
+                2097152,
+            )
+            .build();
+
+            assert!(message.contains("DOWNLOAD STARTED"));
+            assert!(message.contains("transfer_id: 'xfer-456'"));
+            assert!(message.contains("session_id: 'sess-789'"));
+            assert!(message.contains("remote_path: '/home/user/file.txt'"));
+            assert!(message.contains("local_path: '/tmp/file.txt'"));
+            assert!(message.contains("total_bytes: 2097152"));
+            assert!(message.contains("ssh_get_transfer_progress"));
+        }
+
+        #[test]
+        fn test_with_agent_id() {
+            let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "a", "b", 0)
+                .with_agent_id(Some("agent-abc"))
+                .build();
+
+            assert!(message.contains("agent_id: 'agent-abc'"));
+        }
+
+        #[test]
+        fn test_without_agent_id() {
+            let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "a", "b", 0)
+                .with_agent_id(None::<String>)
+                .build();
+
+            assert!(!message.contains("agent_id"));
+        }
+    }
+
+    mod transfer_progress_message_builder {
+        use super::*;
+
+        #[test]
+        fn test_running_message() {
+            let message = TransferProgressMessageBuilder::new(
+                "xfer-123", "upload", "running", 524288, 1048576,
+            )
+            .build();
+
+            assert!(message.contains("TRANSFER xfer-123"));
+            assert!(message.contains("upload"));
+            assert!(message.contains("running"));
+            assert!(message.contains("50%"));
+        }
+
+        #[test]
+        fn test_completed_message() {
+            let message = TransferProgressMessageBuilder::new(
+                "xfer-123",
+                "download",
+                "completed",
+                1000000,
+                1000000,
+            )
+            .build();
+
+            assert!(message.contains("completed"));
+            assert!(message.contains("100%"));
+        }
+
+        #[test]
+        fn test_zero_total_bytes() {
+            let message =
+                TransferProgressMessageBuilder::new("xfer-123", "upload", "running", 0, 0).build();
+
+            assert!(message.contains("0%"));
+        }
+    }
+
+    mod format_bytes_fn {
+        use super::*;
+
+        #[test]
+        fn test_bytes() {
+            assert_eq!(format_bytes(0), "0B");
+            assert_eq!(format_bytes(512), "512B");
+            assert_eq!(format_bytes(1023), "1023B");
+        }
+
+        #[test]
+        fn test_kilobytes() {
+            assert_eq!(format_bytes(1024), "1.0KB");
+            assert_eq!(format_bytes(1536), "1.5KB");
+        }
+
+        #[test]
+        fn test_megabytes() {
+            assert_eq!(format_bytes(1048576), "1.0MB");
+            assert_eq!(format_bytes(1572864), "1.5MB");
+        }
+
+        #[test]
+        fn test_gigabytes() {
+            assert_eq!(format_bytes(1073741824), "1.0GB");
         }
     }
 

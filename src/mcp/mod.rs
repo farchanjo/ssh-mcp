@@ -33,8 +33,10 @@ pub(crate) mod forward;
 pub mod message;
 pub mod schema;
 pub mod session;
+pub(crate) mod sftp;
 pub(crate) mod shell;
 pub mod storage;
+pub(crate) mod transfer;
 pub mod types;
 
 pub use commands::McpSSHCommands;

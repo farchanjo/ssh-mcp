@@ -30,6 +30,7 @@ tokio-util = "0.7"
 
 # SSH client (async)
 russh = "0.55"
+russh-sftp = "2"
 async-trait = "0.1"
 
 # Serialization and data handling
