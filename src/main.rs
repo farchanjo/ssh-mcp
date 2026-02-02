@@ -20,11 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Setup MCP server
+    let mcp_host = std::env::var("MCP_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let mcp_port: u16 = std::env::var("MCP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
-    let mcp_addr = format!("0.0.0.0:{}", mcp_port);
+    let mcp_addr = format!("{}:{}", mcp_host, mcp_port);
     info!("Starting MCP server on {}", mcp_addr);
 
     // Setup the poem-mcpserver endpoint with SSH commands
