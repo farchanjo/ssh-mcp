@@ -4,37 +4,7 @@ This document provides a complete API reference for all MCP tools exposed by the
 
 ## Table of Contents
 
-- [Quick Reference for LLMs](#quick-reference-for-llms)
-- [Key Identifiers](#key-identifiers)
-- [Tool Workflow](#tool-workflow)
-- [Overview](#overview)
-- [Tools](#tools)
-  - [ssh_connect](#ssh_connect)
-  - [ssh_execute](#ssh_execute)
-  - [ssh_get_command_output](#ssh_get_command_output)
-  - [ssh_list_commands](#ssh_list_commands)
-  - [ssh_cancel_command](#ssh_cancel_command)
-  - [ssh_forward](#ssh_forward)
-  - [ssh_disconnect](#ssh_disconnect)
-  - [ssh_list_sessions](#ssh_list_sessions)
-  - [ssh_disconnect_agent](#ssh_disconnect_agent)
-  - [ssh_shell_open](#ssh_shell_open)
-  - [ssh_shell_write](#ssh_shell_write)
-  - [ssh_shell_read](#ssh_shell_read)
-  - [ssh_shell_close](#ssh_shell_close)
-  - [ssh_upload](#ssh_upload)
-  - [ssh_download](#ssh_download)
-  - [ssh_get_transfer_progress](#ssh_get_transfer_progress)
-- [Response Types](#response-types)
-- [Error Responses](#error-responses)
-- [Examples](#examples)
-- [Important Notes](#important-notes)
-  - [Authentication](#authentication)
-  - [Retry Logic](#retry-logic)
-  - [Configuration Priority](#configuration-priority)
-  - [Async Command Execution](#async-command-execution)
-
----
+[[_TOC_]]
 
 ## Quick Reference for LLMs
 
@@ -63,8 +33,6 @@ ssh_connect → session_id → ssh_shell_open → shell_id → ssh_shell_write/r
 ```
 ssh_connect → session_id → ssh_upload/ssh_download → transfer_id → ssh_get_transfer_progress → done
 ```
-
----
 
 ## Key Identifiers
 
@@ -99,8 +67,6 @@ ssh_connect → session_id → ssh_upload/ssh_download → transfer_id → ssh_g
 │ ssh_disconnect_agent │  ← Disconnects ALL sessions + shells with this agent_id
 └──────────────────────┘
 ```
-
----
 
 ## Tool Workflow
 
@@ -140,8 +106,6 @@ ssh_connect → session_id → ssh_upload/ssh_download → transfer_id → ssh_g
 4. ssh_disconnect_agent(agent_id="my-agent") → CLEANUP ALL sessions at once
 ```
 
----
-
 ## Overview
 
 SSH MCP exposes 16 tools for managing SSH connections, commands, interactive shells, SFTP transfers, and port forwarding:
@@ -164,8 +128,6 @@ SSH MCP exposes 16 tools for managing SSH connections, commands, interactive she
 | `ssh_upload` | **UPLOADS** file via SFTP | `transfer_id` to SAVE | - |
 | `ssh_download` | **DOWNLOADS** file via SFTP | `transfer_id` to SAVE | - |
 | `ssh_get_transfer_progress` | **CHECKS** transfer status/progress | status, bytes, percent | - |
-
----
 
 ## Tools
 
@@ -206,7 +168,8 @@ Authentication methods are attempted in this order:
 2. **Key File** - If `key_path` is provided (and no password), public key authentication is used
 3. **SSH Agent** - If neither password nor key_path is provided, SSH agent authentication is attempted (tries all available identities)
 
-> **Note on RSA Keys**: For RSA keys, the server's preferred hash algorithm is automatically negotiated (`rsa-sha2-256` or `rsa-sha2-512`). The legacy `ssh-rsa` (SHA1) signature algorithm is avoided for security reasons.
+> [!note]
+> For RSA keys, the server's preferred hash algorithm is automatically negotiated (`rsa-sha2-256` or `rsa-sha2-512`). The legacy `ssh-rsa` (SHA1) signature algorithm is avoided for security reasons.
 
 #### Retry Behavior
 
@@ -232,7 +195,8 @@ Retry logic with exponential backoff only applies to **transient connection erro
 
 Returns `SshConnectResponse`:
 
-**⚠️ IMPORTANT: SAVE `session_id` - you need it for ssh_execute, ssh_forward, and ssh_disconnect**
+> [!important]
+> SAVE `session_id` - you need it for ssh_execute, ssh_forward, and ssh_disconnect
 
 ```json
 {
@@ -319,8 +283,6 @@ With persistent session (no inactivity timeout):
 }
 ```
 
----
-
 ### ssh_execute
 
 **ACTION:** Starts a command in background and returns a `command_id` that you MUST SAVE.
@@ -345,7 +307,8 @@ Starts a shell command in the background on a connected SSH session and returns 
 
 Returns `SshExecuteResponse`:
 
-**⚠️ IMPORTANT: SAVE `command_id` - you need it for ssh_get_command_output or ssh_cancel_command**
+> [!important]
+> SAVE `command_id` - you need it for ssh_get_command_output or ssh_cancel_command
 
 ```json
 {
@@ -367,11 +330,11 @@ Returns `SshExecuteResponse`:
 | `started_at` | `string` | ISO 8601 timestamp when the command started |
 | `message` | `string` | Human-readable message with next steps |
 
-#### Limits
-
-- Maximum 100 concurrent commands per session
-- Commands are automatically cancelled when the session is disconnected
-- Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
+> [!note]
+> **Limits:**
+> - Maximum 100 concurrent commands per session
+> - Commands are automatically cancelled when the session is disconnected
+> - Default timeout: 180s (configurable via `timeout_secs` or `SSH_COMMAND_TIMEOUT` env)
 
 #### Example Usage
 
@@ -409,8 +372,6 @@ Start multiple commands in parallel:
   }
 }
 ```
-
----
 
 ### ssh_get_command_output
 
@@ -553,8 +514,6 @@ Wait for completion (blocking):
 }
 ```
 
----
-
 ### ssh_list_commands
 
 **ACTION:** Lists all background commands, optionally filtered by session or status.
@@ -649,8 +608,6 @@ List all completed commands:
 }
 ```
 
----
-
 ### ssh_cancel_command
 
 **ACTION:** Stops a running command and returns partial output collected so far.
@@ -715,8 +672,6 @@ When command was not running (already completed/cancelled/failed):
   }
 }
 ```
-
----
 
 ### ssh_forward
 
@@ -796,8 +751,6 @@ Access internal service through bastion:
 }
 ```
 
----
-
 ### ssh_disconnect
 
 **ACTION:** Closes a single SSH session and releases all resources.
@@ -834,8 +787,6 @@ Session 550e8400-e29b-41d4-a716-446655440000 disconnected successfully
   }
 }
 ```
-
----
 
 ### ssh_list_sessions
 
@@ -926,8 +877,6 @@ Filter by agent:
 }
 ```
 
----
-
 ### ssh_disconnect_agent
 
 **ACTION:** Disconnects ALL sessions belonging to a specific agent in one call.
@@ -988,8 +937,6 @@ Returns `AgentDisconnectResponse`:
 3. **Call `ssh_disconnect_agent`** at the end of your task instead of multiple `ssh_disconnect` calls
 4. **Handles edge cases gracefully**: Returns `sessions_disconnected: 0` if no sessions found (not an error)
 
----
-
 ### ssh_shell_open
 
 **ACTION:** Opens an interactive PTY shell session and returns a `shell_id` that you MUST SAVE.
@@ -1015,7 +962,8 @@ Opens an interactive pseudo-terminal (PTY) shell session on a connected SSH sess
 
 Returns `SshShellOpenResponse`:
 
-**⚠️ IMPORTANT: SAVE `shell_id` - you need it for ssh_shell_write, ssh_shell_read, and ssh_shell_close**
+> [!important]
+> SAVE `shell_id` - you need it for ssh_shell_write, ssh_shell_read, and ssh_shell_close
 
 ```json
 {
@@ -1035,10 +983,10 @@ Returns `SshShellOpenResponse`:
 | `term_type` | `string` | Terminal type used |
 | `message` | `string` | Human-readable message with identifiers and next steps |
 
-#### Limits
-
-- Maximum 10 concurrent shells per session
-- Shells are automatically closed when the session is disconnected
+> [!note]
+> **Limits:**
+> - Maximum 10 concurrent shells per session
+> - Shells are automatically closed when the session is disconnected
 
 #### Example Usage
 
@@ -1069,8 +1017,6 @@ SOL / IPMI / OOB console:
   }
 }
 ```
-
----
 
 ### ssh_shell_write
 
@@ -1125,8 +1071,6 @@ Send Ctrl+C:
 }
 ```
 
----
-
 ### ssh_shell_read
 
 **ACTION:** Reads accumulated output from an interactive shell.
@@ -1174,8 +1118,6 @@ Returns `SshShellReadResponse`:
 }
 ```
 
----
-
 ### ssh_shell_close
 
 **ACTION:** Closes an interactive shell session and releases resources.
@@ -1222,8 +1164,6 @@ Returns `SshShellCloseResponse`:
 }
 ```
 
----
-
 ## Response Types
 
 ### Common Response Structure
@@ -1245,6 +1185,9 @@ All tools return responses wrapped in MCP's structured content format:
 ```
 
 ### Type Definitions
+
+<details>
+<summary>TypeScript type definitions</summary>
 
 ```typescript
 interface SshConnectResponse {
@@ -1358,7 +1301,7 @@ interface ShellInfo {
 }
 ```
 
----
+</details>
 
 ## Error Responses
 
@@ -1392,7 +1335,8 @@ All errors are returned as string messages. Common error patterns:
 | `No active SSH session with ID: xxx` | Session not found or already disconnected |
 | `Failed to open channel` | SSH session corrupted |
 
-> **Note**: Command timeouts are **not errors**. When a command times out, `ssh_execute` returns a successful response with `timed_out: true`, `exit_code: -1`, and any partial output collected. The session remains connected.
+> [!note]
+> Command timeouts are **not errors**. When a command times out, `ssh_execute` returns a successful response with `timed_out: true`, `exit_code: -1`, and any partial output collected. The session remains connected.
 
 ### Async Command Errors
 
@@ -1421,11 +1365,12 @@ All errors are returned as string messages. Common error patterns:
 }
 ```
 
----
-
 ## Examples
 
 ### Complete Workflow
+
+<details>
+<summary>Complete workflow example</summary>
 
 1. **Connect to server**
 
@@ -1564,7 +1509,12 @@ Response:
 Session abc-123-def-456 disconnected successfully
 ```
 
+</details>
+
 ### Async Command Workflow
+
+<details>
+<summary>Async command workflow example</summary>
 
 This example demonstrates running multiple commands in parallel and monitoring their progress.
 
@@ -1740,7 +1690,12 @@ Response:
 Session build-session-123 disconnected successfully
 ```
 
+</details>
+
 ### Cancelling a Long-Running Command
+
+<details>
+<summary>Cancelling a command example</summary>
 
 1. **Start a potentially slow command**
 
@@ -1812,7 +1767,7 @@ Response:
 }
 ```
 
----
+</details>
 
 ## Important Notes
 

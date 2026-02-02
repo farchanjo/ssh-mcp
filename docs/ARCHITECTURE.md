@@ -2,20 +2,7 @@
 
 This document describes the system architecture of the SSH Model Context Protocol (MCP) Server, providing a comprehensive overview of components, their relationships, and the underlying threading model.
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Module Structure](#module-structure)
-- [Module Dependency Graph](#module-dependency-graph)
-- [Component Architecture](#component-architecture)
-- [Authentication Flow](#authentication-flow)
-- [Session Storage Architecture](#session-storage-architecture)
-- [Async Command Architecture](#async-command-architecture)
-- [Threading and Async Model](#threading-and-async-model)
-- [Binary Targets](#binary-targets)
-- [Key Dependencies](#key-dependencies)
-
----
+[[_TOC_]]
 
 ## Overview
 
@@ -23,6 +10,9 @@ SSH MCP is a Rust-based server that exposes SSH operations as MCP tools, enablin
 
 1. **HTTP Transport** (`ssh-mcp`) - Poem-based HTTP server on port 8000
 2. **Stdio Transport** (`ssh-mcp-stdio`) - Direct stdio communication for MCP integration
+
+<details>
+<summary>System overview diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -68,7 +58,7 @@ flowchart TB
     style SSH fill:#f3e5f5
 ```
 
----
+</details>
 
 ## Module Structure
 
@@ -262,9 +252,10 @@ pub trait AuthStrategy: Send + Sync {
 - `TransferProgressMessageBuilder` - Transfer progress messages
 - Fluent builder pattern for LLM-friendly formatted responses
 
----
-
 ## Module Dependency Graph
+
+<details>
+<summary>Module dependency graph</summary>
 
 ```mermaid
 flowchart TB
@@ -358,11 +349,14 @@ flowchart TB
     style External fill:#e3f2fd
 ```
 
----
+</details>
 
 ## Component Architecture
 
 The following diagram illustrates the relationships between the main components:
+
+<details>
+<summary>Component class diagram</summary>
 
 ```mermaid
 classDiagram
@@ -488,6 +482,8 @@ classDiagram
     note for ASYNC_COMMANDS "COMMAND_STORAGE using\nDashMap (lock-free)\nMax 100 commands per session"
 ```
 
+</details>
+
 ### Component Descriptions
 
 | Component | Module | Description |
@@ -526,11 +522,12 @@ classDiagram
 | `TransferStatus` | transfer.rs | Enum representing transfer states: Running, Completed, Failed |
 | `TransferDirection` | transfer.rs | Enum representing transfer direction: Upload, Download |
 
----
-
 ## Authentication Flow
 
 The client.rs module handles three authentication methods with modern RSA hash negotiation:
+
+<details>
+<summary>Authentication flow diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -605,6 +602,8 @@ flowchart TB
     style RSAHash fill:#fce4ec
 ```
 
+</details>
+
 ### RSA Hash Algorithm Negotiation
 
 Modern SSH servers often disable legacy `ssh-rsa` (SHA-1) signatures for security. The client.rs module uses `best_supported_rsa_hash()` to negotiate modern algorithms:
@@ -630,11 +629,12 @@ let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_al
 
 This negotiation happens automatically for both key file and SSH agent authentication, ensuring compatibility with modern SSH servers while maintaining backward compatibility.
 
----
-
 ## Session Storage Architecture
 
 SSH sessions are stored via the `SessionStorage` trait, enabling dependency injection and testability. The default implementation uses DashMap for lock-free concurrent access.
+
+<details>
+<summary>Session storage diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -666,6 +666,8 @@ flowchart LR
     style Sessions fill:#fff3e0
 ```
 
+</details>
+
 ### Storage Design Decisions (SOLID)
 
 1. **Trait-based abstraction (DIP)**: `SessionStorage` trait enables mocking for unit tests
@@ -694,11 +696,12 @@ SESSION_STORAGE.register_agent(&agent_id, &session_id);
 let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
 ```
 
----
-
 ## Async Command Architecture
 
 The async command system enables long-running SSH commands to execute in the background while allowing clients to poll for output, check status, and cancel commands. Storage is abstracted via the `CommandStorage` trait.
+
+<details>
+<summary>Async command architecture diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -744,6 +747,8 @@ flowchart TB
     style Execution fill:#e3f2fd
 ```
 
+</details>
+
 ### Async Command Flow
 
 1. **Start Command** (`ssh_execute`):
@@ -786,11 +791,12 @@ When `ssh_disconnect` is called, all async commands for that session are automat
 2. Each command's `cancel_token` is triggered
 3. Commands are removed via `COMMAND_STORAGE.unregister(&command_id)`
 
----
-
 ## Threading and Async Model
 
 The system uses Tokio's multi-threaded async runtime with native async SSH operations via russh.
+
+<details>
+<summary>Threading and async model diagram</summary>
 
 ```mermaid
 flowchart TB
@@ -847,6 +853,8 @@ flowchart TB
     style AsyncCommands fill:#e8f5e9
 ```
 
+</details>
+
 ### Native Async Architecture
 
 Unlike implementations using blocking SSH libraries, this system uses **russh** which provides native async support:
@@ -871,6 +879,9 @@ Unlike implementations using blocking SSH libraries, this system uses **russh** 
 - **Graceful disconnect**: Uses `Disconnect::ByApplication` for clean session termination
 
 ### Retry Logic with Backoff
+
+<details>
+<summary>Retry logic state diagram</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -906,15 +917,18 @@ stateDiagram-v2
     Success --> [*]
 ```
 
+</details>
+
 **Retry Classification (error.rs)**:
 - **Non-retryable**: Authentication failures, permission denied, publickey errors
 - **Retryable**: Connection refused, timeout, network unreachable, broken pipe
 
----
-
 ## Binary Targets
 
 ### HTTP Server (`ssh-mcp`)
+
+<details>
+<summary>HTTP server diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -938,6 +952,8 @@ flowchart LR
     style Server fill:#f3e5f5
 ```
 
+</details>
+
 **Features:**
 - Runs on port 8000 (configurable via `MCP_PORT`)
 - Uses Poem's streamable HTTP transport
@@ -946,6 +962,9 @@ flowchart LR
 - Initializes tracing with `info` level default
 
 ### Stdio Transport (`ssh-mcp-stdio`)
+
+<details>
+<summary>Stdio transport diagram</summary>
 
 ```mermaid
 flowchart LR
@@ -971,6 +990,8 @@ flowchart LR
     style IO fill:#fff3e0
 ```
 
+</details>
+
 **Features:**
 - Minimal binary for direct MCP integration
 - No HTTP overhead
@@ -978,9 +999,10 @@ flowchart LR
 - Tracing initialized with `RUST_LOG` environment filter
 - Logs directed to stderr to avoid interfering with MCP protocol on stdout
 
----
-
 ## Key Dependencies
+
+<details>
+<summary>Dependency graph</summary>
 
 ```mermaid
 flowchart TB
@@ -1012,6 +1034,8 @@ flowchart TB
     style Utilities fill:#e8f5e9
 ```
 
+</details>
+
 | Dependency | Version | Purpose |
 |------------|---------|---------|
 | `russh` | 0.55 | Pure Rust async SSH client implementation |
@@ -1026,8 +1050,6 @@ flowchart TB
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Tracing output and filtering |
 | `chrono` | 0.4 | Timestamp generation |
-
----
 
 ## Feature Flags
 
