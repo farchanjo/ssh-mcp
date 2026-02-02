@@ -5,43 +5,14 @@
 
 use std::collections::HashSet;
 
+use std::sync::LazyLock;
+
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 
 use crate::mcp::shell::RunningShell;
 use crate::mcp::types::ShellInfo;
 
-/// Trait for shell storage operations.
-///
-/// Implementations must be thread-safe (`Send + Sync`) for use across
-/// async tasks. The default implementation uses `DashMap` for lock-free
-/// concurrent access with a secondary index for O(1) session lookups.
-#[allow(dead_code)]
-pub trait ShellStorage: Send + Sync {
-    /// Register a new shell.
-    fn register(&self, shell_id: String, shell: RunningShell);
-
-    /// Unregister a shell by ID, returning it if it existed.
-    fn unregister(&self, shell_id: &str) -> Option<RunningShell>;
-
-    /// Get a direct reference to a shell.
-    fn get_direct(
-        &self,
-        shell_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, RunningShell>>;
-
-    /// List all shell IDs for a session.
-    fn list_by_session(&self, session_id: &str) -> Vec<String>;
-
-    /// Count shells for a session.
-    fn count_by_session(&self, session_id: &str) -> usize;
-
-    /// List all shell info entries.
-    fn list_all(&self) -> Vec<ShellInfo>;
-
-    /// List shell info filtered by session.
-    fn list_filtered(&self, session_id: Option<&str>) -> Vec<ShellInfo>;
-}
+use super::traits::ShellStorage;
 
 /// DashMap-based implementation of `ShellStorage`.
 ///
@@ -140,7 +111,7 @@ impl ShellStorage for DashMapShellStorage {
 }
 
 /// Global shell storage instance.
-pub static SHELL_STORAGE: Lazy<DashMapShellStorage> = Lazy::new(DashMapShellStorage::new);
+pub static SHELL_STORAGE: LazyLock<DashMapShellStorage> = LazyLock::new(DashMapShellStorage::new);
 
 #[cfg(test)]
 mod tests {

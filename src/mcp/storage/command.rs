@@ -6,8 +6,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use std::sync::LazyLock;
+
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus};
@@ -182,7 +183,8 @@ impl CommandStorage for DashMapCommandStorage {
 }
 
 /// Global command storage instance.
-pub static COMMAND_STORAGE: Lazy<DashMapCommandStorage> = Lazy::new(DashMapCommandStorage::new);
+pub static COMMAND_STORAGE: LazyLock<DashMapCommandStorage> =
+    LazyLock::new(DashMapCommandStorage::new);
 
 #[cfg(test)]
 mod tests {
