@@ -9,6 +9,7 @@ mod command;
 mod session;
 mod shell;
 mod traits;
+mod transfer;
 
 pub use command::COMMAND_STORAGE;
 #[allow(unused_imports)]
@@ -21,3 +22,7 @@ pub use shell::DashMapShellStorage;
 pub use shell::SHELL_STORAGE;
 pub use shell::ShellStorage;
 pub use traits::{CommandStorage, SessionStorage};
+#[allow(unused_imports)]
+pub use transfer::DashMapTransferStorage;
+pub use transfer::TRANSFER_STORAGE;
+pub use transfer::TransferStorage;

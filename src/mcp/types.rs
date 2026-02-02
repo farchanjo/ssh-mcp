@@ -272,6 +272,79 @@ pub struct SshShellCloseResponse {
     pub message: String,
 }
 
+/// Response from ssh_upload
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshUploadResponse {
+    /// Unique identifier for this transfer
+    pub transfer_id: String,
+    /// Session ID where the transfer is running
+    pub session_id: String,
+    /// Agent ID that owns this session (if set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Local file path being uploaded
+    pub local_path: String,
+    /// Remote destination path
+    pub remote_path: String,
+    /// Total file size in bytes
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub total_bytes: u64,
+    /// Human-readable message with transfer identifiers
+    pub message: String,
+}
+
+/// Response from ssh_download
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshDownloadResponse {
+    /// Unique identifier for this transfer
+    pub transfer_id: String,
+    /// Session ID where the transfer is running
+    pub session_id: String,
+    /// Agent ID that owns this session (if set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Remote file path being downloaded
+    pub remote_path: String,
+    /// Local destination path
+    pub local_path: String,
+    /// Total file size in bytes
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub total_bytes: u64,
+    /// Human-readable message with transfer identifiers
+    pub message: String,
+}
+
+/// Response from ssh_get_transfer_progress
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SshTransferProgressResponse {
+    /// Transfer ID being queried
+    pub transfer_id: String,
+    /// Session ID where the transfer is running
+    pub session_id: String,
+    /// Direction of transfer: "upload" or "download"
+    pub direction: String,
+    /// Local file path
+    pub local_path: String,
+    /// Remote file path
+    pub remote_path: String,
+    /// Current transfer status
+    pub status: String,
+    /// Bytes transferred so far
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub bytes_transferred: u64,
+    /// Total file size in bytes
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub total_bytes: u64,
+    /// Transfer progress as percentage (0-100)
+    #[schemars(schema_with = "crate::mcp::schema::uint")]
+    pub progress_percent: u8,
+    /// Error message (only present when failed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Human-readable message about transfer progress
+    pub message: String,
+}
+
 #[cfg(test)]
 mod response_serialization {
     use super::*;
@@ -1349,6 +1422,225 @@ mod response_serialization {
 
             assert_eq!(deserialized.shell_id, "shell-123");
             assert!(deserialized.closed);
+        }
+    }
+
+    mod ssh_upload_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshUploadResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                agent_id: Some("my-agent".to_string()),
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                total_bytes: 1048576,
+                message: "Upload started".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshUploadResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.transfer_id, "xfer-123");
+            assert_eq!(deserialized.session_id, "sess-456");
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
+            assert_eq!(deserialized.local_path, "/tmp/file.txt");
+            assert_eq!(deserialized.remote_path, "/home/user/file.txt");
+            assert_eq!(deserialized.total_bytes, 1048576);
+        }
+
+        #[test]
+        fn test_agent_id_omitted_when_none() {
+            let response = SshUploadResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                agent_id: None,
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                total_bytes: 0,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("agent_id"));
+        }
+
+        #[test]
+        fn test_agent_id_included_when_some() {
+            let response = SshUploadResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                agent_id: Some("agent-789".to_string()),
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                total_bytes: 0,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains("agent_id"));
+            assert!(json.contains("agent-789"));
+        }
+    }
+
+    mod ssh_download_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_and_deserialize() {
+            let response = SshDownloadResponse {
+                transfer_id: "xfer-456".to_string(),
+                session_id: "sess-789".to_string(),
+                agent_id: Some("my-agent".to_string()),
+                remote_path: "/home/user/file.txt".to_string(),
+                local_path: "/tmp/file.txt".to_string(),
+                total_bytes: 2097152,
+                message: "Download started".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshDownloadResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.transfer_id, "xfer-456");
+            assert_eq!(deserialized.session_id, "sess-789");
+            assert_eq!(deserialized.agent_id, Some("my-agent".to_string()));
+            assert_eq!(deserialized.remote_path, "/home/user/file.txt");
+            assert_eq!(deserialized.local_path, "/tmp/file.txt");
+            assert_eq!(deserialized.total_bytes, 2097152);
+        }
+
+        #[test]
+        fn test_agent_id_omitted_when_none() {
+            let response = SshDownloadResponse {
+                transfer_id: "xfer-456".to_string(),
+                session_id: "sess-789".to_string(),
+                agent_id: None,
+                remote_path: "/home/user/file.txt".to_string(),
+                local_path: "/tmp/file.txt".to_string(),
+                total_bytes: 0,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("agent_id"));
+        }
+    }
+
+    mod ssh_transfer_progress_response {
+        use super::*;
+
+        #[test]
+        fn test_serialize_running() {
+            let response = SshTransferProgressResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                direction: "upload".to_string(),
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                status: "running".to_string(),
+                bytes_transferred: 524288,
+                total_bytes: 1048576,
+                progress_percent: 50,
+                error: None,
+                message: "Upload 50% complete".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshTransferProgressResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.transfer_id, "xfer-123");
+            assert_eq!(deserialized.direction, "upload");
+            assert_eq!(deserialized.status, "running");
+            assert_eq!(deserialized.bytes_transferred, 524288);
+            assert_eq!(deserialized.total_bytes, 1048576);
+            assert_eq!(deserialized.progress_percent, 50);
+            assert!(deserialized.error.is_none());
+        }
+
+        #[test]
+        fn test_serialize_failed() {
+            let response = SshTransferProgressResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                direction: "download".to_string(),
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                status: "failed".to_string(),
+                bytes_transferred: 100,
+                total_bytes: 1000,
+                progress_percent: 10,
+                error: Some("Connection lost".to_string()),
+                message: "Download failed".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: SshTransferProgressResponse = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.status, "failed");
+            assert_eq!(deserialized.error, Some("Connection lost".to_string()));
+        }
+
+        #[test]
+        fn test_error_omitted_when_none() {
+            let response = SshTransferProgressResponse {
+                transfer_id: "xfer-123".to_string(),
+                session_id: "sess-456".to_string(),
+                direction: "upload".to_string(),
+                local_path: "/tmp/file.txt".to_string(),
+                remote_path: "/home/user/file.txt".to_string(),
+                status: "completed".to_string(),
+                bytes_transferred: 1000,
+                total_bytes: 1000,
+                progress_percent: 100,
+                error: None,
+                message: "Upload complete".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("error"));
+        }
+
+        #[test]
+        fn test_progress_percent_boundaries() {
+            // 0%
+            let response = SshTransferProgressResponse {
+                transfer_id: "xfer".to_string(),
+                session_id: "sess".to_string(),
+                direction: "upload".to_string(),
+                local_path: "a".to_string(),
+                remote_path: "b".to_string(),
+                status: "running".to_string(),
+                bytes_transferred: 0,
+                total_bytes: 100,
+                progress_percent: 0,
+                error: None,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let d: SshTransferProgressResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(d.progress_percent, 0);
+
+            // 100%
+            let response = SshTransferProgressResponse {
+                transfer_id: "xfer".to_string(),
+                session_id: "sess".to_string(),
+                direction: "upload".to_string(),
+                local_path: "a".to_string(),
+                remote_path: "b".to_string(),
+                status: "completed".to_string(),
+                bytes_transferred: 100,
+                total_bytes: 100,
+                progress_percent: 100,
+                error: None,
+                message: "msg".to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let d: SshTransferProgressResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(d.progress_percent, 100);
         }
     }
 }

@@ -12,7 +12,7 @@
 //! - `ssh_list_sessions`: List all active sessions
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -35,18 +35,27 @@ use super::config::{
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
 use super::message::{
-    AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder,
-    ShellOpenMessageBuilder,
+    AgentDisconnectMessageBuilder, ConnectMessageBuilder, DownloadMessageBuilder,
+    ExecuteMessageBuilder, ShellOpenMessageBuilder, TransferProgressMessageBuilder,
+    UploadMessageBuilder,
+};
+use super::sftp::{
+    open_sftp_session, resolve_local_path, sftp_download_streaming, sftp_upload_streaming,
 };
 use super::shell::{ChannelWriter, MAX_SHELLS_PER_SESSION, RunningShell};
 use super::storage::{
     COMMAND_STORAGE, CommandStorage, SESSION_STORAGE, SHELL_STORAGE, SessionStorage, ShellStorage,
+    TRANSFER_STORAGE, TransferStorage,
+};
+use super::transfer::{
+    MAX_TRANSFERS_PER_SESSION, RunningTransfer, TransferDirection, TransferInfo, TransferStatus,
 };
 use super::types::{
     AgentDisconnectResponse, AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse,
     SessionInfo, SessionListResponse, ShellInfo, ShellStatus, SshAsyncOutputResponse,
-    SshCancelCommandResponse, SshConnectResponse, SshExecuteResponse, SshListCommandsResponse,
-    SshShellCloseResponse, SshShellOpenResponse, SshShellReadResponse,
+    SshCancelCommandResponse, SshConnectResponse, SshDownloadResponse, SshExecuteResponse,
+    SshListCommandsResponse, SshShellCloseResponse, SshShellOpenResponse, SshShellReadResponse,
+    SshTransferProgressResponse, SshUploadResponse,
 };
 
 /// MCP SSH Commands tool implementation.
@@ -232,6 +241,14 @@ impl McpSSHCommands {
         session_id: String,
     ) -> Result<Text<String>, String> {
         info!("Disconnecting SSH session: {}", session_id);
+
+        // Cancel all active transfers for this session
+        let transfer_ids = TRANSFER_STORAGE.list_by_session(&session_id);
+        for xfer_id in &transfer_ids {
+            if let Some(xfer) = TRANSFER_STORAGE.unregister(xfer_id) {
+                xfer.cancel_token.cancel();
+            }
+        }
 
         // Close all interactive shells for this session
         let shell_ids = SHELL_STORAGE.list_by_session(&session_id);
@@ -769,11 +786,20 @@ impl McpSSHCommands {
         }
 
         let mut total_commands_cancelled = 0;
-
         let mut total_shells_closed = 0;
+        let mut total_transfers_cancelled = 0;
 
         // Process each session
         for session_id in &session_ids {
+            // Cancel all active transfers for this session
+            let transfer_ids = TRANSFER_STORAGE.list_by_session(session_id);
+            for xfer_id in &transfer_ids {
+                if let Some(xfer) = TRANSFER_STORAGE.unregister(xfer_id) {
+                    xfer.cancel_token.cancel();
+                }
+            }
+            total_transfers_cancelled += transfer_ids.len();
+
             // Close all interactive shells for this session
             let shell_ids = SHELL_STORAGE.list_by_session(session_id);
             for shell_id in &shell_ids {
@@ -813,8 +839,12 @@ impl McpSSHCommands {
         let sessions_disconnected = session_ids.len();
 
         info!(
-            "Disconnected {} sessions, cancelled {} commands, and closed {} shells for agent {}",
-            sessions_disconnected, total_commands_cancelled, total_shells_closed, agent_id
+            "Disconnected {} sessions, cancelled {} commands, closed {} shells, and cancelled {} transfers for agent {}",
+            sessions_disconnected,
+            total_commands_cancelled,
+            total_shells_closed,
+            total_transfers_cancelled,
+            agent_id
         );
 
         let message = AgentDisconnectMessageBuilder::new(&agent_id)
@@ -1035,6 +1065,347 @@ impl McpSSHCommands {
             shell_id,
             closed: true,
             message: "Shell closed successfully".to_string(),
+        }))
+    }
+
+    /// Upload a local file to a remote path via SFTP.
+    ///
+    /// Starts an asynchronous file upload. Returns immediately with a
+    /// `transfer_id` for progress tracking.
+    ///
+    /// **Workflow:**
+    /// 1. ssh_upload → get transfer_id
+    /// 2. ssh_get_transfer_progress(transfer_id, wait=true) → get result
+    ///
+    /// Streams the file in 32KB chunks with minimal memory usage.
+    ///
+    /// **Limits:** Up to 10 concurrent transfers per session.
+    async fn ssh_upload(
+        &self,
+        /// Session ID returned from ssh_connect
+        session_id: String,
+        /// Local file path to upload (relative paths resolve to home directory)
+        local_path: String,
+        /// Remote destination path on the SSH server
+        remote_path: String,
+    ) -> Result<StructuredContent<SshUploadResponse>, String> {
+        // Check transfer limit
+        let current_count = TRANSFER_STORAGE.count_by_session(&session_id);
+        if current_count >= MAX_TRANSFERS_PER_SESSION {
+            return Err(format!(
+                "Maximum transfers per session reached ({}). Wait for existing transfers to complete.",
+                MAX_TRANSFERS_PER_SESSION
+            ));
+        }
+
+        // Get session handle and agent_id
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (s.handle.clone(), s.info.agent_id.clone()))
+            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
+
+        // Resolve and validate local file
+        let resolved_path = resolve_local_path(&local_path);
+        let metadata = tokio::fs::metadata(&resolved_path).await.map_err(|e| {
+            format!(
+                "Failed to access local file '{}': {}",
+                resolved_path.display(),
+                e
+            )
+        })?;
+
+        if !metadata.is_file() {
+            return Err(format!(
+                "'{}' is not a regular file",
+                resolved_path.display()
+            ));
+        }
+
+        let total_bytes = metadata.len();
+        let transfer_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        // Create shared state
+        let (status_tx, status_rx) = watch::channel(TransferStatus::Running);
+        let bytes_transferred = Arc::new(AtomicU64::new(0));
+        let total_bytes_arc = Arc::new(AtomicU64::new(total_bytes));
+        let cancel_token = CancellationToken::new();
+        let error = Arc::new(Mutex::new(None));
+
+        let transfer_info = TransferInfo {
+            transfer_id: transfer_id.clone(),
+            session_id: session_id.clone(),
+            direction: TransferDirection::Upload,
+            local_path: resolved_path.to_string_lossy().into_owned(),
+            remote_path: remote_path.clone(),
+            started_at,
+        };
+
+        // Register transfer
+        TRANSFER_STORAGE.register(
+            transfer_id.clone(),
+            RunningTransfer {
+                info: transfer_info,
+                cancel_token: cancel_token.clone(),
+                bytes_transferred: bytes_transferred.clone(),
+                total_bytes: total_bytes_arc,
+                status_rx,
+                status_tx: status_tx.clone(),
+                error: error.clone(),
+            },
+        );
+
+        info!(
+            "Starting SFTP upload {} on session {}: {} -> {} ({} bytes)",
+            transfer_id,
+            session_id,
+            resolved_path.display(),
+            remote_path,
+            total_bytes
+        );
+
+        // Spawn background upload task
+        tokio::spawn(sftp_upload_streaming(
+            handle_arc,
+            resolved_path.clone(),
+            remote_path.clone(),
+            bytes_transferred,
+            cancel_token,
+            status_tx,
+            error,
+        ));
+
+        let message = UploadMessageBuilder::new(
+            &transfer_id,
+            &session_id,
+            resolved_path.to_string_lossy(),
+            &remote_path,
+            total_bytes,
+        )
+        .with_agent_id(agent_id.as_deref())
+        .build();
+
+        Ok(StructuredContent(SshUploadResponse {
+            transfer_id,
+            session_id,
+            agent_id,
+            local_path: resolved_path.to_string_lossy().into_owned(),
+            remote_path,
+            total_bytes,
+            message,
+        }))
+    }
+
+    /// Download a remote file to a local path via SFTP.
+    ///
+    /// Starts an asynchronous file download. Returns immediately with a
+    /// `transfer_id` for progress tracking.
+    ///
+    /// **Workflow:**
+    /// 1. ssh_download → get transfer_id
+    /// 2. ssh_get_transfer_progress(transfer_id, wait=true) → get result
+    ///
+    /// Streams the file in 32KB chunks with minimal memory usage.
+    ///
+    /// **Limits:** Up to 10 concurrent transfers per session.
+    async fn ssh_download(
+        &self,
+        /// Session ID returned from ssh_connect
+        session_id: String,
+        /// Remote file path to download from the SSH server
+        remote_path: String,
+        /// Local destination path (relative paths resolve to home directory)
+        local_path: String,
+    ) -> Result<StructuredContent<SshDownloadResponse>, String> {
+        // Check transfer limit
+        let current_count = TRANSFER_STORAGE.count_by_session(&session_id);
+        if current_count >= MAX_TRANSFERS_PER_SESSION {
+            return Err(format!(
+                "Maximum transfers per session reached ({}). Wait for existing transfers to complete.",
+                MAX_TRANSFERS_PER_SESSION
+            ));
+        }
+
+        // Get session handle and agent_id
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (s.handle.clone(), s.info.agent_id.clone()))
+            .ok_or_else(|| format!("No active SSH session with ID: {}", session_id))?;
+
+        // Resolve local path
+        let resolved_path = resolve_local_path(&local_path);
+
+        // Get remote file size via SFTP metadata
+        let sftp = open_sftp_session(&handle_arc).await?;
+        let remote_metadata = sftp.metadata(&remote_path).await.map_err(|e| {
+            format!(
+                "Failed to get remote file metadata for '{}': {}",
+                remote_path, e
+            )
+        })?;
+
+        let total_bytes = remote_metadata.size.unwrap_or(0);
+
+        let transfer_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        // Create shared state
+        let (status_tx, status_rx) = watch::channel(TransferStatus::Running);
+        let bytes_transferred = Arc::new(AtomicU64::new(0));
+        let total_bytes_arc = Arc::new(AtomicU64::new(total_bytes));
+        let cancel_token = CancellationToken::new();
+        let error = Arc::new(Mutex::new(None));
+
+        let transfer_info = TransferInfo {
+            transfer_id: transfer_id.clone(),
+            session_id: session_id.clone(),
+            direction: TransferDirection::Download,
+            local_path: resolved_path.to_string_lossy().into_owned(),
+            remote_path: remote_path.clone(),
+            started_at,
+        };
+
+        // Register transfer
+        TRANSFER_STORAGE.register(
+            transfer_id.clone(),
+            RunningTransfer {
+                info: transfer_info,
+                cancel_token: cancel_token.clone(),
+                bytes_transferred: bytes_transferred.clone(),
+                total_bytes: total_bytes_arc,
+                status_rx,
+                status_tx: status_tx.clone(),
+                error: error.clone(),
+            },
+        );
+
+        info!(
+            "Starting SFTP download {} on session {}: {} -> {} ({} bytes)",
+            transfer_id,
+            session_id,
+            remote_path,
+            resolved_path.display(),
+            total_bytes
+        );
+
+        // Spawn background download task
+        tokio::spawn(sftp_download_streaming(
+            handle_arc,
+            remote_path.clone(),
+            resolved_path.clone(),
+            bytes_transferred,
+            cancel_token,
+            status_tx,
+            error,
+        ));
+
+        let message = DownloadMessageBuilder::new(
+            &transfer_id,
+            &session_id,
+            &remote_path,
+            resolved_path.to_string_lossy(),
+            total_bytes,
+        )
+        .with_agent_id(agent_id.as_deref())
+        .build();
+
+        Ok(StructuredContent(SshDownloadResponse {
+            transfer_id,
+            session_id,
+            agent_id,
+            remote_path,
+            local_path: resolved_path.to_string_lossy().into_owned(),
+            total_bytes,
+            message,
+        }))
+    }
+
+    /// Get the current progress of a file transfer.
+    ///
+    /// **Polling mode** (`wait=false`): Returns immediately with current progress.
+    ///
+    /// **Blocking mode** (`wait=true`): Waits until the transfer completes or timeout expires.
+    ///
+    /// **Status values:** `running`, `completed`, `failed`, `cancelled`
+    async fn ssh_get_transfer_progress(
+        &self,
+        /// Transfer ID returned from ssh_upload or ssh_download
+        transfer_id: String,
+        /// If true, block until transfer completes or wait_timeout_secs expires
+        wait: Option<bool>,
+        /// Max seconds to wait when wait=true (default: 30, max: 300)
+        wait_timeout_secs: Option<u64>,
+    ) -> Result<StructuredContent<SshTransferProgressResponse>, String> {
+        let wait = wait.unwrap_or(false);
+        let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
+
+        // Get transfer state
+        let (status_rx, bytes_transferred, total_bytes_arc, error, info) = TRANSFER_STORAGE
+            .get_direct(&transfer_id)
+            .map(|t| {
+                (
+                    t.status_rx.clone(),
+                    t.bytes_transferred.clone(),
+                    t.total_bytes.clone(),
+                    t.error.clone(),
+                    t.info.clone(),
+                )
+            })
+            .ok_or_else(|| format!("No transfer with ID: {}", transfer_id))?;
+
+        // Optionally wait for completion
+        if wait {
+            let mut rx = status_rx.clone();
+            let _ = tokio::time::timeout(wait_timeout, async {
+                loop {
+                    let status = *rx.borrow();
+                    if status != TransferStatus::Running {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        // Read current state
+        let status = *status_rx.borrow();
+        let transferred = bytes_transferred.load(Ordering::SeqCst);
+        let total = total_bytes_arc.load(Ordering::SeqCst);
+        let error_val = error.lock().await.clone();
+
+        let progress_percent = if total > 0 {
+            ((transferred as f64 / total as f64) * 100.0).min(100.0) as u8
+        } else {
+            0
+        };
+
+        let direction_str = info.direction.to_string();
+        let status_str = status.to_string();
+
+        let message = TransferProgressMessageBuilder::new(
+            &transfer_id,
+            &direction_str,
+            &status_str,
+            transferred,
+            total,
+        )
+        .build();
+
+        Ok(StructuredContent(SshTransferProgressResponse {
+            transfer_id,
+            session_id: info.session_id,
+            direction: direction_str,
+            local_path: info.local_path,
+            remote_path: info.remote_path,
+            status: status_str,
+            bytes_transferred: transferred,
+            total_bytes: total,
+            progress_percent,
+            error: error_val,
+            message,
         }))
     }
 }

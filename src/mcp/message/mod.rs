@@ -7,6 +7,7 @@
 mod builder;
 
 pub use builder::{
-    AgentDisconnectMessageBuilder, ConnectMessageBuilder, ExecuteMessageBuilder,
-    ShellOpenMessageBuilder,
+    AgentDisconnectMessageBuilder, ConnectMessageBuilder, DownloadMessageBuilder,
+    ExecuteMessageBuilder, ShellOpenMessageBuilder, TransferProgressMessageBuilder,
+    UploadMessageBuilder,
 };
