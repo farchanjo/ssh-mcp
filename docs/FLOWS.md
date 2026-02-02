@@ -42,7 +42,7 @@ stateDiagram-v2
     Disconnected --> [*]
 
     note right of Connected
-        Session stored in SSH_SESSIONS
+        Session stored in SESSION_STORAGE
         with unique UUID
     end note
 
@@ -88,7 +88,7 @@ sequenceDiagram
     participant Retry as client.rs with backon
     participant SSH as russh client
     participant Server as SSH Server
-    participant Store as SSH_SESSIONS
+    participant Store as SESSION_STORAGE
 
     Client->>Cmd: ssh_connect request
 
@@ -157,9 +157,9 @@ sequenceDiagram
     Cmd->>Cmd: Create SessionInfo with optional name
     Cmd->>Cmd: Set persistent flag if requested
     Cmd->>Cmd: Wrap Handle in Arc Mutex
-    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Lock SESSION_STORAGE
     Cmd->>Store: Insert StoredSession
-    Cmd->>Store: Unlock SSH_SESSIONS
+    Cmd->>Store: Unlock SESSION_STORAGE
 
     Cmd-->>Client: SshConnectResponse with persistent indicator
 ```
@@ -392,8 +392,8 @@ Flow of the `ssh_execute` operation for long-running commands that return immedi
 sequenceDiagram
     participant Client as MCP Client
     participant Cmd as McpSSHCommands
-    participant AsyncStore as ASYNC_COMMANDS
-    participant Store as SSH_SESSIONS
+    participant AsyncStore as COMMAND_STORAGE
+    participant Store as SESSION_STORAGE
     participant Task as Background Task
     participant Handle as russh Handle
     participant Channel as SSH Channel
@@ -410,10 +410,10 @@ sequenceDiagram
     end
 
     Note over Cmd,Store: Get session handle
-    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Lock SESSION_STORAGE
     Cmd->>Store: Get session by ID
     Cmd->>Store: Clone Arc of handle
-    Cmd->>Store: Unlock SSH_SESSIONS
+    Cmd->>Store: Unlock SESSION_STORAGE
 
     Note over Cmd: Generate command_id UUID
 
@@ -426,9 +426,9 @@ sequenceDiagram
     Cmd->>Cmd: Create CancellationToken
 
     Note over Cmd,AsyncStore: Store running command
-    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Lock COMMAND_STORAGE
     Cmd->>AsyncStore: Insert RunningCommand
-    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Unlock COMMAND_STORAGE
 
     Note over Cmd,Task: Spawn background task
     Cmd->>Task: tokio spawn execute_ssh_command_async
@@ -482,16 +482,16 @@ The `ssh_get_command_output` tool allows clients to poll for command status and 
 sequenceDiagram
     participant Client as MCP Client
     participant Cmd as McpSSHCommands
-    participant AsyncStore as ASYNC_COMMANDS
+    participant AsyncStore as COMMAND_STORAGE
     participant Task as Background Task
 
     Client->>Cmd: ssh_get_command_output request
 
     Note over Cmd,AsyncStore: Get command state
-    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Lock COMMAND_STORAGE
     Cmd->>AsyncStore: Get command by ID
     Cmd->>Cmd: Clone status_rx output exit_code error timed_out
-    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Unlock COMMAND_STORAGE
 
     alt wait equals true
         Note over Cmd: Wait for completion with timeout
@@ -577,7 +577,7 @@ flowchart TD
     SessionExists -->|No| SessionError([Error: No active session])
     SessionExists -->|Yes| CreateState[Create shared state]
 
-    CreateState --> Store[Store in ASYNC_COMMANDS]
+    CreateState --> Store[Store in COMMAND_STORAGE]
     Store --> Spawn[Spawn background task]
     Spawn --> Return([Return command_id])
 
@@ -771,14 +771,14 @@ Flow of the `ssh_cancel_command` operation to stop a running async command.
 sequenceDiagram
     participant Client as MCP Client
     participant Cmd as McpSSHCommands
-    participant AsyncStore as ASYNC_COMMANDS
+    participant AsyncStore as COMMAND_STORAGE
     participant Task as Background Task
     participant Channel as SSH Channel
 
     Client->>Cmd: ssh_cancel_command request
 
     Note over Cmd,AsyncStore: Get command state
-    Cmd->>AsyncStore: Lock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Lock COMMAND_STORAGE
     Cmd->>AsyncStore: Get command by ID
     Cmd->>Cmd: Check current status
 
@@ -787,7 +787,7 @@ sequenceDiagram
     end
 
     Cmd->>Cmd: Clone cancel_token output status_rx
-    Cmd->>AsyncStore: Unlock ASYNC_COMMANDS
+    Cmd->>AsyncStore: Unlock COMMAND_STORAGE
 
     Note over Cmd,Task: Signal cancellation
     Cmd->>Task: cancel_token.cancel
@@ -958,7 +958,7 @@ Flow of the `ssh_forward` operation when port_forward feature is enabled.
 sequenceDiagram
     participant Client as MCP Client
     participant Cmd as McpSSHCommands
-    participant Store as SSH_SESSIONS
+    participant Store as SESSION_STORAGE
     participant Fwd as setup_port_forwarding
     participant Listener as TCP Listener
     participant Handler as Connection Handler
@@ -969,10 +969,10 @@ sequenceDiagram
     Client->>Cmd: ssh_forward request
 
     Note over Cmd,Store: Get session handle
-    Cmd->>Store: Lock SSH_SESSIONS
+    Cmd->>Store: Lock SESSION_STORAGE
     Cmd->>Store: Get session by ID
     Cmd->>Store: Clone Arc of handle
-    Cmd->>Store: Unlock SSH_SESSIONS
+    Cmd->>Store: Unlock SESSION_STORAGE
 
     Cmd->>Fwd: setup_port_forwarding
 

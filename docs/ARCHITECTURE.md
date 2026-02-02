@@ -28,7 +28,7 @@ flowchart TB
 
     subgraph Core["SSH MCP Core"]
         MCP["McpSSHCommands<br/>(MCP Tools)"]
-        Sessions["Session Store<br/>(SSH_SESSIONS)"]
+        Sessions["Session Store<br/>(SESSION_STORAGE)"]
     end
 
     subgraph SSH["SSH Layer"]
@@ -453,14 +453,14 @@ classDiagram
         +check_server_key() Result~bool~
     }
 
-    class SSH_SESSIONS {
+    class SESSION_STORAGE {
         <<global>>
-        Lazy~DashMap~~
+        LazyLock~DashMapSessionStorage~
     }
 
-    class ASYNC_COMMANDS {
+    class COMMAND_STORAGE {
         <<global>>
-        Lazy~DashMap~~
+        LazyLock~DashMapCommandStorage~
     }
 
     McpSSHCommands ..> StoredSession : manages
@@ -472,14 +472,14 @@ classDiagram
     McpSSHCommands ..> AgentDisconnectResponse : returns
     StoredSession *-- SessionInfo : contains
     StoredSession --> SshClientHandler : uses
-    SSH_SESSIONS --> StoredSession : stores
-    ASYNC_COMMANDS --> RunningCommand : stores
+    SESSION_STORAGE --> StoredSession : stores
+    COMMAND_STORAGE --> RunningCommand : stores
     RunningCommand *-- AsyncCommandInfo : contains
     RunningCommand *-- OutputBuffer : contains
     AsyncCommandInfo --> AsyncCommandStatus : has
 
-    note for SSH_SESSIONS "SESSION_STORAGE using\nDashMap (lock-free)"
-    note for ASYNC_COMMANDS "COMMAND_STORAGE using\nDashMap (lock-free)\nMax 100 commands per session"
+    note for SESSION_STORAGE "DashMapSessionStorage\nDashMap (lock-free)"
+    note for COMMAND_STORAGE "DashMapCommandStorage\nDashMap (lock-free)\nMax 100 commands per session"
 ```
 
 </details>
@@ -1021,7 +1021,7 @@ flowchart TB
         Backon["backon 1.x<br/>Retry Logic"]
         Serde["serde 1.0<br/>Serialization"]
         UUID["uuid 1.16<br/>Session IDs"]
-        OnceCell["once_cell 1.21<br/>Lazy Statics"]
+        DashMap2["dashmap 6<br/>Lock-free Maps"]
     end
 
     PoemMCP --> Poem
@@ -1046,7 +1046,7 @@ flowchart TB
 | `backon` | 1.x | Retry logic with exponential backoff |
 | `serde` | 1.0 | JSON serialization/deserialization |
 | `uuid` | 1.16 | UUID v4 generation for session and command IDs |
-| `once_cell` | 1.21 | Lazy static initialization |
+| `dashmap` | 6 | Lock-free concurrent hashmap for storage |
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Tracing output and filtering |
 | `chrono` | 0.4 | Timestamp generation |

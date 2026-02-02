@@ -51,7 +51,7 @@ Secondary indices for O(1) lookups: agent-to-sessions, session-to-commands, sess
 ### Authentication Layer (`src/mcp/auth/`)
 
 Strategy pattern via `AuthStrategy` trait with `AuthChain` for fallback:
-- `PasswordAuth`, `KeyAuth` (RSA/Ed25519/ECDSA), `AgentAuth` (SSH agent)
+- `PasswordAuth`, `KeyAuth` (RSA/Ed25519), `AgentAuth` (SSH agent)
 
 ### Message Layer (`src/mcp/message/`)
 
