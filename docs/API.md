@@ -22,6 +22,9 @@ This document provides a complete API reference for all MCP tools exposed by the
   - [ssh_shell_write](#ssh_shell_write)
   - [ssh_shell_read](#ssh_shell_read)
   - [ssh_shell_close](#ssh_shell_close)
+  - [ssh_upload](#ssh_upload)
+  - [ssh_download](#ssh_download)
+  - [ssh_get_transfer_progress](#ssh_get_transfer_progress)
 - [Response Types](#response-types)
 - [Error Responses](#error-responses)
 - [Examples](#examples)
@@ -43,6 +46,8 @@ This document provides a complete API reference for all MCP tools exposed by the
 5. **POLL with `ssh_get_command_output`** for long-running commands (builds, deploys)
 6. **SAVE `shell_id`** from `ssh_shell_open` - required for shell read/write/close
 7. **USE `ssh_shell_*` tools** for interactive PTY sessions (SOL/IPMI/OOB consoles)
+8. **SAVE `transfer_id`** from `ssh_upload`/`ssh_download` - required for progress tracking
+9. **POLL with `ssh_get_transfer_progress`** for file transfer status
 
 **Typical Workflow:**
 ```
@@ -52,6 +57,11 @@ ssh_connect → session_id → ssh_execute → command_id → ssh_get_command_ou
 **Interactive Shell Workflow:**
 ```
 ssh_connect → session_id → ssh_shell_open → shell_id → ssh_shell_write/read → ssh_shell_close
+```
+
+**SFTP Transfer Workflow:**
+```
+ssh_connect → session_id → ssh_upload/ssh_download → transfer_id → ssh_get_transfer_progress → done
 ```
 
 ---
@@ -64,6 +74,7 @@ ssh_connect → session_id → ssh_shell_open → shell_id → ssh_shell_write/r
 | `command_id` | `ssh_execute` returns | `ssh_get_command_output`, `ssh_cancel_command` | Tracks background command |
 | `agent_id` | You provide to `ssh_connect` | `ssh_list_sessions`, `ssh_disconnect_agent` | Groups sessions for bulk operations |
 | `shell_id` | `ssh_shell_open` returns | `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close` | Identifies interactive shell |
+| `transfer_id` | `ssh_upload`/`ssh_download` returns | `ssh_get_transfer_progress` | Tracks SFTP file transfer |
 
 **Identifier Flow Diagram:**
 ```
@@ -133,7 +144,7 @@ ssh_connect → session_id → ssh_shell_open → shell_id → ssh_shell_write/r
 
 ## Overview
 
-SSH MCP exposes 13 tools for managing SSH connections, commands, interactive shells, and port forwarding:
+SSH MCP exposes 16 tools for managing SSH connections, commands, interactive shells, SFTP transfers, and port forwarding:
 
 | Tool | Action | Returns | Feature Flag |
 |------|--------|---------|--------------|
@@ -150,6 +161,9 @@ SSH MCP exposes 13 tools for managing SSH connections, commands, interactive she
 | `ssh_shell_write` | **SENDS** input to shell | confirmation | - |
 | `ssh_shell_read` | **READS** shell output | data, status | - |
 | `ssh_shell_close` | **CLOSES** interactive shell | confirmation | - |
+| `ssh_upload` | **UPLOADS** file via SFTP | `transfer_id` to SAVE | - |
+| `ssh_download` | **DOWNLOADS** file via SFTP | `transfer_id` to SAVE | - |
+| `ssh_get_transfer_progress` | **CHECKS** transfer status/progress | status, bytes, percent | - |
 
 ---
 

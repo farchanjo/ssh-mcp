@@ -1188,13 +1188,15 @@ sequenceDiagram
 
 | Module | Responsibility |
 |--------|----------------|
-| `commands.rs` | MCP tool entry points and response building (13 tools) |
+| `commands.rs` | MCP tool entry points and response building (16 tools) |
 | `client.rs` | SSH connection, authentication, command execution, PTY channels |
 | `session.rs` | SSH client handler for russh |
 | `shell.rs` | Interactive PTY shell session types |
+| `sftp.rs` | SFTP session management, streaming transfers, error classification |
+| `transfer.rs` | Transfer tracking types (RunningTransfer, TransferStatus) |
 | `config.rs` | Configuration resolution with priority chain |
 | `error.rs` | Error classification for retry decisions |
 | `forward.rs` | Port forwarding with bidirectional IO |
-| `storage/` | Session, command, and shell storage with lock-free DashMap |
+| `storage/` | Session, command, shell, and transfer storage with lock-free DashMap |
 | `auth/` | Authentication strategies (password, key, agent, chain) |
 | `message/` | Fluent message builders for LLM-friendly responses |

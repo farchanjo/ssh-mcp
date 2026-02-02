@@ -72,34 +72,37 @@ flowchart TB
 
 ## Module Structure
 
-The codebase consists of **27 source files** organized into a modular SOLID architecture:
+The codebase consists of **30 source files** organized into a modular SOLID architecture:
 
 ### Core Modules (`src/mcp/`)
 
 | File | Lines | Visibility | Description |
 |------|-------|------------|-------------|
 | `lib.rs` | - | `pub` | Library crate root, exposes `mcp` module |
-| `mod.rs` | 40 | - | Module root, re-exports `McpSSHCommands` |
-| `types.rs` | 1354 | `pub` | Serializable response types for MCP tools (session, command, shell) |
+| `mod.rs` | 42 | - | Module root, re-exports `McpSSHCommands` |
+| `types.rs` | 1646 | `pub` | Serializable response types for MCP tools (session, command, shell, transfer) |
 | `config.rs` | 669 | `pub(crate)` | Configuration resolution with environment variable support |
 | `error.rs` | 359 | `pub(crate)` | Error classification for retry logic |
 | `session.rs` | 41 | `pub` | SSH client handler |
 | `client.rs` | 900 | `pub(crate)` | SSH connection, authentication, command execution, PTY channels |
 | `forward.rs` | 155 | `pub(crate)` | Port forwarding implementation (feature-gated) |
 | `async_command.rs` | 183 | `pub(crate)` | Async command types (`RunningCommand`, `OutputBuffer`) |
-| `shell.rs` | 147 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
+| `shell.rs` | 146 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
 | `schema.rs` | 118 | `pub` | JSON schema helpers for LLM-friendly schemas |
-| `commands.rs` | 1082 | `pub` | MCP tool implementations via `#[Tools]` macro (13 tools) |
+| `commands.rs` | 1453 | `pub` | MCP tool implementations via `#[Tools]` macro (16 tools) |
+| `sftp.rs` | 601 | `pub(crate)` | SFTP session management, streaming transfer, error classification |
+| `transfer.rs` | 341 | `pub(crate)` | Transfer tracking types (`RunningTransfer`, `TransferStatus`, `TransferDirection`) |
 
 ### Storage Layer (`src/mcp/storage/`) - SOLID: SRP, DIP
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 23 | Module exports and global storage instances |
-| `traits.rs` | 107 | `SessionStorage` and `CommandStorage` trait definitions |
-| `session.rs` | 491 | `DashMapSessionStorage` with agent index and tests |
-| `command.rs` | 996 | `DashMapCommandStorage` with session index and tests |
-| `shell.rs` | 208 | `DashMapShellStorage` with session index and tests |
+| `mod.rs` | 26 | Module exports and global storage instances |
+| `traits.rs` | 168 | `SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage` trait definitions |
+| `session.rs` | 493 | `DashMapSessionStorage` with agent index and tests |
+| `command.rs` | 998 | `DashMapCommandStorage` with session index and tests |
+| `shell.rs` | 179 | `DashMapShellStorage` with session index and tests |
+| `transfer.rs` | 179 | `DashMapTransferStorage` with session index and tests |
 
 ### Authentication Layer (`src/mcp/auth/`) - SOLID: OCP, SRP
 
@@ -116,8 +119,8 @@ The codebase consists of **27 source files** organized into a modular SOLID arch
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 12 | Module exports |
-| `builder.rs` | 982 | Fluent message builders with comprehensive tests |
+| `mod.rs` | 13 | Module exports |
+| `builder.rs` | 1335 | Fluent message builders with comprehensive tests |
 
 ### Module Responsibilities
 
@@ -173,20 +176,36 @@ The codebase consists of **27 source files** organized into a modular SOLID arch
   - `exit_code`, `error`, `timed_out` - Completion state
 - `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
 
-**commands.rs** - MCP Tools (13 total)
+**commands.rs** - MCP Tools (16 total)
 - `McpSSHCommands` struct with `#[Tools]` impl
-- Uses storage traits (`SessionStorage`, `CommandStorage`, `ShellStorage`) via global instances
+- Uses storage traits (`SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage`) via global instances
 - Uses message builders for LLM-friendly responses
 - Session tools: `ssh_connect`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
 - Command tools: `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`
 - Shell tools: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close`
+- SFTP tools: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`
 - Port forwarding: `ssh_forward`
+
+**sftp.rs** - SFTP Operations
+- `open_sftp_session()` - Opens SFTP subsystem on existing SSH handle
+- `sftp_upload_streaming()` - Streaming upload with progress tracking
+- `sftp_download_streaming()` - Streaming download with progress tracking
+- `classify_transfer_error()` - Maps raw errors to `[FILE_NOT_FOUND]`, `[REMOTE_DIR_NOT_FOUND]`, etc.
+- `resolve_local_path()` - Resolves `~` and relative paths
+
+**transfer.rs** - Transfer Tracking Types
+- `RunningTransfer` - State container for async SFTP transfers
+- `TransferStatus` - Enum: Running, Completed, Failed
+- `TransferDirection` - Enum: Upload, Download
+- `CHUNK_SIZE = 32768` - SFTP transfer chunk size
 
 ### Storage Layer (storage/)
 
 **storage/traits.rs** - Storage Abstractions (DIP)
 - `SessionStorage` trait - CRUD for SSH sessions
 - `CommandStorage` trait - CRUD for async commands
+- `ShellStorage` trait - CRUD for interactive shells
+- `TransferStorage` trait - CRUD for SFTP transfers
 - `SessionRef`, `CommandRef` - Read-only reference types
 
 **storage/session.rs** - Session Storage Implementation
@@ -206,6 +225,12 @@ The codebase consists of **27 source files** organized into a modular SOLID arch
 - `SHELLS_BY_SESSION` - Secondary index for O(1) session lookups
 - `SHELL_STORAGE` - Global instance
 - `MAX_SHELLS_PER_SESSION = 10`
+
+**storage/transfer.rs** - Transfer Storage Implementation
+- `TransferStorage` trait - CRUD for SFTP transfer sessions
+- `DashMapTransferStorage` - Lock-free concurrent transfer storage
+- `TRANSFERS_BY_SESSION` - Secondary index for O(1) session lookups
+- `TRANSFER_STORAGE` - Global instance
 
 ### Authentication Layer (auth/)
 
@@ -232,6 +257,9 @@ pub trait AuthStrategy: Send + Sync {
 - `ExecuteMessageBuilder` - Command start messages
 - `AgentDisconnectMessageBuilder` - Cleanup summary messages
 - `ShellOpenMessageBuilder` - Interactive shell open messages
+- `UploadMessageBuilder` - SFTP upload messages
+- `DownloadMessageBuilder` - SFTP download messages
+- `TransferProgressMessageBuilder` - Transfer progress messages
 - Fluent builder pattern for LLM-friendly formatted responses
 
 ---
@@ -488,6 +516,15 @@ classDiagram
 | `ShellStatus` | types.rs | Enum representing shell states: Open, Closed |
 | `ConnectMessageBuilder` | message/builder.rs | Fluent builder for connection success messages |
 | `ShellOpenMessageBuilder` | message/builder.rs | Fluent builder for shell open messages |
+| `UploadMessageBuilder` | message/builder.rs | Fluent builder for SFTP upload messages |
+| `DownloadMessageBuilder` | message/builder.rs | Fluent builder for SFTP download messages |
+| `TransferProgressMessageBuilder` | message/builder.rs | Fluent builder for transfer progress messages |
+| `TransferStorage` | storage/traits.rs | Trait for SFTP transfer CRUD operations (DIP) |
+| `DashMapTransferStorage` | storage/transfer.rs | Lock-free concurrent transfer storage with session index |
+| `TRANSFER_STORAGE` | storage/transfer.rs | Global transfer storage instance (implements `TransferStorage`) |
+| `RunningTransfer` | transfer.rs | State container for async SFTP transfers |
+| `TransferStatus` | transfer.rs | Enum representing transfer states: Running, Completed, Failed |
+| `TransferDirection` | transfer.rs | Enum representing transfer direction: Upload, Download |
 
 ---
 
