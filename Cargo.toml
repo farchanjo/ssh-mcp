@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 description = "SSH Model Context Protocol Server Integration"
 authors = ["farchanjo"]
@@ -24,7 +24,7 @@ path = "src/lib.rs"
 [dependencies]
 # Web and MCP
 poem = "3.1"                                                                # Match version used by poem-mcpserver
-poem-mcpserver = { version = "0.2.9", features = ["streamable-http"] }
+poem-mcpserver = { version = "0.3.1", features = ["streamable-http"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 
