@@ -17,6 +17,8 @@
 //! | `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout in seconds |
 //! | `SSH_COMPRESSION` | true | Enable zlib compression |
 //! | `SSH_COMMAND_CLEANUP_TTL` | 60s | TTL before unread command output is cleaned up |
+//! | `SSH_SHELL_INACTIVITY_TTL` | 600s | Shell auto-close after inactivity |
+//! | `SSH_SHELL_MAX_BUFFER_SIZE` | 10m | Max shell output buffer (supports b/k/m/g/t) |
 
 use std::env;
 use std::time::Duration;
@@ -62,6 +64,18 @@ pub const DEFAULT_COMMAND_CLEANUP_TTL: Duration = Duration::from_secs(60);
 
 /// Environment variable name for command cleanup TTL
 pub const COMMAND_CLEANUP_TTL_ENV_VAR: &str = "SSH_COMMAND_CLEANUP_TTL";
+
+/// Default shell inactivity timeout (seconds) — auto-close after no read/write
+pub const DEFAULT_SHELL_INACTIVITY_TTL: Duration = Duration::from_secs(600);
+
+/// Environment variable name for shell inactivity TTL
+pub const SHELL_INACTIVITY_TTL_ENV_VAR: &str = "SSH_SHELL_INACTIVITY_TTL";
+
+/// Default shell output buffer max size (10 MB)
+pub const DEFAULT_SHELL_MAX_BUFFER_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Environment variable name for shell output buffer max size
+pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
 #[must_use]
@@ -181,6 +195,102 @@ pub fn resolve_command_cleanup_ttl() -> Duration {
     }
 
     DEFAULT_COMMAND_CLEANUP_TTL
+}
+
+/// Parse a human-readable byte size string with unit suffixes.
+///
+/// Supports case-insensitive suffixes:
+/// - `b` or no suffix: bytes
+/// - `k` / `kb`: kilobytes (×1024)
+/// - `m` / `mb`: megabytes (×1024²)
+/// - `g` / `gb`: gigabytes (×1024³)
+/// - `t` / `tb`: terabytes (×1024⁴)
+///
+/// Examples: `"512k"`, `"10m"`, `"1g"`, `"1024"`, `"500mb"`, `"2tb"`
+pub fn parse_byte_size(input: &str) -> Option<u64> {
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return None;
+    }
+
+    let (num_part, multiplier) = parse_suffix(&input);
+    num_part
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+}
+
+/// Extract the numeric part and byte multiplier from a size string.
+fn parse_suffix(input: &str) -> (&str, u64) {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const TB: u64 = 1024 * 1024 * 1024 * 1024;
+
+    // Check two-char suffixes first, then single-char
+    let suffixes: &[(&str, u64)] = &[("tb", TB), ("gb", GB), ("mb", MB), ("kb", KB)];
+
+    for (suffix, mult) in suffixes {
+        if let Some(n) = input.strip_suffix(suffix) {
+            return (n, *mult);
+        }
+    }
+
+    let single_suffixes: &[(&str, u64)] = &[("t", TB), ("g", GB), ("m", MB), ("k", KB), ("b", 1)];
+
+    for (suffix, mult) in single_suffixes {
+        if let Some(n) = input.strip_suffix(suffix) {
+            return (n, *mult);
+        }
+    }
+
+    (input, 1)
+}
+
+/// Resolve the shell inactivity TTL with priority: parameter -> env var -> default (600s)
+///
+/// Controls how long an idle shell (no read/write) stays open before auto-close.
+#[must_use]
+pub fn resolve_shell_inactivity_ttl(ttl_param: Option<u64>) -> Duration {
+    // Priority 1: Use parameter if provided
+    if let Some(ttl) = ttl_param {
+        return Duration::from_secs(ttl);
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_ttl) = env::var(SHELL_INACTIVITY_TTL_ENV_VAR)
+        && let Ok(ttl) = env_ttl.parse::<u64>()
+    {
+        return Duration::from_secs(ttl);
+    }
+
+    // Priority 3: Default value
+    DEFAULT_SHELL_INACTIVITY_TTL
+}
+
+/// Resolve the shell output buffer max size with priority: parameter -> env var -> default (10m)
+///
+/// Accepts human-readable byte sizes (e.g., `"512k"`, `"10m"`, `"1g"`).
+/// When the buffer exceeds this size, oldest output is truncated.
+#[must_use]
+pub fn resolve_shell_max_buffer_size(size_param: Option<&str>) -> u64 {
+    // Priority 1: Use parameter if provided
+    if let Some(size_str) = size_param
+        && let Some(size) = parse_byte_size(size_str)
+    {
+        return size;
+    }
+
+    // Priority 2: Use environment variable if set
+    if let Ok(env_size) = env::var(SHELL_MAX_BUFFER_SIZE_ENV_VAR)
+        && let Some(size) = parse_byte_size(&env_size)
+    {
+        return size;
+    }
+
+    // Priority 3: Default value
+    DEFAULT_SHELL_MAX_BUFFER_SIZE
 }
 
 #[cfg(test)]
@@ -695,6 +805,194 @@ mod tests {
                 }
                 let result = resolve_compression(None);
                 assert!(result);
+            }
+        }
+
+        mod parse_byte_size_tests {
+            use super::*;
+
+            #[test]
+            fn test_plain_number_is_bytes() {
+                assert_eq!(parse_byte_size("1024"), Some(1024));
+            }
+
+            #[test]
+            fn test_bytes_suffix() {
+                assert_eq!(parse_byte_size("100b"), Some(100));
+            }
+
+            #[test]
+            fn test_kilobytes() {
+                assert_eq!(parse_byte_size("1k"), Some(1024));
+                assert_eq!(parse_byte_size("1kb"), Some(1024));
+            }
+
+            #[test]
+            fn test_megabytes() {
+                assert_eq!(parse_byte_size("10m"), Some(10 * 1024 * 1024));
+                assert_eq!(parse_byte_size("10mb"), Some(10 * 1024 * 1024));
+            }
+
+            #[test]
+            fn test_gigabytes() {
+                assert_eq!(parse_byte_size("1g"), Some(1024 * 1024 * 1024));
+                assert_eq!(parse_byte_size("2gb"), Some(2 * 1024 * 1024 * 1024));
+            }
+
+            #[test]
+            fn test_terabytes() {
+                assert_eq!(parse_byte_size("1t"), Some(1024_u64 * 1024 * 1024 * 1024));
+                assert_eq!(parse_byte_size("1tb"), Some(1024_u64 * 1024 * 1024 * 1024));
+            }
+
+            #[test]
+            fn test_case_insensitive() {
+                assert_eq!(parse_byte_size("10M"), Some(10 * 1024 * 1024));
+                assert_eq!(parse_byte_size("1GB"), Some(1024 * 1024 * 1024));
+                assert_eq!(parse_byte_size("512K"), Some(512 * 1024));
+            }
+
+            #[test]
+            fn test_whitespace_trimmed() {
+                assert_eq!(parse_byte_size("  10m  "), Some(10 * 1024 * 1024));
+            }
+
+            #[test]
+            fn test_empty_is_none() {
+                assert_eq!(parse_byte_size(""), None);
+                assert_eq!(parse_byte_size("  "), None);
+            }
+
+            #[test]
+            fn test_invalid_is_none() {
+                assert_eq!(parse_byte_size("abc"), None);
+                assert_eq!(parse_byte_size("m"), None);
+            }
+
+            #[test]
+            fn test_zero_is_valid() {
+                assert_eq!(parse_byte_size("0"), Some(0));
+                assert_eq!(parse_byte_size("0m"), Some(0));
+            }
+        }
+
+        mod shell_inactivity_ttl {
+            use super::*;
+
+            #[test]
+            fn test_uses_param_when_provided() {
+                let result = resolve_shell_inactivity_ttl(Some(120));
+                assert_eq!(result, Duration::from_secs(120));
+            }
+
+            #[test]
+            fn test_param_takes_priority_over_env() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_INACTIVITY_TTL_ENV_VAR, "300") };
+                let result = resolve_shell_inactivity_ttl(Some(60));
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_INACTIVITY_TTL_ENV_VAR) };
+                assert_eq!(result, Duration::from_secs(60));
+            }
+
+            #[test]
+            fn test_uses_env_var_when_no_param() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_INACTIVITY_TTL_ENV_VAR, "900") };
+                let result = resolve_shell_inactivity_ttl(None);
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_INACTIVITY_TTL_ENV_VAR) };
+                assert_eq!(result, Duration::from_secs(900));
+            }
+
+            #[test]
+            fn test_uses_default_when_no_param_or_env() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_INACTIVITY_TTL_ENV_VAR) };
+                let result = resolve_shell_inactivity_ttl(None);
+                assert_eq!(result, DEFAULT_SHELL_INACTIVITY_TTL);
+            }
+
+            #[test]
+            fn test_default_is_600_seconds() {
+                assert_eq!(DEFAULT_SHELL_INACTIVITY_TTL, Duration::from_secs(600));
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_INACTIVITY_TTL_ENV_VAR, "invalid") };
+                let result = resolve_shell_inactivity_ttl(None);
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_INACTIVITY_TTL_ENV_VAR) };
+                assert_eq!(result, DEFAULT_SHELL_INACTIVITY_TTL);
+            }
+        }
+
+        mod shell_max_buffer_size {
+            use super::*;
+
+            #[test]
+            fn test_uses_param_when_provided() {
+                let result = resolve_shell_max_buffer_size(Some("512k"));
+                assert_eq!(result, 512 * 1024);
+            }
+
+            #[test]
+            fn test_param_takes_priority_over_env() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR, "1g") };
+                let result = resolve_shell_max_buffer_size(Some("5m"));
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR) };
+                assert_eq!(result, 5 * 1024 * 1024);
+            }
+
+            #[test]
+            fn test_uses_env_var_when_no_param() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR, "20m") };
+                let result = resolve_shell_max_buffer_size(None);
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR) };
+                assert_eq!(result, 20 * 1024 * 1024);
+            }
+
+            #[test]
+            fn test_uses_default_when_no_param_or_env() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR) };
+                let result = resolve_shell_max_buffer_size(None);
+                assert_eq!(result, DEFAULT_SHELL_MAX_BUFFER_SIZE);
+            }
+
+            #[test]
+            fn test_default_is_10mb() {
+                assert_eq!(DEFAULT_SHELL_MAX_BUFFER_SIZE, 10 * 1024 * 1024);
+            }
+
+            #[test]
+            fn test_ignores_invalid_param() {
+                let result = resolve_shell_max_buffer_size(Some("invalid"));
+                assert_eq!(result, DEFAULT_SHELL_MAX_BUFFER_SIZE);
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR, "invalid") };
+                let result = resolve_shell_max_buffer_size(None);
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SHELL_MAX_BUFFER_SIZE_ENV_VAR) };
+                assert_eq!(result, DEFAULT_SHELL_MAX_BUFFER_SIZE);
             }
         }
     }

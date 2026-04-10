@@ -7,7 +7,7 @@ cargo build --release                              # Build all binaries
 cargo build --release --bin ssh-mcp                # HTTP server only
 cargo build --release --bin ssh-mcp-stdio           # Stdio transport only
 cargo build --release --no-default-features         # Without port forwarding
-cargo test --all-features                           # Run tests (438 tests)
+cargo test --all-features                           # Run tests (477 tests)
 cargo fmt --all -- --check                          # Check formatting
 cargo clippy -- -D warnings                         # Lint
 cargo dupes                                          # Code duplication detection (cargo-dupes)
@@ -77,6 +77,9 @@ All settings follow: **Parameter -> Environment Variable -> Default**
 | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay |
 | `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout |
 | `SSH_COMPRESSION` | true | Enable zlib compression |
+| `SSH_COMMAND_CLEANUP_TTL` | 60s | TTL before unread command output is cleaned up |
+| `SSH_SHELL_INACTIVITY_TTL` | 600s | Shell auto-close after inactivity (no read/write) |
+| `SSH_SHELL_MAX_BUFFER_SIZE` | 10m | Max shell output buffer size (supports b/k/m/g/t suffixes) |
 | `MCP_HOST` | 0.0.0.0 | HTTP server bind address |
 | `MCP_PORT` | 8000 | HTTP server port |
 | `RUST_LOG` | info | Log level filter |
@@ -105,5 +108,5 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 - Methods < 30 lines, SOLID principles
 - Lock-free data structures (`DashMap`) for concurrent access
-- 438 unit tests (`cargo test --all-features`)
+- 477 unit tests (`cargo test --all-features`)
 - Feature flag: `port_forward` (default: enabled)
