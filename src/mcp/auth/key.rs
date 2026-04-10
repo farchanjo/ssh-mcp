@@ -42,8 +42,10 @@ impl AuthStrategy for KeyAuth {
         let path = Path::new(&self.key_path);
 
         // Load the secret key (supports passphrase-less keys)
-        let key_pair = keys::load_secret_key(path, None)
-            .map_err(|e| format!("Failed to load private key from {:?}: {}", self.key_path, e))?;
+        let key_pair = keys::load_secret_key(path, None).map_err(|e| {
+            let path = &self.key_path;
+            format!("Failed to load private key from {}: {e}", path.display())
+        })?;
 
         // For RSA keys, use the best supported hash algorithm
         let hash_alg = handle
@@ -60,7 +62,7 @@ impl AuthStrategy for KeyAuth {
         let result = handle
             .authenticate_publickey(username, key_with_hash)
             .await
-            .map_err(|e| format!("Key authentication failed: {}", e))?;
+            .map_err(|e| format!("Key authentication failed: {e}"))?;
 
         Ok(result.success())
     }

@@ -18,7 +18,7 @@
 //!
 //! ## SOLID Architecture Modules
 //!
-//! - [`storage`]: Storage traits (`SessionStorage`, `CommandStorage`) with DashMap implementations
+//! - [`storage`]: Storage traits (`SessionStorage`, `CommandStorage`) with `DashMap` implementations
 //! - [`auth`]: Authentication strategies (`PasswordAuth`, `KeyAuth`, `AgentAuth`, `AuthChain`)
 //! - [`message`]: Message builders for LLM-friendly responses
 
@@ -38,5 +38,3 @@ pub(crate) mod shell;
 pub mod storage;
 pub(crate) mod transfer;
 pub mod types;
-
-pub use commands::McpSSHCommands;

@@ -10,6 +10,7 @@
 //! - `sftp_upload_streaming`: Streams a local file to remote via SFTP
 //! - `sftp_download_streaming`: Streams a remote file to local via SFTP
 
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use russh::client;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::File as SftpFile;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -43,49 +45,52 @@ use super::transfer::{CHUNK_SIZE, TransferStatus};
 /// | `SFTP_PROTOCOL` | SFTP channel/subsystem failure |
 /// | `TIMEOUT` | Operation timed out |
 /// | `IO_ERROR` | Generic IO fallback |
-pub(crate) fn classify_transfer_error(operation: &str, raw_error: &str) -> String {
+#[must_use]
+pub fn classify_transfer_error(operation: &str, raw_error: &str) -> String {
     let lower = raw_error.to_lowercase();
+    let (code, detail) = match_error_pattern(&lower, operation);
+    format!("[{code}] {operation}: {detail} (raw: {raw_error})")
+}
 
-    let (code, detail) =
-        if lower.contains("read-only file system") || lower.contains("read only file system") {
-            ("READ_ONLY_FS", "target filesystem is read-only")
-        } else if lower.contains("no space left on device") {
-            ("DISK_FULL", "no space left on device")
-        } else if lower.contains("permission denied") {
-            ("PERMISSION_DENIED", "insufficient permissions")
-        } else if lower.contains("broken pipe")
-            || lower.contains("connection reset")
-            || lower.contains("connection refused")
-            || lower.contains("network is unreachable")
-            || lower.contains("no route to host")
-        {
-            ("CONNECTION_LOST", "SSH connection lost during transfer")
-        } else if lower.contains("timed out") || lower.contains("timeout") {
-            ("TIMEOUT", "operation timed out")
-        } else if (lower.contains("no such file") && operation.contains("create"))
-            || (lower.contains("not a directory") && operation.contains("create"))
-        {
-            ("REMOTE_DIR_NOT_FOUND", "parent directory does not exist")
-        } else if lower.contains("no such file") || lower.contains("not found") {
-            ("FILE_NOT_FOUND", "file does not exist")
-        } else if lower.contains("channel")
-            || lower.contains("subsystem")
-            || lower.contains("sftp")
-            || lower.contains("session")
-        {
-            ("SFTP_PROTOCOL", "SFTP protocol/channel error")
-        } else {
-            ("IO_ERROR", "I/O error")
-        };
-
-    format!("[{}] {}: {} (raw: {})", code, operation, detail, raw_error)
+/// Match a lowercased error string to a structured error code and detail message.
+fn match_error_pattern<'a>(lower: &str, operation: &str) -> (&'a str, &'a str) {
+    if lower.contains("read-only file system") || lower.contains("read only file system") {
+        ("READ_ONLY_FS", "target filesystem is read-only")
+    } else if lower.contains("no space left on device") {
+        ("DISK_FULL", "no space left on device")
+    } else if lower.contains("permission denied") {
+        ("PERMISSION_DENIED", "insufficient permissions")
+    } else if lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+    {
+        ("CONNECTION_LOST", "SSH connection lost during transfer")
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ("TIMEOUT", "operation timed out")
+    } else if (lower.contains("no such file") && operation.contains("create"))
+        || (lower.contains("not a directory") && operation.contains("create"))
+    {
+        ("REMOTE_DIR_NOT_FOUND", "parent directory does not exist")
+    } else if lower.contains("no such file") || lower.contains("not found") {
+        ("FILE_NOT_FOUND", "file does not exist")
+    } else if lower.contains("channel")
+        || lower.contains("subsystem")
+        || lower.contains("sftp")
+        || lower.contains("session")
+    {
+        ("SFTP_PROTOCOL", "SFTP protocol/channel error")
+    } else {
+        ("IO_ERROR", "I/O error")
+    }
 }
 
 /// Open an SFTP session on the given SSH handle.
 ///
 /// Opens a new session channel, requests the "sftp" subsystem, and
 /// creates an `SftpSession` from the channel stream.
-pub(crate) async fn open_sftp_session(
+pub async fn open_sftp_session(
     handle: &Arc<client::Handle<SshClientHandler>>,
 ) -> Result<SftpSession, String> {
     let channel = handle
@@ -108,7 +113,8 @@ pub(crate) async fn open_sftp_session(
 /// - Absolute paths are returned as-is.
 /// - Relative paths are joined with the user's home directory.
 /// - Falls back to current directory if home directory is unavailable.
-pub(crate) fn resolve_local_path(path: &str) -> PathBuf {
+#[must_use]
+pub fn resolve_local_path(path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
         p.to_path_buf()
@@ -119,8 +125,8 @@ pub(crate) fn resolve_local_path(path: &str) -> PathBuf {
 
 /// Get the user's home directory from environment variables.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
 }
@@ -139,7 +145,7 @@ fn home_dir() -> Option<PathBuf> {
 /// * `cancel_token` - Token to signal cancellation
 /// * `status_tx` - Channel to send status updates
 /// * `error` - Shared storage for error messages
-pub(crate) async fn sftp_upload_streaming(
+pub async fn sftp_upload_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     local_path: PathBuf,
     remote_path: String,
@@ -157,33 +163,50 @@ pub(crate) async fn sftp_upload_streaming(
     )
     .await;
 
+    handle_transfer_result(
+        result,
+        "upload",
+        &local_path,
+        &remote_path,
+        &bytes_transferred,
+        &status_tx,
+        &error,
+    )
+    .await;
+}
+
+/// Handles the result of a transfer operation, logging and updating status.
+async fn handle_transfer_result(
+    result: Result<bool, String>,
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+    bytes_transferred: &Arc<AtomicU64>,
+    status_tx: &watch::Sender<TransferStatus>,
+    error_store: &Arc<Mutex<Option<String>>>,
+) {
     match result {
-        Ok(cancelled) => {
-            if cancelled {
-                info!(
-                    "SFTP upload cancelled: {} -> {}",
-                    local_path.display(),
-                    remote_path
-                );
-                let _ = status_tx.send(TransferStatus::Cancelled);
-            } else {
-                info!(
-                    "SFTP upload completed: {} -> {} ({} bytes)",
-                    local_path.display(),
-                    remote_path,
-                    bytes_transferred.load(Ordering::SeqCst)
-                );
-                let _ = status_tx.send(TransferStatus::Completed);
-            }
+        Ok(true) => {
+            info!(
+                "SFTP {direction} cancelled: {remote_path} <-> {}",
+                local_path.display()
+            );
+            let _ = status_tx.send(TransferStatus::Cancelled);
+        }
+        Ok(false) => {
+            let bytes = bytes_transferred.load(Ordering::SeqCst);
+            info!(
+                "SFTP {direction} completed: {remote_path} <-> {} ({bytes} bytes)",
+                local_path.display()
+            );
+            let _ = status_tx.send(TransferStatus::Completed);
         }
         Err(e) => {
             error!(
-                "SFTP upload failed: {} -> {}: {}",
-                local_path.display(),
-                remote_path,
-                e
+                "SFTP {direction} failed: {remote_path} <-> {}: {e}",
+                local_path.display()
             );
-            *error.lock().await = Some(e);
+            *error_store.lock().await = Some(e);
             let _ = status_tx.send(TransferStatus::Failed);
         }
     }
@@ -198,22 +221,68 @@ async fn sftp_upload_inner(
     cancel_token: &CancellationToken,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
+    let mut local_file = open_local_file(local_path).await?;
+    let mut remote_file = create_remote_file(&sftp, remote_path).await?;
 
-    let mut local_file = tokio::fs::File::open(local_path).await.map_err(|e| {
+    let cancelled = upload_chunks(
+        &mut local_file,
+        &mut remote_file,
+        local_path,
+        remote_path,
+        bytes_transferred,
+        cancel_token,
+    )
+    .await?;
+
+    if !cancelled {
+        flush_remote_file(&mut remote_file, remote_path).await?;
+    }
+
+    Ok(cancelled)
+}
+
+/// Opens a local file for reading.
+async fn open_local_file(local_path: &Path) -> Result<File, String> {
+    File::open(local_path).await.map_err(|e| {
         classify_transfer_error(
             &format!("open local file '{}'", local_path.display()),
             &e.to_string(),
         )
-    })?;
+    })
+}
 
-    let mut remote_file = sftp.create(remote_path).await.map_err(|e| {
+/// Creates a remote file via SFTP for writing.
+async fn create_remote_file(sftp: &SftpSession, remote_path: &str) -> Result<SftpFile, String> {
+    sftp.create(remote_path).await.map_err(|e| {
         classify_transfer_error(
-            &format!("create remote file '{}'", remote_path),
+            &format!("create remote file '{remote_path}'"),
             &e.to_string(),
         )
-    })?;
+    })
+}
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
+/// Flushes and shuts down a remote SFTP file.
+async fn flush_remote_file(remote_file: &mut SftpFile, remote_path: &str) -> Result<(), String> {
+    remote_file.shutdown().await.map_err(|e| {
+        classify_transfer_error(
+            &format!("flush remote file '{remote_path}'"),
+            &e.to_string(),
+        )
+    })
+}
+
+/// Reads chunks from a local file and writes them to a remote SFTP file.
+///
+/// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
+async fn upload_chunks(
+    local_file: &mut File,
+    remote_file: &mut SftpFile,
+    local_path: &Path,
+    remote_path: &str,
+    bytes_transferred: &Arc<AtomicU64>,
+    cancel_token: &CancellationToken,
+) -> Result<bool, String> {
+    let mut buf = vec![0_u8; CHUNK_SIZE];
 
     loop {
         if cancel_token.is_cancelled() {
@@ -229,21 +298,12 @@ async fn sftp_upload_inner(
         })?;
 
         if n == 0 {
-            break;
+            return Ok(false);
         }
 
-        write_to_sftp_file(&mut remote_file, &buf[..n], remote_path).await?;
-        bytes_transferred.fetch_add(n as u64, Ordering::SeqCst);
+        write_to_sftp_file(remote_file, &buf[..n], remote_path).await?;
+        bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
     }
-
-    remote_file.shutdown().await.map_err(|e| {
-        classify_transfer_error(
-            &format!("flush remote file '{}'", remote_path),
-            &e.to_string(),
-        )
-    })?;
-
-    Ok(false)
 }
 
 /// Write a buffer to an SFTP file.
@@ -254,7 +314,7 @@ async fn write_to_sftp_file(
 ) -> Result<(), String> {
     file.write_all(data).await.map_err(|e| {
         classify_transfer_error(
-            &format!("write to remote file '{}'", remote_path),
+            &format!("write to remote file '{remote_path}'"),
             &e.to_string(),
         )
     })
@@ -274,7 +334,7 @@ async fn write_to_sftp_file(
 /// * `cancel_token` - Token to signal cancellation
 /// * `status_tx` - Channel to send status updates
 /// * `error` - Shared storage for error messages
-pub(crate) async fn sftp_download_streaming(
+pub async fn sftp_download_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     remote_path: String,
     local_path: PathBuf,
@@ -292,36 +352,16 @@ pub(crate) async fn sftp_download_streaming(
     )
     .await;
 
-    match result {
-        Ok(cancelled) => {
-            if cancelled {
-                info!(
-                    "SFTP download cancelled: {} -> {}",
-                    remote_path,
-                    local_path.display()
-                );
-                let _ = status_tx.send(TransferStatus::Cancelled);
-            } else {
-                info!(
-                    "SFTP download completed: {} -> {} ({} bytes)",
-                    remote_path,
-                    local_path.display(),
-                    bytes_transferred.load(Ordering::SeqCst)
-                );
-                let _ = status_tx.send(TransferStatus::Completed);
-            }
-        }
-        Err(e) => {
-            error!(
-                "SFTP download failed: {} -> {}: {}",
-                remote_path,
-                local_path.display(),
-                e
-            );
-            *error.lock().await = Some(e);
-            let _ = status_tx.send(TransferStatus::Failed);
-        }
-    }
+    handle_transfer_result(
+        result,
+        "download",
+        &local_path,
+        &remote_path,
+        &bytes_transferred,
+        &status_tx,
+        &error,
+    )
+    .await;
 }
 
 /// Inner download logic, returns Ok(true) if cancelled, Ok(false) if completed.
@@ -333,22 +373,65 @@ async fn sftp_download_inner(
     cancel_token: &CancellationToken,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
+    let mut remote_file = open_remote_file(&sftp, remote_path).await?;
+    let mut local_file = create_local_file(local_path).await?;
 
-    let mut remote_file = sftp.open(remote_path).await.map_err(|e| {
-        classify_transfer_error(
-            &format!("open remote file '{}'", remote_path),
-            &e.to_string(),
-        )
-    })?;
+    let cancelled = download_chunks(
+        &mut remote_file,
+        &mut local_file,
+        remote_path,
+        local_path,
+        bytes_transferred,
+        cancel_token,
+    )
+    .await?;
 
-    let mut local_file = tokio::fs::File::create(local_path).await.map_err(|e| {
+    if !cancelled {
+        flush_local_file(&mut local_file, local_path).await?;
+    }
+
+    Ok(cancelled)
+}
+
+/// Opens a remote file via SFTP for reading.
+async fn open_remote_file(sftp: &SftpSession, remote_path: &str) -> Result<SftpFile, String> {
+    sftp.open(remote_path).await.map_err(|e| {
+        classify_transfer_error(&format!("open remote file '{remote_path}'"), &e.to_string())
+    })
+}
+
+/// Creates a local file for writing.
+async fn create_local_file(local_path: &Path) -> Result<File, String> {
+    File::create(local_path).await.map_err(|e| {
         classify_transfer_error(
             &format!("create local file '{}'", local_path.display()),
             &e.to_string(),
         )
-    })?;
+    })
+}
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
+/// Flushes a local file after writing.
+async fn flush_local_file(local_file: &mut File, local_path: &Path) -> Result<(), String> {
+    local_file.flush().await.map_err(|e| {
+        classify_transfer_error(
+            &format!("flush local file '{}'", local_path.display()),
+            &e.to_string(),
+        )
+    })
+}
+
+/// Reads chunks from a remote SFTP file and writes them to a local file.
+///
+/// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
+async fn download_chunks(
+    remote_file: &mut SftpFile,
+    local_file: &mut File,
+    remote_path: &str,
+    local_path: &Path,
+    bytes_transferred: &Arc<AtomicU64>,
+    cancel_token: &CancellationToken,
+) -> Result<bool, String> {
+    let mut buf = vec![0_u8; CHUNK_SIZE];
 
     loop {
         if cancel_token.is_cancelled() {
@@ -357,14 +440,11 @@ async fn sftp_download_inner(
         }
 
         let n = remote_file.read(&mut buf).await.map_err(|e| {
-            classify_transfer_error(
-                &format!("read remote file '{}'", remote_path),
-                &e.to_string(),
-            )
+            classify_transfer_error(&format!("read remote file '{remote_path}'"), &e.to_string())
         })?;
 
         if n == 0 {
-            break;
+            return Ok(false);
         }
 
         local_file.write_all(&buf[..n]).await.map_err(|e| {
@@ -374,17 +454,8 @@ async fn sftp_download_inner(
             )
         })?;
 
-        bytes_transferred.fetch_add(n as u64, Ordering::SeqCst);
+        bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
     }
-
-    local_file.flush().await.map_err(|e| {
-        classify_transfer_error(
-            &format!("flush local file '{}'", local_path.display()),
-            &e.to_string(),
-        )
-    })?;
-
-    Ok(false)
 }
 
 #[cfg(test)]

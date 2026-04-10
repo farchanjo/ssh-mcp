@@ -33,7 +33,7 @@ impl AuthStrategy for PasswordAuth {
         let result = handle
             .authenticate_password(username, &self.password)
             .await
-            .map_err(|e| format!("Password authentication failed: {}", e))?;
+            .map_err(|e| format!("Password authentication failed: {e}"))?;
 
         Ok(result.success())
     }

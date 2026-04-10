@@ -8,8 +8,10 @@ use tracing::debug;
 
 use crate::mcp::session::SshClientHandler;
 
+use super::agent::AgentAuth;
+use super::key::KeyAuth;
+use super::password::PasswordAuth;
 use super::traits::AuthStrategy;
-use super::{AgentAuth, KeyAuth, PasswordAuth};
 
 /// Authentication chain that tries multiple strategies in order.
 ///
@@ -32,6 +34,7 @@ pub struct AuthChain {
 
 impl AuthChain {
     /// Create a new empty authentication chain.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             strategies: Vec::new(),
@@ -39,24 +42,28 @@ impl AuthChain {
     }
 
     /// Add password authentication to the chain.
+    #[must_use]
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.strategies.push(Box::new(PasswordAuth::new(password)));
         self
     }
 
     /// Add key-based authentication to the chain.
+    #[must_use]
     pub fn with_key(mut self, key_path: impl Into<PathBuf>) -> Self {
         self.strategies.push(Box::new(KeyAuth::new(key_path)));
         self
     }
 
     /// Add SSH agent authentication to the chain.
+    #[must_use]
     pub fn with_agent(mut self) -> Self {
         self.strategies.push(Box::new(AgentAuth::new()));
         self
     }
 
     /// Check if the chain has any authentication strategies.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.strategies.is_empty()
     }

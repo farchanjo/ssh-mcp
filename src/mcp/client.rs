@@ -38,18 +38,22 @@
 //! Authentication failures are never retried to avoid account lockouts.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
-use russh::{ChannelMsg, client};
+use russh::compression;
+use russh::{Channel, ChannelMsg, Preferred, client};
+use tokio::sync::Mutex;
+use tokio::time;
 use tracing::{error, info, warn};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::async_command::OutputBuffer;
-use crate::mcp::auth::{AuthChain, AuthStrategy};
+use crate::mcp::auth::chain::AuthChain;
+use crate::mcp::auth::traits::AuthStrategy;
 use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
@@ -77,18 +81,18 @@ use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
 /// let persistent_config = build_client_config(Duration::from_secs(300), true, true);
 /// assert_eq!(persistent_config.inactivity_timeout, None);
 /// ```
-pub(crate) fn build_client_config(
+pub fn build_client_config(
     inactivity_timeout: Duration,
     compress: bool,
     persistent: bool,
 ) -> Arc<client::Config> {
     let compression = if compress {
-        (&[russh::compression::ZLIB, russh::compression::NONE][..]).into()
+        (&[compression::ZLIB, compression::NONE][..]).into()
     } else {
-        (&[russh::compression::NONE][..]).into()
+        (&[compression::NONE][..]).into()
     };
 
-    let preferred = russh::Preferred {
+    let preferred = Preferred {
         compression,
         ..Default::default()
     };
@@ -135,12 +139,12 @@ pub(crate) fn build_client_config(
 /// let (host, port) = parse_address("192.168.1.1")?;
 /// assert_eq!(port, 22); // Default port
 /// ```
-pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
+pub fn parse_address(address: &str) -> Result<(String, u16), String> {
     // Try to parse as "host:port" format
     if let Some((host, port_str)) = address.rsplit_once(':') {
         let port = port_str
             .parse::<u16>()
-            .map_err(|e| format!("Invalid port number: {}", e))?;
+            .map_err(|e| format!("Invalid port number: {e}"))?;
         Ok((host.to_string(), port))
     } else {
         // No port specified, use default SSH port
@@ -177,8 +181,11 @@ pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
 /// - Caps maximum delay at [`MAX_RETRY_DELAY`]
 /// - Adds random jitter to prevent thundering herd
 /// - Only retries on transient connection errors (not auth failures)
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn connect_to_ssh_with_retry(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "SSH connection requires many configuration parameters"
+)]
+pub async fn connect_to_ssh_with_retry(
     address: &str,
     username: &str,
     password: Option<&str>,
@@ -190,36 +197,68 @@ pub(crate) async fn connect_to_ssh_with_retry(
     compress: bool,
     persistent: bool,
 ) -> Result<(client::Handle<SshClientHandler>, u32), String> {
-    // Track retry attempts using atomic counter
     let attempt_counter = AtomicU32::new(0);
-
-    // Clone values for the retry closure
     let address = address.to_string();
     let username = username.to_string();
-    let password = password.map(|s| s.to_string());
-    let key_path = key_path.map(|s| s.to_string());
+    let password = password.map(ToString::to_string);
+    let key_path = key_path.map(ToString::to_string);
+    let backoff = build_backoff(min_delay, max_retries);
 
-    let backoff = ExponentialBuilder::default()
+    let result = execute_with_retry(
+        &attempt_counter,
+        &address,
+        &username,
+        password.as_deref(),
+        key_path.as_deref(),
+        timeout,
+        inactivity_timeout,
+        compress,
+        persistent,
+        backoff,
+    )
+    .await;
+
+    let total_attempts = attempt_counter.load(Ordering::SeqCst);
+    let retry_count = total_attempts.saturating_sub(1);
+    interpret_retry_result(result, &address, &username, retry_count, total_attempts)
+}
+
+/// Build an exponential backoff strategy for SSH connection retries.
+fn build_backoff(min_delay: Duration, max_retries: u32) -> ExponentialBuilder {
+    ExponentialBuilder::default()
         .with_min_delay(min_delay)
         .with_max_delay(MAX_RETRY_DELAY)
-        .with_max_times(max_retries as usize)
-        .with_jitter();
+        .with_max_times(usize::try_from(max_retries).unwrap_or(usize::MAX))
+        .with_jitter()
+}
 
-    let result = (|| async {
+/// Execute an SSH connection attempt with retry logic.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "retry wrapper needs connection params plus retry state"
+)]
+async fn execute_with_retry(
+    attempt_counter: &AtomicU32,
+    address: &str,
+    username: &str,
+    password: Option<&str>,
+    key_path: Option<&str>,
+    timeout: Duration,
+    inactivity_timeout: Duration,
+    compress: bool,
+    persistent: bool,
+    backoff: ExponentialBuilder,
+) -> Result<client::Handle<SshClientHandler>, String> {
+    (|| async {
         let current_attempt = attempt_counter.fetch_add(1, Ordering::SeqCst);
-
         if current_attempt > 0 {
-            warn!(
-                "SSH connection retry attempt {} to {}@{}",
-                current_attempt, username, address
-            );
+            warn!("SSH connection retry attempt {current_attempt} to {username}@{address}");
         }
-
         connect_to_ssh(
-            &address,
-            &username,
-            password.as_deref(),
-            key_path.as_deref(),
+            address,
+            username,
+            password,
+            key_path,
             timeout,
             inactivity_timeout,
             compress,
@@ -231,39 +270,37 @@ pub(crate) async fn connect_to_ssh_with_retry(
     .when(|e| {
         let retryable = is_retryable_error(e);
         if !retryable {
-            warn!(
-                "SSH connection to {}@{} failed with non-retryable error: {}",
-                username, address, e
-            );
+            warn!("SSH connection to {username}@{address} failed with non-retryable error: {e}");
         }
         retryable
     })
-    .notify(|err, dur| {
-        warn!("SSH connection failed: {}. Retrying in {:?}", err, dur);
-    })
-    .await;
+    .notify(|err, dur| warn!("SSH connection failed: {err}. Retrying in {dur:?}"))
+    .await
+}
 
-    let total_attempts = attempt_counter.load(Ordering::SeqCst);
-    let retry_count = total_attempts.saturating_sub(1);
-
+/// Interpret the result of a retried SSH connection attempt.
+fn interpret_retry_result(
+    result: Result<client::Handle<SshClientHandler>, String>,
+    address: &str,
+    username: &str,
+    retry_count: u32,
+    total_attempts: u32,
+) -> Result<(client::Handle<SshClientHandler>, u32), String> {
     match result {
         Ok(handle) => {
             if retry_count > 0 {
                 info!(
-                    "SSH connection to {}@{} succeeded after {} retry attempt(s)",
-                    username, address, retry_count
+                    "SSH connection to {username}@{address} succeeded after {retry_count} retry attempt(s)"
                 );
             }
             Ok((handle, retry_count))
         }
         Err(e) => {
             error!(
-                "SSH connection to {}@{} failed after {} attempt(s). Last error: {}",
-                username, address, total_attempts, e
+                "SSH connection to {username}@{address} failed after {total_attempts} attempt(s). Last error: {e}"
             );
             Err(format!(
-                "SSH connection failed after {} attempt(s). Last error: {}",
-                total_attempts, e
+                "SSH connection failed after {total_attempts} attempt(s). Last error: {e}"
             ))
         }
     }
@@ -276,7 +313,10 @@ pub(crate) async fn connect_to_ssh_with_retry(
 /// 2. Parses the address
 /// 3. Connects with timeout
 /// 4. Authenticates using the appropriate method via [`AuthChain`]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "SSH connection requires many configuration parameters"
+)]
 async fn connect_to_ssh(
     address: &str,
     username: &str,
@@ -296,10 +336,10 @@ async fn connect_to_ssh(
     // Connect with timeout
     let connect_future = client::connect(config, (host.as_str(), port), handler);
 
-    let mut handle = tokio::time::timeout(timeout, connect_future)
+    let mut handle = time::timeout(timeout, connect_future)
         .await
-        .map_err(|_| format!("Connection timed out after {:?}", timeout))?
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+        .map_err(|_elapsed| format!("Connection timed out after {timeout:?}"))?
+        .map_err(|e| format!("Failed to connect: {e}"))?;
 
     // Build authentication chain based on provided credentials
     let auth_chain = build_auth_chain(password, key_path);
@@ -318,7 +358,7 @@ async fn connect_to_ssh(
 ///
 /// The chain is built with the following priority:
 /// 1. Password authentication (if password is provided)
-/// 2. Key-based authentication (if key_path is provided)
+/// 2. Key-based authentication (if `key_path` is provided)
 /// 3. SSH agent authentication (fallback if no explicit credentials)
 fn build_auth_chain(password: Option<&str>, key_path: Option<&str>) -> AuthChain {
     let mut chain = AuthChain::new();
@@ -367,22 +407,12 @@ fn build_auth_chain(password: Option<&str>, key_path: Option<&str>) -> AuthChain
 /// # Exit Code
 ///
 /// Returns -1 as exit code if the remote server doesn't provide one or on timeout.
-pub(crate) async fn execute_ssh_command(
+pub async fn execute_ssh_command(
     handle_arc: &Arc<client::Handle<SshClientHandler>>,
     command: &str,
     timeout: Duration,
 ) -> Result<SshCommandResponse, String> {
-    // Open a session channel
-    let mut channel = handle_arc
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Failed to open channel: {}", e))?;
-
-    // Execute the command
-    channel
-        .exec(true, command)
-        .await
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
+    let mut channel = open_and_exec_command(handle_arc, command).await?;
 
     // Pre-allocate buffers to reduce reallocations during output collection
     let mut stdout = Vec::with_capacity(4096);
@@ -391,48 +421,17 @@ pub(crate) async fn execute_ssh_command(
     let mut timed_out = false;
 
     // Read channel messages with timeout
-    let result = tokio::time::timeout(timeout, async {
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    stdout.extend_from_slice(&data);
-                }
-                Some(ChannelMsg::ExtendedData { data, ext }) => {
-                    // ext == 1 is stderr in SSH protocol
-                    if ext == 1 {
-                        stderr.extend_from_slice(&data);
-                    }
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = Some(exit_status);
-                }
-                Some(ChannelMsg::Eof) => {
-                    // Continue to wait for exit status if not received yet
-                    if exit_code.is_some() {
-                        break;
-                    }
-                }
-                Some(ChannelMsg::Close) => {
-                    break;
-                }
-                Some(_) => {
-                    // Ignore other message types
-                }
-                None => {
-                    // Channel closed
-                    break;
-                }
-            }
-        }
-    })
+    let result = time::timeout(
+        timeout,
+        collect_sync_output(&mut channel, &mut stdout, &mut stderr, &mut exit_code),
+    )
     .await;
 
     // Handle timeout - return partial output, don't treat as error
     if result.is_err() {
         timed_out = true;
         warn!(
-            "Command timed out after {:?}, returning partial output ({} bytes stdout, {} bytes stderr)",
-            timeout,
+            "Command timed out after {timeout:?}, returning partial output ({} bytes stdout, {} bytes stderr)",
             stdout.len(),
             stderr.len()
         );
@@ -447,240 +446,54 @@ pub(crate) async fn execute_ssh_command(
     Ok(SshCommandResponse {
         stdout: stdout_str,
         stderr: stderr_str,
-        exit_code: exit_code.map(|c| c as i32).unwrap_or(-1),
+        exit_code: exit_code.map_or(-1, u32::cast_signed),
         timed_out,
     })
 }
 
-/// Execute a command asynchronously on an SSH session.
+/// Open a session channel and execute a command on it.
 ///
-/// This function runs in a background task and collects output incrementally.
-/// The caller can poll for output, wait for completion, or cancel the command.
-///
-/// # Arguments
-///
-/// * `handle` - Shared handle to the SSH session
-/// * `command` - Shell command to execute
-/// * `timeout` - Command execution timeout duration
-/// * `output` - Shared buffer for collecting stdout/stderr
-/// * `status_tx` - Channel to send status updates
-/// * `cancel_token` - Token to signal cancellation
-/// * `exit_code` - Shared storage for exit code
-/// * `error` - Shared storage for error message
-/// * `timed_out` - Shared flag for timeout status
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_ssh_command_async(
-    handle: Arc<client::Handle<SshClientHandler>>,
-    command: String,
-    timeout: Duration,
-    output: Arc<tokio::sync::Mutex<OutputBuffer>>,
-    status_tx: watch::Sender<AsyncCommandStatus>,
-    cancel_token: CancellationToken,
-    exit_code: Arc<tokio::sync::Mutex<Option<i32>>>,
-    error: Arc<tokio::sync::Mutex<Option<String>>>,
-    timed_out: Arc<std::sync::atomic::AtomicBool>,
-) {
-    // Open a session channel
-    let mut channel = match handle.channel_open_session().await {
-        Ok(ch) => ch,
-        Err(e) => {
-            *error.lock().await = Some(format!("Failed to open channel: {}", e));
-            let _ = status_tx.send(AsyncCommandStatus::Failed);
-            return;
-        }
-    };
-
-    // Execute the command
-    if let Err(e) = channel.exec(true, command.as_str()).await {
-        *error.lock().await = Some(format!("Failed to execute command: {}", e));
-        let _ = status_tx.send(AsyncCommandStatus::Failed);
-        return;
-    }
-
-    // Collect output with timeout and cancellation support
-    tokio::select! {
-        biased;
-
-        // Check for cancellation first
-        _ = cancel_token.cancelled() => {
-            warn!("Async command cancelled: {}", command);
-            let _ = channel.close().await;
-            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
-        }
-
-        // Check for timeout
-        _ = tokio::time::sleep(timeout) => {
-            warn!(
-                "Async command timed out after {:?}: {}",
-                timeout, command
-            );
-            timed_out.store(true, Ordering::SeqCst);
-            let _ = channel.close().await;
-            let _ = status_tx.send(AsyncCommandStatus::Completed);
-        }
-
-        // Collect output
-        result = collect_async_output(&mut channel, &output) => {
-            *exit_code.lock().await = result;
-            let _ = status_tx.send(AsyncCommandStatus::Completed);
-        }
-    }
-}
-
-/// Open a PTY channel with an interactive shell.
-///
-/// Allocates a pseudo-terminal and starts a shell on the remote server.
-/// Returns a pair of channels: one for reading output, one for writing input.
-///
-/// # Arguments
-///
-/// * `handle` - Shared handle to the SSH session
-/// * `term` - Terminal type (e.g., "xterm", "vt100", "ansi")
-/// * `cols` - Terminal width in columns
-/// * `rows` - Terminal height in rows
-///
-/// # Returns
-///
-/// * `Ok(channel)` - The SSH channel with PTY and shell allocated
-/// * `Err(message)` - Error if PTY or shell request fails
-pub(crate) async fn open_pty_shell(
-    handle: &Arc<client::Handle<SshClientHandler>>,
-    term: &str,
-    cols: u32,
-    rows: u32,
-) -> Result<russh::Channel<client::Msg>, String> {
-    let channel = handle
+/// Helper that opens a session channel and issues the exec request.
+async fn open_and_exec_command(
+    handle_arc: &Arc<client::Handle<SshClientHandler>>,
+    command: &str,
+) -> Result<Channel<client::Msg>, String> {
+    let channel = handle_arc
         .channel_open_session()
         .await
-        .map_err(|e| format!("Failed to open channel: {}", e))?;
+        .map_err(|e| format!("Failed to open channel: {e}"))?;
 
     channel
-        .request_pty(true, term, cols, rows, 0, 0, &[])
+        .exec(true, command)
         .await
-        .map_err(|e| format!("Failed to request PTY: {}", e))?;
-
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|e| format!("Failed to request shell: {}", e))?;
+        .map_err(|e| format!("Failed to execute command: {e}"))?;
 
     Ok(channel)
 }
 
-/// Execute a command asynchronously with PTY allocation.
+/// Collect output from a channel synchronously into provided buffers.
 ///
-/// Like `execute_ssh_command_async` but allocates a PTY before executing.
-/// All output goes to the stdout buffer (no stderr separation in PTY mode).
-///
-/// Use this for commands that require a terminal (sudo, top, etc.).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_ssh_command_async_pty(
-    handle: Arc<client::Handle<SshClientHandler>>,
-    command: String,
-    timeout: Duration,
-    output: Arc<tokio::sync::Mutex<OutputBuffer>>,
-    status_tx: watch::Sender<AsyncCommandStatus>,
-    cancel_token: CancellationToken,
-    exit_code: Arc<tokio::sync::Mutex<Option<i32>>>,
-    error: Arc<tokio::sync::Mutex<Option<String>>>,
-    timed_out: Arc<std::sync::atomic::AtomicBool>,
+/// Reads channel messages until the channel closes, collecting stdout,
+/// stderr, and exit code.
+async fn collect_sync_output(
+    channel: &mut Channel<client::Msg>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    exit_code: &mut Option<u32>,
 ) {
-    // Open a session channel
-    let mut channel = match handle.channel_open_session().await {
-        Ok(ch) => ch,
-        Err(e) => {
-            *error.lock().await = Some(format!("Failed to open channel: {}", e));
-            let _ = status_tx.send(AsyncCommandStatus::Failed);
-            return;
-        }
-    };
-
-    // Request PTY before exec (xterm 80x24 default)
-    if let Err(e) = channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await {
-        *error.lock().await = Some(format!("Failed to request PTY: {}", e));
-        let _ = status_tx.send(AsyncCommandStatus::Failed);
-        return;
-    }
-
-    // Execute the command
-    if let Err(e) = channel.exec(true, command.as_str()).await {
-        *error.lock().await = Some(format!("Failed to execute command: {}", e));
-        let _ = status_tx.send(AsyncCommandStatus::Failed);
-        return;
-    }
-
-    // Collect output with timeout and cancellation support
-    // In PTY mode, all output goes to stdout (no stderr separation)
-    tokio::select! {
-        biased;
-
-        _ = cancel_token.cancelled() => {
-            warn!("Async PTY command cancelled: {}", command);
-            let _ = channel.close().await;
-            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
-        }
-
-        _ = tokio::time::sleep(timeout) => {
-            warn!(
-                "Async PTY command timed out after {:?}: {}",
-                timeout, command
-            );
-            timed_out.store(true, Ordering::SeqCst);
-            let _ = channel.close().await;
-            let _ = status_tx.send(AsyncCommandStatus::Completed);
-        }
-
-        result = collect_async_output(&mut channel, &output) => {
-            *exit_code.lock().await = result;
-            let _ = status_tx.send(AsyncCommandStatus::Completed);
-        }
-    }
-}
-
-/// Flush threshold for batched output (8KB)
-const FLUSH_THRESHOLD: usize = 8192;
-
-/// Collect output from an SSH channel into the shared buffer.
-///
-/// Uses batched writes to reduce lock contention - data is accumulated
-/// in local buffers and flushed to the shared buffer periodically or on exit.
-///
-/// Returns the exit code when the channel closes.
-async fn collect_async_output(
-    channel: &mut russh::Channel<russh::client::Msg>,
-    output: &Arc<tokio::sync::Mutex<OutputBuffer>>,
-) -> Option<i32> {
-    use russh::ChannelMsg;
-
-    let mut exit_code: Option<i32> = None;
-
-    // Local buffers to batch output and reduce lock contention
-    let mut local_stdout = Vec::with_capacity(4096);
-    let mut local_stderr = Vec::with_capacity(1024);
-
     loop {
         match channel.wait().await {
             Some(ChannelMsg::Data { data }) => {
-                local_stdout.extend_from_slice(&data);
-                // Flush when buffer exceeds threshold
-                if local_stdout.len() >= FLUSH_THRESHOLD {
-                    let mut buf = output.lock().await;
-                    buf.stdout.append(&mut local_stdout);
-                }
+                stdout.extend_from_slice(&data);
             }
             Some(ChannelMsg::ExtendedData { data, ext }) => {
                 // ext == 1 is stderr in SSH protocol
                 if ext == 1 {
-                    local_stderr.extend_from_slice(&data);
-                    // Flush when buffer exceeds threshold
-                    if local_stderr.len() >= FLUSH_THRESHOLD {
-                        let mut buf = output.lock().await;
-                        buf.stderr.append(&mut local_stderr);
-                    }
+                    stderr.extend_from_slice(&data);
                 }
             }
             Some(ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = Some(exit_status as i32);
+                *exit_code = Some(exit_status);
             }
             Some(ChannelMsg::Eof) => {
                 // Continue to wait for exit status if not received yet
@@ -700,18 +513,333 @@ async fn collect_async_output(
             }
         }
     }
+}
 
-    // Final flush of remaining local data
-    if !local_stdout.is_empty() || !local_stderr.is_empty() {
-        let mut buf = output.lock().await;
-        buf.stdout.append(&mut local_stdout);
-        buf.stderr.append(&mut local_stderr);
+/// Execute a command asynchronously on an SSH session.
+///
+/// This function runs in a background task and collects output incrementally.
+/// The caller can poll for output, wait for completion, or cancel the command.
+///
+/// # Arguments
+///
+/// * `handle` - Shared handle to the SSH session
+/// * `command` - Shell command to execute
+/// * `timeout` - Command execution timeout duration
+/// * `output` - Shared buffer for collecting stdout/stderr
+/// * `status_tx` - Channel to send status updates
+/// * `cancel_token` - Token to signal cancellation
+/// * `exit_code` - Shared storage for exit code
+/// * `error` - Shared storage for error message
+/// * `timed_out` - Shared flag for timeout status
+#[allow(
+    clippy::too_many_arguments,
+    reason = "async command execution requires many shared state parameters"
+)]
+pub async fn execute_ssh_command_async(
+    handle: Arc<client::Handle<SshClientHandler>>,
+    command: String,
+    timeout: Duration,
+    output: Arc<Mutex<OutputBuffer>>,
+    status_tx: watch::Sender<AsyncCommandStatus>,
+    cancel_token: CancellationToken,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    error: Arc<Mutex<Option<String>>>,
+    timed_out: Arc<AtomicBool>,
+) {
+    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx).await else {
+        return;
+    };
+
+    if exec_async_command(&channel, &command, &error, &status_tx).await == Err(()) {
+        return;
     }
 
-    // Close channel gracefully
-    let _ = channel.close().await;
+    run_with_cancellation_and_timeout(
+        &mut channel,
+        &command,
+        timeout,
+        &output,
+        &status_tx,
+        &cancel_token,
+        &exit_code,
+        &timed_out,
+    )
+    .await;
+}
 
+/// Open a session channel for async command execution.
+///
+/// Returns `None` and sets the error/status if the channel cannot be opened.
+async fn open_async_channel(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    error: &Arc<Mutex<Option<String>>>,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+) -> Option<Channel<client::Msg>> {
+    match handle.channel_open_session().await {
+        Ok(ch) => Some(ch),
+        Err(e) => {
+            *error.lock().await = Some(format!("Failed to open channel: {e}"));
+            let _ = status_tx.send(AsyncCommandStatus::Failed);
+            None
+        }
+    }
+}
+
+/// Execute a command on an async channel.
+///
+/// Returns `Err(())` and sets the error/status if the command cannot be executed.
+async fn exec_async_command(
+    channel: &Channel<client::Msg>,
+    command: &str,
+    error: &Arc<Mutex<Option<String>>>,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+) -> Result<(), ()> {
+    if let Err(e) = channel.exec(true, command).await {
+        *error.lock().await = Some(format!("Failed to execute command: {e}"));
+        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Run async output collection with cancellation and timeout support.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "async command state requires many shared references"
+)]
+async fn run_with_cancellation_and_timeout(
+    channel: &mut Channel<client::Msg>,
+    command: &str,
+    timeout: Duration,
+    output: &Arc<Mutex<OutputBuffer>>,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+    cancel_token: &CancellationToken,
+    exit_code: &Arc<Mutex<Option<i32>>>,
+    timed_out: &Arc<AtomicBool>,
+) {
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => {
+            handle_cancellation(channel, command, status_tx).await;
+        }
+        () = time::sleep(timeout) => {
+            handle_timeout(channel, command, timeout, timed_out, status_tx).await;
+        }
+        result = collect_async_output(channel, output) => {
+            *exit_code.lock().await = result;
+            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        }
+    }
+}
+
+/// Handle async command cancellation.
+async fn handle_cancellation(
+    channel: &Channel<client::Msg>,
+    command: &str,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+) {
+    warn!("Async command cancelled: {command}");
+    let _ = channel.close().await;
+    let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+}
+
+/// Handle async command timeout.
+async fn handle_timeout(
+    channel: &Channel<client::Msg>,
+    command: &str,
+    timeout: Duration,
+    timed_out: &Arc<AtomicBool>,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+) {
+    warn!("Async command timed out after {timeout:?}: {command}");
+    timed_out.store(true, Ordering::SeqCst);
+    let _ = channel.close().await;
+    let _ = status_tx.send(AsyncCommandStatus::Completed);
+}
+
+/// Open a PTY channel with an interactive shell.
+///
+/// Allocates a pseudo-terminal and starts a shell on the remote server.
+/// Returns a pair of channels: one for reading output, one for writing input.
+///
+/// # Arguments
+///
+/// * `handle` - Shared handle to the SSH session
+/// * `term` - Terminal type (e.g., "xterm", "vt100", "ansi")
+/// * `cols` - Terminal width in columns
+/// * `rows` - Terminal height in rows
+///
+/// # Returns
+///
+/// * `Ok(channel)` - The SSH channel with PTY and shell allocated
+/// * `Err(message)` - Error if PTY or shell request fails
+pub async fn open_pty_shell(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    term: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<Channel<client::Msg>, String> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed to open channel: {e}"))?;
+
+    channel
+        .request_pty(true, term, cols, rows, 0, 0, &[])
+        .await
+        .map_err(|e| format!("Failed to request PTY: {e}"))?;
+
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|e| format!("Failed to request shell: {e}"))?;
+
+    Ok(channel)
+}
+
+/// Execute a command asynchronously with PTY allocation.
+///
+/// Like `execute_ssh_command_async` but allocates a PTY before executing.
+/// All output goes to the stdout buffer (no stderr separation in PTY mode).
+///
+/// Use this for commands that require a terminal (sudo, top, etc.).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "async PTY command execution requires many shared state parameters"
+)]
+pub async fn execute_ssh_command_async_pty(
+    handle: Arc<client::Handle<SshClientHandler>>,
+    command: String,
+    timeout: Duration,
+    output: Arc<Mutex<OutputBuffer>>,
+    status_tx: watch::Sender<AsyncCommandStatus>,
+    cancel_token: CancellationToken,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    error: Arc<Mutex<Option<String>>>,
+    timed_out: Arc<AtomicBool>,
+) {
+    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx).await else {
+        return;
+    };
+
+    if request_pty_on_channel(&channel, &error, &status_tx).await == Err(()) {
+        return;
+    }
+
+    if exec_async_command(&channel, &command, &error, &status_tx).await == Err(()) {
+        return;
+    }
+
+    run_with_cancellation_and_timeout(
+        &mut channel,
+        &command,
+        timeout,
+        &output,
+        &status_tx,
+        &cancel_token,
+        &exit_code,
+        &timed_out,
+    )
+    .await;
+}
+
+/// Request a PTY on an already-opened channel.
+///
+/// Returns `Err(())` and sets the error/status if the PTY request fails.
+async fn request_pty_on_channel(
+    channel: &Channel<client::Msg>,
+    error: &Arc<Mutex<Option<String>>>,
+    status_tx: &watch::Sender<AsyncCommandStatus>,
+) -> Result<(), ()> {
+    if let Err(e) = channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await {
+        *error.lock().await = Some(format!("Failed to request PTY: {e}"));
+        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Flush threshold for batched output (8KB)
+const FLUSH_THRESHOLD: usize = 8192;
+
+/// Collect output from an SSH channel into the shared buffer.
+///
+/// Uses batched writes to reduce lock contention - data is accumulated
+/// in local buffers and flushed to the shared buffer periodically or on exit.
+///
+/// Returns the exit code when the channel closes.
+async fn collect_async_output(
+    channel: &mut Channel<client::Msg>,
+    output: &Arc<Mutex<OutputBuffer>>,
+) -> Option<i32> {
+    let mut exit_code: Option<i32> = None;
+    let mut local_stdout = Vec::with_capacity(4096);
+    let mut local_stderr = Vec::with_capacity(1024);
+
+    loop {
+        let msg = channel.wait().await;
+        let should_break = process_channel_msg(
+            msg,
+            &mut exit_code,
+            &mut local_stdout,
+            &mut local_stderr,
+            output,
+        )
+        .await;
+        if should_break {
+            break;
+        }
+    }
+
+    flush_local_buffers(&mut local_stdout, &mut local_stderr, output).await;
+    let _ = channel.close().await;
     exit_code
+}
+
+/// Process a single channel message, returning true if the loop should break.
+async fn process_channel_msg(
+    msg: Option<ChannelMsg>,
+    exit_code: &mut Option<i32>,
+    local_stdout: &mut Vec<u8>,
+    local_stderr: &mut Vec<u8>,
+    output: &Arc<Mutex<OutputBuffer>>,
+) -> bool {
+    match msg {
+        Some(ChannelMsg::Data { data }) => {
+            local_stdout.extend_from_slice(&data);
+            if local_stdout.len() >= FLUSH_THRESHOLD {
+                output.lock().await.stdout.append(local_stdout);
+            }
+            false
+        }
+        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+            local_stderr.extend_from_slice(&data);
+            if local_stderr.len() >= FLUSH_THRESHOLD {
+                output.lock().await.stderr.append(local_stderr);
+            }
+            false
+        }
+        Some(ChannelMsg::ExitStatus { exit_status }) => {
+            *exit_code = Some(exit_status.cast_signed());
+            false
+        }
+        Some(ChannelMsg::Eof) => exit_code.is_some(),
+        Some(ChannelMsg::Close) | None => true,
+        Some(_) => false,
+    }
+}
+
+/// Flush remaining local buffers to the shared output buffer.
+async fn flush_local_buffers(
+    local_stdout: &mut Vec<u8>,
+    local_stderr: &mut Vec<u8>,
+    output: &Arc<Mutex<OutputBuffer>>,
+) {
+    if !local_stdout.is_empty() || !local_stderr.is_empty() {
+        let mut buf = output.lock().await;
+        buf.stdout.append(local_stdout);
+        buf.stderr.append(local_stderr);
+    }
 }
 
 #[cfg(test)]

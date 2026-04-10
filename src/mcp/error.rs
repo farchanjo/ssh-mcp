@@ -135,7 +135,7 @@ const RETRYABLE_ERRORS: &[&str] = &[
 /// assert!(!is_retryable_error("SSH protocol error"));
 /// assert!(is_retryable_error("SSH connection timeout"));
 /// ```
-pub(crate) fn is_retryable_error(error: &str) -> bool {
+pub fn is_retryable_error(error: &str) -> bool {
     let error_lower = error.to_lowercase();
 
     // Authentication failures are NOT retryable (checked first for priority)

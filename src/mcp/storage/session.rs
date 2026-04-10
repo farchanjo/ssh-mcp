@@ -22,11 +22,11 @@ pub struct StoredSession {
     pub handle: Arc<client::Handle<SshClientHandler>>,
 }
 
-/// DashMap-based implementation of `SessionStorage`.
+/// `DashMap`-based implementation of `SessionStorage`.
 ///
 /// Uses two `DashMap` instances:
-/// - Primary storage: session_id -> StoredSession
-/// - Secondary index: agent_id -> HashSet<session_id> for O(1) agent lookups
+/// - Primary storage: `session_id` -> `StoredSession`
+/// - Secondary index: `agent_id` -> `HashSet<session_id>` for O(1) agent lookups
 pub struct DashMapSessionStorage {
     sessions: DashMap<String, StoredSession>,
     sessions_by_agent: DashMap<String, HashSet<String>>,
@@ -34,6 +34,7 @@ pub struct DashMapSessionStorage {
 
 impl DashMapSessionStorage {
     /// Create a new session storage instance.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
@@ -62,7 +63,7 @@ impl SessionStorage for DashMapSessionStorage {
     fn get(&self, session_id: &str) -> Option<SessionRef> {
         self.sessions.get(session_id).map(|entry| SessionRef {
             info: entry.info.clone(),
-            handle: entry.handle.clone(),
+            handle: Arc::clone(&entry.handle),
         })
     }
 

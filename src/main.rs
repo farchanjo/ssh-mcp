@@ -4,7 +4,7 @@
 use dotenvy::dotenv;
 use poem::{EndpointExt, Route, Server, listener::TcpListener, middleware::Tracing};
 use poem_mcpserver::{McpServer, streamable_http};
-use ssh_mcp::mcp::McpSSHCommands;
+use ssh_mcp::mcp::commands::McpSSHCommands;
 use tracing::info;
 
 #[tokio::main]

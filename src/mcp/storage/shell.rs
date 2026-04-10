@@ -8,17 +8,18 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use dashmap::DashMap;
+use dashmap::mapref::one::Ref;
 
 use crate::mcp::shell::RunningShell;
 use crate::mcp::types::ShellInfo;
 
 use super::traits::ShellStorage;
 
-/// DashMap-based implementation of `ShellStorage`.
+/// `DashMap`-based implementation of `ShellStorage`.
 ///
 /// Uses two `DashMap` instances:
-/// - Primary storage: shell_id -> RunningShell
-/// - Secondary index: session_id -> HashSet<shell_id> for O(1) session lookups
+/// - Primary storage: `shell_id` -> `RunningShell`
+/// - Secondary index: `session_id` -> `HashSet<shell_id>` for O(1) session lookups
 pub struct DashMapShellStorage {
     shells: DashMap<String, RunningShell>,
     shells_by_session: DashMap<String, HashSet<String>>,
@@ -26,6 +27,7 @@ pub struct DashMapShellStorage {
 
 impl DashMapShellStorage {
     /// Create a new shell storage instance.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             shells: DashMap::new(),
@@ -59,7 +61,7 @@ impl ShellStorage for DashMapShellStorage {
         let removed = self.shells.remove(shell_id).map(|(_, shell)| shell);
 
         // Update secondary index if shell was found
-        if let Some(ref shell) = removed
+        if let Some(shell) = &removed
             && let Some(mut set) = self.shells_by_session.get_mut(&shell.info.session_id)
         {
             set.remove(shell_id);
@@ -72,10 +74,7 @@ impl ShellStorage for DashMapShellStorage {
         removed
     }
 
-    fn get_direct(
-        &self,
-        shell_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, RunningShell>> {
+    fn get_direct(&self, shell_id: &str) -> Option<Ref<'_, String, RunningShell>> {
         self.shells.get(shell_id)
     }
 
@@ -89,8 +88,7 @@ impl ShellStorage for DashMapShellStorage {
     fn count_by_session(&self, session_id: &str) -> usize {
         self.shells_by_session
             .get(session_id)
-            .map(|set| set.len())
-            .unwrap_or(0)
+            .map_or(0, |set| set.len())
     }
 
     fn list_all(&self) -> Vec<ShellInfo> {
@@ -100,11 +98,7 @@ impl ShellStorage for DashMapShellStorage {
     fn list_filtered(&self, session_id: Option<&str>) -> Vec<ShellInfo> {
         self.shells
             .iter()
-            .filter(|entry| {
-                session_id
-                    .map(|sid| entry.info.session_id == sid)
-                    .unwrap_or(true)
-            })
+            .filter(|entry| session_id.is_none_or(|sid| entry.info.session_id == sid))
             .map(|entry| entry.info.clone())
             .collect()
     }

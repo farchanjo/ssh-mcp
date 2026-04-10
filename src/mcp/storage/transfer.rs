@@ -8,16 +8,17 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use dashmap::DashMap;
+use dashmap::mapref::one::Ref;
 
 use crate::mcp::transfer::{RunningTransfer, TransferInfo};
 
 use super::traits::TransferStorage;
 
-/// DashMap-based implementation of `TransferStorage`.
+/// `DashMap`-based implementation of `TransferStorage`.
 ///
 /// Uses two `DashMap` instances:
-/// - Primary storage: transfer_id -> RunningTransfer
-/// - Secondary index: session_id -> HashSet<transfer_id> for O(1) session lookups
+/// - Primary storage: `transfer_id` -> `RunningTransfer`
+/// - Secondary index: `session_id` -> `HashSet<transfer_id>` for O(1) session lookups
 pub struct DashMapTransferStorage {
     transfers: DashMap<String, RunningTransfer>,
     transfers_by_session: DashMap<String, HashSet<String>>,
@@ -25,6 +26,7 @@ pub struct DashMapTransferStorage {
 
 impl DashMapTransferStorage {
     /// Create a new transfer storage instance.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             transfers: DashMap::new(),
@@ -61,7 +63,7 @@ impl TransferStorage for DashMapTransferStorage {
             .map(|(_, transfer)| transfer);
 
         // Update secondary index if transfer was found
-        if let Some(ref transfer) = removed
+        if let Some(transfer) = &removed
             && let Some(mut set) = self.transfers_by_session.get_mut(&transfer.info.session_id)
         {
             set.remove(transfer_id);
@@ -74,10 +76,7 @@ impl TransferStorage for DashMapTransferStorage {
         removed
     }
 
-    fn get_direct(
-        &self,
-        transfer_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, RunningTransfer>> {
+    fn get_direct(&self, transfer_id: &str) -> Option<Ref<'_, String, RunningTransfer>> {
         self.transfers.get(transfer_id)
     }
 
@@ -91,8 +90,7 @@ impl TransferStorage for DashMapTransferStorage {
     fn count_by_session(&self, session_id: &str) -> usize {
         self.transfers_by_session
             .get(session_id)
-            .map(|set| set.len())
-            .unwrap_or(0)
+            .map_or(0, |set| set.len())
     }
 
     fn list_all(&self) -> Vec<TransferInfo> {
@@ -105,11 +103,7 @@ impl TransferStorage for DashMapTransferStorage {
     fn list_filtered(&self, session_id: Option<&str>) -> Vec<TransferInfo> {
         self.transfers
             .iter()
-            .filter(|entry| {
-                session_id
-                    .map(|sid| entry.info.session_id == sid)
-                    .unwrap_or(true)
-            })
+            .filter(|entry| session_id.is_none_or(|sid| entry.info.session_id == sid))
             .map(|entry| entry.info.clone())
             .collect()
     }
