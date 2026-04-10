@@ -7,9 +7,10 @@ cargo build --release                              # Build all binaries
 cargo build --release --bin ssh-mcp                # HTTP server only
 cargo build --release --bin ssh-mcp-stdio           # Stdio transport only
 cargo build --release --no-default-features         # Without port forwarding
-cargo test --all-features                           # Run tests (435 tests)
+cargo test --all-features                           # Run tests (438 tests)
 cargo fmt --all -- --check                          # Check formatting
 cargo clippy -- -D warnings                         # Lint
+cargo dupes                                          # Code duplication detection (cargo-dupes)
 ```
 
 ## Architecture
@@ -87,8 +88,22 @@ All settings follow: **Parameter -> Environment Variable -> Default**
 
 ## Code Standards
 
-- `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]`
+### Clippy Configuration
+
+Strict clippy enforcement via `src/lib.rs` deny attributes:
+
+- **Lint groups**: `clippy::all`, `clippy::pedantic`, `clippy::nursery`, `clippy::cargo`
+- **Safety denials**: `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`
+- **Output denials**: `print_stdout`, `print_stderr`
+- **Code quality**: `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, `allow_attributes_without_reason`
+- **Thresholds** (`clippy.toml`): `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`, `type-complexity-threshold = 250`
+- **Allowed**: `multiple_crate_versions` (transitive deps from russh/poem)
+
+All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disable a lint rule to silence a warning — fix the code instead.
+
+### General
+
 - Methods < 30 lines, SOLID principles
 - Lock-free data structures (`DashMap`) for concurrent access
-- 435 unit tests (`cargo test --all-features`)
+- 438 unit tests (`cargo test --all-features`)
 - Feature flag: `port_forward` (default: enabled)
