@@ -371,10 +371,7 @@ const DEFAULT_KEY_NAMES: &[&str] = &[
 ///
 /// Returns the paths of all default key files that exist on disk.
 fn discover_default_keys() -> Vec<String> {
-    let Some(home) = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .ok()
-    else {
+    let Some(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok() else {
         return Vec::new();
     };
 
@@ -1089,12 +1086,8 @@ mod tests {
 
         #[test]
         fn test_ed25519_is_preferred_over_rsa() {
-            let ed25519_pos = DEFAULT_KEY_NAMES
-                .iter()
-                .position(|k| *k == "id_ed25519");
-            let rsa_pos = DEFAULT_KEY_NAMES
-                .iter()
-                .position(|k| *k == "id_rsa");
+            let ed25519_pos = DEFAULT_KEY_NAMES.iter().position(|k| *k == "id_ed25519");
+            let rsa_pos = DEFAULT_KEY_NAMES.iter().position(|k| *k == "id_rsa");
             assert!(ed25519_pos < rsa_pos);
         }
     }
