@@ -23,7 +23,7 @@ use russh::client::Msg;
 use russh::{Channel, Disconnect, client};
 use tokio::fs;
 use tokio::sync::{Mutex, watch};
-use tokio::time::timeout;
+use tokio::time::{self, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -34,8 +34,8 @@ use super::client::{
     execute_ssh_command_async_pty, open_pty_shell,
 };
 use super::config::{
-    resolve_command_timeout, resolve_compression, resolve_connect_timeout,
-    resolve_inactivity_timeout, resolve_max_retries, resolve_retry_delay,
+    resolve_command_cleanup_ttl, resolve_command_timeout, resolve_compression,
+    resolve_connect_timeout, resolve_inactivity_timeout, resolve_max_retries, resolve_retry_delay,
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
@@ -245,6 +245,7 @@ fn create_running_command(
         exit_code: Arc::new(Mutex::new(None)),
         error: Arc::new(Mutex::new(None)),
         timed_out: Arc::new(AtomicBool::new(false)),
+        output_read: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -293,10 +294,36 @@ fn spawn_command_task(
 }
 
 /// Spawn the cleanup task that removes a command from storage after completion.
-fn spawn_cleanup_task(command_id: String, cleanup_rx: watch::Receiver<AsyncCommandStatus>) {
+///
+/// If the output has been read, cleanup is immediate. Otherwise, the task
+/// waits up to `SSH_COMMAND_CLEANUP_TTL` (default: 60s) before removing.
+fn spawn_cleanup_task(
+    command_id: String,
+    cleanup_rx: watch::Receiver<AsyncCommandStatus>,
+    output_read: Arc<AtomicBool>,
+) {
+    let ttl = resolve_command_cleanup_ttl();
     tokio::spawn(async move {
         let mut rx = cleanup_rx;
         wait_for_command_completion(&mut rx).await;
+
+        // If output already read, cleanup immediately
+        if !output_read.load(Ordering::SeqCst) {
+            // Wait up to TTL, checking periodically if output gets read
+            let deadline = time::Instant::now() + ttl;
+            let mut interval = time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if output_read.load(Ordering::SeqCst) {
+                    break;
+                }
+                if time::Instant::now() >= deadline {
+                    info!("Cleanup: TTL expired for unread command {command_id}");
+                    break;
+                }
+            }
+        }
+
         COMMAND_STORAGE.unregister(&command_id);
         info!("Cleanup: removed completed command {command_id}");
     });
@@ -1015,6 +1042,7 @@ fn register_and_spawn_command(
 
     let running_cmd = create_running_command(&command_id, &session_id, &command, &started_at);
     let cleanup_rx = running_cmd.status_rx.clone();
+    let output_read = Arc::clone(&running_cmd.output_read);
 
     register_and_spawn(
         &command_id,
@@ -1025,7 +1053,7 @@ fn register_and_spawn_command(
         &command,
         cmd_timeout,
     );
-    spawn_cleanup_task(command_id.clone(), cleanup_rx);
+    spawn_cleanup_task(command_id.clone(), cleanup_rx, output_read);
 
     let message = ExecuteMessageBuilder::new(&command_id, &session_id, &command)
         .with_agent_id(agent_id.as_deref())
@@ -1357,7 +1385,7 @@ impl McpSSHCommands {
         let wait = wait.unwrap_or(false);
         let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
 
-        let (status_rx, output, exit_code, error, timed_out) = COMMAND_STORAGE
+        let (status_rx, output, exit_code, error, timed_out, output_read) = COMMAND_STORAGE
             .get_direct(&command_id)
             .map(|cmd| {
                 (
@@ -1366,6 +1394,7 @@ impl McpSSHCommands {
                     Arc::clone(&cmd.exit_code),
                     Arc::clone(&cmd.error),
                     Arc::clone(&cmd.timed_out),
+                    Arc::clone(&cmd.output_read),
                 )
             })
             .ok_or_else(|| format!("No async command with ID: {command_id}"))?;
@@ -1374,6 +1403,9 @@ impl McpSSHCommands {
             let mut rx = status_rx.clone();
             let _ = timeout(wait_timeout, wait_for_command_completion(&mut rx)).await;
         }
+
+        // Mark output as read so the cleanup task can release immediately
+        output_read.store(true, Ordering::SeqCst);
 
         build_command_output_response(
             command_id, &status_rx, &output, &exit_code, &error, &timed_out,
