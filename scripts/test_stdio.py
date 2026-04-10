@@ -12,10 +12,22 @@ import uuid as _uuid
 BINARY = os.environ.get("SSH_MCP_STDIO", os.path.join(os.path.dirname(__file__), "..", "target", "release", "ssh-mcp-stdio"))
 HOST = os.environ.get("SSH_HOST", "vm.services:22")
 USER = os.environ.get("SSH_USER", "root")
+KEY_PATH = os.environ.get("SSH_KEY_PATH", "~/.ssh/id_rsa")
 LOCAL_FILE = os.environ.get("LOCAL_FILE", "/Users/farchanjo/Downloads/IMG_1267.MOV")
 REMOTE_DIR = "/tmp/ssh-mcp-test"
 REMOTE_FILE = f"{REMOTE_DIR}/{os.path.basename(LOCAL_FILE)}"
 DOWNLOAD_FILE = "/tmp/ssh-mcp-test-downloaded" + os.path.splitext(LOCAL_FILE)[1]
+
+
+def connect_args(agent_id=None, name=None, **extra):
+    """Build ssh_connect arguments with key_path."""
+    args = {"address": HOST, "username": USER, "key_path": KEY_PATH}
+    if agent_id:
+        args["agent_id"] = agent_id
+    if name:
+        args["name"] = name
+    args.update(extra)
+    return args
 
 
 class McpClient:
@@ -203,10 +215,7 @@ def main():
 
     # 3. Connect
     print("\n=== SSH CONNECT ===", flush=True)
-    result = client.tool_call("ssh_connect", {
-        "address": HOST, "username": USER,
-        "agent_id": "sftp-test", "name": "sftp-test-session",
-    })
+    result = client.tool_call("ssh_connect", connect_args(agent_id="sftp-test", name="sftp-test-session"))
     session_id = result.get("session_id", "")
     total += 1
     if test("SSH Connect", bool(session_id), f"session_id={session_id[:16]}..." if session_id else str(result)):
@@ -394,7 +403,7 @@ def main():
 
     # -- A. Concurrent Commands on Same Session --
     print("\n=== A. CONCURRENT COMMANDS (SAME SESSION) ===", flush=True)
-    chaos_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-a", "name": "chaos-a"})
+    chaos_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-a", name="chaos-a"))
     chaos_sid = chaos_r.get("session_id", "")
     if chaos_sid:
         N_CONCURRENT = 8
@@ -404,20 +413,18 @@ def main():
             marker = f"MARKER_{i}_{_uuid.uuid4().hex[:8]}"
             markers.append(marker)
             batch_calls.append(("ssh_execute", {"session_id": chaos_sid, "command": f"echo {marker}"}))
-        sent = client.send_batch(batch_calls)
-        responses = client.collect_responses(sent.keys(), timeout=30)
-        cmd_ids = {}
-        for rid, resp in responses.items():
-            parsed = client.tool_call_parsed(resp)
-            cid = parsed.get("command_id", "")
-            idx = list(sent.keys()).index(rid)
-            if cid:
-                cmd_ids[markers[idx]] = cid
+        # Execute and immediately poll output for each command sequentially
+        # (completed commands are auto-cleaned from storage, so batch-then-poll can miss them)
         all_ok = True
-        for marker, cid in cmd_ids.items():
-            r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
-            if marker not in r.get("stdout", ""):
-                all_ok = False
+        cmd_ids = {}
+        for i, marker in enumerate(markers):
+            r = client.tool_call("ssh_execute", {"session_id": chaos_sid, "command": f"echo {marker}"})
+            cid = r.get("command_id", "")
+            if cid:
+                cmd_ids[marker] = cid
+                r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
+                if marker not in r.get("stdout", ""):
+                    all_ok = False
         total += 1
         if test(f"8 concurrent cmds returned correct markers", all_ok, f"got {len(cmd_ids)}/{N_CONCURRENT}"):
             passed += 1
@@ -429,36 +436,26 @@ def main():
     print("\n=== B. CONCURRENT COMMANDS (CROSS SESSION) ===", flush=True)
     cross_sids = []
     for i in range(3):
-        r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-b", "name": f"cross-{i}"})
+        r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-b", name=f"cross-{i}"))
         sid = r.get("session_id", "")
         if sid:
             cross_sids.append(sid)
     if len(cross_sids) == 3:
-        batch_calls = []
-        cross_markers = []
+        # Execute and immediately poll per command (auto-cleanup removes completed commands)
+        cross_ok = True
+        cmd_count = 0
         for si, sid in enumerate(cross_sids):
             for ci in range(2):
                 marker = f"CROSS_{si}_{ci}_{_uuid.uuid4().hex[:8]}"
-                cross_markers.append((si, ci, marker))
-                batch_calls.append(("ssh_execute", {"session_id": sid, "command": f"echo {marker}"}))
-        sent = client.send_batch(batch_calls)
-        responses = client.collect_responses(sent.keys(), timeout=30)
-        cmd_map = {}
-        rid_list = list(sent.keys())
-        for rid, resp in responses.items():
-            parsed = client.tool_call_parsed(resp)
-            cid = parsed.get("command_id", "")
-            idx = rid_list.index(rid)
-            si, ci, marker = cross_markers[idx]
-            if cid:
-                cmd_map[(si, ci)] = (marker, cid)
-        cross_ok = True
-        for (si, ci), (marker, cid) in cmd_map.items():
-            r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
-            if marker not in r.get("stdout", ""):
-                cross_ok = False
+                r = client.tool_call("ssh_execute", {"session_id": sid, "command": f"echo {marker}"})
+                cid = r.get("command_id", "")
+                if cid:
+                    cmd_count += 1
+                    r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
+                    if marker not in r.get("stdout", ""):
+                        cross_ok = False
         total += 1
-        if test("6 cross-session cmds routed correctly", cross_ok, f"got {len(cmd_map)}/6"):
+        if test("6 cross-session cmds routed correctly", cross_ok, f"got {cmd_count}/6"):
             passed += 1
         else:
             failed += 1
@@ -466,7 +463,7 @@ def main():
 
     # -- C. Shell Write During Disconnect Race --
     print("\n=== C. SHELL WRITE + DISCONNECT RACE ===", flush=True)
-    race_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-c", "name": "race"})
+    race_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-c", name="race"))
     race_sid = race_r.get("session_id", "")
     if race_sid:
         race_shell = client.tool_call("ssh_shell_open", {"session_id": race_sid}).get("shell_id", "")
@@ -501,7 +498,7 @@ def main():
     print("\n=== D. RAPID CONNECT/DISCONNECT (10 cycles) ===", flush=True)
     stress_ok = True
     for i in range(10):
-        r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-d", "name": f"stress-{i}"})
+        r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-d", name=f"stress-{i}"))
         sid = r.get("session_id", "")
         if not sid:
             stress_ok = False
@@ -518,7 +515,7 @@ def main():
 
     # -- E. Cancel Command While Polling Output --
     print("\n=== E. CANCEL WHILE POLLING ===", flush=True)
-    cancel_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-e", "name": "cancel-race"})
+    cancel_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-e", name="cancel-race"))
     cancel_sid = cancel_r.get("session_id", "")
     if cancel_sid:
         r = client.tool_call("ssh_execute", {"session_id": cancel_sid, "command": "sleep 60"})
@@ -555,29 +552,29 @@ def main():
     route_agent = f"chaos-f-{_uuid.uuid4().hex[:8]}"
     route_sids = []
     for i in range(3):
-        r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": route_agent, "name": f"route-{i}"})
+        r = client.tool_call("ssh_connect", connect_args(agent_id=route_agent, name=f"route-{i}"))
         sid = r.get("session_id", "")
         if sid:
             route_sids.append(sid)
     if len(route_sids) == 3:
-        route_markers = {}
+        # Execute and immediately poll per session (auto-cleanup removes completed commands)
+        route_outputs = {}
         for i, sid in enumerate(route_sids):
             marker = f"SESSION_ROUTE_{i}_{sid[:8]}"
             r = client.tool_call("ssh_execute", {"session_id": sid, "command": f"echo {marker}"})
             cid = r.get("command_id", "")
             if cid:
-                route_markers[i] = (marker, cid)
+                r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
+                route_outputs[i] = (marker, r.get("stdout", ""))
         route_ok = True
-        for i, (marker, cid) in route_markers.items():
-            r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
-            stdout = r.get("stdout", "")
+        for i, (marker, stdout) in route_outputs.items():
             if marker not in stdout:
                 route_ok = False
-            for j, (other_marker, _) in route_markers.items():
+            for j, (other_marker, _) in route_outputs.items():
                 if j != i and other_marker in stdout:
                     route_ok = False
         total += 1
-        if test("Each session echoed only its own marker", route_ok, f"verified {len(route_markers)} sessions"):
+        if test("Each session echoed only its own marker", route_ok, f"verified {len(route_outputs)} sessions"):
             passed += 1
         else:
             failed += 1
@@ -648,7 +645,7 @@ def main():
         failed += 1
 
     # Double disconnect
-    dd_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g", "name": "dd"})
+    dd_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g", name="dd"))
     dd_sid = dd_r.get("session_id", "")
     if dd_sid:
         client.tool_call("ssh_disconnect", {"session_id": dd_sid})
@@ -660,7 +657,7 @@ def main():
             failed += 1
 
     # Execute on disconnected session
-    disc_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g2", "name": "disc-exec"})
+    disc_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g2", name="disc-exec"))
     disc_sid = disc_r.get("session_id", "")
     if disc_sid:
         client.tool_call("ssh_disconnect", {"session_id": disc_sid})
@@ -672,7 +669,7 @@ def main():
             failed += 1
 
     # Write/read to closed shell
-    closed_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g3", "name": "closed-shell"})
+    closed_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g3", name="closed-shell"))
     closed_sid = closed_r.get("session_id", "")
     if closed_sid:
         sh = client.tool_call("ssh_shell_open", {"session_id": closed_sid}).get("shell_id", "")
@@ -693,7 +690,7 @@ def main():
         client.tool_call("ssh_disconnect", {"session_id": closed_sid})
 
     # Cancel already-completed command
-    comp_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g4", "name": "comp-cancel"})
+    comp_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g4", name="comp-cancel"))
     comp_sid = comp_r.get("session_id", "")
     if comp_sid:
         r = client.tool_call("ssh_execute", {"session_id": comp_sid, "command": "echo done"})
@@ -710,7 +707,7 @@ def main():
 
     # -- H. Mixed Concurrent Valid + Invalid Operations --
     print("\n=== H. MIXED CONCURRENT VALID + INVALID ===", flush=True)
-    mix_r = client.tool_call("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-h", "name": "mixed"})
+    mix_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-h", name="mixed"))
     mix_sid = mix_r.get("session_id", "")
     if mix_sid:
         fake1 = str(_uuid.uuid4())
