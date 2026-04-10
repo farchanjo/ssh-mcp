@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use russh::{client, keys};
+use tokio::net::UnixStream;
 use tracing::{debug, info};
 
 use crate::mcp::session::SshClientHandler;
@@ -10,13 +11,14 @@ use super::traits::AuthStrategy;
 
 /// SSH agent authentication strategy.
 ///
-/// Connects to the SSH agent (via SSH_AUTH_SOCK) and tries each available
+/// Connects to the SSH agent (via `SSH_AUTH_SOCK`) and tries each available
 /// identity until one succeeds.
 pub struct AgentAuth;
 
 impl AgentAuth {
     /// Create a new SSH agent authentication strategy.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -34,59 +36,63 @@ impl AuthStrategy for AgentAuth {
         handle: &mut client::Handle<SshClientHandler>,
         username: &str,
     ) -> Result<bool, String> {
-        // Connect to the SSH agent
         let mut agent = keys::agent::client::AgentClient::connect_env()
             .await
-            .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
+            .map_err(|e| format!("Failed to connect to SSH agent: {e}"))?;
 
-        // Get identities from the agent
         let identities = agent
             .request_identities()
             .await
-            .map_err(|e| format!("Failed to get identities from SSH agent: {}", e))?;
+            .map_err(|e| format!("Failed to get identities from SSH agent: {e}"))?;
 
         if identities.is_empty() {
             return Err("No identities found in SSH agent".to_string());
         }
 
-        // Try each identity until one succeeds
-        for identity in identities {
-            debug!("Trying SSH agent identity: {:?}", identity.comment());
-
-            // For RSA keys, use the best supported hash algorithm
-            let hash_alg = handle
-                .best_supported_rsa_hash()
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-            debug!("Using RSA hash algorithm: {:?}", hash_alg);
-
-            match handle
-                .authenticate_publickey_with(username, identity.clone(), hash_alg, &mut agent)
-                .await
-            {
-                Ok(result) if result.success() => {
-                    info!("Successfully authenticated with SSH agent");
-                    return Ok(true);
-                }
-                Ok(_) => {
-                    debug!("Agent identity not accepted, trying next...");
-                    continue;
-                }
-                Err(e) => {
-                    debug!("Agent authentication error: {}, trying next...", e);
-                    continue;
-                }
-            }
-        }
-
-        Err("Agent authentication failed: no identities accepted".to_string())
+        try_identities(handle, username, &identities, &mut agent).await
     }
 
     fn name(&self) -> &'static str {
         "agent"
     }
+}
+
+/// Try each identity from the SSH agent until one succeeds.
+async fn try_identities(
+    handle: &mut client::Handle<SshClientHandler>,
+    username: &str,
+    identities: &[keys::PublicKey],
+    agent: &mut keys::agent::client::AgentClient<UnixStream>,
+) -> Result<bool, String> {
+    for identity in identities {
+        debug!("Trying SSH agent identity: {:?}", identity.comment());
+
+        let hash_alg = handle
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        debug!("Using RSA hash algorithm: {:?}", hash_alg);
+
+        match handle
+            .authenticate_publickey_with(username, identity.clone(), hash_alg, agent)
+            .await
+        {
+            Ok(result) if result.success() => {
+                info!("Successfully authenticated with SSH agent");
+                return Ok(true);
+            }
+            Ok(_) => {
+                debug!("Agent identity not accepted, trying next...");
+            }
+            Err(e) => {
+                debug!("Agent authentication error: {e}, trying next...");
+            }
+        }
+    }
+
+    Err("Agent authentication failed: no identities accepted".to_string())
 }
 
 #[cfg(test)]

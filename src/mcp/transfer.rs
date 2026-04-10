@@ -9,6 +9,7 @@
 //!   progress counters, cancellation token, and status.
 //! - Storage is handled by `storage::TransferStorage` trait implementations.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -27,11 +28,11 @@ pub enum TransferDirection {
     Download,
 }
 
-impl std::fmt::Display for TransferDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TransferDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransferDirection::Upload => write!(f, "upload"),
-            TransferDirection::Download => write!(f, "download"),
+            Self::Upload => write!(f, "upload"),
+            Self::Download => write!(f, "download"),
         }
     }
 }
@@ -50,13 +51,13 @@ pub enum TransferStatus {
     Cancelled,
 }
 
-impl std::fmt::Display for TransferStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TransferStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransferStatus::Running => write!(f, "running"),
-            TransferStatus::Completed => write!(f, "completed"),
-            TransferStatus::Failed => write!(f, "failed"),
-            TransferStatus::Cancelled => write!(f, "cancelled"),
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -91,7 +92,7 @@ pub struct RunningTransfer {
     /// Receiver for status updates
     pub status_rx: watch::Receiver<TransferStatus>,
     /// Sender for status updates (kept alive to prevent channel closure)
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "kept alive to prevent watch channel closure")]
     pub status_tx: watch::Sender<TransferStatus>,
     /// Error message if transfer failed
     pub error: Arc<Mutex<Option<String>>>,

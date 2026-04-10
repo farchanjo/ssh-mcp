@@ -35,7 +35,7 @@ pub struct ChannelWriter {
 
 impl ChannelWriter {
     /// Create a new channel writer from a channel write half.
-    pub fn new(write_half: ChannelWriteHalf<client::Msg>) -> Self {
+    pub const fn new(write_half: ChannelWriteHalf<client::Msg>) -> Self {
         Self { write_half }
     }
 
@@ -44,7 +44,7 @@ impl ChannelWriter {
         self.write_half
             .data(data)
             .await
-            .map_err(|e| format!("Failed to write to shell: {}", e))
+            .map_err(|e| format!("Failed to write to shell: {e}"))
     }
 
     /// Close the channel gracefully.
@@ -52,7 +52,7 @@ impl ChannelWriter {
         self.write_half
             .close()
             .await
-            .map_err(|e| format!("Failed to close shell channel: {}", e))
+            .map_err(|e| format!("Failed to close shell channel: {e}"))
     }
 }
 
@@ -67,7 +67,7 @@ pub struct RunningShell {
     /// Write handle for sending input to the shell
     pub channel_writer: Arc<Mutex<ChannelWriter>>,
     /// Sender for status updates (kept alive to prevent channel closure)
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "kept alive to prevent watch channel closure")]
     pub status_tx: watch::Sender<ShellStatus>,
     /// Receiver for status updates
     pub status_rx: watch::Receiver<ShellStatus>,

@@ -6,14 +6,14 @@
 //!
 //! # Available Strategies
 //!
-//! - [`PasswordAuth`]: Password-based authentication
-//! - [`KeyAuth`]: Private key file authentication
-//! - [`AgentAuth`]: SSH agent authentication
+//! - [`password::PasswordAuth`]: Password-based authentication
+//! - [`key::KeyAuth`]: Private key file authentication
+//! - [`agent::AgentAuth`]: SSH agent authentication
 //!
 //! # Example
 //!
 //! ```ignore
-//! use ssh_mcp::mcp::auth::{AuthChain, PasswordAuth, KeyAuth, AgentAuth};
+//! use ssh_mcp::mcp::auth::chain::AuthChain;
 //!
 //! let chain = AuthChain::new()
 //!     .with_password("secret")
@@ -23,14 +23,8 @@
 //! let result = chain.authenticate(&mut handle, "username").await?;
 //! ```
 
-mod agent;
-mod chain;
-mod key;
-mod password;
-mod traits;
-
-pub use agent::AgentAuth;
-pub use chain::AuthChain;
-pub use key::KeyAuth;
-pub use password::PasswordAuth;
-pub use traits::AuthStrategy;
+pub mod agent;
+pub mod chain;
+pub mod key;
+pub mod password;
+pub mod traits;

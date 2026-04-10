@@ -16,6 +16,7 @@
 ///     .reused(false)
 ///     .build();
 /// ```
+#[must_use]
 pub struct ConnectMessageBuilder {
     session_id: String,
     username: String,
@@ -59,24 +60,25 @@ impl ConnectMessageBuilder {
     }
 
     /// Set the number of retry attempts.
-    pub fn with_retry_attempts(mut self, attempts: u32) -> Self {
+    pub const fn with_retry_attempts(mut self, attempts: u32) -> Self {
         self.retry_attempts = attempts;
         self
     }
 
     /// Set whether the session is persistent.
-    pub fn with_persistent(mut self, persistent: bool) -> Self {
+    pub const fn with_persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
         self
     }
 
     /// Set whether this is a reused session.
-    pub fn reused(mut self, reused: bool) -> Self {
+    pub const fn reused(mut self, reused: bool) -> Self {
         self.reused = reused;
         self
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let header = if self.reused {
             "SESSION REUSED"
@@ -84,14 +86,22 @@ impl ConnectMessageBuilder {
             "SSH CONNECTION ESTABLISHED"
         };
 
-        let mut lines = vec![format!("{}. REMEMBER THESE IDENTIFIERS:", header)];
+        let mut lines = vec![format!("{header}. REMEMBER THESE IDENTIFIERS:")];
+        self.append_identifiers(&mut lines);
 
-        if let Some(ref aid) = self.agent_id {
-            lines.push(format!("• agent_id: '{}'", aid));
+        lines.push(String::new()); // empty line
+        self.append_instructions(&mut lines);
+
+        lines.join("\n")
+    }
+
+    fn append_identifiers(&self, lines: &mut Vec<String>) {
+        if let Some(aid) = &self.agent_id {
+            lines.push(format!("• agent_id: '{aid}'"));
         }
         lines.push(format!("• session_id: '{}'", self.session_id));
-        if let Some(ref n) = self.name {
-            lines.push(format!("• name: '{}'", n));
+        if let Some(n) = &self.name {
+            lines.push(format!("• name: '{n}'"));
         }
         lines.push(format!("• host: {}@{}", self.username, self.host));
         if self.retry_attempts > 0 {
@@ -100,20 +110,18 @@ impl ConnectMessageBuilder {
         if self.persistent {
             lines.push("• persistent: true".to_string());
         }
+    }
 
-        lines.push(String::new()); // empty line
+    fn append_instructions(&self, lines: &mut Vec<String>) {
         lines.push(format!(
             "Use ssh_execute with session_id '{}' to run commands.",
             self.session_id
         ));
-        if let Some(ref aid) = self.agent_id {
+        if let Some(aid) = &self.agent_id {
             lines.push(format!(
-                "Use ssh_disconnect_agent with agent_id '{}' to disconnect all sessions for this agent.",
-                aid
+                "Use ssh_disconnect_agent with agent_id '{aid}' to disconnect all sessions for this agent.",
             ));
         }
-
-        lines.join("\n")
     }
 }
 
@@ -126,6 +134,7 @@ impl ConnectMessageBuilder {
 ///     .with_agent_id(Some("my-agent"))
 ///     .build();
 /// ```
+#[must_use]
 pub struct ExecuteMessageBuilder {
     command_id: String,
     session_id: String,
@@ -155,6 +164,7 @@ impl ExecuteMessageBuilder {
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let mut lines = vec![
             "COMMAND STARTED. REMEMBER THESE IDENTIFIERS:".to_string(),
@@ -162,13 +172,13 @@ impl ExecuteMessageBuilder {
             format!("• session_id: '{}'", self.session_id),
         ];
 
-        if let Some(ref aid) = self.agent_id {
-            lines.push(format!("• agent_id: '{}'", aid));
+        if let Some(aid) = &self.agent_id {
+            lines.push(format!("• agent_id: '{aid}'"));
         }
 
         // Truncate command if too long
         let cmd_display = truncate_command(&self.command, 50);
-        lines.push(format!("• command: '{}'", cmd_display));
+        lines.push(format!("• command: '{cmd_display}'"));
 
         lines.push(String::new()); // empty line
         lines.push(format!(
@@ -194,6 +204,7 @@ impl ExecuteMessageBuilder {
 ///     .with_commands_cancelled(5)
 ///     .build();
 /// ```
+#[must_use]
 pub struct AgentDisconnectMessageBuilder {
     agent_id: String,
     sessions_disconnected: usize,
@@ -211,18 +222,19 @@ impl AgentDisconnectMessageBuilder {
     }
 
     /// Set the number of sessions disconnected.
-    pub fn with_sessions_disconnected(mut self, count: usize) -> Self {
+    pub const fn with_sessions_disconnected(mut self, count: usize) -> Self {
         self.sessions_disconnected = count;
         self
     }
 
     /// Set the number of commands cancelled.
-    pub fn with_commands_cancelled(mut self, count: usize) -> Self {
+    pub const fn with_commands_cancelled(mut self, count: usize) -> Self {
         self.commands_cancelled = count;
         self
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let mut lines = vec![
             "AGENT CLEANUP COMPLETE. SUMMARY:".to_string(),
@@ -254,6 +266,7 @@ impl AgentDisconnectMessageBuilder {
 ///     .with_agent_id(Some("my-agent"))
 ///     .build();
 /// ```
+#[must_use]
 pub struct ShellOpenMessageBuilder {
     shell_id: String,
     session_id: String,
@@ -289,11 +302,12 @@ impl ShellOpenMessageBuilder {
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let mut lines = vec!["INTERACTIVE SHELL OPENED. REMEMBER THESE IDENTIFIERS:".to_string()];
 
-        if let Some(ref aid) = self.agent_id {
-            lines.push(format!("• agent_id: '{}'", aid));
+        if let Some(aid) = &self.agent_id {
+            lines.push(format!("• agent_id: '{aid}'"));
         }
         lines.push(format!("• shell_id: '{}'", self.shell_id));
         lines.push(format!("• session_id: '{}'", self.session_id));
@@ -329,6 +343,7 @@ impl ShellOpenMessageBuilder {
 ///     .with_agent_id(Some("my-agent"))
 ///     .build();
 /// ```
+#[must_use]
 pub struct UploadMessageBuilder {
     transfer_id: String,
     session_id: String,
@@ -364,11 +379,12 @@ impl UploadMessageBuilder {
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let mut lines = vec!["UPLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
 
-        if let Some(ref aid) = self.agent_id {
-            lines.push(format!("• agent_id: '{}'", aid));
+        if let Some(aid) = &self.agent_id {
+            lines.push(format!("• agent_id: '{aid}'"));
         }
         lines.push(format!("• transfer_id: '{}'", self.transfer_id));
         lines.push(format!("• session_id: '{}'", self.session_id));
@@ -395,6 +411,7 @@ impl UploadMessageBuilder {
 ///     .with_agent_id(Some("my-agent"))
 ///     .build();
 /// ```
+#[must_use]
 pub struct DownloadMessageBuilder {
     transfer_id: String,
     session_id: String,
@@ -430,11 +447,12 @@ impl DownloadMessageBuilder {
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
         let mut lines = vec!["DOWNLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
 
-        if let Some(ref aid) = self.agent_id {
-            lines.push(format!("• agent_id: '{}'", aid));
+        if let Some(aid) = &self.agent_id {
+            lines.push(format!("• agent_id: '{aid}'"));
         }
         lines.push(format!("• transfer_id: '{}'", self.transfer_id));
         lines.push(format!("• session_id: '{}'", self.session_id));
@@ -460,6 +478,7 @@ impl DownloadMessageBuilder {
 /// let message = TransferProgressMessageBuilder::new("xfer-123", "upload", "running", 524288, 1048576)
 ///     .build();
 /// ```
+#[must_use]
 pub struct TransferProgressMessageBuilder {
     transfer_id: String,
     direction: String,
@@ -487,37 +506,57 @@ impl TransferProgressMessageBuilder {
     }
 
     /// Build the message string.
+    #[must_use]
     pub fn build(&self) -> String {
-        let percent = if self.total_bytes > 0 {
-            ((self.bytes_transferred as f64 / self.total_bytes as f64) * 100.0) as u8
-        } else {
-            0
-        };
-
+        let percent = compute_percent(self.bytes_transferred, self.total_bytes);
         let human_transferred = format_bytes(self.bytes_transferred);
         let human_total = format_bytes(self.total_bytes);
 
         format!(
-            "TRANSFER {} ({}): {} - {}/{} ({}%)",
-            self.transfer_id, self.direction, self.status, human_transferred, human_total, percent
+            "TRANSFER {} ({}): {} - {}/{} ({percent}%)",
+            self.transfer_id, self.direction, self.status, human_transferred, human_total
         )
     }
 }
 
+/// Compute a transfer percentage as a `u8` value (0..=100).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::as_conversions,
+    reason = "percentage calculation where precision loss is acceptable and result is always 0..=100"
+)]
+fn compute_percent(bytes_transferred: u64, total_bytes: u64) -> u8 {
+    if total_bytes > 0 {
+        (bytes_transferred as f64 / total_bytes as f64 * 100.0) as u8
+    } else {
+        0
+    }
+}
+
 /// Format bytes into human-readable string.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "display-only formatting where precision loss is acceptable for human-readable output"
+)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
 
     if bytes >= GB {
-        format!("{:.1}GB", bytes as f64 / GB as f64)
+        let value = bytes as f64 / GB as f64;
+        format!("{value:.1}GB")
     } else if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
+        let value = bytes as f64 / MB as f64;
+        format!("{value:.1}MB")
     } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
+        let value = bytes as f64 / KB as f64;
+        format!("{value:.1}KB")
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }
 

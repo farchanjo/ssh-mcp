@@ -2,7 +2,7 @@
 #![deny(clippy::unwrap_used)]
 
 use poem_mcpserver::McpServer;
-use ssh_mcp::mcp::McpSSHCommands;
+use ssh_mcp::mcp::commands::McpSSHCommands;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -34,8 +34,7 @@ async fn stdio_with_unknown_method_handling(
                         continue;
                     }
                     if let Some(resp) = server.handle_request(request).await {
-                        let out =
-                            serde_json::to_string(&resp).expect("serialize response");
+                        let out = serde_json::to_string(&resp).expect("serialize response");
                         println!("{out}");
                     }
                 }

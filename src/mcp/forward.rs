@@ -26,8 +26,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use russh::client;
-use tokio::net::TcpListener;
+use russh::Channel;
+use russh::client::{self, Msg};
+use tokio::io;
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error};
 
 use super::session::SshClientHandler;
@@ -47,60 +49,73 @@ use super::session::SshClientHandler;
 /// # Returns
 ///
 /// Returns the actual bound socket address on success, or an error message on failure.
-pub(crate) async fn setup_port_forwarding(
+pub async fn setup_port_forwarding(
     handle_arc: Arc<client::Handle<SshClientHandler>>,
     local_port: u16,
     remote_address: &str,
     remote_port: u16,
 ) -> Result<SocketAddr, String> {
-    // Create a TCP listener for the local port
-    let listener_addr = format!("127.0.0.1:{}", local_port);
+    let listener_addr = format!("127.0.0.1:{local_port}");
     let listener = TcpListener::bind(&listener_addr)
         .await
-        .map_err(|e| format!("Failed to bind to local port {}: {}", local_port, e))?;
+        .map_err(|e| format!("Failed to bind to local port {local_port}: {e}"))?;
 
     let local_addr = listener
         .local_addr()
-        .map_err(|e| format!("Failed to get local address: {}", e))?;
+        .map_err(|e| format!("Failed to get local address: {e}"))?;
 
-    let remote_addr_clone = remote_address.to_string();
+    let remote_addr_owned = remote_address.to_string();
 
-    // Spawn an async task to handle port forwarding connections
     tokio::spawn(async move {
-        debug!("Port forwarding active on {}", local_addr);
-
-        loop {
-            match listener.accept().await {
-                Ok((local_stream, client_addr)) => {
-                    debug!("New connection from {} to forwarded port", client_addr);
-
-                    // Clone handle arc for this connection
-                    let handle_arc = handle_arc.clone();
-                    let remote_host = remote_addr_clone.clone();
-
-                    // Spawn a task for each connection
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_port_forward_connection(
-                            handle_arc,
-                            local_stream,
-                            &remote_host,
-                            remote_port,
-                        )
-                        .await
-                        {
-                            debug!("Port forwarding connection error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
-        }
+        run_accept_loop(listener, handle_arc, &remote_addr_owned, remote_port).await;
     });
 
     Ok(local_addr)
+}
+
+/// Accepts incoming TCP connections and spawns forwarding tasks for each.
+async fn run_accept_loop(
+    listener: TcpListener,
+    handle_arc: Arc<client::Handle<SshClientHandler>>,
+    remote_address: &str,
+    remote_port: u16,
+) {
+    debug!("Port forwarding active on {:?}", listener.local_addr());
+
+    loop {
+        match listener.accept().await {
+            Ok((local_stream, client_addr)) => {
+                debug!("New connection from {client_addr} to forwarded port");
+                spawn_forward_task(
+                    Arc::clone(&handle_arc),
+                    local_stream,
+                    remote_address.to_owned(),
+                    remote_port,
+                );
+            }
+            Err(e) => {
+                error!("Error accepting connection: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Spawns a task to handle a single forwarded connection.
+fn spawn_forward_task(
+    handle_arc: Arc<client::Handle<SshClientHandler>>,
+    local_stream: TcpStream,
+    remote_host: String,
+    remote_port: u16,
+) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            handle_port_forward_connection(handle_arc, local_stream, &remote_host, remote_port)
+                .await
+        {
+            debug!("Port forwarding connection error: {e}");
+        }
+    });
 }
 
 /// Handles a single port forwarding connection using async I/O.
@@ -110,46 +125,44 @@ pub(crate) async fn setup_port_forwarding(
 /// SSH channel.
 async fn handle_port_forward_connection(
     handle_arc: Arc<client::Handle<SshClientHandler>>,
-    local_stream: tokio::net::TcpStream,
+    local_stream: TcpStream,
     remote_host: &str,
     remote_port: u16,
 ) -> Result<(), String> {
-    // Open a direct-tcpip channel to the remote destination
-    let channel = handle_arc
-        .channel_open_direct_tcpip(
-            remote_host,
-            remote_port as u32,
-            "127.0.0.1",
-            0, // Local originator port (not significant for direct-tcpip)
-        )
-        .await
-        .map_err(|e| format!("Failed to open direct-tcpip channel: {}", e))?;
-
-    // Convert channel to stream for bidirectional I/O
+    let channel = open_direct_tcpip_channel(&handle_arc, remote_host, remote_port).await?;
     let channel_stream = channel.into_stream();
 
-    // Split both streams for bidirectional forwarding
-    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
-    let (mut channel_read, mut channel_write) = tokio::io::split(channel_stream);
+    let (mut local_read, mut local_write) = io::split(local_stream);
+    let (mut channel_read, mut channel_write) = io::split(channel_stream);
 
-    // Use tokio::io::copy for efficient bidirectional forwarding
-    let local_to_remote = tokio::io::copy(&mut local_read, &mut channel_write);
-    let remote_to_local = tokio::io::copy(&mut channel_read, &mut local_write);
+    let local_to_remote = io::copy(&mut local_read, &mut channel_write);
+    let remote_to_local = io::copy(&mut channel_read, &mut local_write);
 
-    // Run both directions concurrently until one completes or errors
     tokio::select! {
         result = local_to_remote => {
             if let Err(e) = result {
-                debug!("Local to remote copy ended: {}", e);
+                debug!("Local to remote copy ended: {e}");
             }
         }
         result = remote_to_local => {
             if let Err(e) = result {
-                debug!("Remote to local copy ended: {}", e);
+                debug!("Remote to local copy ended: {e}");
             }
         }
     }
 
     debug!("Port forwarding connection closed");
     Ok(())
+}
+
+/// Opens a direct-tcpip channel to the remote destination via SSH.
+async fn open_direct_tcpip_channel(
+    handle_arc: &Arc<client::Handle<SshClientHandler>>,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<Channel<Msg>, String> {
+    handle_arc
+        .channel_open_direct_tcpip(remote_host, u32::from(remote_port), "127.0.0.1", 0)
+        .await
+        .map_err(|e| format!("Failed to open direct-tcpip channel: {e}"))
 }

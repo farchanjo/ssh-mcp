@@ -7,7 +7,7 @@
 //!
 //! - `SshClientHandler`: A russh client handler that accepts all host keys (similar to
 //!   `StrictHostKeyChecking=no` in OpenSSH). In production environments, this should be
-//!   extended to verify against known_hosts.
+//!   extended to verify against `known_hosts`.
 //!
 //! # Thread Safety
 //!
@@ -24,7 +24,7 @@ use russh::{client, keys};
 /// # Security Note
 ///
 /// In production environments, you should implement proper host key verification
-/// against a known_hosts file to prevent man-in-the-middle attacks.
+/// against a `known_hosts` file to prevent man-in-the-middle attacks.
 pub struct SshClientHandler;
 
 impl client::Handler for SshClientHandler {
@@ -35,7 +35,7 @@ impl client::Handler for SshClientHandler {
         _server_public_key: &keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         // Accept all host keys (similar to StrictHostKeyChecking=no)
-        // In production, you'd want to verify against known_hosts
+        // In production, you'd want to verify against `known_hosts`
         Ok(true)
     }
 }

@@ -4,10 +4,4 @@
 //! messages that help LLMs remember important identifiers and understand
 //! available operations.
 
-mod builder;
-
-pub use builder::{
-    AgentDisconnectMessageBuilder, ConnectMessageBuilder, DownloadMessageBuilder,
-    ExecuteMessageBuilder, ShellOpenMessageBuilder, TransferProgressMessageBuilder,
-    UploadMessageBuilder,
-};
+pub mod builder;

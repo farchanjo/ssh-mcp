@@ -21,43 +21,44 @@ use std::env;
 use std::time::Duration;
 
 /// Default SSH connection timeout
-pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default SSH command execution timeout
-pub(crate) const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Default maximum retry attempts for SSH connection
-pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// Default retry delay
-pub(crate) const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
+pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
 /// Default session inactivity timeout (separate from connect timeout)
-pub(crate) const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum retry delay cap (10 seconds)
-pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Environment variable name for SSH connection timeout
-pub(crate) const CONNECT_TIMEOUT_ENV_VAR: &str = "SSH_CONNECT_TIMEOUT";
+pub const CONNECT_TIMEOUT_ENV_VAR: &str = "SSH_CONNECT_TIMEOUT";
 
 /// Environment variable name for SSH command execution timeout
-pub(crate) const COMMAND_TIMEOUT_ENV_VAR: &str = "SSH_COMMAND_TIMEOUT";
+pub const COMMAND_TIMEOUT_ENV_VAR: &str = "SSH_COMMAND_TIMEOUT";
 
 /// Environment variable name for SSH max retries
-pub(crate) const MAX_RETRIES_ENV_VAR: &str = "SSH_MAX_RETRIES";
+pub const MAX_RETRIES_ENV_VAR: &str = "SSH_MAX_RETRIES";
 
 /// Environment variable name for SSH retry delay in milliseconds
-pub(crate) const RETRY_DELAY_MS_ENV_VAR: &str = "SSH_RETRY_DELAY_MS";
+pub const RETRY_DELAY_MS_ENV_VAR: &str = "SSH_RETRY_DELAY_MS";
 
 /// Environment variable name for SSH session inactivity timeout
-pub(crate) const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
+pub const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
 
 /// Environment variable name for SSH compression
-pub(crate) const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
+pub const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
-pub(crate) fn resolve_connect_timeout(timeout_param: Option<u64>) -> Duration {
+#[must_use]
+pub fn resolve_connect_timeout(timeout_param: Option<u64>) -> Duration {
     // Priority 1: Use parameter if provided
     if let Some(timeout) = timeout_param {
         return Duration::from_secs(timeout);
@@ -75,7 +76,8 @@ pub(crate) fn resolve_connect_timeout(timeout_param: Option<u64>) -> Duration {
 }
 
 /// Resolve the command execution timeout value with priority: parameter -> env var -> default
-pub(crate) fn resolve_command_timeout(timeout_param: Option<u64>) -> Duration {
+#[must_use]
+pub fn resolve_command_timeout(timeout_param: Option<u64>) -> Duration {
     // Priority 1: Use parameter if provided
     if let Some(timeout) = timeout_param {
         return Duration::from_secs(timeout);
@@ -93,7 +95,8 @@ pub(crate) fn resolve_command_timeout(timeout_param: Option<u64>) -> Duration {
 }
 
 /// Resolve the max retries value with priority: parameter -> env var -> default
-pub(crate) fn resolve_max_retries(max_retries_param: Option<u32>) -> u32 {
+#[must_use]
+pub fn resolve_max_retries(max_retries_param: Option<u32>) -> u32 {
     // Priority 1: Use parameter if provided
     if let Some(max_retries) = max_retries_param {
         return max_retries;
@@ -111,7 +114,8 @@ pub(crate) fn resolve_max_retries(max_retries_param: Option<u32>) -> u32 {
 }
 
 /// Resolve the retry delay value with priority: parameter -> env var -> default
-pub(crate) fn resolve_retry_delay(retry_delay_param: Option<u64>) -> Duration {
+#[must_use]
+pub fn resolve_retry_delay(retry_delay_param: Option<u64>) -> Duration {
     // Priority 1: Use parameter if provided (milliseconds)
     if let Some(delay) = retry_delay_param {
         return Duration::from_millis(delay);
@@ -129,7 +133,8 @@ pub(crate) fn resolve_retry_delay(retry_delay_param: Option<u64>) -> Duration {
 }
 
 /// Resolve the inactivity timeout with priority: env var -> default (300s)
-pub(crate) fn resolve_inactivity_timeout() -> Duration {
+#[must_use]
+pub fn resolve_inactivity_timeout() -> Duration {
     if let Ok(env_timeout) = env::var(INACTIVITY_TIMEOUT_ENV_VAR)
         && let Ok(timeout) = env_timeout.parse::<u64>()
     {
@@ -140,7 +145,8 @@ pub(crate) fn resolve_inactivity_timeout() -> Duration {
 }
 
 /// Resolve the compression setting with priority: parameter -> env var -> default (true)
-pub(crate) fn resolve_compression(compress_param: Option<bool>) -> bool {
+#[must_use]
+pub fn resolve_compression(compress_param: Option<bool>) -> bool {
     // Priority 1: Use parameter if provided
     if let Some(compress) = compress_param {
         return compress;
@@ -156,14 +162,18 @@ pub(crate) fn resolve_compression(compress_param: Option<bool>) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions and mutex locks may use unwrap"
+)]
 mod tests {
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
     use super::*;
-    use std::sync::Mutex as StdMutex;
 
     // Use a mutex to serialize env var tests to avoid race conditions
     // SAFETY: Tests are serialized via ENV_TEST_MUTEX to prevent data races
-    static ENV_TEST_MUTEX: std::sync::LazyLock<StdMutex<()>> =
-        std::sync::LazyLock::new(|| StdMutex::new(()));
+    static ENV_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
     /// Helper to set an environment variable safely within tests.
     /// SAFETY: Must be called while holding ENV_TEST_MUTEX to prevent data races.

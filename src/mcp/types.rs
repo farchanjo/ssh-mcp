@@ -4,6 +4,8 @@
 //! All types implement `Serialize`, `Deserialize`, and `JsonSchema` for proper
 //! MCP protocol compatibility.
 
+use std::fmt;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +61,7 @@ pub(crate) struct SshCommandResponse {
     pub timed_out: bool,
 }
 
-/// Port forwarding response (only functional when port_forward feature is enabled)
+/// Port forwarding response (only functional when `port_forward` feature is enabled)
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PortForwardingResponse {
     pub local_address: String,
@@ -82,7 +84,7 @@ pub struct SessionListResponse {
 pub enum AsyncCommandStatus {
     /// Command is currently running
     Running,
-    /// Command has completed (check exit_code)
+    /// Command has completed (check `exit_code`)
     Completed,
     /// Command was cancelled by user
     Cancelled,
@@ -90,18 +92,18 @@ pub enum AsyncCommandStatus {
     Failed,
 }
 
-impl std::fmt::Display for AsyncCommandStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for AsyncCommandStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AsyncCommandStatus::Running => write!(f, "running"),
-            AsyncCommandStatus::Completed => write!(f, "completed"),
-            AsyncCommandStatus::Cancelled => write!(f, "cancelled"),
-            AsyncCommandStatus::Failed => write!(f, "failed"),
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
 
-/// Response from ssh_execute
+/// Response from `ssh_execute`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshExecuteResponse {
     /// Unique identifier for this command
@@ -119,7 +121,7 @@ pub struct SshExecuteResponse {
     pub message: String,
 }
 
-/// Response from ssh_get_command_output
+/// Response from `ssh_get_command_output`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshAsyncOutputResponse {
     /// Command ID being queried
@@ -141,7 +143,7 @@ pub struct SshAsyncOutputResponse {
     pub timed_out: bool,
 }
 
-/// Response from ssh_cancel_command
+/// Response from `ssh_cancel_command`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshCancelCommandResponse {
     /// Command ID that was cancelled
@@ -156,7 +158,7 @@ pub struct SshCancelCommandResponse {
     pub stderr: String,
 }
 
-/// Response from ssh_disconnect_agent
+/// Response from `ssh_disconnect_agent`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentDisconnectResponse {
     /// Agent ID that was disconnected
@@ -186,7 +188,7 @@ pub struct AsyncCommandInfo {
     pub started_at: String,
 }
 
-/// Response from ssh_list_commands
+/// Response from `ssh_list_commands`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshListCommandsResponse {
     /// List of async commands
@@ -206,11 +208,11 @@ pub enum ShellStatus {
     Closed,
 }
 
-impl std::fmt::Display for ShellStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ShellStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ShellStatus::Open => write!(f, "open"),
-            ShellStatus::Closed => write!(f, "closed"),
+            Self::Open => write!(f, "open"),
+            Self::Closed => write!(f, "closed"),
         }
     }
 }
@@ -234,7 +236,7 @@ pub struct ShellInfo {
     pub opened_at: String,
 }
 
-/// Response from ssh_shell_open
+/// Response from `ssh_shell_open`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshShellOpenResponse {
     /// Unique identifier for this shell
@@ -250,7 +252,7 @@ pub struct SshShellOpenResponse {
     pub message: String,
 }
 
-/// Response from ssh_shell_read
+/// Response from `ssh_shell_read`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshShellReadResponse {
     /// Shell ID being read
@@ -261,7 +263,7 @@ pub struct SshShellReadResponse {
     pub status: ShellStatus,
 }
 
-/// Response from ssh_shell_close
+/// Response from `ssh_shell_close`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshShellCloseResponse {
     /// Shell ID that was closed
@@ -272,7 +274,7 @@ pub struct SshShellCloseResponse {
     pub message: String,
 }
 
-/// Response from ssh_upload
+/// Response from `ssh_upload`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshUploadResponse {
     /// Unique identifier for this transfer
@@ -293,7 +295,7 @@ pub struct SshUploadResponse {
     pub message: String,
 }
 
-/// Response from ssh_download
+/// Response from `ssh_download`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshDownloadResponse {
     /// Unique identifier for this transfer
@@ -314,7 +316,7 @@ pub struct SshDownloadResponse {
     pub message: String,
 }
 
-/// Response from ssh_get_transfer_progress
+/// Response from `ssh_get_transfer_progress`
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SshTransferProgressResponse {
     /// Transfer ID being queried

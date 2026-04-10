@@ -25,7 +25,10 @@ pub struct SessionRef {
 /// Implementations must be thread-safe (`Send + Sync`) for use across
 /// async tasks. The default implementation uses `DashMap` for lock-free
 /// concurrent access.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "trait defines the storage API contract used via dynamic dispatch"
+)]
 pub trait SessionStorage: Send + Sync {
     /// Insert a new session into storage.
     fn insert(
@@ -67,7 +70,7 @@ pub trait SessionStorage: Send + Sync {
 }
 
 /// Reference to a running command for read-only access.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "struct fields are part of the public storage API")]
 pub struct CommandRef {
     pub info: AsyncCommandInfo,
     pub running: Arc<RunningCommand>,
@@ -78,7 +81,10 @@ pub struct CommandRef {
 /// Implementations must be thread-safe (`Send + Sync`) for use across
 /// async tasks. The default implementation uses `DashMap` for lock-free
 /// concurrent access with a secondary index for O(1) session lookups.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "trait defines the storage API contract used via dynamic dispatch"
+)]
 pub trait CommandStorage: Send + Sync {
     /// Register a new async command.
     fn register(&self, command_id: String, command: RunningCommand);
@@ -98,6 +104,9 @@ pub trait CommandStorage: Send + Sync {
     /// Count commands for a session.
     fn count_by_session(&self, session_id: &str) -> usize;
 
+    /// Count only running commands for a session.
+    fn count_running_by_session(&self, session_id: &str) -> usize;
+
     /// List all commands.
     fn list_all(&self) -> Vec<AsyncCommandInfo>;
 
@@ -114,7 +123,10 @@ pub trait CommandStorage: Send + Sync {
 /// Implementations must be thread-safe (`Send + Sync`) for use across
 /// async tasks. The default implementation uses `DashMap` for lock-free
 /// concurrent access with a secondary index for O(1) session lookups.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "trait defines the storage API contract used via dynamic dispatch"
+)]
 pub trait ShellStorage: Send + Sync {
     /// Register a new shell.
     fn register(&self, shell_id: String, shell: RunningShell);
@@ -143,7 +155,10 @@ pub trait ShellStorage: Send + Sync {
 /// Implementations must be thread-safe (`Send + Sync`) for use across
 /// async tasks. The default implementation uses `DashMap` for lock-free
 /// concurrent access with a secondary index for O(1) session lookups.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "trait defines the storage API contract used via dynamic dispatch"
+)]
 pub trait TransferStorage: Send + Sync {
     /// Register a new transfer.
     fn register(&self, transfer_id: String, transfer: RunningTransfer);

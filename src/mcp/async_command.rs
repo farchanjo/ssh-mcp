@@ -50,7 +50,7 @@ pub struct RunningCommand {
     /// Receiver for status updates
     pub status_rx: watch::Receiver<AsyncCommandStatus>,
     /// Sender for status updates (kept alive to prevent channel closure)
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "kept alive to prevent watch channel closure")]
     pub status_tx: watch::Sender<AsyncCommandStatus>,
     /// Output buffer (stdout/stderr)
     pub output: Arc<Mutex<OutputBuffer>>,
