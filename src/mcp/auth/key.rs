@@ -8,6 +8,7 @@ use russh::{client, keys};
 use tracing::debug;
 
 use crate::mcp::session::SshClientHandler;
+use crate::mcp::sftp::expand_tilde;
 
 use super::traits::AuthStrategy;
 
@@ -26,8 +27,10 @@ impl KeyAuth {
     ///
     /// * `key_path` - Path to the private key file
     pub fn new(key_path: impl Into<PathBuf>) -> Self {
+        let raw: PathBuf = key_path.into();
+        let expanded = expand_tilde(&raw.to_string_lossy());
         Self {
-            key_path: key_path.into(),
+            key_path: PathBuf::from(expanded),
         }
     }
 }
@@ -102,9 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn test_key_auth_relative_path() {
+    fn test_key_auth_tilde_expansion() {
         let auth = KeyAuth::new("~/.ssh/id_rsa");
-        assert_eq!(auth.key_path, PathBuf::from("~/.ssh/id_rsa"));
+        // Tilde should be expanded to home directory
+        assert!(!auth.key_path.starts_with("~"));
+        assert!(auth.key_path.to_string_lossy().ends_with(".ssh/id_rsa"));
     }
 
     #[test]
