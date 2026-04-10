@@ -13,6 +13,7 @@ BASE_HOST = "127.0.0.1"
 BASE_PORT = int(os.environ.get("MCP_PORT", "8000"))
 HOST = os.environ.get("SSH_HOST", "vm.services:22")
 USER = os.environ.get("SSH_USER", "root")
+KEY_PATH = os.environ.get("SSH_KEY_PATH", "~/.ssh/id_rsa")
 LOCAL_FILE = os.environ.get("LOCAL_FILE", "/Users/farchanjo/Downloads/IMG_1267.MOV")
 REMOTE_DIR = "/tmp/ssh-mcp-http-test"
 REMOTE_FILE = f"{REMOTE_DIR}/{os.path.basename(LOCAL_FILE)}"
@@ -20,6 +21,17 @@ DOWNLOAD_FILE = "/tmp/ssh-mcp-http-test-downloaded" + os.path.splitext(LOCAL_FIL
 
 req_id = 0
 session_header = None
+
+
+def connect_args(agent_id=None, name=None, **extra):
+    """Build ssh_connect arguments with key_path."""
+    args = {"address": HOST, "username": USER, "key_path": KEY_PATH}
+    if agent_id:
+        args["agent_id"] = agent_id
+    if name:
+        args["name"] = name
+    args.update(extra)
+    return args
 
 
 def mcp(method, params=None):
@@ -186,7 +198,7 @@ for t in tools:
 
 # -- 3. ssh_connect --
 print("\n=== 3. ssh_connect ===", flush=True)
-r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "http-test", "name": "http-test-session", "persistent": True})
+r = tool("ssh_connect", connect_args(agent_id="http-test", name="http-test-session", persistent=True))
 session_id = r.get("session_id", "")
 test("ssh_connect", bool(session_id), f"session_id={session_id[:16]}..." if session_id else str(r))
 if not session_id:
@@ -329,7 +341,7 @@ test("[FILE_NOT_FOUND]", "[FILE_NOT_FOUND]" in err, f"{err[:130]}")
 
 # -- A. Concurrent Commands on Same Session --
 print("\n=== A. CONCURRENT COMMANDS (SAME SESSION) ===", flush=True)
-chaos_sid = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-a", "name": "chaos-a"}).get("session_id", "")
+chaos_sid = tool("ssh_connect", connect_args(agent_id="chaos-a", name="chaos-a")).get("session_id", "")
 if chaos_sid:
     N_CONCURRENT = 8
     futures = {}
@@ -358,7 +370,7 @@ if chaos_sid:
 print("\n=== B. CONCURRENT COMMANDS (CROSS SESSION) ===", flush=True)
 cross_sids = []
 for i in range(3):
-    r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-b", "name": f"cross-{i}"})
+    r = tool("ssh_connect", connect_args(agent_id="chaos-b", name=f"cross-{i}"))
     sid = r.get("session_id", "")
     if sid:
         cross_sids.append(sid)
@@ -387,7 +399,7 @@ if len(cross_sids) == 3:
 
 # -- C. Shell Write During Disconnect Race --
 print("\n=== C. SHELL WRITE + DISCONNECT RACE ===", flush=True)
-race_sid = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-c", "name": "race"}).get("session_id", "")
+race_sid = tool("ssh_connect", connect_args(agent_id="chaos-c", name="race")).get("session_id", "")
 if race_sid:
     race_shell = tool("ssh_shell_open", {"session_id": race_sid}).get("shell_id", "")
     if race_shell:
@@ -410,7 +422,7 @@ else:
 print("\n=== D. RAPID CONNECT/DISCONNECT (10 cycles) ===", flush=True)
 stress_ok = True
 for i in range(10):
-    r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-d", "name": f"stress-{i}"})
+    r = tool("ssh_connect", connect_args(agent_id="chaos-d", name=f"stress-{i}"))
     sid = r.get("session_id", "")
     if not sid:
         stress_ok = False
@@ -423,7 +435,7 @@ test("10 rapid connect/disconnect cycles", stress_ok)
 
 # -- E. Cancel Command While Polling Output --
 print("\n=== E. CANCEL WHILE POLLING ===", flush=True)
-cancel_sid = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-e", "name": "cancel-race"}).get("session_id", "")
+cancel_sid = tool("ssh_connect", connect_args(agent_id="chaos-e", name="cancel-race")).get("session_id", "")
 if cancel_sid:
     r = tool("ssh_execute", {"session_id": cancel_sid, "command": "sleep 60"})
     long_cid = r.get("command_id", "")
@@ -449,7 +461,7 @@ print("\n=== F. MULTI-SESSION ROUTING ===", flush=True)
 route_agent = f"chaos-f-{_uuid.uuid4().hex[:8]}"
 route_sids = []
 for i in range(3):
-    r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": route_agent, "name": f"route-{i}"})
+    r = tool("ssh_connect", connect_args(agent_id=route_agent, name=f"route-{i}"))
     sid = r.get("session_id", "")
     if sid:
         route_sids.append(sid)
@@ -502,7 +514,7 @@ r = tool("ssh_get_transfer_progress", {"transfer_id": fake_uuid})
 test("Transfer progress for fake transfer_id -> error", "error" in r, str(r)[:100])
 
 # Double disconnect
-dd_r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g", "name": "dd"})
+dd_r = tool("ssh_connect", connect_args(agent_id="chaos-g", name="dd"))
 dd_sid = dd_r.get("session_id", "")
 if dd_sid:
     tool("ssh_disconnect", {"session_id": dd_sid})
@@ -510,7 +522,7 @@ if dd_sid:
     test("Double disconnect -> error", "error" in r, str(r)[:100])
 
 # Execute on disconnected session
-disc_r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g2", "name": "disc-exec"})
+disc_r = tool("ssh_connect", connect_args(agent_id="chaos-g2", name="disc-exec"))
 disc_sid = disc_r.get("session_id", "")
 if disc_sid:
     tool("ssh_disconnect", {"session_id": disc_sid})
@@ -518,7 +530,7 @@ if disc_sid:
     test("Execute on disconnected session -> error", "error" in r, str(r)[:100])
 
 # Write/read to closed shell
-closed_r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g3", "name": "closed-shell"})
+closed_r = tool("ssh_connect", connect_args(agent_id="chaos-g3", name="closed-shell"))
 closed_sid = closed_r.get("session_id", "")
 if closed_sid:
     sh = tool("ssh_shell_open", {"session_id": closed_sid}).get("shell_id", "")
@@ -531,7 +543,7 @@ if closed_sid:
     tool("ssh_disconnect", {"session_id": closed_sid})
 
 # Cancel already-completed command
-comp_r = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-g4", "name": "comp-cancel"})
+comp_r = tool("ssh_connect", connect_args(agent_id="chaos-g4", name="comp-cancel"))
 comp_sid = comp_r.get("session_id", "")
 if comp_sid:
     r = tool("ssh_execute", {"session_id": comp_sid, "command": "echo done"})
@@ -544,7 +556,7 @@ if comp_sid:
 
 # -- H. Mixed Concurrent Valid + Invalid Operations --
 print("\n=== H. MIXED CONCURRENT VALID + INVALID ===", flush=True)
-mix_sid = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "chaos-h", "name": "mixed"}).get("session_id", "")
+mix_sid = tool("ssh_connect", connect_args(agent_id="chaos-h", name="mixed")).get("session_id", "")
 if mix_sid:
     fake1 = str(_uuid.uuid4())
     fake2 = str(_uuid.uuid4())
@@ -583,7 +595,7 @@ for agent in ["chaos-g", "chaos-g2", "chaos-g3", "chaos-g4", "chaos-h"]:
 
 # -- ssh_disconnect --
 print("\n=== ssh_disconnect ===", flush=True)
-r2 = tool("ssh_connect", {"address": HOST, "username": USER, "agent_id": "http-test", "name": "disc-test"})
+r2 = tool("ssh_connect", connect_args(agent_id="http-test", name="disc-test"))
 sid2 = r2.get("session_id", "")
 r = tool("ssh_disconnect", {"session_id": sid2})
 test("ssh_disconnect", "disconnected" in str(r).lower(), str(r)[:80])
