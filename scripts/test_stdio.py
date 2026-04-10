@@ -757,6 +757,102 @@ def main():
         client.tool_call("ssh_disconnect_agent", {"agent_id": agent})
 
     # =========================================================================
+    # COMMAND AUTO-CLEANUP TESTS
+    # =========================================================================
+
+    # -- I. Output read -> command cleaned up immediately --
+    print("\n=== I. CLEANUP: OUTPUT READ -> IMMEDIATE REMOVAL ===", flush=True)
+    cleanup_sid = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-i", name="cleanup-read")).get("session_id", "")
+    if cleanup_sid:
+        r = client.tool_call("ssh_execute", {"session_id": cleanup_sid, "command": "echo CLEANUP_READ"})
+        cid = r.get("command_id", "")
+        if cid:
+            # Read the output (marks output_read=true, triggers immediate cleanup)
+            r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
+            total += 1
+            if test("Command completed with output", "CLEANUP_READ" in r.get("stdout", ""), f"stdout={r.get('stdout', '').strip()}"):
+                passed += 1
+            else:
+                failed += 1
+
+            # Wait briefly for the cleanup task to run
+            time.sleep(2)
+
+            # Try to read output again — should fail because command was cleaned up
+            r2 = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": False})
+            total += 1
+            if test("Command removed after output read", "error" in r2, str(r2)[:100]):
+                passed += 1
+            else:
+                failed += 1
+        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid})
+
+    # -- J. Output NOT read -> command persists for TTL --
+    print("\n=== J. CLEANUP: OUTPUT UNREAD -> PERSISTS DURING TTL ===", flush=True)
+    cleanup_sid2 = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-j", name="cleanup-ttl")).get("session_id", "")
+    if cleanup_sid2:
+        r = client.tool_call("ssh_execute", {"session_id": cleanup_sid2, "command": "echo CLEANUP_TTL"})
+        cid2 = r.get("command_id", "")
+        if cid2:
+            # Wait for the command to complete but do NOT read the output
+            time.sleep(3)
+
+            # Command should still be in storage (TTL default=60s has not expired)
+            r2 = client.tool_call("ssh_get_command_output", {"command_id": cid2, "wait": False})
+            total += 1
+            if test("Unread command still in storage after 3s", "CLEANUP_TTL" in r2.get("stdout", ""), f"status={r2.get('status')}"):
+                passed += 1
+            else:
+                failed += 1
+        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid2})
+
+    # -- K. Completed commands don't block new executions --
+    print("\n=== K. CLEANUP: COMPLETED COMMANDS DON'T BLOCK LIMIT ===", flush=True)
+    cleanup_sid3 = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-k", name="cleanup-limit")).get("session_id", "")
+    if cleanup_sid3:
+        # Run 5 commands and read their output (they get cleaned up)
+        for i in range(5):
+            r = client.tool_call("ssh_execute", {"session_id": cleanup_sid3, "command": f"echo BATCH_{i}"})
+            cid = r.get("command_id", "")
+            if cid:
+                client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5})
+        time.sleep(1)
+
+        # Run 5 more — should succeed because completed commands were cleaned up
+        # (if they counted toward the limit, we'd eventually hit 100)
+        batch_ok = True
+        for i in range(5):
+            r = client.tool_call("ssh_execute", {"session_id": cleanup_sid3, "command": f"echo MORE_{i}"})
+            if "error" in r:
+                batch_ok = False
+                break
+            cid = r.get("command_id", "")
+            if cid:
+                client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5})
+
+        total += 1
+        if test("10 sequential commands all succeeded (no limit hit)", batch_ok):
+            passed += 1
+        else:
+            failed += 1
+
+        # Verify list_commands shows 0 running (all completed and cleaned up)
+        time.sleep(1)
+        r = client.tool_call("ssh_list_commands", {"session_id": cleanup_sid3, "status": "running"})
+        running_count = r.get("count", -1)
+        total += 1
+        if test("No running commands after all completed", running_count == 0, f"running={running_count}"):
+            passed += 1
+        else:
+            failed += 1
+
+        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid3})
+
+    # Cleanup test agents
+    for agent in ["cleanup-i", "cleanup-j", "cleanup-k"]:
+        client.tool_call("ssh_disconnect_agent", {"agent_id": agent})
+
+    # =========================================================================
     # ORIGINAL DISCONNECT / CLEANUP TESTS
     # =========================================================================
 
