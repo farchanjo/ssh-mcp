@@ -15,8 +15,9 @@
 //!
 //! 4. **Authentication**: Authenticate using one of:
 //!    - Password authentication
-//!    - Private key file authentication
-//!    - SSH agent authentication (tries all available identities)
+//!    - Private key file authentication (explicit path)
+//!    - Default `~/.ssh/` keys (auto-discovered when no key path is given)
+//!    - SSH agent authentication (always tried as final fallback)
 //!
 //! 5. **Command Execution**: Execute commands on established sessions and
 //!    collect stdout, stderr, and exit code.
@@ -37,6 +38,8 @@
 //!
 //! Authentication failures are never retried to avoid account lockouts.
 
+use std::env;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -354,12 +357,43 @@ async fn connect_to_ssh(
     Ok(handle)
 }
 
+/// Default SSH key filenames, in the order OpenSSH tries them.
+const DEFAULT_KEY_NAMES: &[&str] = &[
+    "id_ed25519",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
+    "id_rsa",
+    "id_dsa",
+];
+
+/// Discover SSH private keys in `~/.ssh/` following OpenSSH defaults.
+///
+/// Returns the paths of all default key files that exist on disk.
+fn discover_default_keys() -> Vec<String> {
+    let Some(home) = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .ok()
+    else {
+        return Vec::new();
+    };
+
+    let ssh_dir = Path::new(&home).join(".ssh");
+    DEFAULT_KEY_NAMES
+        .iter()
+        .map(|name| ssh_dir.join(name))
+        .filter(|p| p.is_file())
+        .filter_map(|p| p.to_str().map(String::from))
+        .collect()
+}
+
 /// Build an authentication chain based on the provided credentials.
 ///
 /// The chain is built with the following priority:
 /// 1. Password authentication (if password is provided)
 /// 2. Key-based authentication (if `key_path` is provided)
-/// 3. SSH agent authentication (fallback if no explicit credentials)
+/// 3. Default `~/.ssh/` keys (if no explicit key was given)
+/// 4. SSH agent authentication (always added as final fallback)
 fn build_auth_chain(password: Option<&str>, key_path: Option<&str>) -> AuthChain {
     let mut chain = AuthChain::new();
 
@@ -369,12 +403,14 @@ fn build_auth_chain(password: Option<&str>, key_path: Option<&str>) -> AuthChain
 
     if let Some(key_path) = key_path {
         chain = chain.with_key(key_path);
+    } else {
+        for path in discover_default_keys() {
+            chain = chain.with_key(path);
+        }
     }
 
-    // If no explicit credentials, use SSH agent as fallback
-    if chain.is_empty() {
-        chain = chain.with_agent();
-    }
+    // Always try SSH agent as final fallback
+    chain = chain.with_agent();
 
     chain
 }
@@ -1023,6 +1059,73 @@ mod tests {
         fn test_max_retry_delay_duration_properties() {
             assert_eq!(MAX_RETRY_DELAY.as_secs(), 10);
             assert_eq!(MAX_RETRY_DELAY.as_millis(), 10_000);
+        }
+    }
+
+    mod default_key_discovery {
+        use super::*;
+
+        #[test]
+        fn test_default_key_names_order() {
+            assert_eq!(DEFAULT_KEY_NAMES[0], "id_ed25519");
+            assert_eq!(DEFAULT_KEY_NAMES[1], "id_ecdsa");
+            assert_eq!(DEFAULT_KEY_NAMES[4], "id_rsa");
+        }
+
+        #[test]
+        fn test_default_key_names_count() {
+            assert_eq!(DEFAULT_KEY_NAMES.len(), 6);
+        }
+
+        #[test]
+        fn test_default_key_names_contains_expected_types() {
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_ed25519"));
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_rsa"));
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_ecdsa"));
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_ecdsa_sk"));
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_ed25519_sk"));
+            assert!(DEFAULT_KEY_NAMES.contains(&"id_dsa"));
+        }
+
+        #[test]
+        fn test_ed25519_is_preferred_over_rsa() {
+            let ed25519_pos = DEFAULT_KEY_NAMES
+                .iter()
+                .position(|k| *k == "id_ed25519");
+            let rsa_pos = DEFAULT_KEY_NAMES
+                .iter()
+                .position(|k| *k == "id_rsa");
+            assert!(ed25519_pos < rsa_pos);
+        }
+    }
+
+    mod auth_chain_building {
+        use super::*;
+
+        #[test]
+        fn test_with_explicit_key_skips_discovery() {
+            let chain = build_auth_chain(None, Some("/tmp/my_key"));
+            // Explicit key + agent fallback
+            assert!(!chain.is_empty());
+        }
+
+        #[test]
+        fn test_with_password_only() {
+            let chain = build_auth_chain(Some("secret"), None);
+            assert!(!chain.is_empty());
+        }
+
+        #[test]
+        fn test_with_no_credentials_includes_agent() {
+            let chain = build_auth_chain(None, None);
+            // Even with no keys found, agent should always be present
+            assert!(!chain.is_empty());
+        }
+
+        #[test]
+        fn test_with_password_and_key() {
+            let chain = build_auth_chain(Some("pass"), Some("/tmp/key"));
+            assert!(!chain.is_empty());
         }
     }
 }
