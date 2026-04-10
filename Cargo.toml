@@ -7,6 +7,8 @@ authors = ["farchanjo"]
 default-run = "ssh-mcp"
 license = "MIT"
 repository = "https://github.com/farchanjo/ssh-mcp"
+keywords = ["ssh", "mcp", "remote", "sftp", "automation"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "ssh-mcp-stdio"
