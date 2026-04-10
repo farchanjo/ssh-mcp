@@ -111,6 +111,7 @@ impl CommandStorage for DashMapCommandStorage {
                 exit_code: Arc::clone(&entry.exit_code),
                 error: Arc::clone(&entry.error),
                 timed_out: Arc::clone(&entry.timed_out),
+                output_read: Arc::clone(&entry.output_read),
             })
         })
     }
@@ -127,6 +128,7 @@ impl CommandStorage for DashMapCommandStorage {
                 exit_code: Arc::clone(&entry.exit_code),
                 error: Arc::clone(&entry.error),
                 timed_out: Arc::clone(&entry.timed_out),
+                output_read: Arc::clone(&entry.output_read),
             }),
         })
     }
@@ -217,6 +219,7 @@ mod tests {
             exit_code: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
             timed_out: Arc::new(AtomicBool::new(false)),
+            output_read: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -241,6 +244,7 @@ mod tests {
             exit_code: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
             timed_out: Arc::new(AtomicBool::new(false)),
+            output_read: Arc::new(AtomicBool::new(false)),
         }
     }
 

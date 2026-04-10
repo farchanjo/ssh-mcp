@@ -16,6 +16,7 @@
 //! | `SSH_RETRY_DELAY_MS` | 1000ms | Initial retry delay in milliseconds |
 //! | `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout in seconds |
 //! | `SSH_COMPRESSION` | true | Enable zlib compression |
+//! | `SSH_COMMAND_CLEANUP_TTL` | 60s | TTL before unread command output is cleaned up |
 
 use std::env;
 use std::time::Duration;
@@ -55,6 +56,12 @@ pub const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
 
 /// Environment variable name for SSH compression
 pub const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
+
+/// Default TTL for completed command cleanup (seconds)
+pub const DEFAULT_COMMAND_CLEANUP_TTL: Duration = Duration::from_secs(60);
+
+/// Environment variable name for command cleanup TTL
+pub const COMMAND_CLEANUP_TTL_ENV_VAR: &str = "SSH_COMMAND_CLEANUP_TTL";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
 #[must_use]
@@ -159,6 +166,21 @@ pub fn resolve_compression(compress_param: Option<bool>) -> bool {
 
     // Priority 3: Default value (enabled)
     true
+}
+
+/// Resolve the command cleanup TTL with priority: env var -> default (60s)
+///
+/// Controls how long completed commands remain in storage when their output
+/// has not been read. Once output is read, commands are cleaned up immediately.
+#[must_use]
+pub fn resolve_command_cleanup_ttl() -> Duration {
+    if let Ok(env_ttl) = env::var(COMMAND_CLEANUP_TTL_ENV_VAR)
+        && let Ok(ttl) = env_ttl.parse::<u64>()
+    {
+        return Duration::from_secs(ttl);
+    }
+
+    DEFAULT_COMMAND_CLEANUP_TTL
 }
 
 #[cfg(test)]

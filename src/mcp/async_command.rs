@@ -60,6 +60,8 @@ pub struct RunningCommand {
     pub error: Arc<Mutex<Option<String>>>,
     /// Whether the command timed out
     pub timed_out: Arc<AtomicBool>,
+    /// Whether the output has been read by `ssh_get_command_output`
+    pub output_read: Arc<AtomicBool>,
 }
 
 /// Maximum number of concurrent async commands (multiplexed channels) per session
