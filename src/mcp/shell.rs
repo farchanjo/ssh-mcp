@@ -17,10 +17,12 @@
 //! - Persistent shell sessions for multi-step workflows
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use russh::ChannelWriteHalf;
 use russh::client;
 use tokio::sync::{Mutex, watch};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::types::{ShellInfo, ShellStatus};
@@ -71,6 +73,10 @@ pub struct RunningShell {
     pub status_tx: watch::Sender<ShellStatus>,
     /// Receiver for status updates
     pub status_rx: watch::Receiver<ShellStatus>,
+    /// Last activity timestamp for inactivity TTL tracking
+    pub last_activity: Arc<Mutex<Instant>>,
+    /// Maximum output buffer size in bytes (oldest data is truncated when exceeded)
+    pub max_buffer_size: Arc<AtomicU64>,
 }
 
 /// Maximum number of concurrent shells per session
