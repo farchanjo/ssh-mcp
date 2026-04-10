@@ -1,4 +1,4 @@
-//! DashMap-based command storage implementation.
+//! `DashMap`-based command storage implementation.
 //!
 //! Provides lock-free concurrent access to async commands using `DashMap`.
 //! Includes a secondary index for O(1) session-to-commands lookups.
@@ -9,17 +9,19 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use dashmap::DashMap;
+use dashmap::mapref::multiple::RefMulti;
+use dashmap::mapref::one::Ref;
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus};
 
 use super::traits::{CommandRef, CommandStorage};
 
-/// DashMap-based implementation of `CommandStorage`.
+/// `DashMap`-based implementation of `CommandStorage`.
 ///
 /// Uses two `DashMap` instances:
-/// - Primary storage: command_id -> RunningCommand
-/// - Secondary index: session_id -> HashSet<command_id> for O(1) session lookups
+/// - Primary storage: `command_id` -> `RunningCommand`
+/// - Secondary index: `session_id` -> `HashSet<command_id>` for O(1) session lookups
 pub struct DashMapCommandStorage {
     commands: DashMap<String, RunningCommand>,
     commands_by_session: DashMap<String, HashSet<String>>,
@@ -27,6 +29,7 @@ pub struct DashMapCommandStorage {
 
 impl DashMapCommandStorage {
     /// Create a new command storage instance.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             commands: DashMap::new(),
@@ -34,26 +37,22 @@ impl DashMapCommandStorage {
         }
     }
 
-    /// Get direct access to the underlying DashMap for iteration.
+    /// Get direct access to the underlying `DashMap` for iteration.
     ///
     /// This is available for advanced use cases that require custom iteration logic.
     /// For standard filtering, prefer `list_filtered()` from the `CommandStorage` trait.
-    #[allow(dead_code)]
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, String, RunningCommand>> {
+    #[allow(dead_code, reason = "public API for advanced iteration use cases")]
+    pub fn iter(&self) -> impl Iterator<Item = RefMulti<'_, String, RunningCommand>> {
         self.commands.iter()
     }
 
     /// Get a reference to a command for direct field access.
     ///
-    /// Returns a DashMap reference guard that provides access to the underlying
+    /// Returns a `DashMap` reference guard that provides access to the underlying
     /// `RunningCommand`. This is useful when you need to access multiple fields
     /// without cloning the entire struct.
-    pub fn get_direct(
-        &self,
-        command_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, RunningCommand>> {
+    #[must_use]
+    pub fn get_direct(&self, command_id: &str) -> Option<Ref<'_, String, RunningCommand>> {
         self.commands.get(command_id)
     }
 }
@@ -65,11 +64,11 @@ impl Default for DashMapCommandStorage {
 }
 
 impl CommandStorage for DashMapCommandStorage {
-    fn register(&self, command_id: String, cmd: RunningCommand) {
-        let session_id = cmd.info.session_id.clone();
+    fn register(&self, command_id: String, command: RunningCommand) {
+        let session_id = command.info.session_id.clone();
 
         // Insert into primary storage
-        self.commands.insert(command_id.clone(), cmd);
+        self.commands.insert(command_id.clone(), command);
 
         // Update secondary index
         self.commands_by_session
@@ -83,7 +82,7 @@ impl CommandStorage for DashMapCommandStorage {
         let removed = self.commands.remove(command_id).map(|(_, cmd)| cmd);
 
         // Update secondary index if command was found
-        if let Some(ref cmd) = removed
+        if let Some(cmd) = &removed
             && let Some(mut set) = self.commands_by_session.get_mut(&cmd.info.session_id)
         {
             set.remove(command_id);
@@ -108,10 +107,10 @@ impl CommandStorage for DashMapCommandStorage {
                 cancel_token: entry.cancel_token.clone(),
                 status_rx: entry.status_rx.clone(),
                 status_tx: entry.status_tx.clone(),
-                output: entry.output.clone(),
-                exit_code: entry.exit_code.clone(),
-                error: entry.error.clone(),
-                timed_out: entry.timed_out.clone(),
+                output: Arc::clone(&entry.output),
+                exit_code: Arc::clone(&entry.exit_code),
+                error: Arc::clone(&entry.error),
+                timed_out: Arc::clone(&entry.timed_out),
             })
         })
     }
@@ -124,10 +123,10 @@ impl CommandStorage for DashMapCommandStorage {
                 cancel_token: entry.cancel_token.clone(),
                 status_rx: entry.status_rx.clone(),
                 status_tx: entry.status_tx.clone(),
-                output: entry.output.clone(),
-                exit_code: entry.exit_code.clone(),
-                error: entry.error.clone(),
-                timed_out: entry.timed_out.clone(),
+                output: Arc::clone(&entry.output),
+                exit_code: Arc::clone(&entry.exit_code),
+                error: Arc::clone(&entry.error),
+                timed_out: Arc::clone(&entry.timed_out),
             }),
         })
     }
@@ -135,15 +134,25 @@ impl CommandStorage for DashMapCommandStorage {
     fn list_by_session(&self, session_id: &str) -> Vec<String> {
         self.commands_by_session
             .get(session_id)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |set| set.iter().cloned().collect())
     }
 
     fn count_by_session(&self, session_id: &str) -> usize {
         self.commands_by_session
             .get(session_id)
-            .map(|set| set.len())
-            .unwrap_or(0)
+            .map_or(0, |set| set.len())
+    }
+
+    fn count_running_by_session(&self, session_id: &str) -> usize {
+        self.commands_by_session.get(session_id).map_or(0, |set| {
+            set.iter()
+                .filter(|cmd_id| {
+                    self.commands
+                        .get(cmd_id.as_str())
+                        .is_some_and(|cmd| *cmd.status_rx.borrow() == AsyncCommandStatus::Running)
+                })
+                .count()
+        })
     }
 
     fn list_all(&self) -> Vec<AsyncCommandInfo> {
@@ -165,12 +174,8 @@ impl CommandStorage for DashMapCommandStorage {
         self.commands
             .iter()
             .filter(|entry| {
-                let session_matches = session_id
-                    .map(|sid| entry.info.session_id == sid)
-                    .unwrap_or(true);
-                let status_matches = status
-                    .map(|s| *entry.status_rx.borrow() == s)
-                    .unwrap_or(true);
+                let session_matches = session_id.is_none_or(|sid| entry.info.session_id == sid);
+                let status_matches = status.is_none_or(|s| *entry.status_rx.borrow() == s);
                 session_matches && status_matches
             })
             .map(|entry| {
@@ -563,7 +568,7 @@ mod tests {
 
         // Register 50 commands
         for i in 0..50 {
-            let cmd_id = format!("cmd-{}-{}", i, uuid::Uuid::new_v4());
+            let cmd_id = format!("cmd-{i}-{}", uuid::Uuid::new_v4());
             storage.register(cmd_id.clone(), create_test_command(&cmd_id, &session_id));
             cmd_ids.push(cmd_id);
         }
@@ -589,7 +594,7 @@ mod tests {
         let storage = DashMapCommandStorage::new();
         let session_id = format!("session-{}", uuid::Uuid::new_v4());
         let cmd_ids: Vec<String> = (0..5)
-            .map(|i| format!("cmd-{}-{}", i, uuid::Uuid::new_v4()))
+            .map(|i| format!("cmd-{i}-{}", uuid::Uuid::new_v4()))
             .collect();
 
         for cmd_id in &cmd_ids {
@@ -827,7 +832,7 @@ mod tests {
             let direct_ref = storage.get_direct(&cmd_id);
             assert!(direct_ref.is_some());
 
-            if let Some(ref guard) = direct_ref {
+            if let Some(guard) = &direct_ref {
                 assert_eq!(guard.info.command_id, cmd_id);
                 assert_eq!(guard.info.session_id, session_id);
             }
@@ -994,5 +999,86 @@ mod tests {
 
         let filtered = storage.list_filtered(Some(&unique_session), None);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_count_running_by_session_only_counts_running() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+
+        let running_id = format!("running-{}", uuid::Uuid::new_v4());
+        let completed_id = format!("completed-{}", uuid::Uuid::new_v4());
+        let failed_id = format!("failed-{}", uuid::Uuid::new_v4());
+        let cancelled_id = format!("cancelled-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            running_id.clone(),
+            create_test_command(&running_id, &session_id),
+        );
+        storage.register(
+            completed_id.clone(),
+            create_test_command_with_status(
+                &completed_id,
+                &session_id,
+                AsyncCommandStatus::Completed,
+            ),
+        );
+        storage.register(
+            failed_id.clone(),
+            create_test_command_with_status(&failed_id, &session_id, AsyncCommandStatus::Failed),
+        );
+        storage.register(
+            cancelled_id.clone(),
+            create_test_command_with_status(
+                &cancelled_id,
+                &session_id,
+                AsyncCommandStatus::Cancelled,
+            ),
+        );
+
+        // Total count includes all statuses
+        assert_eq!(storage.count_by_session(&session_id), 4);
+
+        // Running count only includes running commands
+        assert_eq!(storage.count_running_by_session(&session_id), 1);
+
+        // Cleanup
+        storage.unregister(&running_id);
+        storage.unregister(&completed_id);
+        storage.unregister(&failed_id);
+        storage.unregister(&cancelled_id);
+    }
+
+    #[test]
+    fn test_count_running_by_session_empty() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+
+        assert_eq!(storage.count_running_by_session(&session_id), 0);
+    }
+
+    #[test]
+    fn test_count_running_by_session_all_completed() {
+        let storage = DashMapCommandStorage::new();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+
+        let cmd1 = format!("cmd-{}", uuid::Uuid::new_v4());
+        let cmd2 = format!("cmd-{}", uuid::Uuid::new_v4());
+
+        storage.register(
+            cmd1.clone(),
+            create_test_command_with_status(&cmd1, &session_id, AsyncCommandStatus::Completed),
+        );
+        storage.register(
+            cmd2.clone(),
+            create_test_command_with_status(&cmd2, &session_id, AsyncCommandStatus::Completed),
+        );
+
+        assert_eq!(storage.count_by_session(&session_id), 2);
+        assert_eq!(storage.count_running_by_session(&session_id), 0);
+
+        // Cleanup
+        storage.unregister(&cmd1);
+        storage.unregister(&cmd2);
     }
 }
