@@ -108,19 +108,37 @@ pub async fn open_sftp_session(
         .map_err(|e| classify_transfer_error("initialize SFTP session", &e.to_string()))
 }
 
-/// Resolve a local path, expanding relative paths against the home directory.
+/// Resolve a local path, expanding `~` and relative paths against the home directory.
 ///
+/// - Paths starting with `~/` are expanded to the user's home directory.
 /// - Absolute paths are returned as-is.
 /// - Relative paths are joined with the user's home directory.
 /// - Falls back to current directory if home directory is unavailable.
 #[must_use]
 pub fn resolve_local_path(path: &str) -> PathBuf {
-    let p = Path::new(path);
+    let expanded = expand_tilde(path);
+    let p = Path::new(&expanded);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
         home_dir().unwrap_or_else(|| PathBuf::from(".")).join(p)
     }
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+///
+/// - `~` alone resolves to the home directory.
+/// - `~/path` resolves to `home_dir/path`.
+/// - All other paths are returned unchanged.
+#[must_use]
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return home_dir().map_or_else(|| "~".to_string(), |h| h.to_string_lossy().into_owned());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir().map_or_else(|| path.to_string(), |h| format!("{}/{rest}", h.display()));
+    }
+    path.to_string()
 }
 
 /// Get the user's home directory from environment variables.
@@ -489,6 +507,56 @@ mod tests {
         fn test_absolute_path_with_spaces() {
             let path = resolve_local_path("/tmp/my files/doc.txt");
             assert_eq!(path, PathBuf::from("/tmp/my files/doc.txt"));
+        }
+
+        #[test]
+        fn test_tilde_path_expanded() {
+            let path = resolve_local_path("~/.ssh/id_rsa");
+            assert!(!path.to_string_lossy().starts_with('~'));
+            assert!(path.to_string_lossy().ends_with(".ssh/id_rsa"));
+            assert!(path.is_absolute());
+        }
+
+        #[test]
+        fn test_tilde_alone_expanded() {
+            let path = resolve_local_path("~");
+            assert!(!path.to_string_lossy().starts_with('~'));
+            assert!(path.is_absolute());
+        }
+    }
+
+    mod expand_tilde_fn {
+        use super::*;
+
+        #[test]
+        fn test_tilde_slash_prefix() {
+            let result = expand_tilde("~/.ssh/id_rsa");
+            assert!(!result.starts_with('~'));
+            assert!(result.ends_with(".ssh/id_rsa"));
+        }
+
+        #[test]
+        fn test_tilde_alone() {
+            let result = expand_tilde("~");
+            assert!(!result.starts_with('~'));
+        }
+
+        #[test]
+        fn test_absolute_path_unchanged() {
+            let result = expand_tilde("/tmp/file.txt");
+            assert_eq!(result, "/tmp/file.txt");
+        }
+
+        #[test]
+        fn test_relative_path_unchanged() {
+            let result = expand_tilde("relative/path");
+            assert_eq!(result, "relative/path");
+        }
+
+        #[test]
+        fn test_tilde_in_middle_unchanged() {
+            let result = expand_tilde("/path/~/file");
+            assert_eq!(result, "/path/~/file");
         }
     }
 
