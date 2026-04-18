@@ -11,14 +11,22 @@
 //! - `ssh_disconnect`: Disconnect and cleanup a session
 //! - `ssh_list_sessions`: List all active sessions
 
-use std::mem;
+#![allow(
+    clippy::too_many_lines,
+    reason = "MCP tool handlers and related helpers aggregate validation, storage lookup, builder construction, and background task spawning in one place; splitting further would hide intent"
+)]
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "the MCP #[Tools] macro requires owned parameters for the tool-call argument deserialization"
+)]
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
-use poem_mcpserver::{Tools, content::Text, tool::StructuredContent};
+use poem_mcpserver::{Tools, content::Text};
 use russh::client::Msg;
 use russh::{Channel, Disconnect, client};
 use tokio::fs;
@@ -41,10 +49,14 @@ use super::config::{
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
 use super::message::builder::{
-    AgentDisconnectMessageBuilder, ConnectMessageBuilder, DownloadMessageBuilder,
-    ExecuteMessageBuilder, ShellOpenMessageBuilder, TransferProgressMessageBuilder,
-    UploadMessageBuilder,
+    CancelCommandCancelledBuilder, ConnectOkBuilder, ExecuteStartedBuilder,
+    GetCommandOutputBuilder, GetCommandOutputState, ListCommandsBuilder, ListSessionsBuilder,
+    ShellOpenBuilder, ShellReadBuilder, ShellReadState, TransferProgressBuilder,
+    TransferProgressState, TransferStartDirection, TransferStartedBuilder,
+    render_cancel_command_noop, render_disconnect_agent, render_disconnect_ok, render_forward_ok,
+    render_shell_close_ok, render_shell_write_ok,
 };
+use super::message::helpers::{format_error, generate_nonce};
 use super::session::SshClientHandler;
 use super::sftp::{
     classify_transfer_error, open_sftp_session, resolve_local_path, sftp_download_streaming,
@@ -62,12 +74,42 @@ use super::transfer::{
     MAX_TRANSFERS_PER_SESSION, RunningTransfer, TransferDirection, TransferInfo, TransferStatus,
 };
 use super::types::{
-    AgentDisconnectResponse, AsyncCommandInfo, AsyncCommandStatus, PortForwardingResponse,
-    SessionInfo, SessionListResponse, ShellInfo, ShellStatus, SshAsyncOutputResponse,
-    SshCancelCommandResponse, SshCommandResponse, SshConnectResponse, SshDownloadResponse,
-    SshExecuteResponse, SshListCommandsResponse, SshShellCloseResponse, SshShellOpenResponse,
-    SshShellReadResponse, SshTransferProgressResponse, SshUploadResponse,
+    AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo, ShellStatus, SshCommandResponse,
 };
+
+/// Default maximum bytes to show in stdout/stderr/data blocks when the caller
+/// does not provide `max_output_bytes`.
+const DEFAULT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// Hard cap on `max_output_bytes` regardless of caller request.
+const OUTPUT_MAX_BYTES_CAP: usize = 1024 * 1024;
+/// Default maximum items returned by list tools when no `max_items` provided.
+const DEFAULT_LIST_MAX_ITEMS: usize = 500;
+/// Hard cap on `max_items` to prevent abusive requests.
+const LIST_MAX_ITEMS_CAP: usize = 10_000;
+
+/// Clamp a caller-provided `max_output_bytes`.
+fn clamp_output_bytes(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_OUTPUT_MAX_BYTES)
+        .min(OUTPUT_MAX_BYTES_CAP)
+}
+
+/// Clamp a caller-provided `max_items` for list tools.
+fn clamp_list_items(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_LIST_MAX_ITEMS)
+        .clamp(1, LIST_MAX_ITEMS_CAP)
+}
+
+/// Map an internal session-id-not-found error to the standardized format.
+fn err_session_not_found(tool: &str, session_id: &str) -> String {
+    format_error(
+        tool,
+        "SESSION_NOT_FOUND",
+        "no active SSH session with the given ID",
+        Some(session_id),
+    )
+}
 
 /// Type alias for the SSH client handle used throughout this module.
 type SshHandle = client::Handle<SshClientHandler>;
@@ -82,9 +124,8 @@ pub struct McpSSHCommands;
 
 /// Try to reuse an existing session by performing a health check.
 ///
-/// Returns the reuse response if the session is healthy, or `None` if
-/// dead or not found.
-async fn try_reuse_session(sid: &str) -> Option<StructuredContent<SshConnectResponse>> {
+/// Returns the reuse response if the session is healthy, or `None` if dead.
+async fn try_reuse_session(sid: &str) -> Option<Text<String>> {
     let session_ref = SESSION_STORAGE.get(sid)?;
     let health_timeout = Duration::from_secs(5);
     let now = chrono::Utc::now().to_rfc3339();
@@ -99,25 +140,17 @@ fn build_reuse_response(
     session_ref: &SessionRef,
     now: String,
     result: Result<SshCommandResponse, String>,
-) -> Option<StructuredContent<SshConnectResponse>> {
+) -> Option<Text<String>> {
     match result {
         Ok(response) if !response.timed_out && response.exit_code == 0 => {
             SESSION_STORAGE.update_health(sid, now, true);
             info!("Reusing healthy session {sid}");
-            let reuse_agent_id = session_ref.info.agent_id.clone();
-            let message =
-                ConnectMessageBuilder::new(sid, &session_ref.info.username, &session_ref.info.host)
-                    .with_agent_id(reuse_agent_id.as_deref())
-                    .with_name(session_ref.info.name.as_deref())
+            let markdown =
+                ConnectOkBuilder::new(sid, &session_ref.info.username, &session_ref.info.host)
+                    .with_agent_id(session_ref.info.agent_id.as_deref())
                     .reused(true)
                     .build();
-            Some(StructuredContent(SshConnectResponse {
-                session_id: sid.to_string(),
-                agent_id: reuse_agent_id,
-                message,
-                authenticated: true,
-                retry_attempts: 0,
-            }))
+            Some(Text(markdown))
         }
         _ => {
             warn!("Session {sid} is dead, removing");
@@ -174,26 +207,6 @@ fn cancel_session_commands(session_id: &str) -> usize {
         COMMAND_STORAGE.unregister(&cmd_id);
     }
     count
-}
-
-/// Get a session handle and agent ID, or return a formatted error.
-fn get_session_handle_and_agent(
-    session_id: &str,
-) -> Result<(Arc<SshHandle>, Option<String>), String> {
-    SESSION_STORAGE
-        .get(session_id)
-        .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
-        .ok_or_else(|| format!("No active SSH session with ID: {session_id}"))
-}
-
-/// Compute transfer progress as a percentage (0-100).
-fn compute_progress_percent(transferred: u64, total: u64) -> u8 {
-    if total > 0 {
-        let percent = (u128::from(transferred) * 100) / u128::from(total);
-        u8::try_from(percent.min(100)).unwrap_or(100)
-    } else {
-        0
-    }
 }
 
 /// Wait for a watch receiver to leave the `Running` command status.
@@ -368,6 +381,13 @@ fn spawn_shell_inactivity_task(
 }
 
 /// Build the output response for a command.
+///
+/// # Lock ordering
+///
+/// This function acquires several mutexes. To prevent any deadlock risk we
+/// take each lock in its own scope so only one mutex is held at a time, and
+/// we render the output block via the borrow-based API (no full buffer
+/// clone under the lock).
 async fn build_command_output_response(
     command_id: String,
     status_rx: &watch::Receiver<AsyncCommandStatus>,
@@ -375,22 +395,57 @@ async fn build_command_output_response(
     exit_code: &Mutex<Option<i32>>,
     error: &Mutex<Option<String>>,
     timed_out: &AtomicBool,
-) -> Result<StructuredContent<SshAsyncOutputResponse>, String> {
+    max_output_bytes: usize,
+) -> Result<Text<String>, String> {
     let status = *status_rx.borrow();
-    let output_buf = output.lock().await;
-    let exit_code_val = *exit_code.lock().await;
-    let error_val = error.lock().await.clone();
     let timed_out_val = timed_out.load(Ordering::SeqCst);
+    let exit_code_val = {
+        let guard = exit_code.lock().await;
+        *guard
+    };
+    let error_val = {
+        let guard = error.lock().await;
+        guard.clone()
+    };
 
-    Ok(StructuredContent(SshAsyncOutputResponse {
-        command_id,
-        status,
-        stdout: String::from_utf8_lossy(&output_buf.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output_buf.stderr).into_owned(),
-        exit_code: exit_code_val,
-        error: error_val,
-        timed_out: timed_out_val,
-    }))
+    // Failed / error path shortcuts to the standardized error format.
+    if matches!(status, AsyncCommandStatus::Failed) {
+        let reason = error_val.as_deref().unwrap_or("command failed");
+        return Ok(Text(format_error(
+            "SSH_GET_COMMAND_OUTPUT",
+            "COMMAND_FAILED",
+            reason,
+            None,
+        )));
+    }
+
+    let state = if timed_out_val {
+        GetCommandOutputState::Timeout
+    } else {
+        match status {
+            AsyncCommandStatus::Running | AsyncCommandStatus::Failed => {
+                GetCommandOutputState::Running
+            }
+            AsyncCommandStatus::Completed | AsyncCommandStatus::Cancelled => {
+                GetCommandOutputState::Completed(exit_code_val.unwrap_or(0))
+            }
+        }
+    };
+
+    let nonce = generate_nonce();
+    let markdown = {
+        let guard = output.lock().await;
+        GetCommandOutputBuilder::new(
+            &command_id,
+            state,
+            &guard.stdout,
+            &guard.stderr,
+            max_output_bytes,
+            &nonce,
+        )
+        .build()
+    };
+    Ok(Text(markdown))
 }
 
 /// Build the agent disconnect response.
@@ -398,18 +453,12 @@ fn build_agent_disconnect_response(
     agent_id: &str,
     sessions_disconnected: usize,
     commands_cancelled: usize,
-) -> StructuredContent<AgentDisconnectResponse> {
-    let message = AgentDisconnectMessageBuilder::new(agent_id)
-        .with_sessions_disconnected(sessions_disconnected)
-        .with_commands_cancelled(commands_cancelled)
-        .build();
-
-    StructuredContent(AgentDisconnectResponse {
-        agent_id: agent_id.to_string(),
+) -> Text<String> {
+    Text(render_disconnect_agent(
+        agent_id,
         sessions_disconnected,
         commands_cancelled,
-        message,
-    })
+    ))
 }
 
 /// Cleanup all sessions for an agent and return total commands cancelled.
@@ -450,7 +499,8 @@ fn process_health_results(
         String,
         Result<SshCommandResponse, String>,
     )>,
-) -> StructuredContent<SessionListResponse> {
+    max_items: usize,
+) -> Text<String> {
     let (healthy_sessions, dead_session_ids) = classify_sessions(results);
 
     for (id, info) in &healthy_sessions {
@@ -464,14 +514,13 @@ fn process_health_results(
         SESSION_STORAGE.remove(id);
     }
 
-    let session_infos: Vec<SessionInfo> =
+    let mut session_infos: Vec<SessionInfo> =
         healthy_sessions.into_iter().map(|(_, info)| info).collect();
-    let count = session_infos.len();
-
-    StructuredContent(SessionListResponse {
-        sessions: session_infos,
-        count,
-    })
+    // Deterministic order: by connected_at ascending.
+    session_infos.sort_by(|a, b| a.connected_at.cmp(&b.connected_at));
+    let total = session_infos.len();
+    session_infos.truncate(max_items);
+    Text(ListSessionsBuilder::new(&session_infos, total).build())
 }
 
 /// Classify sessions into healthy and dead based on health check results.
@@ -588,7 +637,7 @@ fn register_shell(
     channel: Channel<Msg>,
     inactivity_ttl: Duration,
     max_buffer_size: u64,
-) -> StructuredContent<SshShellOpenResponse> {
+) -> Text<String> {
     let shell_id = Uuid::new_v4().to_string();
 
     let shell_info = ShellInfo {
@@ -612,17 +661,11 @@ fn register_shell(
         "Opened interactive shell {shell_id} on session {session_id} (term={term}, {cols}x{rows})"
     );
 
-    let message = ShellOpenMessageBuilder::new(&shell_id, session_id, &term, cols, rows)
-        .with_agent_id(agent_id.as_deref())
-        .build();
-
-    StructuredContent(SshShellOpenResponse {
-        shell_id,
-        session_id: session_id.to_string(),
-        agent_id,
-        term_type: term,
-        message,
-    })
+    Text(
+        ShellOpenBuilder::new(&shell_id, session_id, &term, cols, rows)
+            .with_agent_id(agent_id.as_deref())
+            .build(),
+    )
 }
 
 /// Shared state returned by transfer registration.
@@ -688,7 +731,7 @@ fn start_upload(
     resolved_path: &Path,
     remote_path: String,
     total_bytes: u64,
-) -> StructuredContent<SshUploadResponse> {
+) -> Text<String> {
     let transfer_id = Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     let local_path = resolved_path.to_string_lossy().into_owned();
@@ -708,44 +751,18 @@ fn start_upload(
     );
     spawn_upload_task(handle_arc, resolved_path, remote_path.clone(), state);
 
-    build_upload_response(
-        transfer_id,
-        session_id,
-        agent_id,
-        local_path,
-        remote_path,
-        total_bytes,
+    Text(
+        TransferStartedBuilder::new(
+            TransferStartDirection::Upload,
+            transfer_id,
+            session_id,
+            local_path,
+            remote_path,
+            total_bytes,
+        )
+        .with_agent_id(agent_id.as_deref())
+        .build(),
     )
-}
-
-/// Build the upload response with message.
-fn build_upload_response(
-    transfer_id: String,
-    session_id: String,
-    agent_id: Option<String>,
-    local_path: String,
-    remote_path: String,
-    total_bytes: u64,
-) -> StructuredContent<SshUploadResponse> {
-    let message = UploadMessageBuilder::new(
-        &transfer_id,
-        &session_id,
-        &local_path,
-        &remote_path,
-        total_bytes,
-    )
-    .with_agent_id(agent_id.as_deref())
-    .build();
-
-    StructuredContent(SshUploadResponse {
-        transfer_id,
-        session_id,
-        agent_id,
-        local_path,
-        remote_path,
-        total_bytes,
-        message,
-    })
 }
 
 /// Spawn the background upload task.
@@ -774,7 +791,7 @@ fn start_download(
     remote_path: String,
     resolved_path: &Path,
     total_bytes: u64,
-) -> StructuredContent<SshDownloadResponse> {
+) -> Text<String> {
     let transfer_id = Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     let local_path = resolved_path.to_string_lossy().into_owned();
@@ -794,44 +811,18 @@ fn start_download(
     );
     spawn_download_task(handle_arc, &remote_path, resolved_path, state);
 
-    build_download_response(
-        transfer_id,
-        session_id,
-        agent_id,
-        remote_path,
-        local_path,
-        total_bytes,
+    Text(
+        TransferStartedBuilder::new(
+            TransferStartDirection::Download,
+            transfer_id,
+            session_id,
+            local_path,
+            remote_path,
+            total_bytes,
+        )
+        .with_agent_id(agent_id.as_deref())
+        .build(),
     )
-}
-
-/// Build the download response with message.
-fn build_download_response(
-    transfer_id: String,
-    session_id: String,
-    agent_id: Option<String>,
-    remote_path: String,
-    local_path: String,
-    total_bytes: u64,
-) -> StructuredContent<SshDownloadResponse> {
-    let message = DownloadMessageBuilder::new(
-        &transfer_id,
-        &session_id,
-        &remote_path,
-        &local_path,
-        total_bytes,
-    )
-    .with_agent_id(agent_id.as_deref())
-    .build();
-
-    StructuredContent(SshDownloadResponse {
-        transfer_id,
-        session_id,
-        agent_id,
-        remote_path,
-        local_path,
-        total_bytes,
-        message,
-    })
 }
 
 /// Spawn the background download task.
@@ -860,38 +851,53 @@ async fn build_transfer_progress_response(
     total_bytes_arc: &AtomicU64,
     error: &Mutex<Option<String>>,
     info: &TransferInfo,
-) -> Result<StructuredContent<SshTransferProgressResponse>, String> {
+) -> Result<Text<String>, String> {
     let status = *status_rx.borrow();
     let transferred = bytes_transferred.load(Ordering::SeqCst);
     let total = total_bytes_arc.load(Ordering::SeqCst);
-    let error_val = error.lock().await.clone();
-    let progress_percent = compute_progress_percent(transferred, total);
+    let error_val = {
+        let guard = error.lock().await;
+        guard.clone()
+    };
 
-    let direction_str = info.direction.to_string();
-    let status_str = status.to_string();
+    let direction = match info.direction {
+        TransferDirection::Upload => TransferStartDirection::Upload,
+        TransferDirection::Download => TransferStartDirection::Download,
+    };
 
-    let message = TransferProgressMessageBuilder::new(
-        &transfer_id,
-        &direction_str,
-        &status_str,
-        transferred,
-        total,
-    )
-    .build();
+    let state = match status {
+        TransferStatus::Running => TransferProgressState::Running,
+        TransferStatus::Completed => TransferProgressState::Completed,
+        TransferStatus::Failed => {
+            let reason = error_val.as_deref().unwrap_or("transfer failed");
+            return Ok(Text(
+                TransferProgressBuilder::new(
+                    &transfer_id,
+                    direction,
+                    transferred,
+                    total,
+                    TransferProgressState::Failed(reason),
+                )
+                .build(),
+            ));
+        }
+        TransferStatus::Cancelled => {
+            return Ok(Text(
+                TransferProgressBuilder::new(
+                    &transfer_id,
+                    direction,
+                    transferred,
+                    total,
+                    TransferProgressState::Failed("transfer cancelled"),
+                )
+                .build(),
+            ));
+        }
+    };
 
-    Ok(StructuredContent(SshTransferProgressResponse {
-        transfer_id,
-        session_id: info.session_id.clone(),
-        direction: direction_str,
-        local_path: info.local_path.clone(),
-        remote_path: info.remote_path.clone(),
-        status: status_str,
-        bytes_transferred: transferred,
-        total_bytes: total,
-        progress_percent,
-        error: error_val,
-        message,
-    }))
+    Ok(Text(
+        TransferProgressBuilder::new(&transfer_id, direction, transferred, total, state).build(),
+    ))
 }
 
 /// Create a new SSH connection (non-reuse path).
@@ -911,7 +917,7 @@ async fn create_new_connection(
     name: Option<String>,
     persistent: Option<bool>,
     agent_id: Option<String>,
-) -> Result<StructuredContent<SshConnectResponse>, String> {
+) -> Result<Text<String>, String> {
     let cfg = resolve_connection_config(
         timeout_secs,
         max_retries,
@@ -928,8 +934,9 @@ async fn create_new_connection(
         agent_id.as_deref(),
     );
 
-    let (handle, retries) =
-        attempt_connection(&address, &username, password, key_path, &cfg).await?;
+    let (handle, retries) = attempt_connection(&address, &username, password, key_path, &cfg)
+        .await
+        .map_err(|e| format_error("SSH_CONNECT", "CONNECTION_FAILED", &e, None))?;
 
     Ok(build_connect_success(
         handle,
@@ -1045,7 +1052,7 @@ fn build_connect_success(
     agent_id: Option<String>,
     compress: bool,
     persistent: bool,
-) -> StructuredContent<SshConnectResponse> {
+) -> Text<String> {
     let new_session_id = Uuid::new_v4().to_string();
 
     let session_info = SessionInfo {
@@ -1064,20 +1071,13 @@ fn build_connect_success(
 
     store_new_session(&new_session_id, handle, session_info, agent_id.as_deref());
 
-    let message = ConnectMessageBuilder::new(&new_session_id, username, address)
-        .with_agent_id(agent_id.as_deref())
-        .with_name(name)
-        .with_retry_attempts(retry_attempts)
-        .with_persistent(persistent)
-        .build();
-
-    StructuredContent(SshConnectResponse {
-        session_id: new_session_id,
-        agent_id,
-        message,
-        authenticated: true,
-        retry_attempts,
-    })
+    Text(
+        ConnectOkBuilder::new(&new_session_id, username, address)
+            .with_agent_id(agent_id.as_deref())
+            .with_retry_attempts(retry_attempts)
+            .with_persistent(persistent)
+            .build(),
+    )
 }
 
 /// State needed to cancel a running command and retrieve its output.
@@ -1122,7 +1122,7 @@ fn register_and_spawn_command(
     handle_arc: Arc<SshHandle>,
     cmd_timeout: Duration,
     use_pty: bool,
-) -> StructuredContent<SshExecuteResponse> {
+) -> Text<String> {
     let command_id = Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
 
@@ -1141,18 +1141,11 @@ fn register_and_spawn_command(
     );
     spawn_cleanup_task(command_id.clone(), cleanup_rx, output_read);
 
-    let message = ExecuteMessageBuilder::new(&command_id, &session_id, &command)
-        .with_agent_id(agent_id.as_deref())
-        .build();
-
-    StructuredContent(SshExecuteResponse {
-        command_id,
-        session_id,
-        agent_id,
-        command,
-        started_at,
-        message,
-    })
+    Text(
+        ExecuteStartedBuilder::new(&command_id, &session_id)
+            .with_agent_id(agent_id.as_deref())
+            .build(),
+    )
 }
 
 /// Register the command in storage and spawn the execution task.
@@ -1196,7 +1189,7 @@ async fn forward_impl(
     local_port: u16,
     remote_address: String,
     remote_port: u16,
-) -> Result<StructuredContent<PortForwardingResponse>, String> {
+) -> Result<Text<String>, String> {
     info!(
         "Setting up port forwarding from local port {} to {}:{} using session {}",
         local_port, remote_address, remote_port, session_id
@@ -1205,20 +1198,20 @@ async fn forward_impl(
     let handle_arc = SESSION_STORAGE
         .get(&session_id)
         .map(|s| Arc::clone(&s.handle))
-        .ok_or_else(|| format!("No active SSH session with ID: {session_id}"))?;
+        .ok_or_else(|| err_session_not_found("SSH_FORWARD", &session_id))?;
 
     setup_port_forwarding(handle_arc, local_port, &remote_address, remote_port)
         .await
         .map(|local_addr| {
-            StructuredContent(PortForwardingResponse {
-                local_address: local_addr.to_string(),
-                remote_address: format!("{remote_address}:{remote_port}"),
-                active: true,
-            })
+            Text(render_forward_ok(
+                &local_addr.to_string(),
+                &format!("{remote_address}:{remote_port}"),
+                true,
+            ))
         })
         .map_err(|e| {
             error!("Port forwarding setup failed: {e}");
-            e
+            format_error("SSH_FORWARD", "FORWARD_FAILED", &e, None)
         })
 }
 
@@ -1268,7 +1261,7 @@ impl McpSSHCommands {
         persistent: Option<bool>,
         /// Optional agent identifier for grouping sessions (e.g., "claude-code-instance-abc123"). Use ssh_disconnect_agent to disconnect all sessions for an agent.
         agent_id: Option<String>,
-    ) -> Result<StructuredContent<SshConnectResponse>, String> {
+    ) -> Result<Text<String>, String> {
         if let Some(sid) = &session_id {
             if let Some(response) = try_reuse_session(sid).await {
                 return Ok(response);
@@ -1320,11 +1313,9 @@ impl McpSSHCommands {
             {
                 warn!("Error during disconnect: {e}");
             }
-            Ok(Text(format!(
-                "Session {session_id} disconnected successfully"
-            )))
+            Ok(Text(render_disconnect_ok(&session_id)))
         } else {
-            Err(format!("No active SSH session with ID: {session_id}"))
+            Err(err_session_not_found("SSH_DISCONNECT", &session_id))
         }
     }
 
@@ -1340,8 +1331,11 @@ impl McpSSHCommands {
         &self,
         /// Filter by agent ID to list only sessions for a specific agent
         agent_id: Option<String>,
-    ) -> StructuredContent<SessionListResponse> {
+        /// Maximum number of sessions to return (default: 500, cap: 10000)
+        max_items: Option<usize>,
+    ) -> Text<String> {
         let health_timeout = Duration::from_secs(5);
+        let max = clamp_list_items(max_items);
 
         let session_ids_to_check: Vec<String> = agent_id.as_ref().map_or_else(
             || SESSION_STORAGE.session_ids(),
@@ -1363,7 +1357,7 @@ impl McpSSHCommands {
             .collect();
 
         let results = join_all(health_futures).await;
-        process_health_results(results)
+        process_health_results(results, max)
     }
 
     /// Setup port forwarding on an existing SSH session
@@ -1381,15 +1375,17 @@ impl McpSSHCommands {
         remote_address: String,
         /// Remote port to forward to (e.g., 3306 for MySQL)
         remote_port: u16,
-    ) -> Result<StructuredContent<PortForwardingResponse>, String> {
+    ) -> Result<Text<String>, String> {
         #[cfg(feature = "port_forward")]
         return forward_impl(session_id, local_port, remote_address, remote_port).await;
 
         #[cfg(not(feature = "port_forward"))]
-        Err(
-            "Port forwarding feature is not enabled. Rebuild with --features port_forward"
-                .to_string(),
-        )
+        Err(format_error(
+            "SSH_FORWARD",
+            "FEATURE_DISABLED",
+            "port forwarding feature is not enabled",
+            Some("rebuild with --features port_forward"),
+        ))
     }
 
     /// Execute a command asynchronously on a connected SSH session.
@@ -1428,17 +1424,23 @@ impl McpSSHCommands {
         timeout_secs: Option<u64>,
         /// Allocate a pseudo-terminal (PTY) for the command. Use for commands requiring a terminal (sudo, top). All output goes to stdout in PTY mode (no stderr separation).
         pty: Option<bool>,
-    ) -> Result<StructuredContent<SshExecuteResponse>, String> {
+    ) -> Result<Text<String>, String> {
         let cmd_timeout = resolve_command_timeout(timeout_secs);
 
         let running_count = COMMAND_STORAGE.count_running_by_session(&session_id);
         if running_count >= MAX_ASYNC_COMMANDS_PER_SESSION {
-            return Err(format!(
-                "Maximum running async commands per session reached ({MAX_ASYNC_COMMANDS_PER_SESSION}). Cancel or wait for existing commands to complete."
+            return Err(format_error(
+                "SSH_EXECUTE",
+                "MAX_COMMANDS_EXCEEDED",
+                "maximum running async commands per session reached",
+                Some(&format!("limit={MAX_ASYNC_COMMANDS_PER_SESSION}")),
             ));
         }
 
-        let (handle_arc, agent_id) = get_session_handle_and_agent(&session_id)?;
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
+            .ok_or_else(|| err_session_not_found("SSH_EXECUTE", &session_id))?;
 
         Ok(register_and_spawn_command(
             session_id,
@@ -1467,9 +1469,13 @@ impl McpSSHCommands {
         wait: Option<bool>,
         /// Max seconds to wait when wait=true (default: 30, max: 300)
         wait_timeout_secs: Option<u64>,
-    ) -> Result<StructuredContent<SshAsyncOutputResponse>, String> {
+        /// Maximum bytes to show for stdout/stderr (default: 16384, cap: 1048576).
+        /// Content is truncated head-side; the tail (most recent output) is preserved.
+        max_output_bytes: Option<usize>,
+    ) -> Result<Text<String>, String> {
         let wait = wait.unwrap_or(false);
         let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
+        let max_bytes = clamp_output_bytes(max_output_bytes);
 
         let (status_rx, output, exit_code, error, timed_out, output_read) = COMMAND_STORAGE
             .get_direct(&command_id)
@@ -1483,18 +1489,25 @@ impl McpSSHCommands {
                     Arc::clone(&cmd.output_read),
                 )
             })
-            .ok_or_else(|| format!("No async command with ID: {command_id}"))?;
+            .ok_or_else(|| {
+                format_error(
+                    "SSH_GET_COMMAND_OUTPUT",
+                    "COMMAND_NOT_FOUND",
+                    "no async command with the given ID",
+                    Some(&command_id),
+                )
+            })?;
 
         if wait {
             let mut rx = status_rx.clone();
             let _ = timeout(wait_timeout, wait_for_command_completion(&mut rx)).await;
         }
 
-        // Mark output as read so the cleanup task can release immediately
+        // Mark output as read so the cleanup task can release immediately.
         output_read.store(true, Ordering::SeqCst);
 
         build_command_output_response(
-            command_id, &status_rx, &output, &exit_code, &error, &timed_out,
+            command_id, &status_rx, &output, &exit_code, &error, &timed_out, max_bytes,
         )
         .await
     }
@@ -1513,7 +1526,9 @@ impl McpSSHCommands {
         session_id: Option<String>,
         /// Filter by status: "running", "completed", "cancelled", "failed"
         status: Option<String>,
-    ) -> StructuredContent<SshListCommandsResponse> {
+        /// Maximum number of commands to return (default: 500, cap: 10000)
+        max_items: Option<usize>,
+    ) -> Text<String> {
         let status_filter: Option<AsyncCommandStatus> = status.and_then(|s| match s.as_str() {
             "running" => Some(AsyncCommandStatus::Running),
             "completed" => Some(AsyncCommandStatus::Completed),
@@ -1522,13 +1537,12 @@ impl McpSSHCommands {
             _ => None,
         });
 
-        let filtered = COMMAND_STORAGE.list_filtered(session_id.as_deref(), status_filter);
-        let count = filtered.len();
-
-        StructuredContent(SshListCommandsResponse {
-            commands: filtered,
-            count,
-        })
+        let max = clamp_list_items(max_items);
+        let mut filtered = COMMAND_STORAGE.list_filtered(session_id.as_deref(), status_filter);
+        filtered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        let total = filtered.len();
+        filtered.truncate(max);
+        Text(ListCommandsBuilder::new(&filtered, total).build())
     }
 
     /// Cancel a running async command.
@@ -1542,24 +1556,45 @@ impl McpSSHCommands {
         &self,
         /// Command ID to cancel
         command_id: String,
-    ) -> Result<StructuredContent<SshCancelCommandResponse>, String> {
-        let (cancel_token, output, status_rx) = get_running_command(&command_id)?;
+        /// Maximum bytes to show for stdout/stderr (default: 16384, cap: 1048576).
+        max_output_bytes: Option<usize>,
+    ) -> Result<Text<String>, String> {
+        let max_bytes = clamp_output_bytes(max_output_bytes);
+        let (cancel_token, output, status_rx) = match get_running_command(&command_id) {
+            Ok(x) => x,
+            Err(e) => {
+                // Distinguish "not found" from "not running" (noop).
+                if e.contains("No async command") {
+                    return Err(format_error(
+                        "SSH_CANCEL_COMMAND",
+                        "COMMAND_NOT_FOUND",
+                        "no async command with the given ID",
+                        Some(&command_id),
+                    ));
+                }
+                return Ok(Text(render_cancel_command_noop(&command_id, "not running")));
+            }
+        };
 
         cancel_token.cancel();
 
         let mut rx = status_rx;
         let _ = timeout(Duration::from_secs(2), wait_for_command_completion(&mut rx)).await;
 
-        let output_buf = output.lock().await;
         info!("Cancelled async command: {command_id}");
-
-        Ok(StructuredContent(SshCancelCommandResponse {
-            command_id,
-            cancelled: true,
-            message: "Command cancelled successfully".to_string(),
-            stdout: String::from_utf8_lossy(&output_buf.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output_buf.stderr).into_owned(),
-        }))
+        let nonce = generate_nonce();
+        let markdown = {
+            let guard = output.lock().await;
+            CancelCommandCancelledBuilder::new(
+                &command_id,
+                &guard.stdout,
+                &guard.stderr,
+                max_bytes,
+                &nonce,
+            )
+            .build()
+        };
+        Ok(Text(markdown))
     }
 
     /// Disconnect ALL sessions for a specific agent.
@@ -1575,7 +1610,7 @@ impl McpSSHCommands {
         &self,
         /// The agent identifier to disconnect all sessions for
         agent_id: String,
-    ) -> Result<StructuredContent<AgentDisconnectResponse>, String> {
+    ) -> Result<Text<String>, String> {
         info!("Disconnecting all sessions for agent: {agent_id}");
 
         let session_ids = SESSION_STORAGE.remove_agent_sessions(&agent_id);
@@ -1626,7 +1661,7 @@ impl McpSSHCommands {
         inactivity_ttl: Option<u64>,
         /// Maximum output buffer size. Accepts human-readable sizes: "512k", "10m", "1g", "1t". When exceeded, oldest output is truncated. Default: "10m" (env: SSH_SHELL_MAX_BUFFER_SIZE).
         max_buffer_size: Option<String>,
-    ) -> Result<StructuredContent<SshShellOpenResponse>, String> {
+    ) -> Result<Text<String>, String> {
         let term = term.unwrap_or_else(|| "xterm".to_string());
         let cols = cols.unwrap_or(80);
         let rows = rows.unwrap_or(24);
@@ -1635,13 +1670,21 @@ impl McpSSHCommands {
 
         let current_count = SHELL_STORAGE.count_by_session(&session_id);
         if current_count >= MAX_SHELLS_PER_SESSION {
-            return Err(format!(
-                "Maximum shells per session reached ({MAX_SHELLS_PER_SESSION}). Close existing shells first."
+            return Err(format_error(
+                "SSH_SHELL_OPEN",
+                "MAX_SHELLS_EXCEEDED",
+                "maximum shells per session reached",
+                Some(&format!("limit={MAX_SHELLS_PER_SESSION}")),
             ));
         }
 
-        let (handle_arc, agent_id) = get_session_handle_and_agent(&session_id)?;
-        let channel = open_pty_shell(&handle_arc, &term, cols, rows).await?;
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
+            .ok_or_else(|| err_session_not_found("SSH_SHELL_OPEN", &session_id))?;
+        let channel = open_pty_shell(&handle_arc, &term, cols, rows)
+            .await
+            .map_err(|e| format_error("SSH_SHELL_OPEN", "CHANNEL_FAILED", &e, None))?;
 
         Ok(register_shell(
             &session_id,
@@ -1676,17 +1719,26 @@ impl McpSSHCommands {
                     Arc::clone(&shell.last_activity),
                 )
             })
-            .ok_or_else(|| format!("No active shell with ID: {shell_id}"))?;
+            .ok_or_else(|| {
+                format_error(
+                    "SSH_SHELL_WRITE",
+                    "SHELL_NOT_FOUND",
+                    "no active shell with the given ID",
+                    Some(&shell_id),
+                )
+            })?;
 
-        channel_writer.lock().await.write(input.as_bytes()).await?;
+        channel_writer
+            .lock()
+            .await
+            .write(input.as_bytes())
+            .await
+            .map_err(|e| format_error("SSH_SHELL_WRITE", "WRITE_FAILED", &e, None))?;
 
-        // Reset inactivity timer on write
+        // Reset inactivity timer on write.
         *last_activity.lock().await = time::Instant::now();
 
-        Ok(Text(format!(
-            "Sent {} bytes to shell '{shell_id}'",
-            input.len(),
-        )))
+        Ok(Text(render_shell_write_ok(&shell_id, input.len())))
     }
 
     /// Read accumulated output from an interactive shell.
@@ -1702,10 +1754,16 @@ impl McpSSHCommands {
         &self,
         /// Shell ID returned from ssh_shell_open
         shell_id: String,
-        /// Clear the output buffer after reading (default: true). Set to false to peek without consuming.
+        /// Clear the output buffer after reading (default: true). When true, only
+        /// the bytes actually shown in this response are removed from the buffer
+        /// (head-based pagination). The rest stays available for the next call.
         clear: Option<bool>,
-    ) -> Result<StructuredContent<SshShellReadResponse>, String> {
+        /// Maximum bytes to show (default: 16384, cap: 1048576). Content is
+        /// rendered as the tail (most recent output).
+        max_output_bytes: Option<usize>,
+    ) -> Result<Text<String>, String> {
         let clear = clear.unwrap_or(true);
+        let max_bytes = clamp_output_bytes(max_output_bytes);
 
         let (output_arc, status_rx, last_activity) = SHELL_STORAGE
             .get_direct(&shell_id)
@@ -1716,26 +1774,44 @@ impl McpSSHCommands {
                     Arc::clone(&shell.last_activity),
                 )
             })
-            .ok_or_else(|| format!("No active shell with ID: {shell_id}"))?;
+            .ok_or_else(|| {
+                format_error(
+                    "SSH_SHELL_READ",
+                    "SHELL_NOT_FOUND",
+                    "no active shell with the given ID",
+                    Some(&shell_id),
+                )
+            })?;
 
-        let data = if clear {
-            let data = mem::take(&mut *output_arc.lock().await);
-            String::from_utf8_lossy(&data).into_owned()
-        } else {
-            let buf = output_arc.lock().await;
-            String::from_utf8_lossy(&buf).into_owned()
+        let nonce = generate_nonce();
+        let status = *status_rx.borrow();
+        let state = match status {
+            ShellStatus::Open => ShellReadState::Open,
+            ShellStatus::Closed => ShellReadState::Closed,
         };
 
-        let status = *status_rx.borrow();
+        // Acquire the buffer lock in a narrow scope: either render + drain_head
+        // (head-based pagination) or render without mutation (peek mode).
+        let markdown = {
+            let mut guard = output_arc.lock().await;
+            let markdown =
+                ShellReadBuilder::new(&shell_id, state, &guard, max_bytes, &nonce).build();
+            if clear {
+                // Remove exactly the bytes shown (head-based pagination).
+                let shown = guard.len().min(max_bytes);
+                guard.drain(..shown);
+                // Release memory when capacity dwarfs remaining content.
+                if guard.capacity() > guard.len().saturating_mul(4) {
+                    guard.shrink_to_fit();
+                }
+            }
+            markdown
+        };
 
-        // Reset inactivity timer on read
+        // Reset inactivity timer on read.
         *last_activity.lock().await = time::Instant::now();
 
-        Ok(StructuredContent(SshShellReadResponse {
-            shell_id,
-            data,
-            status,
-        }))
+        Ok(Text(markdown))
     }
 
     /// Close an interactive shell session.
@@ -1746,21 +1822,22 @@ impl McpSSHCommands {
         &self,
         /// Shell ID to close
         shell_id: String,
-    ) -> Result<StructuredContent<SshShellCloseResponse>, String> {
-        let shell = SHELL_STORAGE
-            .unregister(&shell_id)
-            .ok_or_else(|| format!("No active shell with ID: {shell_id}"))?;
+    ) -> Result<Text<String>, String> {
+        let shell = SHELL_STORAGE.unregister(&shell_id).ok_or_else(|| {
+            format_error(
+                "SSH_SHELL_CLOSE",
+                "SHELL_NOT_FOUND",
+                "no active shell with the given ID",
+                Some(&shell_id),
+            )
+        })?;
 
         shell.cancel_token.cancel();
         let _ = shell.channel_writer.lock().await.close().await;
 
         info!("Closed interactive shell: {shell_id}");
 
-        Ok(StructuredContent(SshShellCloseResponse {
-            shell_id,
-            closed: true,
-            message: "Shell closed successfully".to_string(),
-        }))
+        Ok(Text(render_shell_close_ok(&shell_id)))
     }
 
     /// Upload a local file to a remote path via SFTP.
@@ -1783,28 +1860,37 @@ impl McpSSHCommands {
         local_path: String,
         /// Remote destination path on the SSH server
         remote_path: String,
-    ) -> Result<StructuredContent<SshUploadResponse>, String> {
+    ) -> Result<Text<String>, String> {
         let current_count = TRANSFER_STORAGE.count_by_session(&session_id);
         if current_count >= MAX_TRANSFERS_PER_SESSION {
-            return Err(format!(
-                "Maximum transfers per session reached ({MAX_TRANSFERS_PER_SESSION}). Wait for existing transfers to complete."
+            return Err(format_error(
+                "SSH_UPLOAD",
+                "MAX_TRANSFERS_EXCEEDED",
+                "maximum transfers per session reached",
+                Some(&format!("limit={MAX_TRANSFERS_PER_SESSION}")),
             ));
         }
 
-        let (handle_arc, agent_id) = get_session_handle_and_agent(&session_id)?;
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
+            .ok_or_else(|| err_session_not_found("SSH_UPLOAD", &session_id))?;
 
         let resolved_path = resolve_local_path(&local_path);
         let metadata = fs::metadata(&resolved_path).await.map_err(|e| {
-            classify_transfer_error(
+            let reason = classify_transfer_error(
                 &format!("access local file '{}'", resolved_path.display()),
                 &e.to_string(),
-            )
+            );
+            format_error("SSH_UPLOAD", "LOCAL_FILE_ERROR", &reason, None)
         })?;
 
         if !metadata.is_file() {
-            return Err(format!(
-                "'{}' is not a regular file",
-                resolved_path.display()
+            return Err(format_error(
+                "SSH_UPLOAD",
+                "LOCAL_NOT_FILE",
+                "path is not a regular file",
+                Some(&resolved_path.display().to_string()),
             ));
         }
 
@@ -1838,23 +1924,32 @@ impl McpSSHCommands {
         remote_path: String,
         /// Local destination path (relative paths resolve to home directory)
         local_path: String,
-    ) -> Result<StructuredContent<SshDownloadResponse>, String> {
+    ) -> Result<Text<String>, String> {
         let current_count = TRANSFER_STORAGE.count_by_session(&session_id);
         if current_count >= MAX_TRANSFERS_PER_SESSION {
-            return Err(format!(
-                "Maximum transfers per session reached ({MAX_TRANSFERS_PER_SESSION}). Wait for existing transfers to complete."
+            return Err(format_error(
+                "SSH_DOWNLOAD",
+                "MAX_TRANSFERS_EXCEEDED",
+                "maximum transfers per session reached",
+                Some(&format!("limit={MAX_TRANSFERS_PER_SESSION}")),
             ));
         }
 
-        let (handle_arc, agent_id) = get_session_handle_and_agent(&session_id)?;
+        let (handle_arc, agent_id) = SESSION_STORAGE
+            .get(&session_id)
+            .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
+            .ok_or_else(|| err_session_not_found("SSH_DOWNLOAD", &session_id))?;
         let resolved_path = resolve_local_path(&local_path);
 
-        let sftp = open_sftp_session(&handle_arc).await?;
+        let sftp = open_sftp_session(&handle_arc)
+            .await
+            .map_err(|e| format_error("SSH_DOWNLOAD", "SFTP_OPEN_FAILED", &e, None))?;
         let remote_metadata = sftp.metadata(&remote_path).await.map_err(|e| {
-            classify_transfer_error(
+            let reason = classify_transfer_error(
                 &format!("get remote file metadata for '{remote_path}'"),
                 &e.to_string(),
-            )
+            );
+            format_error("SSH_DOWNLOAD", "REMOTE_METADATA_ERROR", &reason, None)
         })?;
 
         let total_bytes = remote_metadata.size.unwrap_or(0);
@@ -1884,7 +1979,7 @@ impl McpSSHCommands {
         wait: Option<bool>,
         /// Max seconds to wait when wait=true (default: 30, max: 300)
         wait_timeout_secs: Option<u64>,
-    ) -> Result<StructuredContent<SshTransferProgressResponse>, String> {
+    ) -> Result<Text<String>, String> {
         let wait = wait.unwrap_or(false);
         let wait_timeout = Duration::from_secs(wait_timeout_secs.unwrap_or(30).min(300));
 
@@ -1900,7 +1995,14 @@ impl McpSSHCommands {
                         t.info.clone(),
                     )
                 })
-                .ok_or_else(|| format!("No transfer with ID: {transfer_id}"))?;
+                .ok_or_else(|| {
+                    format_error(
+                        "SSH_GET_TRANSFER_PROGRESS",
+                        "TRANSFER_NOT_FOUND",
+                        "no transfer with the given ID",
+                        Some(&transfer_id),
+                    )
+                })?;
 
         if wait {
             let mut rx = status_rx.clone();
