@@ -78,10 +78,36 @@ pub const DEFAULT_SHELL_MAX_BUFFER_SIZE: u64 = 10 * 1024 * 1024;
 /// Exceeding this causes oldest bytes to be drained head-first, bounding RAM usage.
 pub const DEFAULT_COMMAND_MAX_BUFFER_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Default TTL (in seconds) before a terminal (completed/failed/cancelled)
+/// transfer is removed from storage. Gives LLM a chance to poll final state.
+pub const DEFAULT_TRANSFER_CLEANUP_TTL_SECS: u64 = 300;
+
+/// Default `max_output_bytes` applied to output-returning tools when the
+/// caller does not pass an explicit value.
+pub const DEFAULT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// Hard cap on `max_output_bytes` regardless of caller request.
+pub const DEFAULT_OUTPUT_MAX_BYTES_CAP: usize = 1024 * 1024;
+/// Default `max_items` applied to list-returning tools when the caller
+/// does not pass an explicit value.
+pub const DEFAULT_LIST_MAX_ITEMS: usize = 500;
+/// Hard cap on `max_items`.
+pub const DEFAULT_LIST_MAX_ITEMS_CAP: usize = 10_000;
+
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
 /// Environment variable name for the per-command output buffer cap.
 pub const COMMAND_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_COMMAND_MAX_BUFFER_SIZE";
+/// Environment variable for the transfer cleanup TTL.
+pub const TRANSFER_CLEANUP_TTL_ENV_VAR: &str = "SSH_TRANSFER_CLEANUP_TTL";
+/// Environment variable for the default `max_output_bytes` applied to the
+/// render layer of output-returning tools.
+pub const OUTPUT_DEFAULT_BYTES_ENV_VAR: &str = "SSH_MCP_OUTPUT_DEFAULT_BYTES";
+/// Environment variable for the hard cap on `max_output_bytes`.
+pub const OUTPUT_MAX_BYTES_CAP_ENV_VAR: &str = "SSH_MCP_OUTPUT_MAX_BYTES_CAP";
+/// Environment variable for the default `max_items` returned by list tools.
+pub const LIST_MAX_ITEMS_ENV_VAR: &str = "SSH_MCP_LIST_MAX_ITEMS";
+/// Environment variable for the hard cap on `max_items`.
+pub const LIST_MAX_ITEMS_CAP_ENV_VAR: &str = "SSH_MCP_LIST_MAX_ITEMS_CAP";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
 #[must_use]
@@ -313,6 +339,60 @@ pub fn resolve_command_max_buffer_size() -> u64 {
         return size;
     }
     DEFAULT_COMMAND_MAX_BUFFER_SIZE
+}
+
+/// Resolve the transfer cleanup TTL. Reads `SSH_TRANSFER_CLEANUP_TTL`
+/// as an integer number of seconds; defaults to 300s (5 minutes).
+///
+/// Applied per-transfer: once a transfer reaches a terminal state
+/// (Completed / Failed / Cancelled), a background task removes it from
+/// storage after the TTL elapses.
+#[must_use]
+pub fn resolve_transfer_cleanup_ttl() -> Duration {
+    let secs = env::var(TRANSFER_CLEANUP_TTL_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TRANSFER_CLEANUP_TTL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Resolve the effective `max_output_bytes` for output rendering.
+///
+/// Priority: caller parameter -> `SSH_MCP_OUTPUT_DEFAULT_BYTES` -> 16 KiB.
+/// Then clamped to `resolve_output_max_bytes_cap()` (hard cap).
+#[must_use]
+pub fn resolve_output_default_bytes() -> usize {
+    env::var(OUTPUT_DEFAULT_BYTES_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_MAX_BYTES)
+}
+
+/// Resolve the hard cap on `max_output_bytes` from env (default 1 MiB).
+#[must_use]
+pub fn resolve_output_max_bytes_cap() -> usize {
+    env::var(OUTPUT_MAX_BYTES_CAP_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_MAX_BYTES_CAP)
+}
+
+/// Resolve the default `max_items` for list tools.
+#[must_use]
+pub fn resolve_list_max_items_default() -> usize {
+    env::var(LIST_MAX_ITEMS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LIST_MAX_ITEMS)
+}
+
+/// Resolve the hard cap on `max_items`.
+#[must_use]
+pub fn resolve_list_max_items_cap() -> usize {
+    env::var(LIST_MAX_ITEMS_CAP_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LIST_MAX_ITEMS_CAP)
 }
 
 #[cfg(test)]
