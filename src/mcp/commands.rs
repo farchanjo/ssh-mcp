@@ -49,10 +49,10 @@ use super::config::{
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
 use super::message::builder::{
-    CancelCommandCancelledBuilder, ConnectOkBuilder, ExecuteStartedBuilder,
-    GetCommandOutputBuilder, GetCommandOutputState, ListCommandsBuilder, ListSessionsBuilder,
-    ShellOpenBuilder, ShellReadBuilder, ShellReadState, TransferProgressBuilder,
-    TransferProgressState, TransferStartDirection, TransferStartedBuilder,
+    CancelCommandCancelledBuilder, ConnectOkBuilder, ConnectSuggestedBuilder,
+    ExecuteStartedBuilder, GetCommandOutputBuilder, GetCommandOutputState, ListCommandsBuilder,
+    ListSessionsBuilder, SessionMatch, ShellOpenBuilder, ShellReadBuilder, ShellReadState,
+    TransferProgressBuilder, TransferProgressState, TransferStartDirection, TransferStartedBuilder,
     render_cancel_command_noop, render_disconnect_agent, render_disconnect_ok, render_forward_ok,
     render_shell_close_ok, render_shell_write_ok,
 };
@@ -64,7 +64,7 @@ use super::sftp::{
 };
 use super::shell::{ChannelWriter, MAX_SHELLS_PER_SESSION, RunningShell};
 use super::storage::command::COMMAND_STORAGE;
-use super::storage::session::SESSION_STORAGE;
+use super::storage::session::{SESSION_STORAGE, parse_host_port};
 use super::storage::shell::SHELL_STORAGE;
 use super::storage::traits::{
     CommandStorage, SessionRef, SessionStorage, ShellStorage, TransferStorage,
@@ -99,6 +99,25 @@ fn clamp_list_items(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_LIST_MAX_ITEMS)
         .clamp(1, LIST_MAX_ITEMS_CAP)
+}
+
+/// Format a `host:port` pair for display when the port is not the default 22.
+fn format_host_for_display(host_lc: &str, port: u16) -> String {
+    if port == 22 {
+        host_lc.to_string()
+    } else {
+        format!("{host_lc}:{port}")
+    }
+}
+
+/// Append a `REPLACED: N` line to a new-connection response when unhealthy
+/// matches were purged before creating it.
+fn append_replaced_line(mut response: String, replaced: usize) -> String {
+    if replaced > 0 {
+        response.push_str("\nREPLACED: ");
+        response.push_str(&replaced.to_string());
+    }
+    response
 }
 
 /// Map an internal session-id-not-found error to the standardized format.
@@ -158,6 +177,67 @@ fn build_reuse_response(
             None
         }
     }
+}
+
+/// Outcome of evaluating existing sessions for a smart-reuse lookup.
+struct IdentityMatches {
+    /// Sessions that passed the health check, newest first.
+    healthy: Vec<SessionMatch>,
+    /// Session IDs that failed the health check and were disconnected.
+    replaced: usize,
+}
+
+/// Evaluate matching sessions for the given identity triple.
+///
+/// Runs a health check on every candidate, disconnects the unhealthy ones
+/// (including removing them from storage), and returns the healthy ones
+/// sorted by `connected_at` descending (most recent first).
+async fn evaluate_identity_matches(host: &str, port: u16, username: &str) -> IdentityMatches {
+    let candidates = SESSION_STORAGE.find_by_identity(host, port, username);
+    let mut healthy: Vec<SessionMatch> = Vec::new();
+    let mut replaced = 0_usize;
+
+    for sid in candidates {
+        let Some(session_ref) = SESSION_STORAGE.get(&sid) else {
+            continue;
+        };
+        let health_timeout = Duration::from_secs(5);
+        let health = execute_ssh_command(&session_ref.handle, "echo 1", health_timeout).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let is_healthy = matches!(&health, Ok(r) if !r.timed_out && r.exit_code == 0);
+        if is_healthy {
+            SESSION_STORAGE.update_health(&sid, now, true);
+            healthy.push(SessionMatch {
+                session_id: sid,
+                host: format!("{}@{}", session_ref.info.username, session_ref.info.host),
+                agent_id: session_ref.info.agent_id.clone(),
+                name: session_ref.info.name.clone(),
+                connected_at: session_ref.info.connected_at.clone(),
+                healthy: true,
+            });
+        } else {
+            replaced += 1;
+            cancel_session_transfers(&sid);
+            close_session_shells(&sid).await;
+            cancel_session_commands(&sid);
+            if let Some(stale) = SESSION_STORAGE.remove(&sid) {
+                if let Some(agent_id) = &stale.info.agent_id {
+                    SESSION_STORAGE.unregister_agent(agent_id, &sid);
+                }
+                let _ = stale
+                    .handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "Unhealthy session replaced",
+                        "en",
+                    )
+                    .await;
+            }
+        }
+    }
+
+    healthy.sort_by(|a, b| b.connected_at.cmp(&a.connected_at));
+    IdentityMatches { healthy, replaced }
 }
 
 /// Cancel all transfers for a session.
@@ -1261,6 +1341,13 @@ impl McpSSHCommands {
         persistent: Option<bool>,
         /// Optional agent identifier for grouping sessions (e.g., "claude-code-instance-abc123"). Use ssh_disconnect_agent to disconnect all sessions for an agent.
         agent_id: Option<String>,
+        /// Reuse policy when an existing session with the same (host, port, username)
+        /// is found: "suggest" (default) returns a SUGGESTED response listing the
+        /// matching sessions without connecting; "auto" reuses the most recent
+        /// healthy match and returns REUSED; "force_new" skips the lookup and
+        /// always creates a new connection. In all policies, unhealthy matches are
+        /// disconnected and reported as REPLACED.
+        reuse: Option<String>,
     ) -> Result<Text<String>, String> {
         if let Some(sid) = &session_id {
             if let Some(response) = try_reuse_session(sid).await {
@@ -1269,7 +1356,42 @@ impl McpSSHCommands {
             info!("Session {sid} not found or dead, creating new connection");
         }
 
-        create_new_connection(
+        let reuse_policy = reuse.as_deref().unwrap_or("suggest");
+        let (host_lc, port) = parse_host_port(&address);
+
+        let matches = if reuse_policy == "force_new" {
+            IdentityMatches {
+                healthy: Vec::new(),
+                replaced: 0,
+            }
+        } else {
+            evaluate_identity_matches(&host_lc, port, &username).await
+        };
+
+        if !matches.healthy.is_empty() {
+            match reuse_policy {
+                "auto" => {
+                    if let Some(m) = matches.healthy.first() {
+                        return Ok(Text(
+                            ConnectOkBuilder::new(
+                                &m.session_id,
+                                &username,
+                                format_host_for_display(&host_lc, port),
+                            )
+                            .with_agent_id(m.agent_id.as_deref())
+                            .reused(true)
+                            .build(),
+                        ));
+                    }
+                }
+                "suggest" => {
+                    return Ok(Text(ConnectSuggestedBuilder::new(matches.healthy).build()));
+                }
+                _ => {}
+            }
+        }
+
+        let mut response = create_new_connection(
             address,
             username,
             password,
@@ -1282,7 +1404,11 @@ impl McpSSHCommands {
             persistent,
             agent_id,
         )
-        .await
+        .await?;
+        if matches.replaced > 0 {
+            response = Text(append_replaced_line(response.0, matches.replaced));
+        }
+        Ok(response)
     }
 
     /// Disconnect an SSH session and release resources.
