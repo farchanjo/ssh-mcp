@@ -22,14 +22,22 @@ pub struct StoredSession {
     pub handle: Arc<client::Handle<SshClientHandler>>,
 }
 
+/// Normalized identity triple used to look up equivalent sessions.
+///
+/// `host` is stored lowercased; `port` defaults to 22 when the input
+/// `host` string does not contain an explicit `:port` suffix.
+pub type IdentityTriple = (String, u16, String);
+
 /// `DashMap`-based implementation of `SessionStorage`.
 ///
-/// Uses two `DashMap` instances:
-/// - Primary storage: `session_id` -> `StoredSession`
-/// - Secondary index: `agent_id` -> `HashSet<session_id>` for O(1) agent lookups
+/// Secondary indices:
+/// - `sessions_by_agent`: `agent_id` -> `HashSet<session_id>`
+/// - `sessions_by_identity`: `(host_lc, port, user)` -> `HashSet<session_id>`
+///   for smart-reuse detection on `ssh_connect`.
 pub struct DashMapSessionStorage {
     sessions: DashMap<String, StoredSession>,
     sessions_by_agent: DashMap<String, HashSet<String>>,
+    sessions_by_identity: DashMap<IdentityTriple, HashSet<String>>,
 }
 
 impl DashMapSessionStorage {
@@ -39,8 +47,54 @@ impl DashMapSessionStorage {
         Self {
             sessions: DashMap::new(),
             sessions_by_agent: DashMap::new(),
+            sessions_by_identity: DashMap::new(),
         }
     }
+
+    /// Find all session IDs with the given `(host, port, username)` identity.
+    ///
+    /// `host` is compared case-insensitively. `port` of 0 is treated as 22
+    /// for backwards compatibility with callers that omit the port.
+    #[must_use]
+    pub fn find_by_identity(&self, host: &str, port: u16, username: &str) -> Vec<String> {
+        let triple = (
+            host.to_lowercase(),
+            if port == 0 { 22 } else { port },
+            username.to_string(),
+        );
+        self.sessions_by_identity
+            .get(&triple)
+            .map(|entry| entry.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Parse a `host[:port]` string into a lowercased host and a port (default 22).
+///
+/// Supports `"host"`, `"host:22"`, and IPv6 bracketed forms `"[::1]:22"`.
+#[must_use]
+pub fn parse_host_port(raw: &str) -> (String, u16) {
+    if let Some(rest) = raw.strip_prefix('[')
+        && let Some((host, after)) = rest.split_once(']')
+    {
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(22);
+        return (host.to_lowercase(), port);
+    }
+    raw.rsplit_once(':').map_or_else(
+        || (raw.to_lowercase(), 22_u16),
+        |(host, port_str)| {
+            let port = port_str.parse::<u16>().unwrap_or(22);
+            (host.to_lowercase(), port)
+        },
+    )
+}
+
+fn identity_of(info: &SessionInfo) -> IdentityTriple {
+    let (host_lc, port) = parse_host_port(&info.host);
+    (host_lc, port, info.username.clone())
 }
 
 impl Default for DashMapSessionStorage {
@@ -56,6 +110,11 @@ impl SessionStorage for DashMapSessionStorage {
         info: SessionInfo,
         handle: Arc<client::Handle<SshClientHandler>>,
     ) {
+        let triple = identity_of(&info);
+        self.sessions_by_identity
+            .entry(triple)
+            .or_default()
+            .insert(session_id.clone());
         self.sessions
             .insert(session_id, StoredSession { info, handle });
     }
@@ -68,12 +127,21 @@ impl SessionStorage for DashMapSessionStorage {
     }
 
     fn remove(&self, session_id: &str) -> Option<SessionRef> {
-        self.sessions
-            .remove(session_id)
-            .map(|(_, stored)| SessionRef {
-                info: stored.info,
-                handle: stored.handle,
-            })
+        let removed = self.sessions.remove(session_id).map(|(_, stored)| stored);
+        if let Some(stored) = removed.as_ref() {
+            let triple = identity_of(&stored.info);
+            if let Some(mut entry) = self.sessions_by_identity.get_mut(&triple) {
+                entry.remove(session_id);
+                if entry.is_empty() {
+                    drop(entry);
+                    self.sessions_by_identity.remove(&triple);
+                }
+            }
+        }
+        removed.map(|stored| SessionRef {
+            info: stored.info,
+            handle: stored.handle,
+        })
     }
 
     fn list(&self) -> Vec<SessionInfo> {
@@ -474,6 +542,82 @@ mod tests {
     fn test_storage_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DashMapSessionStorage>();
+    }
+
+    #[test]
+    fn parse_host_port_bare_host_defaults_port_22() {
+        let (host, port) = parse_host_port("example.com");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_host_port_explicit_port() {
+        let (host, port) = parse_host_port("example.com:2222");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 2222);
+    }
+
+    #[test]
+    fn parse_host_port_lowercases_host() {
+        let (host, port) = parse_host_port("EXAMPLE.COM:22");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_host_port_ipv6_bracketed() {
+        let (host, port) = parse_host_port("[::1]:2222");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 2222);
+    }
+
+    #[test]
+    fn parse_host_port_ipv4() {
+        let (host, port) = parse_host_port("192.168.1.1:22");
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_host_port_invalid_port_defaults_22() {
+        let (host, port) = parse_host_port("host:not-a-port");
+        assert_eq!(host, "host");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn find_by_identity_empty_when_nothing_registered() {
+        let storage = DashMapSessionStorage::new();
+        assert!(storage.find_by_identity("host", 22, "user").is_empty());
+    }
+
+    #[test]
+    fn find_by_identity_is_case_insensitive_on_host() {
+        let storage = DashMapSessionStorage::new();
+        // Populate the secondary index by using a SessionInfo directly on the map.
+        // We can't insert without a real handle, so exercise via internal maps.
+        storage
+            .sessions_by_identity
+            .entry(("vm.services".to_string(), 22, "root".to_string()))
+            .or_default()
+            .insert("sess-x".to_string());
+        let hits_upper = storage.find_by_identity("VM.SERVICES", 22, "root");
+        let hits_lower = storage.find_by_identity("vm.services", 22, "root");
+        assert_eq!(hits_upper, hits_lower);
+        assert!(hits_lower.contains(&"sess-x".to_string()));
+    }
+
+    #[test]
+    fn find_by_identity_port_zero_treated_as_22() {
+        let storage = DashMapSessionStorage::new();
+        storage
+            .sessions_by_identity
+            .entry(("host".to_string(), 22, "u".to_string()))
+            .or_default()
+            .insert("sess-a".to_string());
+        let hits = storage.find_by_identity("host", 0, "u");
+        assert!(hits.contains(&"sess-a".to_string()));
     }
 
     #[test]
