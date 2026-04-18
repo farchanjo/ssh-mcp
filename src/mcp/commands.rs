@@ -43,8 +43,10 @@ use super::client::{
 };
 use super::config::{
     resolve_command_cleanup_ttl, resolve_command_timeout, resolve_compression,
-    resolve_connect_timeout, resolve_inactivity_timeout, resolve_max_retries, resolve_retry_delay,
-    resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size,
+    resolve_connect_timeout, resolve_inactivity_timeout, resolve_list_max_items_cap,
+    resolve_list_max_items_default, resolve_max_retries, resolve_output_default_bytes,
+    resolve_output_max_bytes_cap, resolve_retry_delay, resolve_shell_inactivity_ttl,
+    resolve_shell_max_buffer_size, resolve_transfer_cleanup_ttl,
 };
 #[cfg(feature = "port_forward")]
 use super::forward::setup_port_forwarding;
@@ -77,28 +79,26 @@ use super::types::{
     AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo, ShellStatus, SshCommandResponse,
 };
 
-/// Default maximum bytes to show in stdout/stderr/data blocks when the caller
-/// does not provide `max_output_bytes`.
-const DEFAULT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
-/// Hard cap on `max_output_bytes` regardless of caller request.
-const OUTPUT_MAX_BYTES_CAP: usize = 1024 * 1024;
-/// Default maximum items returned by list tools when no `max_items` provided.
-const DEFAULT_LIST_MAX_ITEMS: usize = 500;
-/// Hard cap on `max_items` to prevent abusive requests.
-const LIST_MAX_ITEMS_CAP: usize = 10_000;
-
 /// Clamp a caller-provided `max_output_bytes`.
+///
+/// Priority: caller-supplied -> `SSH_MCP_OUTPUT_DEFAULT_BYTES` env var ->
+/// 16 KiB hard default. Then clamped to `SSH_MCP_OUTPUT_MAX_BYTES_CAP`
+/// (default 1 MiB).
 fn clamp_output_bytes(requested: Option<usize>) -> usize {
-    requested
-        .unwrap_or(DEFAULT_OUTPUT_MAX_BYTES)
-        .min(OUTPUT_MAX_BYTES_CAP)
+    let default = resolve_output_default_bytes();
+    let cap = resolve_output_max_bytes_cap();
+    requested.unwrap_or(default).min(cap)
 }
 
 /// Clamp a caller-provided `max_items` for list tools.
+///
+/// Priority: caller-supplied -> `SSH_MCP_LIST_MAX_ITEMS` env var ->
+/// 500 hard default. Then clamped to `SSH_MCP_LIST_MAX_ITEMS_CAP`
+/// (default 10 000).
 fn clamp_list_items(requested: Option<usize>) -> usize {
-    requested
-        .unwrap_or(DEFAULT_LIST_MAX_ITEMS)
-        .clamp(1, LIST_MAX_ITEMS_CAP)
+    let default = resolve_list_max_items_default();
+    let cap = resolve_list_max_items_cap();
+    requested.unwrap_or(default).clamp(1, cap)
 }
 
 /// Format a `host:port` pair for display when the port is not the default 22.
@@ -789,11 +789,13 @@ fn create_and_register_transfer(
             cancel_token: cancel_token.clone(),
             bytes_transferred: Arc::clone(&bytes_transferred),
             total_bytes: Arc::new(AtomicU64::new(total_bytes)),
-            status_rx,
+            status_rx: status_rx.clone(),
             status_tx: status_tx.clone(),
             error: Arc::clone(&error),
         },
     );
+
+    spawn_transfer_cleanup_task(transfer_id.to_string(), status_rx);
 
     TransferSharedState {
         cancel_token,
@@ -801,6 +803,26 @@ fn create_and_register_transfer(
         status_tx,
         error,
     }
+}
+
+/// Remove a terminated transfer from storage after `SSH_TRANSFER_CLEANUP_TTL`.
+///
+/// Waits for the transfer to leave the `Running` state, then sleeps for the
+/// configured TTL (default 300s) and removes the entry from `TRANSFER_STORAGE`.
+/// This bounds memory for long-lived processes that accumulate completed
+/// transfers without the LLM polling their final state.
+fn spawn_transfer_cleanup_task(
+    transfer_id: String,
+    mut status_rx: watch::Receiver<TransferStatus>,
+) {
+    let ttl = resolve_transfer_cleanup_ttl();
+    tokio::spawn(async move {
+        wait_for_transfer_completion(&mut status_rx).await;
+        time::sleep(ttl).await;
+        if TRANSFER_STORAGE.unregister(&transfer_id).is_some() {
+            info!("Cleanup: removed terminal transfer {transfer_id} (TTL expired)");
+        }
+    });
 }
 
 /// Start an upload transfer and return the response.
