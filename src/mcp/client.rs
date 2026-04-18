@@ -579,7 +579,8 @@ pub async fn execute_ssh_command_async(
     error: Arc<Mutex<Option<String>>>,
     timed_out: Arc<AtomicBool>,
 ) {
-    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx).await else {
+    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx, &cancel_token).await
+    else {
         return;
     };
 
@@ -603,18 +604,74 @@ pub async fn execute_ssh_command_async(
 /// Open a session channel for async command execution.
 ///
 /// Returns `None` and sets the error/status if the channel cannot be opened.
+///
+/// Retries transient `ConnectFailed` errors with short backoff. OpenSSH's
+/// default `MaxSessions=10` can refuse new channels under rapid
+/// `execute+cancel` bursts because the server needs a small window to
+/// reclaim channel slots after a `CHANNEL_CLOSE`. The retry loop lets the
+/// client wait for slot reclamation instead of surfacing a transient
+/// failure as a permanent `Failed` command.
+#[allow(
+    clippy::too_many_lines,
+    reason = "cohesive retry loop with cancel checks; splitting hurts readability"
+)]
 async fn open_async_channel(
     handle: &Arc<client::Handle<SshClientHandler>>,
     error: &Arc<Mutex<Option<String>>>,
     status_tx: &watch::Sender<AsyncCommandStatus>,
+    cancel_token: &CancellationToken,
 ) -> Option<Channel<client::Msg>> {
-    match handle.channel_open_session().await {
-        Ok(ch) => Some(ch),
-        Err(e) => {
-            *error.lock().await = Some(format!("Failed to open channel: {e}"));
-            let _ = status_tx.send(AsyncCommandStatus::Failed);
-            None
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut attempt = 0_u32;
+    loop {
+        if cancel_token.is_cancelled() {
+            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+            return None;
         }
+        attempt += 1;
+        match handle.channel_open_session().await {
+            Ok(ch) => {
+                if attempt > 1 {
+                    info!("channel_open_session succeeded on attempt {attempt}");
+                }
+                return Some(ch);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!("channel_open_session attempt {attempt} failed: {msg}");
+                if is_transient_open_error(&msg) && attempt < MAX_ATTEMPTS {
+                    if wait_with_cancel(cancel_token, attempt).await {
+                        let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+                        return None;
+                    }
+                    continue;
+                }
+                *error.lock().await = Some(format!("Failed to open channel: {e}"));
+                let _ = status_tx.send(AsyncCommandStatus::Failed);
+                return None;
+            }
+        }
+    }
+}
+
+/// Classify a `channel_open_session` error as transient (slot may reopen soon).
+fn is_transient_open_error(msg: &str) -> bool {
+    // OpenSSH surfaces `MaxSessions` exhaustion as `ConnectFailed` /
+    // `Administratively prohibited`. `RESOURCE_SHORTAGE` is the RFC label.
+    msg.contains("ConnectFailed")
+        || msg.contains("RESOURCE_SHORTAGE")
+        || msg.contains("Administratively")
+}
+
+/// Sleep the exponential backoff for `attempt`, or return `true` if cancelled.
+async fn wait_with_cancel(cancel_token: &CancellationToken, attempt: u32) -> bool {
+    const BASE_BACKOFF_MS: u64 = 100;
+    const MAX_BACKOFF_MS: u64 = 1_000;
+    let step = BASE_BACKOFF_MS.saturating_mul(u64::from(1_u32 << (attempt - 1)));
+    let wait_ms = step.min(MAX_BACKOFF_MS);
+    tokio::select! {
+        () = cancel_token.cancelled() => true,
+        () = time::sleep(Duration::from_millis(wait_ms)) => false,
     }
 }
 
@@ -666,13 +723,36 @@ async fn run_with_cancellation_and_timeout(
 }
 
 /// Handle async command cancellation.
+///
+/// Sends `CHANNEL_CLOSE`, then drains inbound messages until the server
+/// acknowledges the close (bounded by timeout), and finally pauses briefly
+/// so OpenSSH can reclaim the channel slot before the next
+/// `channel_open_session` call on the same SSH session.
+///
+/// Under rapid `execute + cancel` bursts this pacing prevents
+/// `MaxSessions` exhaustion: without it, the next open lands on the
+/// server before the `CHANNEL_CLOSE` is fully applied and the server
+/// refuses with `ConnectFailed` / `Administratively prohibited`.
 async fn handle_cancellation(
-    channel: &Channel<client::Msg>,
+    channel: &mut Channel<client::Msg>,
     command: &str,
     status_tx: &watch::Sender<AsyncCommandStatus>,
 ) {
+    use russh::ChannelMsg;
     warn!("Async command cancelled: {command}");
     let _ = channel.close().await;
+    // Drain inbound messages until the server acknowledges the close.
+    // Generous timeout so a slow server doesn't leave us guessing whether
+    // the channel slot has actually been released.
+    let drain = async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Close | ChannelMsg::Eof) | None => break,
+                Some(_) => {}
+            }
+        }
+    };
+    let _ = time::timeout(Duration::from_secs(2), drain).await;
     let _ = status_tx.send(AsyncCommandStatus::Cancelled);
 }
 
@@ -751,7 +831,8 @@ pub async fn execute_ssh_command_async_pty(
     error: Arc<Mutex<Option<String>>>,
     timed_out: Arc<AtomicBool>,
 ) {
-    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx).await else {
+    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx, &cancel_token).await
+    else {
         return;
     };
 

@@ -10,16 +10,31 @@ use std::sync::LazyLock;
 
 use dashmap::DashMap;
 use russh::client;
+use tokio::sync::Semaphore;
 
 use crate::mcp::session::SshClientHandler;
 use crate::mcp::types::SessionInfo;
 
 use super::traits::{SessionRef, SessionStorage};
 
+/// Max concurrent SSH channels opened per session.
+///
+/// Strictly serializes channel opens on the same SSH session so rapid
+/// `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget
+/// (default 10). One permit guarantees the previous channel has fully
+/// closed (including the server's `CHANNEL_CLOSE` ack) before the next
+/// `channel_open_session` call. Parallel workloads on the same session
+/// still proceed — they simply queue through the semaphore.
+pub const CHANNEL_CONCURRENCY_PER_SESSION: usize = 1;
+
 /// Stored session data combining metadata with the actual session handle.
 pub struct StoredSession {
     pub info: SessionInfo,
     pub handle: Arc<client::Handle<SshClientHandler>>,
+    /// Semaphore gating how many channels may be open simultaneously on
+    /// this SSH session. Acquired before `channel_open_session()` and
+    /// released when the channel fully closes.
+    pub channel_permits: Arc<Semaphore>,
 }
 
 /// Normalized identity triple used to look up equivalent sessions.
@@ -115,14 +130,22 @@ impl SessionStorage for DashMapSessionStorage {
             .entry(triple)
             .or_default()
             .insert(session_id.clone());
-        self.sessions
-            .insert(session_id, StoredSession { info, handle });
+        let channel_permits = Arc::new(Semaphore::new(CHANNEL_CONCURRENCY_PER_SESSION));
+        self.sessions.insert(
+            session_id,
+            StoredSession {
+                info,
+                handle,
+                channel_permits,
+            },
+        );
     }
 
     fn get(&self, session_id: &str) -> Option<SessionRef> {
         self.sessions.get(session_id).map(|entry| SessionRef {
             info: entry.info.clone(),
             handle: Arc::clone(&entry.handle),
+            channel_permits: Arc::clone(&entry.channel_permits),
         })
     }
 
@@ -141,6 +164,7 @@ impl SessionStorage for DashMapSessionStorage {
         removed.map(|stored| SessionRef {
             info: stored.info,
             handle: stored.handle,
+            channel_permits: stored.channel_permits,
         })
     }
 

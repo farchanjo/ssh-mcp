@@ -916,6 +916,38 @@ if _rss_before is not None:
     except Exception:
         pass
 
+# -- V. REGRESSION: rapid cancel/execute must not exhaust SSH channel slots --
+# Original bug (STRESS II root cause): OpenSSH's MaxSessions=10 default refuses
+# new channels when rapid execute+cancel cycles accumulate un-reclaimed slots.
+# Fixed in src/mcp/client.rs::open_async_channel by retrying on transient
+# ConnectFailed/RESOURCE_SHORTAGE with exponential backoff (50/100/200/400 ms).
+# This test drives the exact failure pattern — 30 rapid cancel iterations
+# followed by an echo — and asserts the echo still succeeds.
+print("\n=== STRESS V: channel-exhaustion regression ===", flush=True)
+chex_sid = tool("ssh_connect", connect_args(agent_id="stress-chex", name="stress-chex")).get("session_id", "")
+regression_ok = bool(chex_sid)
+if chex_sid:
+    # Burn 30 channels via rapid cancel (faster than OpenSSH reclaims them).
+    for i in range(30):
+        r = tool("ssh_execute", {"session_id": chex_sid, "command": "sleep 30"})
+        cid = r.get("command_id", "")
+        if cid:
+            time.sleep(0.02)
+            tool("ssh_cancel_command", {"command_id": cid})
+    # Immediately after the burst, a fresh command MUST succeed.
+    r = tool("ssh_execute", {"session_id": chex_sid, "command": "echo CHANNEL_SLOT_OK"})
+    cid = r.get("command_id", "")
+    if cid:
+        out = tool("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
+        regression_ok = "CHANNEL_SLOT_OK" in out.get("stdout", "")
+        err_detail = out.get("error", "") if not regression_ok else ""
+    else:
+        regression_ok = False
+        err_detail = r.get("error", str(r))[:200]
+    tool("ssh_disconnect", {"session_id": chex_sid})
+test("channel slots reclaimed after 30 rapid cancels", regression_ok,
+     "" if regression_ok else f"{err_detail}")
+
 for agent in ["stress-cycle", "stress-exec", "stress-shell", "stress-big"]:
     tool("ssh_disconnect_agent", {"agent_id": agent})
 

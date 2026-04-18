@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use dashmap::mapref::one::Ref;
 use russh::client;
+use tokio::sync::Semaphore;
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::session::SshClientHandler;
@@ -18,6 +19,8 @@ use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo, Shell
 pub struct SessionRef {
     pub info: SessionInfo,
     pub handle: Arc<client::Handle<SshClientHandler>>,
+    /// Semaphore limiting concurrent SSH channels on this session.
+    pub channel_permits: Arc<Semaphore>,
 }
 
 /// Trait for session storage operations.
