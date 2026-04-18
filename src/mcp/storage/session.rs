@@ -609,6 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn stress_identity_index_thousand_entries_lookup_is_fast() {
+        let storage = DashMapSessionStorage::new();
+        // Pre-populate the index directly (we can't easily create real handles).
+        for i in 0..1000_usize {
+            storage
+                .sessions_by_identity
+                .entry((format!("host-{}", i % 50), 22, format!("user-{}", i % 10)))
+                .or_default()
+                .insert(format!("sess-{i}"));
+        }
+        let start = std::time::Instant::now();
+        // Run 1000 lookups
+        for i in 0..1000_usize {
+            let hits = storage.find_by_identity(
+                &format!("host-{}", i % 50),
+                22,
+                &format!("user-{}", i % 10),
+            );
+            assert!(!hits.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 100,
+            "1000 lookups on 1000-entry index took {}ms (expected <100ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
     fn find_by_identity_port_zero_treated_as_22() {
         let storage = DashMapSessionStorage::new();
         storage
