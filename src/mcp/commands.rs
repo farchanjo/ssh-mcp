@@ -30,7 +30,7 @@ use poem_mcpserver::{Tools, content::Text};
 use russh::client::Msg;
 use russh::{Channel, Disconnect, client};
 use tokio::fs;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::time::{self, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -344,6 +344,12 @@ fn create_running_command(
 }
 
 /// Spawn the background command execution task.
+///
+/// The task first awaits a permit from the session's channel semaphore so
+/// the number of concurrent russh channels on this SSH session stays
+/// below OpenSSH's `MaxSessions` budget. The permit is released when the
+/// task returns (after the channel is closed either through completion,
+/// cancellation, or timeout), freeing the slot for subsequent executes.
 #[allow(
     clippy::too_many_arguments,
     reason = "passes through shared state to async task"
@@ -359,32 +365,46 @@ fn spawn_command_task(
     exit_code: Arc<Mutex<Option<i32>>>,
     error: Arc<Mutex<Option<String>>>,
     timed_out: Arc<AtomicBool>,
+    channel_permits: Arc<Semaphore>,
 ) {
-    if use_pty {
-        tokio::spawn(execute_ssh_command_async_pty(
-            handle_arc,
-            command,
-            cmd_timeout,
-            output,
-            status_tx,
-            cancel_token,
-            exit_code,
-            error,
-            timed_out,
-        ));
-    } else {
-        tokio::spawn(execute_ssh_command_async(
-            handle_arc,
-            command,
-            cmd_timeout,
-            output,
-            status_tx,
-            cancel_token,
-            exit_code,
-            error,
-            timed_out,
-        ));
-    }
+    tokio::spawn(async move {
+        // Hold permit for the entire channel lifecycle.
+        let Ok(_permit) = channel_permits.acquire_owned().await else {
+            *error.lock().await = Some(String::from(
+                "Failed to acquire channel permit (session semaphore closed)",
+            ));
+            let _ = status_tx.send(AsyncCommandStatus::Failed);
+            return;
+        };
+        if use_pty {
+            execute_ssh_command_async_pty(
+                handle_arc,
+                command,
+                cmd_timeout,
+                output,
+                status_tx,
+                cancel_token,
+                exit_code,
+                error,
+                timed_out,
+            )
+            .await;
+        } else {
+            execute_ssh_command_async(
+                handle_arc,
+                command,
+                cmd_timeout,
+                output,
+                status_tx,
+                cancel_token,
+                exit_code,
+                error,
+                timed_out,
+            )
+            .await;
+        }
+        // Permit dropped here -> slot freed.
+    });
 }
 
 /// Spawn the cleanup task that removes a command from storage after completion.
@@ -396,12 +416,16 @@ fn spawn_cleanup_task(
     cleanup_rx: watch::Receiver<AsyncCommandStatus>,
     output_read: Arc<AtomicBool>,
 ) {
+    /// Minimum delay between marking a command as read and removing it from
+    /// storage. Lets the caller issue a follow-up `ssh_list_commands` or a
+    /// double-poll without seeing `COMMAND_NOT_FOUND` immediately.
+    const POST_READ_GRACE: Duration = Duration::from_millis(1_000);
     let ttl = resolve_command_cleanup_ttl();
     tokio::spawn(async move {
         let mut rx = cleanup_rx;
         wait_for_command_completion(&mut rx).await;
 
-        // If output already read, cleanup immediately
+        // If output already read, skip the TTL wait loop.
         if !output_read.load(Ordering::SeqCst) {
             // Wait up to TTL, checking periodically if output gets read
             let deadline = time::Instant::now() + ttl;
@@ -417,6 +441,9 @@ fn spawn_cleanup_task(
                 }
             }
         }
+
+        // Small grace window so callers can chain list/poll after reading.
+        time::sleep(POST_READ_GRACE).await;
 
         COMMAND_STORAGE.unregister(&command_id);
         info!("Cleanup: removed completed command {command_id}");
@@ -1224,6 +1251,7 @@ fn register_and_spawn_command(
     handle_arc: Arc<SshHandle>,
     cmd_timeout: Duration,
     use_pty: bool,
+    channel_permits: Arc<Semaphore>,
 ) -> Text<String> {
     let command_id = Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -1240,6 +1268,7 @@ fn register_and_spawn_command(
         handle_arc,
         &command,
         cmd_timeout,
+        channel_permits,
     );
     spawn_cleanup_task(command_id.clone(), cleanup_rx, output_read);
 
@@ -1251,6 +1280,10 @@ fn register_and_spawn_command(
 }
 
 /// Register the command in storage and spawn the execution task.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "command spawn needs full shared state plus the channel semaphore"
+)]
 fn register_and_spawn(
     command_id: &str,
     session_id: &str,
@@ -1259,6 +1292,7 @@ fn register_and_spawn(
     handle_arc: Arc<SshHandle>,
     command: &str,
     cmd_timeout: Duration,
+    channel_permits: Arc<Semaphore>,
 ) {
     let status_tx = running_cmd.status_tx.clone();
     let output = Arc::clone(&running_cmd.output);
@@ -1281,6 +1315,7 @@ fn register_and_spawn(
         exit_code,
         error,
         timed_out,
+        channel_permits,
     );
 }
 
@@ -1585,9 +1620,15 @@ impl McpSSHCommands {
             ));
         }
 
-        let (handle_arc, agent_id) = SESSION_STORAGE
+        let (handle_arc, agent_id, channel_permits) = SESSION_STORAGE
             .get(&session_id)
-            .map(|s| (Arc::clone(&s.handle), s.info.agent_id.clone()))
+            .map(|s| {
+                (
+                    Arc::clone(&s.handle),
+                    s.info.agent_id.clone(),
+                    Arc::clone(&s.channel_permits),
+                )
+            })
             .ok_or_else(|| err_session_not_found("SSH_EXECUTE", &session_id))?;
 
         Ok(register_and_spawn_command(
@@ -1597,6 +1638,7 @@ impl McpSSHCommands {
             handle_arc,
             cmd_timeout,
             pty.unwrap_or(false),
+            channel_permits,
         ))
     }
 
@@ -1726,8 +1768,19 @@ impl McpSSHCommands {
 
         cancel_token.cancel();
 
+        // Wait up to 5s for the background task to transition out of Running.
+        // handle_cancellation first awaits channel.close() before sending
+        // status Cancelled, so when we return the server-side SSH channel is
+        // confirmed closed, letting subsequent ssh_execute calls claim a
+        // fresh multiplexed channel without hitting MaxSessions.
         let mut rx = status_rx;
-        let _ = timeout(Duration::from_secs(2), wait_for_command_completion(&mut rx)).await;
+        let _ = timeout(Duration::from_secs(5), wait_for_command_completion(&mut rx)).await;
+
+        // Post-drain pacing: ensures callers always pause a beat after a
+        // cancel, even when the task aborted before opening its channel.
+        // Keeps back-to-back cancel+execute bursts from racing the server's
+        // CHANNEL_CLOSE accounting.
+        time::sleep(Duration::from_millis(100)).await;
 
         info!("Cancelled async command: {command_id}");
         let nonce = generate_nonce();
