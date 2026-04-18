@@ -20,14 +20,172 @@ DOWNLOAD_FILE = "/tmp/ssh-mcp-test-downloaded" + os.path.splitext(LOCAL_FILE)[1]
 
 
 def connect_args(agent_id=None, name=None, **extra):
-    """Build ssh_connect arguments with key_path."""
-    args = {"address": HOST, "username": USER, "key_path": KEY_PATH}
+    """Build ssh_connect arguments with key_path.
+
+    Defaults `reuse="force_new"` so repeated connects in the test suite
+    always produce distinct sessions.
+    """
+    args = {"address": HOST, "username": USER, "key_path": KEY_PATH, "reuse": "force_new"}
     if agent_id:
         args["agent_id"] = agent_id
     if name:
         args["name"] = name
     args.update(extra)
     return args
+
+
+import re
+
+
+def parse_mcp_response(text: str) -> dict:
+    """Parse the markdown MCP response format (v2.0+)."""
+    out = {"_text": text}
+    if not text:
+        return out
+    lines = text.splitlines()
+    if not lines:
+        return out
+    header = lines[0]
+    parts = [p.strip() for p in header.split("|")] if "|" in header else [header.strip()]
+    head = parts[0]
+    if ":" in head:
+        tool, status = head.split(":", 1)
+        out["_tool"] = tool.strip()
+        out["_status"] = status.strip()
+        out["status"] = status.strip().lower()
+    for p in parts[1:]:
+        if ":" in p:
+            k, v = p.split(":", 1)
+            _assign_field(out, k.strip(), v.strip())
+        else:
+            _assign_token(out, p)
+    current_block = None
+    block_lines = []
+    bullet_list = []
+    marker_re = re.compile(r"^--- (stdout|stderr|data)(?: \[[^\]]+\])?(?: \([^)]*\))? ---$")
+    for line in lines[1:]:
+        m = marker_re.match(line)
+        if m:
+            if current_block is not None:
+                out[current_block] = "\n".join(block_lines)
+                block_lines = []
+            current_block = m.group(1)
+            continue
+        if current_block is not None:
+            block_lines.append(line)
+            continue
+        if line.startswith("- "):
+            bullet_list.append(line[2:])
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            _assign_field(out, k.strip(), v.strip())
+    if current_block is not None:
+        out[current_block] = "\n".join(block_lines)
+    if bullet_list:
+        _assign_bullets(out, bullet_list)
+    return out
+
+
+def _assign_token(out, token):
+    m = re.match(r"^(UPLOAD|DOWNLOAD)\s+(\d+)%\s+\((\d+)/(\d+)\s+bytes\)$", token)
+    if m:
+        out["direction"] = m.group(1).lower()
+        out["progress_percent"] = int(m.group(2))
+        out["bytes_transferred"] = int(m.group(3))
+        out["total_bytes"] = int(m.group(4))
+
+
+def _assign_field(out, key, value):
+    k_lower = key.lower()
+    key_map = {
+        "session_id": "session_id", "existing_session_id": "session_id",
+        "command_id": "command_id", "shell_id": "shell_id",
+        "transfer_id": "transfer_id", "agent": "agent_id",
+        "exit": "exit_code", "bytes_sent": "bytes_sent",
+        "bytes": "total_bytes", "size": "size_raw",
+        "local": "local_address", "remote": "remote_address",
+        "active": "active", "count": "count", "matches": "matches_count",
+        "host": "host", "name": "name", "connected_at": "connected_at",
+        "healthy": "healthy", "retry": "retry_attempts",
+        "persistent": "persistent", "replaced": "replaced",
+        "sessions": "sessions_disconnected",
+        "commands": "commands_cancelled",
+        "term": "term_type", "reason": "error", "detail": "error_detail",
+        "direction": "direction", "progress": "progress_raw",
+        "from": "from_path", "to": "to_path", "hint": "_hint",
+    }
+    mapped = key_map.get(k_lower, k_lower)
+    if mapped in ("active", "healthy", "persistent"):
+        out[mapped] = value.lower() == "true"
+        return
+    if mapped in ("exit_code", "count", "matches_count", "retry_attempts",
+                  "sessions_disconnected", "commands_cancelled", "replaced", "bytes_sent"):
+        try:
+            out[mapped] = int(value.split()[0])
+        except (ValueError, IndexError):
+            out[mapped] = value
+        return
+    if mapped == "total_bytes":
+        try:
+            out[mapped] = int(value)
+        except ValueError:
+            out[mapped] = value
+        return
+    if mapped == "size_raw":
+        m = re.search(r"\((\d+)\s+bytes\)", value)
+        if m:
+            out["total_bytes"] = int(m.group(1))
+        out[mapped] = value
+        return
+    if mapped == "progress_raw":
+        m = re.match(r"^(\d+)%\s+\((\d+)/(\d+)\s+bytes\)$", value)
+        if m:
+            out["progress_percent"] = int(m.group(1))
+            out["bytes_transferred"] = int(m.group(2))
+            out["total_bytes"] = int(m.group(3))
+        out[mapped] = value
+        return
+    if mapped == "direction":
+        out[mapped] = value.lower()
+        return
+    out[mapped] = value
+
+
+def _assign_bullets(out, bullets):
+    tool = out.get("_tool", "")
+    if tool == "SSH_LIST_SESSIONS":
+        parsed = []
+        for b in bullets:
+            m = re.match(r"^(\S+)\s+(\S+)(?:\s+\[([^\]]+)\])?$", b)
+            if not m:
+                continue
+            tags = m.group(3) or ""
+            item = {"session_id": m.group(1), "host": m.group(2)}
+            for tag in (t.strip() for t in tags.split(",") if t.strip()):
+                if tag == "healthy":
+                    item["healthy"] = True
+                elif tag == "unhealthy":
+                    item["healthy"] = False
+                elif ":" in tag:
+                    k, v = tag.split(":", 1)
+                    item[k.strip()] = v.strip()
+            parsed.append(item)
+        out["sessions"] = parsed
+    elif tool == "SSH_LIST_COMMANDS":
+        parsed = []
+        for b in bullets:
+            m = re.match(r"^(\S+)\s+\[(\w+)\]\s+(\S+):\s+(.+?)\s+\(([^)]+)\)$", b)
+            if not m:
+                continue
+            parsed.append({
+                "command_id": m.group(1),
+                "status": m.group(2).lower(),
+                "session_id": m.group(3),
+                "command": m.group(4),
+                "started_at": m.group(5),
+            })
+        out["commands"] = parsed
 
 
 class McpClient:
@@ -97,13 +255,18 @@ class McpClient:
         result = resp.get("result", {})
         if result.get("isError"):
             error_text = result["content"][0]["text"] if result.get("content") else "Unknown error"
-            return {"error": error_text}
+            parsed = parse_mcp_response(error_text)
+            return {"error": parsed.get("error", error_text), **parsed}
         if result.get("content"):
             text = result["content"][0].get("text", "")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"text": text}
+            parsed = parse_mcp_response(text)
+            if parsed.get("_status") == "ERROR" and "error" in parsed:
+                return {"error": parsed["error"], **parsed}
+            if parsed.get("_status") == "CANCELLED":
+                parsed["cancelled"] = True
+            if name == "ssh_shell_close" and parsed.get("_status") == "OK":
+                parsed["closed"] = True
+            return parsed
         return result
 
     def send_batch(self, calls):
@@ -145,10 +308,12 @@ class McpClient:
             return {"error": error_text}
         if result.get("content"):
             text = result["content"][0].get("text", "")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"text": text}
+            parsed = parse_mcp_response(text)
+            if parsed.get("_status") == "ERROR" and "error" in parsed:
+                return {"error": parsed["error"], **parsed}
+            if parsed.get("_status") == "CANCELLED":
+                parsed["cancelled"] = True
+            return parsed
         return result
 
     def close(self):
