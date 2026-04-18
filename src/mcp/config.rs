@@ -74,8 +74,14 @@ pub const SHELL_INACTIVITY_TTL_ENV_VAR: &str = "SSH_SHELL_INACTIVITY_TTL";
 /// Default shell output buffer max size (10 MB)
 pub const DEFAULT_SHELL_MAX_BUFFER_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Default maximum per-command output buffer size (stdout + stderr each) in bytes.
+/// Exceeding this causes oldest bytes to be drained head-first, bounding RAM usage.
+pub const DEFAULT_COMMAND_MAX_BUFFER_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
+/// Environment variable name for the per-command output buffer cap.
+pub const COMMAND_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_COMMAND_MAX_BUFFER_SIZE";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
 #[must_use]
@@ -291,6 +297,22 @@ pub fn resolve_shell_max_buffer_size(size_param: Option<&str>) -> u64 {
 
     // Priority 3: Default value
     DEFAULT_SHELL_MAX_BUFFER_SIZE
+}
+
+/// Resolve the per-command output buffer max size. Mirrors the shell cap
+/// resolver but reads `SSH_COMMAND_MAX_BUFFER_SIZE` and defaults to 10 MiB.
+///
+/// Applies independently to stdout and stderr. When exceeded, the oldest
+/// bytes are drained head-first so the buffer stays bounded even for
+/// long-running commands that produce unbounded output.
+#[must_use]
+pub fn resolve_command_max_buffer_size() -> u64 {
+    if let Ok(env_size) = env::var(COMMAND_MAX_BUFFER_SIZE_ENV_VAR)
+        && let Some(size) = parse_byte_size(&env_size)
+    {
+        return size;
+    }
+    DEFAULT_COMMAND_MAX_BUFFER_SIZE
 }
 
 #[cfg(test)]

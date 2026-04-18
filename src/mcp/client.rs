@@ -805,6 +805,8 @@ async fn collect_async_output(
     channel: &mut Channel<client::Msg>,
     output: &Arc<Mutex<OutputBuffer>>,
 ) -> Option<i32> {
+    let max_buffer = super::config::resolve_command_max_buffer_size();
+    let max = usize::try_from(max_buffer).unwrap_or(usize::MAX);
     let mut exit_code: Option<i32> = None;
     let mut local_stdout = Vec::with_capacity(4096);
     let mut local_stderr = Vec::with_capacity(1024);
@@ -817,6 +819,7 @@ async fn collect_async_output(
             &mut local_stdout,
             &mut local_stderr,
             output,
+            max,
         )
         .await;
         if should_break {
@@ -824,31 +827,42 @@ async fn collect_async_output(
         }
     }
 
-    flush_local_buffers(&mut local_stdout, &mut local_stderr, output).await;
+    flush_local_buffers(&mut local_stdout, &mut local_stderr, output, max).await;
     let _ = channel.close().await;
     exit_code
 }
 
 /// Process a single channel message, returning true if the loop should break.
+#[allow(
+    clippy::too_many_lines,
+    reason = "full ChannelMsg match arms kept in one place for readability"
+)]
 async fn process_channel_msg(
     msg: Option<ChannelMsg>,
     exit_code: &mut Option<i32>,
     local_stdout: &mut Vec<u8>,
     local_stderr: &mut Vec<u8>,
     output: &Arc<Mutex<OutputBuffer>>,
+    max_buffer: usize,
 ) -> bool {
     match msg {
         Some(ChannelMsg::Data { data }) => {
             local_stdout.extend_from_slice(&data);
             if local_stdout.len() >= FLUSH_THRESHOLD {
-                output.lock().await.stdout.append(local_stdout);
+                output
+                    .lock()
+                    .await
+                    .append_stdout_slice(local_stdout, max_buffer);
             }
             false
         }
         Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
             local_stderr.extend_from_slice(&data);
             if local_stderr.len() >= FLUSH_THRESHOLD {
-                output.lock().await.stderr.append(local_stderr);
+                output
+                    .lock()
+                    .await
+                    .append_stderr_slice(local_stderr, max_buffer);
             }
             false
         }
@@ -867,11 +881,12 @@ async fn flush_local_buffers(
     local_stdout: &mut Vec<u8>,
     local_stderr: &mut Vec<u8>,
     output: &Arc<Mutex<OutputBuffer>>,
+    max_buffer: usize,
 ) {
     if !local_stdout.is_empty() || !local_stderr.is_empty() {
         let mut buf = output.lock().await;
-        buf.stdout.append(local_stdout);
-        buf.stderr.append(local_stderr);
+        buf.append_stdout_slice(local_stdout, max_buffer);
+        buf.append_stderr_slice(local_stderr, max_buffer);
     }
 }
 

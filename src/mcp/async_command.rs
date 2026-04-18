@@ -33,11 +33,56 @@ impl OutputBuffer {
     /// Create a new output buffer with pre-allocated capacity.
     ///
     /// Pre-allocating reduces reallocations during output collection.
+    #[must_use]
     pub fn with_capacity(stdout_cap: usize, stderr_cap: usize) -> Self {
         Self {
             stdout: Vec::with_capacity(stdout_cap),
             stderr: Vec::with_capacity(stderr_cap),
         }
+    }
+
+    /// Append bytes to `stdout`, then drop oldest bytes if the buffer exceeds `max_size`.
+    ///
+    /// `max_size == 0` disables the cap. Runs in O(n) on the drained portion only.
+    pub fn append_stdout_bounded(&mut self, data: &[u8], max_size: usize) {
+        self.stdout.extend_from_slice(data);
+        drain_head_if_over(&mut self.stdout, max_size);
+    }
+
+    /// Append bytes to `stderr`, then drop oldest bytes if the buffer exceeds `max_size`.
+    pub fn append_stderr_bounded(&mut self, data: &[u8], max_size: usize) {
+        self.stderr.extend_from_slice(data);
+        drain_head_if_over(&mut self.stderr, max_size);
+    }
+
+    /// Absorb a local staging buffer into `stdout` and enforce the cap.
+    ///
+    /// The caller's buffer is drained via `Vec::append`, consistent with the
+    /// previous non-cap-aware API used by `execute_ssh_command_async`.
+    pub fn append_stdout_slice(&mut self, src: &mut Vec<u8>, max_size: usize) {
+        self.stdout.append(src);
+        drain_head_if_over(&mut self.stdout, max_size);
+    }
+
+    /// Absorb a local staging buffer into `stderr` and enforce the cap.
+    pub fn append_stderr_slice(&mut self, src: &mut Vec<u8>, max_size: usize) {
+        self.stderr.append(src);
+        drain_head_if_over(&mut self.stderr, max_size);
+    }
+}
+
+/// Drop head bytes of `buf` so its length falls at/under `max_size`.
+///
+/// Skips when `max_size == 0` (disabled) or when the buffer already fits.
+/// After a drain, shrinks capacity when it dwarfs the remaining content.
+fn drain_head_if_over(buf: &mut Vec<u8>, max_size: usize) {
+    if max_size == 0 || buf.len() <= max_size {
+        return;
+    }
+    let excess = buf.len() - max_size;
+    buf.drain(..excess);
+    if buf.capacity() > buf.len().saturating_mul(4) {
+        buf.shrink_to_fit();
     }
 }
 
