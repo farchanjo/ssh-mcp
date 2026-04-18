@@ -47,34 +47,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_list_response_schema_no_uint() {
-        use crate::mcp::types::SessionListResponse;
-
-        let schema = SchemaGenerator::default().into_root_schema_for::<SessionListResponse>();
-        let json_str = serde_json::to_string(&schema).expect("Failed to serialize schema");
-
-        assert!(
-            !json_str.contains("\"uint"),
-            "SessionListResponse schema should not contain 'uint' format: {}",
-            json_str
-        );
-    }
-
-    #[test]
-    fn test_agent_disconnect_response_schema_no_uint() {
-        use crate::mcp::types::AgentDisconnectResponse;
-
-        let schema = SchemaGenerator::default().into_root_schema_for::<AgentDisconnectResponse>();
-        let json_str = serde_json::to_string(&schema).expect("Failed to serialize schema");
-
-        assert!(
-            !json_str.contains("\"uint"),
-            "AgentDisconnectResponse schema should not contain 'uint' format: {}",
-            json_str
-        );
-    }
-
-    #[test]
     fn test_session_info_schema_no_uint() {
         use crate::mcp::types::SessionInfo;
 
@@ -89,29 +61,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ssh_connect_response_schema_no_uint() {
-        use crate::mcp::types::SshConnectResponse;
+    fn test_async_command_info_schema_no_uint() {
+        use crate::mcp::types::AsyncCommandInfo;
 
-        let schema = SchemaGenerator::default().into_root_schema_for::<SshConnectResponse>();
+        let schema = SchemaGenerator::default().into_root_schema_for::<AsyncCommandInfo>();
         let json_str = serde_json::to_string(&schema).expect("Failed to serialize schema");
 
         assert!(
             !json_str.contains("\"uint"),
-            "SshConnectResponse schema should not contain 'uint' format: {}",
-            json_str
-        );
-    }
-
-    #[test]
-    fn test_ssh_list_commands_response_schema_no_uint() {
-        use crate::mcp::types::SshListCommandsResponse;
-
-        let schema = SchemaGenerator::default().into_root_schema_for::<SshListCommandsResponse>();
-        let json_str = serde_json::to_string(&schema).expect("Failed to serialize schema");
-
-        assert!(
-            !json_str.contains("\"uint"),
-            "SshListCommandsResponse schema should not contain 'uint' format: {}",
+            "AsyncCommandInfo schema should not contain 'uint' format: {}",
             json_str
         );
     }

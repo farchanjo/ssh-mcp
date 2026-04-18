@@ -1,35 +1,42 @@
-//! Builder patterns for constructing MCP response messages.
+//! Markdown response builders for the MCP SSH tools.
 //!
-//! These builders follow the fluent API pattern to construct human-readable
-//! messages that help LLMs remember important identifiers.
+//! Each builder produces the full response text for a tool call, using the
+//! shared helpers in `super::helpers` for nonce generation, UTF-8 safe
+//! truncation, value sanitization, and standardized error formatting.
+//!
+//! # Format overview
+//!
+//! - First line: `TOOL_NAME: STATUS` (where status is `OK`, `REUSED`,
+//!   `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`,
+//!   `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`).
+//! - Block layout: `KEY: value` per line when there are ≥ 4 fields or an
+//!   embedded output block (`--- name [nonce] --- ... `) is present.
+//! - Inline layout: `TOOL: STATUS | KEY: v | KEY: v` when ≤ 3 simple fields.
+//! - Identifiers use the `_ID` suffix (`SESSION_ID`, `COMMAND_ID`,
+//!   `SHELL_ID`, `TRANSFER_ID`).
 
-/// Builder for SSH connection success messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = ConnectMessageBuilder::new("session-123", "user", "host:22")
-///     .with_agent_id(Some("my-agent"))
-///     .with_name(Some("production-db"))
-///     .with_retry_attempts(2)
-///     .with_persistent(true)
-///     .reused(false)
-///     .build();
-/// ```
+use super::helpers::{format_bytes_human, render_output_block, sanitize_value};
+use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo};
+
+// ---------------------------------------------------------------------------
+// ssh_connect — OK / REUSED
+// ---------------------------------------------------------------------------
+
+/// Builder for `ssh_connect` in OK or REUSED scenarios.
 #[must_use]
-pub struct ConnectMessageBuilder {
+pub struct ConnectOkBuilder {
     session_id: String,
     username: String,
     host: String,
     agent_id: Option<String>,
-    name: Option<String>,
     retry_attempts: u32,
     persistent: bool,
     reused: bool,
+    replaced: usize,
 }
 
-impl ConnectMessageBuilder {
-    /// Create a new connect message builder with required fields.
+impl ConnectOkBuilder {
+    /// Create a new builder with the required identifiers.
     pub fn new(
         session_id: impl Into<String>,
         username: impl Into<String>,
@@ -40,244 +47,611 @@ impl ConnectMessageBuilder {
             username: username.into(),
             host: host.into(),
             agent_id: None,
-            name: None,
             retry_attempts: 0,
             persistent: false,
             reused: false,
+            replaced: 0,
         }
     }
 
-    /// Set the agent ID for the message.
+    /// Attach an agent identifier.
     pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
         self.agent_id = agent_id.map(Into::into);
         self
     }
 
-    /// Set the session name for the message.
-    pub fn with_name(mut self, name: Option<impl Into<String>>) -> Self {
-        self.name = name.map(Into::into);
+    /// Set the retry attempts counter.
+    pub const fn with_retry_attempts(mut self, retry: u32) -> Self {
+        self.retry_attempts = retry;
         self
     }
 
-    /// Set the number of retry attempts.
-    pub const fn with_retry_attempts(mut self, attempts: u32) -> Self {
-        self.retry_attempts = attempts;
-        self
-    }
-
-    /// Set whether the session is persistent.
+    /// Mark whether the session uses persistent keepalive.
     pub const fn with_persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
         self
     }
 
-    /// Set whether this is a reused session.
+    /// Mark whether this response is a REUSED (already existed) case.
     pub const fn reused(mut self, reused: bool) -> Self {
         self.reused = reused;
         self
     }
 
-    /// Build the message string.
+    /// Record how many unhealthy sessions were disconnected before creating this one.
+    pub const fn with_replaced(mut self, replaced: usize) -> Self {
+        self.replaced = replaced;
+        self
+    }
+
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
-        let header = if self.reused {
-            "SESSION REUSED"
-        } else {
-            "SSH CONNECTION ESTABLISHED"
-        };
-
-        let mut lines = vec![format!("{header}. REMEMBER THESE IDENTIFIERS:")];
-        self.append_identifiers(&mut lines);
-
-        lines.push(String::new()); // empty line
-        self.append_instructions(&mut lines);
-
-        lines.join("\n")
-    }
-
-    fn append_identifiers(&self, lines: &mut Vec<String>) {
+        let status = if self.reused { "REUSED" } else { "OK" };
+        let mut out = String::with_capacity(192);
+        out.push_str("SSH_CONNECT: ");
+        out.push_str(status);
+        out.push('\n');
+        out.push_str("SESSION_ID: ");
+        out.push_str(&self.session_id);
+        out.push_str("\nHOST: ");
+        out.push_str(&self.username);
+        out.push('@');
+        out.push_str(&self.host);
         if let Some(aid) = &self.agent_id {
-            lines.push(format!("• agent_id: '{aid}'"));
+            out.push_str("\nAGENT: ");
+            out.push_str(&sanitize_value(aid));
         }
-        lines.push(format!("• session_id: '{}'", self.session_id));
-        if let Some(n) = &self.name {
-            lines.push(format!("• name: '{n}'"));
+        // REUSED omits RETRY / PERSISTENT — the original connect set those.
+        if !self.reused {
+            out.push_str("\nRETRY: ");
+            out.push_str(&self.retry_attempts.to_string());
+            out.push_str("\nPERSISTENT: ");
+            out.push_str(if self.persistent { "true" } else { "false" });
+            if self.replaced > 0 {
+                out.push_str("\nREPLACED: ");
+                out.push_str(&self.replaced.to_string());
+            }
         }
-        lines.push(format!("• host: {}@{}", self.username, self.host));
-        if self.retry_attempts > 0 {
-            lines.push(format!("• retry_attempts: {}", self.retry_attempts));
-        }
-        if self.persistent {
-            lines.push("• persistent: true".to_string());
-        }
-    }
-
-    fn append_instructions(&self, lines: &mut Vec<String>) {
-        lines.push(format!(
-            "Use ssh_execute with session_id '{}' to run commands.",
-            self.session_id
-        ));
-        if let Some(aid) = &self.agent_id {
-            lines.push(format!(
-                "Use ssh_disconnect_agent with agent_id '{aid}' to disconnect all sessions for this agent.",
-            ));
-        }
+        out
     }
 }
 
-/// Builder for command execution start messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = ExecuteMessageBuilder::new("cmd-123", "session-456", "ls -la")
-///     .with_agent_id(Some("my-agent"))
-///     .build();
-/// ```
+// ---------------------------------------------------------------------------
+// ssh_connect — SUGGESTED (reuse detection)
+// ---------------------------------------------------------------------------
+
+/// Information about an existing session that matches a connect request.
+#[derive(Debug, Clone)]
+pub struct SessionMatch {
+    pub session_id: String,
+    /// Formatted as `"user@host:port"`.
+    pub host: String,
+    pub agent_id: Option<String>,
+    pub name: Option<String>,
+    /// Connection timestamp in RFC3339 form.
+    pub connected_at: String,
+    pub healthy: bool,
+}
+
+/// Builder for `ssh_connect` in SUGGESTED scenario (one or more matching sessions).
 #[must_use]
-pub struct ExecuteMessageBuilder {
+pub struct ConnectSuggestedBuilder {
+    matches: Vec<SessionMatch>,
+}
+
+impl ConnectSuggestedBuilder {
+    /// Create a new suggested builder from a non-empty match list.
+    pub const fn new(matches: Vec<SessionMatch>) -> Self {
+        Self { matches }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        if self.matches.len() == 1 {
+            self.render_single()
+        } else {
+            self.render_multi()
+        }
+    }
+
+    fn render_single(&self) -> String {
+        let Some(m) = self.matches.first() else {
+            return String::from("SSH_CONNECT: SUGGESTED\nMATCHES: 0");
+        };
+        let mut out = String::with_capacity(256);
+        out.push_str("SSH_CONNECT: SUGGESTED\nEXISTING_SESSION_ID: ");
+        out.push_str(&m.session_id);
+        out.push_str("\nHOST: ");
+        out.push_str(&m.host);
+        if let Some(a) = &m.agent_id {
+            out.push_str("\nAGENT: ");
+            out.push_str(&sanitize_value(a));
+        }
+        if let Some(n) = &m.name {
+            out.push_str("\nNAME: ");
+            out.push_str(&sanitize_value(n));
+        }
+        out.push_str("\nCONNECTED_AT: ");
+        out.push_str(&m.connected_at);
+        out.push_str("\nHEALTHY: ");
+        out.push_str(if m.healthy { "true" } else { "false" });
+        out.push_str("\nHINT: use existing SESSION_ID, or retry with reuse=\"force_new\"");
+        out
+    }
+
+    fn render_multi(&self) -> String {
+        let mut out = String::with_capacity(64 + self.matches.len() * 128);
+        out.push_str("SSH_CONNECT: SUGGESTED\nMATCHES: ");
+        out.push_str(&self.matches.len().to_string());
+        for m in &self.matches {
+            out.push_str("\n- ");
+            out.push_str(&m.session_id);
+            out.push(' ');
+            out.push_str(&m.host);
+            append_match_decorations(&mut out, m);
+        }
+        out.push_str("\nHINT: pick an existing SESSION_ID, or retry with reuse=\"force_new\"");
+        out
+    }
+}
+
+#[allow(
+    clippy::useless_let_if_seq,
+    reason = "accumulator tracking multiple optional fields is clearer than nested if/else"
+)]
+fn append_match_decorations(out: &mut String, m: &SessionMatch) {
+    out.push_str(" [");
+    let mut wrote_field = false;
+    if let Some(a) = &m.agent_id {
+        out.push_str("agent: ");
+        out.push_str(&sanitize_value(a));
+        wrote_field = true;
+    }
+    if let Some(n) = &m.name {
+        append_separator_if(out, wrote_field);
+        out.push_str("name: ");
+        out.push_str(&sanitize_value(n));
+        wrote_field = true;
+    }
+    append_separator_if(out, wrote_field);
+    out.push_str("connected: ");
+    out.push_str(extract_time(&m.connected_at));
+    out.push_str(", ");
+    out.push_str(if m.healthy { "healthy" } else { "unhealthy" });
+    out.push(']');
+}
+
+/// Extract the `HH:MM:SS` portion from an RFC3339 timestamp, or return the
+/// entire input if it does not contain a `T` separator.
+fn extract_time(ts: &str) -> &str {
+    if let Some((_, rest)) = ts.split_once('T') {
+        // Strip timezone suffix like "Z" or "+00:00".
+        let end = rest.find(['Z', '+', '-']).unwrap_or(rest.len());
+        &rest[..end]
+    } else {
+        ts
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_disconnect
+// ---------------------------------------------------------------------------
+
+/// Inline response for `ssh_disconnect: OK`.
+#[must_use]
+pub fn render_disconnect_ok(session_id: &str) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str("SSH_DISCONNECT: OK | SESSION_ID: ");
+    out.push_str(session_id);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ssh_list_sessions
+// ---------------------------------------------------------------------------
+
+/// Builder for `ssh_list_sessions`.
+#[must_use]
+pub struct ListSessionsBuilder<'a> {
+    sessions: &'a [SessionInfo],
+    total: usize,
+}
+
+impl<'a> ListSessionsBuilder<'a> {
+    /// Create a new list sessions builder. `total` is the count before
+    /// pagination; `sessions.len()` may be less if `max_items` was applied.
+    pub const fn new(sessions: &'a [SessionInfo], total: usize) -> Self {
+        Self { sessions, total }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        if self.sessions.is_empty() && self.total == 0 {
+            return String::from("SSH_LIST_SESSIONS: OK | COUNT: 0");
+        }
+        let mut out = String::with_capacity(64 + self.sessions.len() * 128);
+        out.push_str("SSH_LIST_SESSIONS: OK\nCOUNT: ");
+        out.push_str(&self.sessions.len().to_string());
+        if self.total > self.sessions.len() {
+            out.push_str(" (showing ");
+            out.push_str(&self.sessions.len().to_string());
+            out.push_str(" of ");
+            out.push_str(&self.total.to_string());
+            out.push(')');
+        }
+        for s in self.sessions {
+            out.push_str("\n- ");
+            append_session_item(&mut out, s);
+        }
+        out
+    }
+}
+
+fn append_session_item(out: &mut String, s: &SessionInfo) {
+    out.push_str(&s.session_id);
+    out.push(' ');
+    out.push_str(&sanitize_value(&s.username));
+    out.push('@');
+    out.push_str(&sanitize_value(&s.host));
+    append_session_flags(out, s);
+}
+
+#[allow(
+    clippy::useless_let_if_seq,
+    clippy::too_many_lines,
+    reason = "accumulator tracking multiple optional fields; restructure would hurt readability"
+)]
+fn append_session_flags(out: &mut String, s: &SessionInfo) {
+    let show_compression = !s.compression_enabled;
+    let health_label = match s.healthy {
+        Some(true) => Some("healthy"),
+        Some(false) => Some("unhealthy"),
+        None => None,
+    };
+    if s.agent_id.is_none() && s.name.is_none() && !show_compression && health_label.is_none() {
+        return;
+    }
+    out.push_str(" [");
+    let mut wrote = false;
+    if let Some(a) = &s.agent_id {
+        out.push_str("agent: ");
+        out.push_str(&sanitize_value(a));
+        wrote = true;
+    }
+    if let Some(n) = &s.name {
+        append_separator_if(out, wrote);
+        out.push_str("name: ");
+        out.push_str(&sanitize_value(n));
+        wrote = true;
+    }
+    if show_compression {
+        append_separator_if(out, wrote);
+        out.push_str("compression: off");
+        wrote = true;
+    }
+    if let Some(label) = health_label {
+        append_separator_if(out, wrote);
+        out.push_str(label);
+    }
+    out.push(']');
+}
+
+fn append_separator_if(out: &mut String, yes: bool) {
+    if yes {
+        out.push_str(", ");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_disconnect_agent
+// ---------------------------------------------------------------------------
+
+/// Inline response for `ssh_disconnect_agent: OK`.
+#[must_use]
+pub fn render_disconnect_agent(agent_id: &str, sessions: usize, commands: usize) -> String {
+    let mut out = String::with_capacity(96);
+    out.push_str("SSH_DISCONNECT_AGENT: OK | AGENT: ");
+    out.push_str(&sanitize_value(agent_id));
+    out.push_str(" | SESSIONS: ");
+    out.push_str(&sessions.to_string());
+    out.push_str(" | COMMANDS: ");
+    out.push_str(&commands.to_string());
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ssh_execute (STARTED)
+// ---------------------------------------------------------------------------
+
+/// Builder for the `ssh_execute: STARTED` response.
+#[must_use]
+#[allow(
+    clippy::struct_field_names,
+    reason = "identifier fields naturally share the _id suffix for the MCP contract"
+)]
+pub struct ExecuteStartedBuilder {
     command_id: String,
     session_id: String,
-    command: String,
     agent_id: Option<String>,
 }
 
-impl ExecuteMessageBuilder {
-    /// Create a new execute message builder with required fields.
-    pub fn new(
-        command_id: impl Into<String>,
-        session_id: impl Into<String>,
-        command: impl Into<String>,
-    ) -> Self {
+impl ExecuteStartedBuilder {
+    /// Create a new builder.
+    pub fn new(command_id: impl Into<String>, session_id: impl Into<String>) -> Self {
         Self {
             command_id: command_id.into(),
             session_id: session_id.into(),
-            command: command.into(),
             agent_id: None,
         }
     }
 
-    /// Set the agent ID for the message.
+    /// Attach an agent identifier.
     pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
         self.agent_id = agent_id.map(Into::into);
         self
     }
 
-    /// Build the message string.
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
-        let mut lines = vec![
-            "COMMAND STARTED. REMEMBER THESE IDENTIFIERS:".to_string(),
-            format!("• command_id: '{}'", self.command_id),
-            format!("• session_id: '{}'", self.session_id),
-        ];
-
-        if let Some(aid) = &self.agent_id {
-            lines.push(format!("• agent_id: '{aid}'"));
+        let mut out = String::with_capacity(128);
+        out.push_str("SSH_EXECUTE: STARTED\nCOMMAND_ID: ");
+        out.push_str(&self.command_id);
+        out.push_str("\nSESSION_ID: ");
+        out.push_str(&self.session_id);
+        if let Some(a) = &self.agent_id {
+            out.push_str("\nAGENT: ");
+            out.push_str(&sanitize_value(a));
         }
-
-        // Truncate command if too long
-        let cmd_display = truncate_command(&self.command, 50);
-        lines.push(format!("• command: '{cmd_display}'"));
-
-        lines.push(String::new()); // empty line
-        lines.push(format!(
-            "Use ssh_get_command_output with command_id '{}' to poll for results.",
-            self.command_id
-        ));
-        lines.push(format!(
-            "Use ssh_cancel_command with command_id '{}' to cancel.",
-            self.command_id
-        ));
-
-        lines.join("\n")
+        out
     }
 }
 
-/// Builder for agent disconnect messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = AgentDisconnectMessageBuilder::new("my-agent")
-///     .with_sessions_disconnected(3)
-///     .with_commands_cancelled(5)
-///     .build();
-/// ```
-#[must_use]
-pub struct AgentDisconnectMessageBuilder {
-    agent_id: String,
-    sessions_disconnected: usize,
-    commands_cancelled: usize,
+// ---------------------------------------------------------------------------
+// ssh_get_command_output
+// ---------------------------------------------------------------------------
+
+/// State of an async command for `ssh_get_command_output`.
+#[derive(Debug, Clone, Copy)]
+pub enum GetCommandOutputState {
+    /// The command is still running. Content is marked `(partial)`.
+    Running,
+    /// The command completed with the given exit code.
+    Completed(i32),
+    /// The command timed out. Content is marked `(partial)`.
+    Timeout,
 }
 
-impl AgentDisconnectMessageBuilder {
-    /// Create a new agent disconnect message builder.
-    pub fn new(agent_id: impl Into<String>) -> Self {
+/// Builder for `ssh_get_command_output`.
+#[must_use]
+pub struct GetCommandOutputBuilder<'a> {
+    command_id: &'a str,
+    state: GetCommandOutputState,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+    max_output_bytes: usize,
+    nonce: &'a str,
+}
+
+impl<'a> GetCommandOutputBuilder<'a> {
+    /// Create a new builder. `max_output_bytes` governs both stdout and stderr tails.
+    pub const fn new(
+        command_id: &'a str,
+        state: GetCommandOutputState,
+        stdout: &'a [u8],
+        stderr: &'a [u8],
+        max_output_bytes: usize,
+        nonce: &'a str,
+    ) -> Self {
         Self {
-            agent_id: agent_id.into(),
-            sessions_disconnected: 0,
-            commands_cancelled: 0,
+            command_id,
+            state,
+            stdout,
+            stderr,
+            max_output_bytes,
+            nonce,
         }
     }
 
-    /// Set the number of sessions disconnected.
-    pub const fn with_sessions_disconnected(mut self, count: usize) -> Self {
-        self.sessions_disconnected = count;
-        self
-    }
-
-    /// Set the number of commands cancelled.
-    pub const fn with_commands_cancelled(mut self, count: usize) -> Self {
-        self.commands_cancelled = count;
-        self
-    }
-
-    /// Build the message string.
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
-        let mut lines = vec![
-            "AGENT CLEANUP COMPLETE. SUMMARY:".to_string(),
-            format!("• agent_id: '{}'", self.agent_id),
-            format!("• sessions_disconnected: {}", self.sessions_disconnected),
-            format!("• commands_cancelled: {}", self.commands_cancelled),
-            String::new(), // empty line
-        ];
-
-        if self.sessions_disconnected == 0 {
-            lines.push(format!("No sessions found for agent '{}'.", self.agent_id));
-        } else {
-            lines.push(format!(
-                "All sessions and commands for agent '{}' have been terminated.",
-                self.agent_id
-            ));
+        let (status, hint, exit) = classify_command_output_state(self.state);
+        let stdout_block = render_output_block(
+            "stdout",
+            self.nonce,
+            self.stdout,
+            self.max_output_bytes,
+            hint,
+        );
+        let stderr_block = render_output_block(
+            "stderr",
+            self.nonce,
+            self.stderr,
+            self.max_output_bytes,
+            hint,
+        );
+        let mut out = String::with_capacity(128 + stdout_block.len() + stderr_block.len());
+        out.push_str("SSH_GET_COMMAND_OUTPUT: ");
+        out.push_str(status);
+        out.push_str("\nCOMMAND_ID: ");
+        out.push_str(self.command_id);
+        if let Some(code) = exit {
+            out.push_str("\nEXIT: ");
+            out.push_str(&code.to_string());
         }
-
-        lines.join("\n")
+        out.push('\n');
+        out.push_str(&stdout_block);
+        out.push('\n');
+        out.push_str(&stderr_block);
+        out
     }
 }
 
-/// Builder for interactive shell open messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
-///     .with_agent_id(Some("my-agent"))
-///     .build();
-/// ```
+const fn classify_command_output_state(
+    state: GetCommandOutputState,
+) -> (&'static str, Option<&'static str>, Option<i32>) {
+    match state {
+        GetCommandOutputState::Running => ("RUNNING", Some("partial"), None),
+        GetCommandOutputState::Completed(code) => ("COMPLETED", None, Some(code)),
+        GetCommandOutputState::Timeout => ("TIMEOUT", Some("partial"), None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_list_commands
+// ---------------------------------------------------------------------------
+
+/// Builder for `ssh_list_commands`.
 #[must_use]
-pub struct ShellOpenMessageBuilder {
+pub struct ListCommandsBuilder<'a> {
+    commands: &'a [AsyncCommandInfo],
+    total: usize,
+}
+
+impl<'a> ListCommandsBuilder<'a> {
+    /// Create a new builder. `total` is the count before pagination.
+    pub const fn new(commands: &'a [AsyncCommandInfo], total: usize) -> Self {
+        Self { commands, total }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        if self.commands.is_empty() && self.total == 0 {
+            return String::from("SSH_LIST_COMMANDS: OK | COUNT: 0");
+        }
+        let mut out = String::with_capacity(64 + self.commands.len() * 128);
+        out.push_str("SSH_LIST_COMMANDS: OK\nCOUNT: ");
+        out.push_str(&self.commands.len().to_string());
+        if self.total > self.commands.len() {
+            out.push_str(" (showing ");
+            out.push_str(&self.commands.len().to_string());
+            out.push_str(" of ");
+            out.push_str(&self.total.to_string());
+            out.push(')');
+        }
+        for c in self.commands {
+            out.push_str("\n- ");
+            append_command_item(&mut out, c);
+        }
+        out
+    }
+}
+
+fn append_command_item(out: &mut String, c: &AsyncCommandInfo) {
+    out.push_str(&c.command_id);
+    out.push_str(" [");
+    out.push_str(status_name_upper(c.status));
+    out.push_str("] ");
+    out.push_str(&c.session_id);
+    out.push_str(": ");
+    out.push_str(&sanitize_value(&c.command));
+    out.push_str(" (");
+    out.push_str(extract_time(&c.started_at));
+    out.push(')');
+}
+
+const fn status_name_upper(s: AsyncCommandStatus) -> &'static str {
+    match s {
+        AsyncCommandStatus::Running => "RUNNING",
+        AsyncCommandStatus::Completed => "COMPLETED",
+        AsyncCommandStatus::Cancelled => "CANCELLED",
+        AsyncCommandStatus::Failed => "FAILED",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_cancel_command
+// ---------------------------------------------------------------------------
+
+/// Builder for `ssh_cancel_command` in the CANCELLED scenario (with output).
+#[must_use]
+pub struct CancelCommandCancelledBuilder<'a> {
+    command_id: &'a str,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+    max_output_bytes: usize,
+    nonce: &'a str,
+}
+
+impl<'a> CancelCommandCancelledBuilder<'a> {
+    /// Create a new builder.
+    pub const fn new(
+        command_id: &'a str,
+        stdout: &'a [u8],
+        stderr: &'a [u8],
+        max_output_bytes: usize,
+        nonce: &'a str,
+    ) -> Self {
+        Self {
+            command_id,
+            stdout,
+            stderr,
+            max_output_bytes,
+            nonce,
+        }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        let stdout_block = render_output_block(
+            "stdout",
+            self.nonce,
+            self.stdout,
+            self.max_output_bytes,
+            Some("partial"),
+        );
+        let stderr_block = render_output_block(
+            "stderr",
+            self.nonce,
+            self.stderr,
+            self.max_output_bytes,
+            Some("partial"),
+        );
+        let mut out = String::with_capacity(96 + stdout_block.len() + stderr_block.len());
+        out.push_str("SSH_CANCEL_COMMAND: CANCELLED\nCOMMAND_ID: ");
+        out.push_str(self.command_id);
+        out.push('\n');
+        out.push_str(&stdout_block);
+        out.push('\n');
+        out.push_str(&stderr_block);
+        out
+    }
+}
+
+/// Inline response for `ssh_cancel_command: NOOP` (command not running).
+#[must_use]
+pub fn render_cancel_command_noop(command_id: &str, reason: &str) -> String {
+    let mut out = String::with_capacity(96);
+    out.push_str("SSH_CANCEL_COMMAND: NOOP | COMMAND_ID: ");
+    out.push_str(command_id);
+    out.push_str(" | REASON: ");
+    out.push_str(&sanitize_value(reason));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ssh_shell_open
+// ---------------------------------------------------------------------------
+
+/// Builder for `ssh_shell_open: OK`.
+#[must_use]
+pub struct ShellOpenBuilder {
     shell_id: String,
     session_id: String,
-    agent_id: Option<String>,
     term: String,
     cols: u32,
     rows: u32,
+    agent_id: Option<String>,
 }
 
-impl ShellOpenMessageBuilder {
-    /// Create a new shell open message builder with required fields.
+impl ShellOpenBuilder {
+    /// Create a new builder.
     pub fn new(
         shell_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -288,63 +662,141 @@ impl ShellOpenMessageBuilder {
         Self {
             shell_id: shell_id.into(),
             session_id: session_id.into(),
-            agent_id: None,
             term: term.into(),
             cols,
             rows,
+            agent_id: None,
         }
     }
 
-    /// Set the agent ID for the message.
+    /// Attach an agent identifier.
     pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
         self.agent_id = agent_id.map(Into::into);
         self
     }
 
-    /// Build the message string.
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
-        let mut lines = vec!["INTERACTIVE SHELL OPENED. REMEMBER THESE IDENTIFIERS:".to_string()];
-
-        if let Some(aid) = &self.agent_id {
-            lines.push(format!("• agent_id: '{aid}'"));
+        let mut out = String::with_capacity(192);
+        out.push_str("SSH_SHELL_OPEN: OK\nSHELL_ID: ");
+        out.push_str(&self.shell_id);
+        out.push_str("\nSESSION_ID: ");
+        out.push_str(&self.session_id);
+        out.push_str("\nTERM: ");
+        out.push_str(&sanitize_value(&self.term));
+        out.push(' ');
+        out.push_str(&self.cols.to_string());
+        out.push('x');
+        out.push_str(&self.rows.to_string());
+        if let Some(a) = &self.agent_id {
+            out.push_str("\nAGENT: ");
+            out.push_str(&sanitize_value(a));
         }
-        lines.push(format!("• shell_id: '{}'", self.shell_id));
-        lines.push(format!("• session_id: '{}'", self.session_id));
-        lines.push(format!(
-            "• term: {} ({}x{})",
-            self.term, self.cols, self.rows
-        ));
-
-        lines.push(String::new()); // empty line
-        lines.push(format!(
-            "Use ssh_shell_write with shell_id '{}' to send input.",
-            self.shell_id
-        ));
-        lines.push(format!(
-            "Use ssh_shell_read with shell_id '{}' to read output.",
-            self.shell_id
-        ));
-        lines.push(format!(
-            "Use ssh_shell_close with shell_id '{}' to close the shell.",
-            self.shell_id
-        ));
-
-        lines.join("\n")
+        out
     }
 }
 
-/// Builder for upload start messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = UploadMessageBuilder::new("xfer-123", "sess-456", "/tmp/file.txt", "/home/user/file.txt", 1048576)
-///     .with_agent_id(Some("my-agent"))
-///     .build();
-/// ```
+// ---------------------------------------------------------------------------
+// ssh_shell_write / ssh_shell_close
+// ---------------------------------------------------------------------------
+
+/// Inline response for `ssh_shell_write: OK`.
 #[must_use]
-pub struct UploadMessageBuilder {
+pub fn render_shell_write_ok(shell_id: &str, bytes: usize) -> String {
+    let mut out = String::with_capacity(80);
+    out.push_str("SSH_SHELL_WRITE: OK | SHELL_ID: ");
+    out.push_str(shell_id);
+    out.push_str(" | BYTES_SENT: ");
+    out.push_str(&bytes.to_string());
+    out
+}
+
+/// Inline response for `ssh_shell_close: OK`.
+#[must_use]
+pub fn render_shell_close_ok(shell_id: &str) -> String {
+    let mut out = String::with_capacity(64);
+    out.push_str("SSH_SHELL_CLOSE: OK | SHELL_ID: ");
+    out.push_str(shell_id);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ssh_shell_read
+// ---------------------------------------------------------------------------
+
+/// Shell state reported by `ssh_shell_read`.
+#[derive(Debug, Clone, Copy)]
+pub enum ShellReadState {
+    /// Shell is still open.
+    Open,
+    /// Shell has been closed (background reader ended).
+    Closed,
+}
+
+/// Builder for `ssh_shell_read`.
+#[must_use]
+pub struct ShellReadBuilder<'a> {
+    shell_id: &'a str,
+    state: ShellReadState,
+    data: &'a [u8],
+    max_output_bytes: usize,
+    nonce: &'a str,
+}
+
+impl<'a> ShellReadBuilder<'a> {
+    /// Create a new builder.
+    pub const fn new(
+        shell_id: &'a str,
+        state: ShellReadState,
+        data: &'a [u8],
+        max_output_bytes: usize,
+        nonce: &'a str,
+    ) -> Self {
+        Self {
+            shell_id,
+            state,
+            data,
+            max_output_bytes,
+            nonce,
+        }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        let status = match self.state {
+            ShellReadState::Open => "OPEN",
+            ShellReadState::Closed => "CLOSED",
+        };
+        let data_block =
+            render_output_block("data", self.nonce, self.data, self.max_output_bytes, None);
+        let mut out = String::with_capacity(64 + data_block.len());
+        out.push_str("SSH_SHELL_READ: ");
+        out.push_str(status);
+        out.push_str("\nSHELL_ID: ");
+        out.push_str(self.shell_id);
+        out.push('\n');
+        out.push_str(&data_block);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_upload / ssh_download (STARTED)
+// ---------------------------------------------------------------------------
+
+/// Direction marker for transfer-start responses.
+#[derive(Debug, Clone, Copy)]
+pub enum TransferStartDirection {
+    Upload,
+    Download,
+}
+
+/// Builder for `ssh_upload: STARTED` or `ssh_download: STARTED`.
+#[must_use]
+pub struct TransferStartedBuilder {
+    direction: TransferStartDirection,
     transfer_id: String,
     session_id: String,
     local_path: String,
@@ -353,9 +805,10 @@ pub struct UploadMessageBuilder {
     agent_id: Option<String>,
 }
 
-impl UploadMessageBuilder {
-    /// Create a new upload message builder with required fields.
+impl TransferStartedBuilder {
+    /// Create a new builder.
     pub fn new(
+        direction: TransferStartDirection,
         transfer_id: impl Into<String>,
         session_id: impl Into<String>,
         local_path: impl Into<String>,
@@ -363,6 +816,7 @@ impl UploadMessageBuilder {
         total_bytes: u64,
     ) -> Self {
         Self {
+            direction,
             transfer_id: transfer_id.into(),
             session_id: session_id.into(),
             local_path: local_path.into(),
@@ -372,154 +826,138 @@ impl UploadMessageBuilder {
         }
     }
 
-    /// Set the agent ID for the message.
+    /// Attach an agent identifier.
     pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
         self.agent_id = agent_id.map(Into::into);
         self
     }
 
-    /// Build the message string.
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
-        let mut lines = vec!["UPLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
-
-        if let Some(aid) = &self.agent_id {
-            lines.push(format!("• agent_id: '{aid}'"));
+        let (tool, from, to) = match self.direction {
+            TransferStartDirection::Upload => ("SSH_UPLOAD", &self.local_path, &self.remote_path),
+            TransferStartDirection::Download => {
+                ("SSH_DOWNLOAD", &self.remote_path, &self.local_path)
+            }
+        };
+        let mut out = String::with_capacity(256);
+        out.push_str(tool);
+        out.push_str(": STARTED\nTRANSFER_ID: ");
+        out.push_str(&self.transfer_id);
+        out.push_str("\nSESSION_ID: ");
+        out.push_str(&self.session_id);
+        if let Some(a) = &self.agent_id {
+            out.push_str("\nAGENT: ");
+            out.push_str(&sanitize_value(a));
         }
-        lines.push(format!("• transfer_id: '{}'", self.transfer_id));
-        lines.push(format!("• session_id: '{}'", self.session_id));
-        lines.push(format!("• local_path: '{}'", self.local_path));
-        lines.push(format!("• remote_path: '{}'", self.remote_path));
-        lines.push(format!("• total_bytes: {}", self.total_bytes));
-
-        lines.push(String::new());
-        lines.push(format!(
-            "Use ssh_get_transfer_progress with transfer_id '{}' to poll progress.",
-            self.transfer_id
-        ));
-
-        lines.join("\n")
+        out.push_str("\nFROM: ");
+        out.push_str(&sanitize_value(from));
+        out.push_str("\nTO: ");
+        out.push_str(&sanitize_value(to));
+        out.push_str("\nSIZE: ");
+        out.push_str(&format_bytes_human(self.total_bytes));
+        out.push_str(" (");
+        out.push_str(&self.total_bytes.to_string());
+        out.push_str(" bytes)\nBYTES: ");
+        out.push_str(&self.total_bytes.to_string());
+        out
     }
 }
 
-/// Builder for download start messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "/home/user/file.txt", "/tmp/file.txt", 2097152)
-///     .with_agent_id(Some("my-agent"))
-///     .build();
-/// ```
+// ---------------------------------------------------------------------------
+// ssh_get_transfer_progress
+// ---------------------------------------------------------------------------
+
+/// Progress state for `ssh_get_transfer_progress`.
+#[derive(Debug, Clone, Copy)]
+pub enum TransferProgressState<'a> {
+    Running,
+    Completed,
+    /// Carries the structured REASON text (no DETAIL lines are emitted here;
+    /// full error formatting lives in `format_error`).
+    Failed(&'a str),
+}
+
+/// Builder for `ssh_get_transfer_progress`.
 #[must_use]
-pub struct DownloadMessageBuilder {
-    transfer_id: String,
-    session_id: String,
-    remote_path: String,
-    local_path: String,
-    total_bytes: u64,
-    agent_id: Option<String>,
-}
-
-impl DownloadMessageBuilder {
-    /// Create a new download message builder with required fields.
-    pub fn new(
-        transfer_id: impl Into<String>,
-        session_id: impl Into<String>,
-        remote_path: impl Into<String>,
-        local_path: impl Into<String>,
-        total_bytes: u64,
-    ) -> Self {
-        Self {
-            transfer_id: transfer_id.into(),
-            session_id: session_id.into(),
-            remote_path: remote_path.into(),
-            local_path: local_path.into(),
-            total_bytes,
-            agent_id: None,
-        }
-    }
-
-    /// Set the agent ID for the message.
-    pub fn with_agent_id(mut self, agent_id: Option<impl Into<String>>) -> Self {
-        self.agent_id = agent_id.map(Into::into);
-        self
-    }
-
-    /// Build the message string.
-    #[must_use]
-    pub fn build(&self) -> String {
-        let mut lines = vec!["DOWNLOAD STARTED. REMEMBER THESE IDENTIFIERS:".to_string()];
-
-        if let Some(aid) = &self.agent_id {
-            lines.push(format!("• agent_id: '{aid}'"));
-        }
-        lines.push(format!("• transfer_id: '{}'", self.transfer_id));
-        lines.push(format!("• session_id: '{}'", self.session_id));
-        lines.push(format!("• remote_path: '{}'", self.remote_path));
-        lines.push(format!("• local_path: '{}'", self.local_path));
-        lines.push(format!("• total_bytes: {}", self.total_bytes));
-
-        lines.push(String::new());
-        lines.push(format!(
-            "Use ssh_get_transfer_progress with transfer_id '{}' to poll progress.",
-            self.transfer_id
-        ));
-
-        lines.join("\n")
-    }
-}
-
-/// Builder for transfer progress messages.
-///
-/// # Example
-///
-/// ```ignore
-/// let message = TransferProgressMessageBuilder::new("xfer-123", "upload", "running", 524288, 1048576)
-///     .build();
-/// ```
-#[must_use]
-pub struct TransferProgressMessageBuilder {
-    transfer_id: String,
-    direction: String,
-    status: String,
+pub struct TransferProgressBuilder<'a> {
+    transfer_id: &'a str,
+    direction: TransferStartDirection,
     bytes_transferred: u64,
     total_bytes: u64,
+    state: TransferProgressState<'a>,
 }
 
-impl TransferProgressMessageBuilder {
-    /// Create a new transfer progress message builder.
-    pub fn new(
-        transfer_id: impl Into<String>,
-        direction: impl Into<String>,
-        status: impl Into<String>,
+impl<'a> TransferProgressBuilder<'a> {
+    /// Create a new builder.
+    pub const fn new(
+        transfer_id: &'a str,
+        direction: TransferStartDirection,
         bytes_transferred: u64,
         total_bytes: u64,
+        state: TransferProgressState<'a>,
     ) -> Self {
         Self {
-            transfer_id: transfer_id.into(),
-            direction: direction.into(),
-            status: status.into(),
+            transfer_id,
+            direction,
             bytes_transferred,
             total_bytes,
+            state,
         }
     }
 
-    /// Build the message string.
+    /// Render the markdown response.
     #[must_use]
     pub fn build(&self) -> String {
+        let dir_upper = match self.direction {
+            TransferStartDirection::Upload => "UPLOAD",
+            TransferStartDirection::Download => "DOWNLOAD",
+        };
         let percent = compute_percent(self.bytes_transferred, self.total_bytes);
-        let human_transferred = format_bytes(self.bytes_transferred);
-        let human_total = format_bytes(self.total_bytes);
+        match self.state {
+            TransferProgressState::Running => self.render_inline("RUNNING", dir_upper, percent),
+            TransferProgressState::Completed => self.render_inline("COMPLETED", dir_upper, percent),
+            TransferProgressState::Failed(reason) => self.render_failed(dir_upper, percent, reason),
+        }
+    }
 
-        format!(
-            "TRANSFER {} ({}): {} - {}/{} ({percent}%)",
-            self.transfer_id, self.direction, self.status, human_transferred, human_total
-        )
+    fn render_inline(&self, status: &str, dir: &str, percent: u8) -> String {
+        let mut out = String::with_capacity(128);
+        out.push_str("SSH_GET_TRANSFER_PROGRESS: ");
+        out.push_str(status);
+        out.push_str(" | TRANSFER_ID: ");
+        out.push_str(self.transfer_id);
+        out.push_str(" | ");
+        out.push_str(dir);
+        out.push(' ');
+        out.push_str(&percent.to_string());
+        out.push_str("% (");
+        out.push_str(&self.bytes_transferred.to_string());
+        out.push('/');
+        out.push_str(&self.total_bytes.to_string());
+        out.push_str(" bytes)");
+        out
+    }
+
+    fn render_failed(&self, dir: &str, percent: u8, reason: &str) -> String {
+        let mut out = String::with_capacity(192);
+        out.push_str("SSH_GET_TRANSFER_PROGRESS: FAILED\nTRANSFER_ID: ");
+        out.push_str(self.transfer_id);
+        out.push_str("\nDIRECTION: ");
+        out.push_str(dir);
+        out.push_str("\nPROGRESS: ");
+        out.push_str(&percent.to_string());
+        out.push_str("% (");
+        out.push_str(&self.bytes_transferred.to_string());
+        out.push('/');
+        out.push_str(&self.total_bytes.to_string());
+        out.push_str(" bytes)\nREASON: ");
+        out.push_str(&sanitize_value(reason));
+        out
     }
 }
 
-/// Compute a transfer percentage as a `u8` value (0..=100).
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -527,848 +965,671 @@ impl TransferProgressMessageBuilder {
     clippy::as_conversions,
     reason = "percentage calculation where precision loss is acceptable and result is always 0..=100"
 )]
-fn compute_percent(bytes_transferred: u64, total_bytes: u64) -> u8 {
-    if total_bytes > 0 {
-        (bytes_transferred as f64 / total_bytes as f64 * 100.0) as u8
+fn compute_percent(transferred: u64, total: u64) -> u8 {
+    if total > 0 {
+        (transferred as f64 / total as f64 * 100.0) as u8
     } else {
         0
     }
 }
 
-/// Format bytes into human-readable string.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::as_conversions,
-    reason = "display-only formatting where precision loss is acceptable for human-readable output"
-)]
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
+// ---------------------------------------------------------------------------
+// ssh_forward
+// ---------------------------------------------------------------------------
 
-    if bytes >= GB {
-        let value = bytes as f64 / GB as f64;
-        format!("{value:.1}GB")
-    } else if bytes >= MB {
-        let value = bytes as f64 / MB as f64;
-        format!("{value:.1}MB")
-    } else if bytes >= KB {
-        let value = bytes as f64 / KB as f64;
-        format!("{value:.1}KB")
-    } else {
-        format!("{bytes}B")
-    }
+/// Inline response for `ssh_forward: OK`.
+#[must_use]
+pub fn render_forward_ok(local: &str, remote: &str, active: bool) -> String {
+    let mut out = String::with_capacity(96);
+    out.push_str("SSH_FORWARD: OK | LOCAL: ");
+    out.push_str(&sanitize_value(local));
+    out.push_str(" | REMOTE: ");
+    out.push_str(&sanitize_value(remote));
+    out.push_str(" | ACTIVE: ");
+    out.push_str(if active { "true" } else { "false" });
+    out
 }
 
-/// Truncate a command string for display purposes.
-fn truncate_command(command: &str, max_len: usize) -> String {
-    if command.len() > max_len {
-        format!("{}...", &command[..max_len.saturating_sub(3)])
-    } else {
-        command.to_string()
-    }
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    mod connect_message_builder {
+    mod connect_ok_builder {
         use super::*;
 
         #[test]
-        fn test_basic_message() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22").build();
-
-            assert!(message.contains("SSH CONNECTION ESTABLISHED"));
-            assert!(message.contains("session_id: 'sess-123'"));
-            assert!(message.contains("host: user@host:22"));
-            assert!(message.contains("ssh_execute"));
+        fn ok_minimal() {
+            let m = ConnectOkBuilder::new("sess-abc", "user", "host:22").build();
+            assert!(m.starts_with("SSH_CONNECT: OK\n"));
+            assert!(m.contains("SESSION_ID: sess-abc"));
+            assert!(m.contains("HOST: user@host:22"));
+            assert!(m.contains("RETRY: 0"));
+            assert!(m.contains("PERSISTENT: false"));
         }
 
         #[test]
-        fn test_reused_session() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .reused(true)
-                .build();
-
-            assert!(message.contains("SESSION REUSED"));
-            assert!(!message.contains("SSH CONNECTION ESTABLISHED"));
-        }
-
-        #[test]
-        fn test_with_agent_id() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
+        fn ok_with_agent_and_retry() {
+            let m = ConnectOkBuilder::new("sess-abc", "user", "host:22")
                 .with_agent_id(Some("my-agent"))
-                .build();
-
-            assert!(message.contains("agent_id: 'my-agent'"));
-            assert!(message.contains("ssh_disconnect_agent"));
-        }
-
-        #[test]
-        fn test_with_name() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_name(Some("production-db"))
-                .build();
-
-            assert!(message.contains("name: 'production-db'"));
-        }
-
-        #[test]
-        fn test_with_retry_attempts() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_retry_attempts(2)
-                .build();
-
-            assert!(message.contains("retry_attempts: 2"));
-        }
-
-        #[test]
-        fn test_zero_retry_attempts_not_shown() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_retry_attempts(0)
-                .build();
-
-            assert!(!message.contains("retry_attempts"));
-        }
-
-        #[test]
-        fn test_with_persistent() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_persistent(true)
-                .build();
-
-            assert!(message.contains("persistent: true"));
-        }
-
-        #[test]
-        fn test_persistent_false_not_shown() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_persistent(false)
-                .build();
-
-            assert!(!message.contains("persistent"));
-        }
-
-        #[test]
-        fn test_with_agent_id_none_explicit() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_agent_id(None::<String>)
-                .build();
-
-            assert!(!message.contains("agent_id"));
-            assert!(!message.contains("ssh_disconnect_agent"));
-        }
-
-        #[test]
-        fn test_with_name_none_explicit() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_name(None::<String>)
-                .build();
-
-            assert!(!message.contains("name:"));
-        }
-
-        #[test]
-        fn test_all_options_combined() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_agent_id(Some("my-agent"))
-                .with_name(Some("production-db"))
                 .with_retry_attempts(3)
                 .with_persistent(true)
-                .reused(false)
                 .build();
-
-            assert!(message.contains("SSH CONNECTION ESTABLISHED"));
-            assert!(message.contains("agent_id: 'my-agent'"));
-            assert!(message.contains("session_id: 'sess-123'"));
-            assert!(message.contains("name: 'production-db'"));
-            assert!(message.contains("host: user@host:22"));
-            assert!(message.contains("retry_attempts: 3"));
-            assert!(message.contains("persistent: true"));
+            assert!(m.contains("AGENT: my-agent"));
+            assert!(m.contains("RETRY: 3"));
+            assert!(m.contains("PERSISTENT: true"));
         }
 
         #[test]
-        fn test_reused_with_all_options() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_agent_id(Some("my-agent"))
-                .with_name(Some("staging"))
-                .with_retry_attempts(1)
-                .with_persistent(true)
+        fn reused_omits_retry_and_persistent() {
+            let m = ConnectOkBuilder::new("sess-abc", "user", "host:22")
                 .reused(true)
-                .build();
-
-            assert!(message.contains("SESSION REUSED"));
-            assert!(!message.contains("SSH CONNECTION ESTABLISHED"));
-            assert!(message.contains("agent_id"));
-            assert!(message.contains("name"));
-        }
-
-        #[test]
-        fn test_from_string_types() {
-            let session_id = String::from("sess-456");
-            let username = String::from("admin");
-            let host = String::from("server:2222");
-
-            let message = ConnectMessageBuilder::new(session_id, username, host).build();
-
-            assert!(message.contains("session_id: 'sess-456'"));
-            assert!(message.contains("host: admin@server:2222"));
-        }
-
-        #[test]
-        fn test_builder_order_independence() {
-            // Order of method calls shouldn't affect output content
-            let msg1 = ConnectMessageBuilder::new("s1", "u", "h:22")
-                .with_agent_id(Some("a"))
+                .with_retry_attempts(5)
                 .with_persistent(true)
                 .build();
-
-            let msg2 = ConnectMessageBuilder::new("s1", "u", "h:22")
-                .with_persistent(true)
-                .with_agent_id(Some("a"))
-                .build();
-
-            // Both should have the same content
-            assert!(msg1.contains("agent_id: 'a'"));
-            assert!(msg2.contains("agent_id: 'a'"));
-            assert!(msg1.contains("persistent: true"));
-            assert!(msg2.contains("persistent: true"));
+            assert!(m.starts_with("SSH_CONNECT: REUSED\n"));
+            assert!(!m.contains("RETRY"));
+            assert!(!m.contains("PERSISTENT"));
         }
 
         #[test]
-        fn test_message_format_structure() {
-            let message = ConnectMessageBuilder::new("sess-123", "user", "host:22")
-                .with_agent_id(Some("my-agent"))
+        fn ok_with_replaced() {
+            let m = ConnectOkBuilder::new("sess-abc", "user", "host:22")
+                .with_replaced(2)
                 .build();
+            assert!(m.contains("REPLACED: 2"));
+        }
 
-            // Verify message has proper structure with newlines
-            let lines: Vec<&str> = message.lines().collect();
-            assert!(lines.len() >= 4); // Header, identifiers, empty line, instructions
-            assert!(lines[0].contains("ESTABLISHED"));
+        #[test]
+        fn replaced_zero_omitted() {
+            let m = ConnectOkBuilder::new("sess-abc", "user", "host:22")
+                .with_replaced(0)
+                .build();
+            assert!(!m.contains("REPLACED"));
+        }
+
+        #[test]
+        fn agent_id_sanitized() {
+            let m = ConnectOkBuilder::new("s", "u", "h")
+                .with_agent_id(Some("my\nagent"))
+                .build();
+            assert!(m.contains("AGENT: my\\nagent"));
         }
     }
 
-    mod execute_message_builder {
+    mod connect_suggested_builder {
+        use super::*;
+
+        fn sample_match() -> SessionMatch {
+            SessionMatch {
+                session_id: "sess-abc".to_string(),
+                host: "user@host:22".to_string(),
+                agent_id: Some("my-agent".to_string()),
+                name: Some("prod-db".to_string()),
+                connected_at: "2026-04-18T10:30:00Z".to_string(),
+                healthy: true,
+            }
+        }
+
+        #[test]
+        fn single_match_full_fields() {
+            let m = ConnectSuggestedBuilder::new(vec![sample_match()]).build();
+            assert!(m.contains("SSH_CONNECT: SUGGESTED"));
+            assert!(m.contains("EXISTING_SESSION_ID: sess-abc"));
+            assert!(m.contains("HOST: user@host:22"));
+            assert!(m.contains("AGENT: my-agent"));
+            assert!(m.contains("NAME: prod-db"));
+            assert!(m.contains("CONNECTED_AT: 2026-04-18T10:30:00Z"));
+            assert!(m.contains("HEALTHY: true"));
+            assert!(m.contains("HINT: use existing SESSION_ID"));
+        }
+
+        #[test]
+        fn single_match_unhealthy_shown() {
+            let mut s = sample_match();
+            s.healthy = false;
+            let m = ConnectSuggestedBuilder::new(vec![s]).build();
+            assert!(m.contains("HEALTHY: false"));
+        }
+
+        #[test]
+        fn multi_match_list_format() {
+            let matches = vec![
+                sample_match(),
+                SessionMatch {
+                    session_id: "sess-def".to_string(),
+                    host: "user@host:22".to_string(),
+                    agent_id: None,
+                    name: None,
+                    connected_at: "2026-04-18T09:15:00Z".to_string(),
+                    healthy: true,
+                },
+            ];
+            let m = ConnectSuggestedBuilder::new(matches).build();
+            assert!(m.contains("MATCHES: 2"));
+            assert!(m.contains("- sess-abc user@host:22 [agent: my-agent"));
+            assert!(m.contains("connected: 10:30:00"));
+            assert!(m.contains("healthy"));
+            assert!(m.contains("- sess-def user@host:22 [connected: 09:15:00"));
+            assert!(m.contains("HINT: pick an existing SESSION_ID"));
+        }
+
+        #[test]
+        fn empty_matches_shows_zero() {
+            let m = ConnectSuggestedBuilder::new(vec![]).build();
+            assert!(m.contains("MATCHES: 0"));
+        }
+    }
+
+    mod disconnect {
         use super::*;
 
         #[test]
-        fn test_basic_message() {
-            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls -la").build();
+        fn inline_format() {
+            let m = render_disconnect_ok("sess-abc");
+            assert_eq!(m, "SSH_DISCONNECT: OK | SESSION_ID: sess-abc");
+        }
+    }
 
-            assert!(message.contains("COMMAND STARTED"));
-            assert!(message.contains("command_id: 'cmd-123'"));
-            assert!(message.contains("session_id: 'sess-456'"));
-            assert!(message.contains("command: 'ls -la'"));
-            assert!(message.contains("ssh_get_command_output"));
-            assert!(message.contains("ssh_cancel_command"));
+    mod list_sessions_builder {
+        use super::*;
+
+        fn sample_session(id: &str, healthy: Option<bool>, agent: Option<&str>) -> SessionInfo {
+            SessionInfo {
+                session_id: id.to_string(),
+                name: None,
+                agent_id: agent.map(str::to_string),
+                host: "host:22".to_string(),
+                username: "user".to_string(),
+                connected_at: "2026-04-18T10:30:00Z".to_string(),
+                default_timeout_secs: 30,
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy,
+            }
         }
 
         #[test]
-        fn test_with_agent_id() {
-            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls -la")
+        fn empty_list_inline() {
+            let m = ListSessionsBuilder::new(&[], 0).build();
+            assert_eq!(m, "SSH_LIST_SESSIONS: OK | COUNT: 0");
+        }
+
+        #[test]
+        fn multi_session_rendered_as_bullets() {
+            let sessions = vec![
+                sample_session("sess-1", Some(true), Some("my-agent")),
+                sample_session("sess-2", None, None),
+            ];
+            let m = ListSessionsBuilder::new(&sessions, 2).build();
+            assert!(m.contains("COUNT: 2"));
+            assert!(m.contains("- sess-1 user@host:22 [agent: my-agent, healthy]"));
+            assert!(m.contains("- sess-2 user@host:22"));
+        }
+
+        #[test]
+        fn pagination_marker_when_truncated() {
+            let sessions = vec![sample_session("sess-1", Some(true), None)];
+            let m = ListSessionsBuilder::new(&sessions, 10).build();
+            assert!(m.contains("COUNT: 1 (showing 1 of 10)"));
+        }
+
+        #[test]
+        fn compression_off_shown() {
+            let mut s = sample_session("sess-1", None, None);
+            s.compression_enabled = false;
+            let sessions = vec![s];
+            let m = ListSessionsBuilder::new(&sessions, 1).build();
+            assert!(m.contains("[compression: off]"));
+        }
+
+        #[test]
+        fn unhealthy_marker() {
+            let sessions = vec![sample_session("sess-1", Some(false), None)];
+            let m = ListSessionsBuilder::new(&sessions, 1).build();
+            assert!(m.contains("[unhealthy]"));
+        }
+    }
+
+    mod disconnect_agent {
+        use super::*;
+
+        #[test]
+        fn inline_format() {
+            let m = render_disconnect_agent("my-agent", 3, 5);
+            assert_eq!(
+                m,
+                "SSH_DISCONNECT_AGENT: OK | AGENT: my-agent | SESSIONS: 3 | COMMANDS: 5"
+            );
+        }
+
+        #[test]
+        fn zero_counts_still_rendered() {
+            let m = render_disconnect_agent("agent", 0, 0);
+            assert!(m.contains("SESSIONS: 0"));
+            assert!(m.contains("COMMANDS: 0"));
+        }
+    }
+
+    mod execute_started_builder {
+        use super::*;
+
+        #[test]
+        fn without_agent() {
+            let m = ExecuteStartedBuilder::new("cmd-1", "sess-1").build();
+            assert!(m.contains("SSH_EXECUTE: STARTED"));
+            assert!(m.contains("COMMAND_ID: cmd-1"));
+            assert!(m.contains("SESSION_ID: sess-1"));
+            assert!(!m.contains("AGENT"));
+        }
+
+        #[test]
+        fn with_agent() {
+            let m = ExecuteStartedBuilder::new("cmd-1", "sess-1")
                 .with_agent_id(Some("my-agent"))
                 .build();
-
-            assert!(message.contains("agent_id: 'my-agent'"));
+            assert!(m.contains("AGENT: my-agent"));
         }
 
         #[test]
-        fn test_long_command_truncated() {
-            let long_cmd = "a".repeat(100);
-            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", &long_cmd).build();
+        fn no_command_text_in_output() {
+            // Explicit: execute STARTED must NOT echo the command line.
+            let m = ExecuteStartedBuilder::new("cmd-1", "sess-1").build();
+            assert!(!m.contains("CMD"));
+            assert!(!m.contains("RUNNING:"));
+        }
+    }
 
-            assert!(message.contains("..."));
-            assert!(!message.contains(&long_cmd));
+    mod get_command_output_builder {
+        use super::*;
+
+        #[test]
+        fn running_with_partial_annotation() {
+            let m = GetCommandOutputBuilder::new(
+                "cmd-1",
+                GetCommandOutputState::Running,
+                b"line1\nline2",
+                b"",
+                1024,
+                "nonce001",
+            )
+            .build();
+            assert!(m.starts_with("SSH_GET_COMMAND_OUTPUT: RUNNING\n"));
+            assert!(m.contains("COMMAND_ID: cmd-1"));
+            assert!(m.contains("--- stdout [nonce001] (partial) ---"));
+            assert!(m.contains("line1\nline2"));
+            assert!(m.contains("--- stderr [nonce001] (partial, empty) ---"));
+            assert!(!m.contains("EXIT:"));
         }
 
         #[test]
-        fn test_with_agent_id_none_explicit() {
-            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls")
-                .with_agent_id(None::<String>)
+        fn completed_with_exit_code() {
+            let m = GetCommandOutputBuilder::new(
+                "cmd-2",
+                GetCommandOutputState::Completed(0),
+                b"ok",
+                b"",
+                1024,
+                "nonce002",
+            )
+            .build();
+            assert!(m.contains("SSH_GET_COMMAND_OUTPUT: COMPLETED"));
+            assert!(m.contains("EXIT: 0"));
+            assert!(m.contains("--- stdout [nonce002] ---"));
+            assert!(m.contains("--- stderr [nonce002] (empty) ---"));
+        }
+
+        #[test]
+        fn completed_negative_exit_code() {
+            let m = GetCommandOutputBuilder::new(
+                "cmd-3",
+                GetCommandOutputState::Completed(-1),
+                b"",
+                b"err",
+                1024,
+                "n",
+            )
+            .build();
+            assert!(m.contains("EXIT: -1"));
+        }
+
+        #[test]
+        fn timeout_shows_partial() {
+            let m = GetCommandOutputBuilder::new(
+                "cmd-4",
+                GetCommandOutputState::Timeout,
+                b"partial",
+                b"",
+                1024,
+                "n",
+            )
+            .build();
+            assert!(m.contains("SSH_GET_COMMAND_OUTPUT: TIMEOUT"));
+            assert!(m.contains("(partial)"));
+            assert!(!m.contains("EXIT:"));
+        }
+
+        #[test]
+        fn truncation_propagates_to_block() {
+            let big = vec![b'x'; 1024 * 1024];
+            let m = GetCommandOutputBuilder::new(
+                "cmd-5",
+                GetCommandOutputState::Completed(0),
+                &big,
+                b"",
+                256,
+                "n",
+            )
+            .build();
+            assert!(m.contains("truncated: showing 256B of 1.0MB"));
+        }
+    }
+
+    mod list_commands_builder {
+        use super::*;
+
+        fn sample_cmd(id: &str, status: AsyncCommandStatus, cmd: &str) -> AsyncCommandInfo {
+            AsyncCommandInfo {
+                command_id: id.to_string(),
+                session_id: "sess-1".to_string(),
+                command: cmd.to_string(),
+                status,
+                started_at: "2026-04-18T10:30:00Z".to_string(),
+            }
+        }
+
+        #[test]
+        fn empty_inline() {
+            let m = ListCommandsBuilder::new(&[], 0).build();
+            assert_eq!(m, "SSH_LIST_COMMANDS: OK | COUNT: 0");
+        }
+
+        #[test]
+        fn multi_command_list() {
+            let cmds = vec![
+                sample_cmd("cmd-1", AsyncCommandStatus::Running, "sleep 10"),
+                sample_cmd("cmd-2", AsyncCommandStatus::Completed, "ls -la"),
+            ];
+            let m = ListCommandsBuilder::new(&cmds, 2).build();
+            assert!(m.contains("COUNT: 2"));
+            assert!(m.contains("- cmd-1 [RUNNING] sess-1: sleep 10 (10:30:00)"));
+            assert!(m.contains("- cmd-2 [COMPLETED] sess-1: ls -la (10:30:00)"));
+        }
+
+        #[test]
+        fn command_text_sanitized() {
+            let cmds = vec![sample_cmd(
+                "cmd-1",
+                AsyncCommandStatus::Running,
+                "echo a\nb",
+            )];
+            let m = ListCommandsBuilder::new(&cmds, 1).build();
+            assert!(m.contains("echo a\\nb"));
+        }
+
+        #[test]
+        fn pagination_marker() {
+            let cmds = vec![sample_cmd("c1", AsyncCommandStatus::Running, "x")];
+            let m = ListCommandsBuilder::new(&cmds, 50).build();
+            assert!(m.contains("COUNT: 1 (showing 1 of 50)"));
+        }
+    }
+
+    mod cancel_command {
+        use super::*;
+
+        #[test]
+        fn cancelled_with_output_blocks() {
+            let m =
+                CancelCommandCancelledBuilder::new("cmd-1", b"line1", b"", 1024, "nonce").build();
+            assert!(m.contains("SSH_CANCEL_COMMAND: CANCELLED"));
+            assert!(m.contains("COMMAND_ID: cmd-1"));
+            assert!(m.contains("--- stdout [nonce] (partial) ---"));
+            assert!(m.contains("line1"));
+            assert!(m.contains("--- stderr [nonce] (partial, empty) ---"));
+        }
+
+        #[test]
+        fn noop_inline() {
+            let m = render_cancel_command_noop("cmd-1", "not running");
+            assert_eq!(
+                m,
+                "SSH_CANCEL_COMMAND: NOOP | COMMAND_ID: cmd-1 | REASON: not running"
+            );
+        }
+
+        #[test]
+        fn noop_reason_sanitized() {
+            let m = render_cancel_command_noop("cmd-1", "line1\nline2");
+            assert!(m.contains("line1\\nline2"));
+        }
+    }
+
+    mod shell_open_builder {
+        use super::*;
+
+        #[test]
+        fn basic_message() {
+            let m = ShellOpenBuilder::new("shell-1", "sess-1", "xterm", 80, 24).build();
+            assert!(m.contains("SSH_SHELL_OPEN: OK"));
+            assert!(m.contains("SHELL_ID: shell-1"));
+            assert!(m.contains("SESSION_ID: sess-1"));
+            assert!(m.contains("TERM: xterm 80x24"));
+        }
+
+        #[test]
+        fn with_agent() {
+            let m = ShellOpenBuilder::new("shell-1", "sess-1", "vt100", 80, 24)
+                .with_agent_id(Some("my-agent"))
                 .build();
-
-            assert!(!message.contains("agent_id"));
+            assert!(m.contains("AGENT: my-agent"));
+            assert!(m.contains("TERM: vt100 80x24"));
         }
 
         #[test]
-        fn test_from_string_types() {
-            let cmd_id = String::from("cmd-789");
-            let session_id = String::from("sess-012");
-            let command = String::from("echo hello");
+        fn custom_dimensions() {
+            let m = ShellOpenBuilder::new("shell-1", "sess-1", "xterm", 132, 43).build();
+            assert!(m.contains("TERM: xterm 132x43"));
+        }
+    }
 
-            let message = ExecuteMessageBuilder::new(cmd_id, session_id, command).build();
+    mod shell_write_close {
+        use super::*;
 
-            assert!(message.contains("command_id: 'cmd-789'"));
-            assert!(message.contains("session_id: 'sess-012'"));
-            assert!(message.contains("command: 'echo hello'"));
+        #[test]
+        fn write_inline() {
+            let m = render_shell_write_ok("shell-1", 42);
+            assert_eq!(
+                m,
+                "SSH_SHELL_WRITE: OK | SHELL_ID: shell-1 | BYTES_SENT: 42"
+            );
         }
 
         #[test]
-        fn test_command_with_special_characters() {
-            let message =
-                ExecuteMessageBuilder::new("cmd-1", "sess-1", "echo 'hello world' && ls -la")
+        fn close_inline() {
+            let m = render_shell_close_ok("shell-1");
+            assert_eq!(m, "SSH_SHELL_CLOSE: OK | SHELL_ID: shell-1");
+        }
+    }
+
+    mod shell_read_builder {
+        use super::*;
+
+        #[test]
+        fn open_with_data() {
+            let m =
+                ShellReadBuilder::new("shell-1", ShellReadState::Open, b"$ ls\nfile1", 1024, "n")
                     .build();
-
-            assert!(message.contains("echo 'hello world' && ls -la"));
+            assert!(m.starts_with("SSH_SHELL_READ: OPEN\n"));
+            assert!(m.contains("SHELL_ID: shell-1"));
+            assert!(m.contains("--- data [n] ---"));
+            assert!(m.contains("$ ls\nfile1"));
         }
 
         #[test]
-        fn test_command_at_truncation_boundary() {
-            // Exactly 50 characters
-            let cmd = "a".repeat(50);
-            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", &cmd).build();
-
-            assert!(message.contains(&cmd));
-            assert!(!message.contains("..."));
-        }
-
-        #[test]
-        fn test_command_just_over_truncation() {
-            // 51 characters
-            let cmd = "a".repeat(51);
-            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", &cmd).build();
-
-            assert!(message.contains("..."));
-        }
-
-        #[test]
-        fn test_message_includes_usage_instructions() {
-            let message = ExecuteMessageBuilder::new("cmd-123", "sess-456", "ls").build();
-
-            // Check that helpful instructions are included
-            assert!(message.contains("ssh_get_command_output"));
-            assert!(message.contains("ssh_cancel_command"));
-            assert!(message.contains("command_id 'cmd-123'"));
+        fn closed_with_empty_data() {
+            let m =
+                ShellReadBuilder::new("shell-1", ShellReadState::Closed, b"", 1024, "n").build();
+            assert!(m.contains("SSH_SHELL_READ: CLOSED"));
+            assert!(m.contains("--- data [n] (empty) ---"));
         }
     }
 
-    mod agent_disconnect_message_builder {
+    mod transfer_started_builder {
         use super::*;
 
         #[test]
-        fn test_with_sessions() {
-            let message = AgentDisconnectMessageBuilder::new("my-agent")
-                .with_sessions_disconnected(3)
-                .with_commands_cancelled(5)
-                .build();
-
-            assert!(message.contains("AGENT CLEANUP COMPLETE"));
-            assert!(message.contains("agent_id: 'my-agent'"));
-            assert!(message.contains("sessions_disconnected: 3"));
-            assert!(message.contains("commands_cancelled: 5"));
-            assert!(message.contains("have been terminated"));
-        }
-
-        #[test]
-        fn test_no_sessions() {
-            let message = AgentDisconnectMessageBuilder::new("my-agent")
-                .with_sessions_disconnected(0)
-                .with_commands_cancelled(0)
-                .build();
-
-            assert!(message.contains("No sessions found"));
-        }
-
-        #[test]
-        fn test_from_string_type() {
-            let agent_id = String::from("my-agent-123");
-            let message = AgentDisconnectMessageBuilder::new(agent_id)
-                .with_sessions_disconnected(1)
-                .build();
-
-            assert!(message.contains("agent_id: 'my-agent-123'"));
-        }
-
-        #[test]
-        fn test_default_values() {
-            let message = AgentDisconnectMessageBuilder::new("agent-1").build();
-
-            // Default should be 0 for both
-            assert!(message.contains("sessions_disconnected: 0"));
-            assert!(message.contains("commands_cancelled: 0"));
-            assert!(message.contains("No sessions found"));
-        }
-
-        #[test]
-        fn test_sessions_but_no_commands() {
-            let message = AgentDisconnectMessageBuilder::new("agent-1")
-                .with_sessions_disconnected(2)
-                .with_commands_cancelled(0)
-                .build();
-
-            assert!(message.contains("sessions_disconnected: 2"));
-            assert!(message.contains("commands_cancelled: 0"));
-            assert!(message.contains("have been terminated"));
-        }
-
-        #[test]
-        fn test_large_numbers() {
-            let message = AgentDisconnectMessageBuilder::new("agent-1")
-                .with_sessions_disconnected(100)
-                .with_commands_cancelled(500)
-                .build();
-
-            assert!(message.contains("sessions_disconnected: 100"));
-            assert!(message.contains("commands_cancelled: 500"));
-        }
-
-        #[test]
-        fn test_builder_order_independence() {
-            let msg1 = AgentDisconnectMessageBuilder::new("a")
-                .with_sessions_disconnected(1)
-                .with_commands_cancelled(2)
-                .build();
-
-            let msg2 = AgentDisconnectMessageBuilder::new("a")
-                .with_commands_cancelled(2)
-                .with_sessions_disconnected(1)
-                .build();
-
-            assert!(msg1.contains("sessions_disconnected: 1"));
-            assert!(msg2.contains("sessions_disconnected: 1"));
-            assert!(msg1.contains("commands_cancelled: 2"));
-            assert!(msg2.contains("commands_cancelled: 2"));
-        }
-    }
-
-    mod shell_open_message_builder {
-        use super::*;
-
-        #[test]
-        fn test_basic_message() {
-            let message =
-                ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24).build();
-
-            assert!(message.contains("INTERACTIVE SHELL OPENED"));
-            assert!(message.contains("shell_id: 'shell-123'"));
-            assert!(message.contains("session_id: 'sess-456'"));
-            assert!(message.contains("term: xterm (80x24)"));
-            assert!(message.contains("ssh_shell_write"));
-            assert!(message.contains("ssh_shell_read"));
-            assert!(message.contains("ssh_shell_close"));
-        }
-
-        #[test]
-        fn test_with_agent_id() {
-            let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
-                .with_agent_id(Some("my-agent"))
-                .build();
-
-            assert!(message.contains("agent_id: 'my-agent'"));
-        }
-
-        #[test]
-        fn test_without_agent_id() {
-            let message = ShellOpenMessageBuilder::new("shell-123", "sess-456", "xterm", 80, 24)
-                .with_agent_id(None::<String>)
-                .build();
-
-            assert!(!message.contains("agent_id"));
-        }
-
-        #[test]
-        fn test_vt100_terminal() {
-            let message =
-                ShellOpenMessageBuilder::new("shell-1", "sess-1", "vt100", 80, 24).build();
-
-            assert!(message.contains("term: vt100 (80x24)"));
-        }
-
-        #[test]
-        fn test_custom_dimensions() {
-            let message =
-                ShellOpenMessageBuilder::new("shell-1", "sess-1", "xterm", 132, 43).build();
-
-            assert!(message.contains("term: xterm (132x43)"));
-        }
-
-        #[test]
-        fn test_from_string_types() {
-            let shell_id = String::from("shell-789");
-            let session_id = String::from("sess-012");
-            let term = String::from("ansi");
-
-            let message = ShellOpenMessageBuilder::new(shell_id, session_id, term, 80, 24).build();
-
-            assert!(message.contains("shell_id: 'shell-789'"));
-            assert!(message.contains("session_id: 'sess-012'"));
-            assert!(message.contains("term: ansi"));
-        }
-
-        #[test]
-        fn test_message_contains_proper_instructions() {
-            let message =
-                ShellOpenMessageBuilder::new("shell-abc", "sess-def", "xterm", 80, 24).build();
-
-            assert!(message.contains("ssh_shell_write"));
-            assert!(message.contains("ssh_shell_read"));
-            assert!(message.contains("ssh_shell_close"));
-            assert!(message.contains("shell_id 'shell-abc'"));
-        }
-
-        #[test]
-        fn test_message_format_structure() {
-            let message = ShellOpenMessageBuilder::new("shell-1", "sess-1", "xterm", 80, 24)
-                .with_agent_id(Some("agent-1"))
-                .build();
-
-            let lines: Vec<&str> = message.lines().collect();
-            assert!(lines.len() >= 6); // Header, identifiers, empty line, instructions
-            assert!(lines[0].contains("INTERACTIVE SHELL OPENED"));
-        }
-    }
-
-    mod truncate_command {
-        use super::*;
-
-        #[test]
-        fn test_short_command() {
-            assert_eq!(truncate_command("ls -la", 50), "ls -la");
-        }
-
-        #[test]
-        fn test_exact_length() {
-            let cmd = "a".repeat(50);
-            assert_eq!(truncate_command(&cmd, 50), cmd);
-        }
-
-        #[test]
-        fn test_long_command() {
-            let cmd = "a".repeat(60);
-            let result = truncate_command(&cmd, 50);
-            assert!(result.ends_with("..."));
-            assert!(result.len() <= 50);
-        }
-
-        #[test]
-        fn test_empty_command() {
-            assert_eq!(truncate_command("", 50), "");
-        }
-
-        #[test]
-        fn test_very_small_max_len() {
-            let cmd = "hello world";
-            let result = truncate_command(cmd, 5);
-            assert_eq!(result, "he...");
-            assert_eq!(result.len(), 5);
-        }
-
-        #[test]
-        fn test_max_len_three() {
-            // Edge case: max_len equals length of "..."
-            let cmd = "hello";
-            let result = truncate_command(cmd, 3);
-            assert_eq!(result, "...");
-        }
-
-        #[test]
-        fn test_max_len_less_than_three() {
-            // Edge case: max_len < 3 (less than "..." length)
-            let cmd = "hello";
-            let result = truncate_command(cmd, 2);
-            // saturating_sub prevents underflow
-            assert_eq!(result, "...");
-        }
-
-        #[test]
-        fn test_max_len_zero() {
-            let cmd = "hello";
-            let result = truncate_command(cmd, 0);
-            // With saturating_sub(3) on 0, we get 0, so empty string + "..."
-            assert_eq!(result, "...");
-        }
-
-        #[test]
-        fn test_unicode_command() {
-            // Unicode characters may be multi-byte
-            let cmd = "echo \u{1F600}"; // emoji
-            let result = truncate_command(cmd, 50);
-            assert_eq!(result, cmd);
-        }
-
-        #[test]
-        fn test_one_over_limit() {
-            let cmd = "a".repeat(51);
-            let result = truncate_command(&cmd, 50);
-            assert!(result.ends_with("..."));
-            assert_eq!(result.len(), 50);
-        }
-
-        #[test]
-        fn test_newlines_in_command() {
-            let cmd = "echo 'line1\nline2'";
-            let result = truncate_command(cmd, 50);
-            assert_eq!(result, cmd);
-        }
-
-        #[test]
-        fn test_tabs_in_command() {
-            let cmd = "echo 'col1\tcol2\tcol3'";
-            let result = truncate_command(cmd, 50);
-            assert_eq!(result, cmd);
-        }
-    }
-
-    mod upload_message_builder {
-        use super::*;
-
-        #[test]
-        fn test_basic_message() {
-            let message = UploadMessageBuilder::new(
-                "xfer-123",
-                "sess-456",
-                "/tmp/file.txt",
-                "/home/user/file.txt",
-                1048576,
+        fn upload_direction() {
+            let m = TransferStartedBuilder::new(
+                TransferStartDirection::Upload,
+                "xfer-1",
+                "sess-1",
+                "/tmp/f.txt",
+                "/home/user/f.txt",
+                1_048_576,
             )
             .build();
-
-            assert!(message.contains("UPLOAD STARTED"));
-            assert!(message.contains("transfer_id: 'xfer-123'"));
-            assert!(message.contains("session_id: 'sess-456'"));
-            assert!(message.contains("local_path: '/tmp/file.txt'"));
-            assert!(message.contains("remote_path: '/home/user/file.txt'"));
-            assert!(message.contains("total_bytes: 1048576"));
-            assert!(message.contains("ssh_get_transfer_progress"));
+            assert!(m.contains("SSH_UPLOAD: STARTED"));
+            assert!(m.contains("FROM: /tmp/f.txt"));
+            assert!(m.contains("TO: /home/user/f.txt"));
+            assert!(m.contains("SIZE: 1.0MB (1048576 bytes)"));
+            assert!(m.contains("BYTES: 1048576"));
         }
 
         #[test]
-        fn test_with_agent_id() {
-            let message = UploadMessageBuilder::new("xfer-123", "sess-456", "a", "b", 0)
-                .with_agent_id(Some("my-agent"))
-                .build();
-
-            assert!(message.contains("agent_id: 'my-agent'"));
-        }
-
-        #[test]
-        fn test_without_agent_id() {
-            let message = UploadMessageBuilder::new("xfer-123", "sess-456", "a", "b", 0)
-                .with_agent_id(None::<String>)
-                .build();
-
-            assert!(!message.contains("agent_id"));
-        }
-    }
-
-    mod download_message_builder {
-        use super::*;
-
-        #[test]
-        fn test_basic_message() {
-            let message = DownloadMessageBuilder::new(
-                "xfer-456",
-                "sess-789",
-                "/home/user/file.txt",
-                "/tmp/file.txt",
-                2097152,
+        fn download_swaps_from_to() {
+            let m = TransferStartedBuilder::new(
+                TransferStartDirection::Download,
+                "xfer-2",
+                "sess-1",
+                "/tmp/local",
+                "/remote",
+                100,
             )
             .build();
-
-            assert!(message.contains("DOWNLOAD STARTED"));
-            assert!(message.contains("transfer_id: 'xfer-456'"));
-            assert!(message.contains("session_id: 'sess-789'"));
-            assert!(message.contains("remote_path: '/home/user/file.txt'"));
-            assert!(message.contains("local_path: '/tmp/file.txt'"));
-            assert!(message.contains("total_bytes: 2097152"));
-            assert!(message.contains("ssh_get_transfer_progress"));
+            assert!(m.contains("SSH_DOWNLOAD: STARTED"));
+            assert!(m.contains("FROM: /remote"));
+            assert!(m.contains("TO: /tmp/local"));
         }
 
         #[test]
-        fn test_with_agent_id() {
-            let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "a", "b", 0)
-                .with_agent_id(Some("agent-abc"))
-                .build();
-
-            assert!(message.contains("agent_id: 'agent-abc'"));
-        }
-
-        #[test]
-        fn test_without_agent_id() {
-            let message = DownloadMessageBuilder::new("xfer-456", "sess-789", "a", "b", 0)
-                .with_agent_id(None::<String>)
-                .build();
-
-            assert!(!message.contains("agent_id"));
+        fn with_agent_id() {
+            let m =
+                TransferStartedBuilder::new(TransferStartDirection::Upload, "x", "s", "a", "b", 0)
+                    .with_agent_id(Some("my-agent"))
+                    .build();
+            assert!(m.contains("AGENT: my-agent"));
         }
     }
 
-    mod transfer_progress_message_builder {
+    mod transfer_progress_builder {
         use super::*;
 
         #[test]
-        fn test_running_message() {
-            let message = TransferProgressMessageBuilder::new(
-                "xfer-123", "upload", "running", 524288, 1048576,
+        fn running_inline() {
+            let m = TransferProgressBuilder::new(
+                "xfer-1",
+                TransferStartDirection::Upload,
+                524_288,
+                1_048_576,
+                TransferProgressState::Running,
             )
             .build();
-
-            assert!(message.contains("TRANSFER xfer-123"));
-            assert!(message.contains("upload"));
-            assert!(message.contains("running"));
-            assert!(message.contains("50%"));
+            assert_eq!(
+                m,
+                "SSH_GET_TRANSFER_PROGRESS: RUNNING | TRANSFER_ID: xfer-1 | UPLOAD 50% (524288/1048576 bytes)"
+            );
         }
 
         #[test]
-        fn test_completed_message() {
-            let message = TransferProgressMessageBuilder::new(
-                "xfer-123",
-                "download",
-                "completed",
-                1000000,
-                1000000,
+        fn completed_inline_100_percent() {
+            let m = TransferProgressBuilder::new(
+                "xfer-1",
+                TransferStartDirection::Download,
+                1_048_576,
+                1_048_576,
+                TransferProgressState::Completed,
             )
             .build();
-
-            assert!(message.contains("completed"));
-            assert!(message.contains("100%"));
+            assert!(m.contains("COMPLETED"));
+            assert!(m.contains("DOWNLOAD 100%"));
         }
 
         #[test]
-        fn test_zero_total_bytes() {
-            let message =
-                TransferProgressMessageBuilder::new("xfer-123", "upload", "running", 0, 0).build();
-
-            assert!(message.contains("0%"));
-        }
-    }
-
-    mod format_bytes_fn {
-        use super::*;
-
-        #[test]
-        fn test_bytes() {
-            assert_eq!(format_bytes(0), "0B");
-            assert_eq!(format_bytes(512), "512B");
-            assert_eq!(format_bytes(1023), "1023B");
+        fn failed_block_format() {
+            let m = TransferProgressBuilder::new(
+                "xfer-1",
+                TransferStartDirection::Download,
+                100,
+                1000,
+                TransferProgressState::Failed("connection lost"),
+            )
+            .build();
+            assert!(m.starts_with("SSH_GET_TRANSFER_PROGRESS: FAILED\n"));
+            assert!(m.contains("TRANSFER_ID: xfer-1"));
+            assert!(m.contains("DIRECTION: DOWNLOAD"));
+            assert!(m.contains("PROGRESS: 10% (100/1000 bytes)"));
+            assert!(m.contains("REASON: connection lost"));
         }
 
         #[test]
-        fn test_kilobytes() {
-            assert_eq!(format_bytes(1024), "1.0KB");
-            assert_eq!(format_bytes(1536), "1.5KB");
-        }
-
-        #[test]
-        fn test_megabytes() {
-            assert_eq!(format_bytes(1048576), "1.0MB");
-            assert_eq!(format_bytes(1572864), "1.5MB");
-        }
-
-        #[test]
-        fn test_gigabytes() {
-            assert_eq!(format_bytes(1073741824), "1.0GB");
+        fn zero_total_shows_zero_percent() {
+            let m = TransferProgressBuilder::new(
+                "xfer-1",
+                TransferStartDirection::Upload,
+                0,
+                0,
+                TransferProgressState::Running,
+            )
+            .build();
+            assert!(m.contains("0%"));
         }
     }
 
-    mod edge_cases {
+    mod forward {
         use super::*;
 
         #[test]
-        fn test_connect_message_special_chars_in_host() {
-            let message =
-                ConnectMessageBuilder::new("sess-1", "user", "host-name.example.com:2222").build();
-
-            assert!(message.contains("host: user@host-name.example.com:2222"));
+        fn active_inline() {
+            let m = render_forward_ok("127.0.0.1:8080", "localhost:3306", true);
+            assert_eq!(
+                m,
+                "SSH_FORWARD: OK | LOCAL: 127.0.0.1:8080 | REMOTE: localhost:3306 | ACTIVE: true"
+            );
         }
 
         #[test]
-        fn test_connect_message_ipv6_host() {
-            let message = ConnectMessageBuilder::new("sess-1", "user", "[::1]:22").build();
+        fn inactive_renders_false() {
+            let m = render_forward_ok("a", "b", false);
+            assert!(m.contains("ACTIVE: false"));
+        }
+    }
 
-            assert!(message.contains("host: user@[::1]:22"));
+    mod extract_time {
+        use super::*;
+
+        #[test]
+        fn zulu_timestamp() {
+            assert_eq!(extract_time("2026-04-18T10:30:00Z"), "10:30:00");
         }
 
         #[test]
-        fn test_execute_message_command_with_quotes() {
-            let message =
-                ExecuteMessageBuilder::new("cmd-1", "sess-1", "echo \"hello 'world'\"").build();
-
-            assert!(message.contains("echo \"hello 'world'\""));
+        fn offset_timestamp() {
+            assert_eq!(extract_time("2026-04-18T10:30:00+03:00"), "10:30:00");
         }
 
         #[test]
-        fn test_execute_message_empty_command() {
-            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", "").build();
-
-            assert!(message.contains("command: ''"));
+        fn no_t_separator_falls_back() {
+            assert_eq!(extract_time("whatever"), "whatever");
         }
 
         #[test]
-        fn test_agent_disconnect_unicode_agent_id() {
-            let message = AgentDisconnectMessageBuilder::new("代理-123")
-                .with_sessions_disconnected(1)
-                .build();
-
-            assert!(message.contains("agent_id: '代理-123'"));
-        }
-
-        #[test]
-        fn test_connect_message_empty_values() {
-            let message = ConnectMessageBuilder::new("", "", "").build();
-
-            assert!(message.contains("session_id: ''"));
-            assert!(message.contains("host: @"));
-        }
-
-        #[test]
-        fn test_execute_message_multiline_command() {
-            let multi_cmd = "#!/bin/bash\necho 'hello'\nexit 0";
-            let message = ExecuteMessageBuilder::new("cmd-1", "sess-1", multi_cmd).build();
-
-            // Command should be truncated if too long
-            assert!(message.contains("command:"));
-        }
-
-        #[test]
-        fn test_all_builders_produce_non_empty_output() {
-            let connect_msg = ConnectMessageBuilder::new("s", "u", "h").build();
-            let execute_msg = ExecuteMessageBuilder::new("c", "s", "cmd").build();
-            let agent_msg = AgentDisconnectMessageBuilder::new("a").build();
-
-            assert!(!connect_msg.is_empty());
-            assert!(!execute_msg.is_empty());
-            assert!(!agent_msg.is_empty());
-        }
-
-        #[test]
-        fn test_connect_message_contains_proper_instructions() {
-            let message = ConnectMessageBuilder::new("sess-abc", "user", "host:22").build();
-
-            // Verify it contains helpful instructions
-            assert!(message.contains("ssh_execute"));
-            assert!(message.contains("sess-abc")); // Session ID mentioned in instructions
-        }
-
-        #[test]
-        fn test_execute_message_contains_proper_instructions() {
-            let message = ExecuteMessageBuilder::new("cmd-xyz", "sess-abc", "ls").build();
-
-            // Verify it contains helpful instructions
-            assert!(message.contains("ssh_get_command_output"));
-            assert!(message.contains("ssh_cancel_command"));
-            assert!(message.contains("cmd-xyz")); // Command ID mentioned in instructions
-        }
-
-        #[test]
-        fn test_very_long_session_id() {
-            let long_id = "s".repeat(500);
-            let message = ConnectMessageBuilder::new(&long_id, "user", "host:22").build();
-
-            // Should handle long IDs without truncation
-            assert!(message.contains(&long_id));
-        }
-
-        #[test]
-        fn test_very_long_agent_id() {
-            let long_id = "a".repeat(500);
-            let message = ConnectMessageBuilder::new("sess-1", "user", "host:22")
-                .with_agent_id(Some(&long_id))
-                .build();
-
-            assert!(message.contains(&long_id));
+        fn fractional_seconds() {
+            assert_eq!(extract_time("2026-04-18T10:30:00.123Z"), "10:30:00.123");
         }
     }
 }
