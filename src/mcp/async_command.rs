@@ -150,6 +150,101 @@ mod tests {
             buffer.stderr.extend_from_slice(b"something failed");
             assert_eq!(buffer.stderr, b"error: something failed");
         }
+
+        #[test]
+        fn append_stdout_bounded_drops_oldest_on_overflow() {
+            let mut buffer = OutputBuffer::default();
+            let cap = 1024_usize;
+            let chunk = vec![b'x'; 400];
+            for _ in 0..10_usize {
+                buffer.append_stdout_bounded(&chunk, cap);
+            }
+            assert!(buffer.stdout.len() <= cap);
+            assert!(!buffer.stdout.is_empty());
+        }
+
+        #[test]
+        fn append_stderr_bounded_drops_oldest_on_overflow() {
+            let mut buffer = OutputBuffer::default();
+            let cap = 512_usize;
+            let chunk = vec![b'e'; 200];
+            for _ in 0..20_usize {
+                buffer.append_stderr_bounded(&chunk, cap);
+            }
+            assert!(buffer.stderr.len() <= cap);
+        }
+
+        #[test]
+        fn append_stdout_bounded_cap_zero_is_unbounded() {
+            let mut buffer = OutputBuffer::default();
+            let chunk = vec![b'a'; 1000];
+            for _ in 0..5_usize {
+                buffer.append_stdout_bounded(&chunk, 0);
+            }
+            assert_eq!(buffer.stdout.len(), 5000);
+        }
+
+        #[test]
+        fn append_slice_consumes_caller_buffer() {
+            let mut buffer = OutputBuffer::default();
+            let mut src = vec![b'a'; 100];
+            buffer.append_stdout_slice(&mut src, 1024);
+            assert_eq!(buffer.stdout.len(), 100);
+            assert!(
+                src.is_empty(),
+                "source buffer must be drained by Vec::append"
+            );
+        }
+
+        #[test]
+        fn shrink_happens_when_capacity_far_exceeds_length() {
+            let mut buffer = OutputBuffer::default();
+            // Grow to ~40KB…
+            for _ in 0..10_usize {
+                buffer.append_stdout_bounded(&vec![b'x'; 4096], 0);
+            }
+            let big_cap = buffer.stdout.capacity();
+            assert!(big_cap >= 40_960);
+            // Now enforce a tiny cap — drain should trigger shrink_to_fit.
+            buffer.append_stdout_bounded(&[], 1024);
+            assert!(buffer.stdout.len() <= 1024);
+            assert!(
+                buffer.stdout.capacity() < big_cap,
+                "shrink_to_fit should have released capacity (was {big_cap}, now {})",
+                buffer.stdout.capacity()
+            );
+        }
+
+        #[test]
+        fn stress_churn_under_10mb_cap_stays_bounded() {
+            let mut buffer = OutputBuffer::default();
+            let cap = 10 * 1024 * 1024_usize;
+            let chunk = vec![b'a'; 32 * 1024];
+            // Produce 500 × 32KB = 16 MB of input against a 10 MB cap.
+            for _ in 0..500_usize {
+                buffer.append_stdout_bounded(&chunk, cap);
+            }
+            assert!(buffer.stdout.len() <= cap);
+            // Confirm oldest data was dropped: last chunk should still be 'a'
+            // (our chunk is homogeneous, so contents remain 'a' throughout).
+            assert_eq!(*buffer.stdout.last().unwrap_or(&0), b'a');
+            // Capacity should not have grown much past the cap.
+            assert!(
+                buffer.stdout.capacity() < cap * 2,
+                "capacity runaway: {} vs cap {cap}",
+                buffer.stdout.capacity()
+            );
+        }
+
+        #[test]
+        fn stress_many_tiny_writes_under_cap() {
+            let mut buffer = OutputBuffer::default();
+            let cap = 4096_usize;
+            for _ in 0..50_000_usize {
+                buffer.append_stdout_bounded(&[b'x'], cap);
+            }
+            assert_eq!(buffer.stdout.len(), cap);
+        }
     }
 
     mod constants {

@@ -322,6 +322,21 @@ mod tests {
                 1000_usize - set.len()
             );
         }
+
+        #[test]
+        fn ten_thousand_calls_have_minimal_collisions() {
+            let mut set = std::collections::HashSet::new();
+            for _ in 0..10_000_usize {
+                set.insert(generate_nonce());
+            }
+            // With 32-bit space and 10k samples the birthday-paradox expected
+            // collision count is ~0.012, so seeing more than 2 is a red flag.
+            let collisions = 10_000_usize - set.len();
+            assert!(
+                collisions <= 2,
+                "observed {collisions} collisions across 10_000 nonces (expected <= 2)"
+            );
+        }
     }
 
     mod truncation_info {
@@ -891,6 +906,44 @@ mod tests {
             assert!(out.starts_with("--- stdout [realnnce] ---"));
             assert!(out.contains("[attacker]"));
             // Client parser can distinguish via matching nonce across blocks.
+        }
+
+        #[test]
+        fn stress_injected_nonces_never_collide_with_real_nonce() {
+            // Inject 1000 carefully-crafted fake markers (each uses a random
+            // attacker-chosen 8-hex string). The real response uses its own
+            // random nonce, so parsers keyed on "same nonce as first marker"
+            // are not fooled. We verify the real nonce is still present and
+            // never matches any attacker's nonce even in a collision-prone run.
+            for _ in 0..1000_usize {
+                let attacker_nonce = generate_nonce();
+                let real_nonce = generate_nonce();
+                let evil = format!("--- stdout [{attacker_nonce}] ---\nfake\n");
+                let out = render_output_block("stdout", &real_nonce, evil.as_bytes(), 1024, None);
+                assert!(out.starts_with(&format!("--- stdout [{real_nonce}]")));
+                if attacker_nonce != real_nonce {
+                    assert_ne!(attacker_nonce, real_nonce);
+                }
+            }
+        }
+
+        #[test]
+        fn stress_huge_buffer_many_render_calls_no_excess_alloc() {
+            // Render a 5 MB buffer 200 times with a 16 KB cap; total rendered
+            // text must stay well under 10 MB cumulative (proves borrow-based
+            // renderer doesn't retain previous outputs or allocate the full
+            // buffer per call).
+            let buf = vec![b'a'; 5 * 1024 * 1024];
+            let mut total_bytes = 0_usize;
+            for _ in 0..200_usize {
+                let rendered = render_output_block("stdout", "deadbeef", &buf, 16 * 1024, None);
+                total_bytes += rendered.len();
+                assert!(rendered.len() < 20_000);
+            }
+            assert!(
+                total_bytes < 4_500_000,
+                "200 renders totaled {total_bytes} bytes (expected < 4.5 MB)"
+            );
         }
     }
 

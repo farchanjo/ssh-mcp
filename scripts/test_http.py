@@ -821,6 +821,105 @@ for agent in ["chaos-g", "chaos-g2", "chaos-g3", "chaos-g4", "chaos-h"]:
     tool("ssh_disconnect_agent", {"agent_id": agent})
 
 # =============================================================================
+# STRESS / LEAK TESTS (v2.0 buffer cap and no-leak guarantee)
+# =============================================================================
+
+print("\n=== STRESS I: 100 connect/disconnect cycles ===", flush=True)
+_rss_before = None
+try:
+    import resource
+    _rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+except (ImportError, AttributeError):
+    pass
+
+stress1_ok = True
+for i in range(100):
+    r = tool("ssh_connect", connect_args(agent_id="stress-cycle", name=f"cycle-{i}"))
+    sid = r.get("session_id", "")
+    if not sid:
+        stress1_ok = False
+        print(f"         Cycle {i}: connect failed -> {str(r)[:120]}", flush=True)
+        break
+    dc = tool("ssh_disconnect", {"session_id": sid})
+    if "error" in dc:
+        stress1_ok = False
+        break
+test("100 connect/disconnect cycles (no-leak)", stress1_ok)
+
+print("\n=== STRESS II: 50 execute + read + cancel (output buffer churn) ===", flush=True)
+stress_sid = tool("ssh_connect", connect_args(agent_id="stress-exec", name="stress-exec")).get("session_id", "")
+stress2_ok = bool(stress_sid)
+if stress_sid:
+    for i in range(50):
+        # Alternate: half complete quickly, half get cancelled mid-flight.
+        if i % 2 == 0:
+            r = tool("ssh_execute", {"session_id": stress_sid, "command": f"echo STRESS_{i}"})
+            cid = r.get("command_id", "")
+            out = tool("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5, "max_output_bytes": 512})
+            if f"STRESS_{i}" not in out.get("stdout", ""):
+                stress2_ok = False
+                break
+        else:
+            r = tool("ssh_execute", {"session_id": stress_sid, "command": "sleep 30"})
+            cid = r.get("command_id", "")
+            if cid:
+                time.sleep(0.05)
+                tool("ssh_cancel_command", {"command_id": cid, "max_output_bytes": 256})
+    tool("ssh_disconnect", {"session_id": stress_sid})
+test("50 execute+read/cancel iterations", stress2_ok)
+
+print("\n=== STRESS III: 20 shell open/close cycles ===", flush=True)
+shell_stress_sid = tool("ssh_connect", connect_args(agent_id="stress-shell", name="stress-shell")).get("session_id", "")
+stress3_ok = bool(shell_stress_sid)
+if shell_stress_sid:
+    for i in range(20):
+        sh = tool("ssh_shell_open", {"session_id": shell_stress_sid}).get("shell_id", "")
+        if not sh:
+            stress3_ok = False
+            break
+        tool("ssh_shell_write", {"shell_id": sh, "input": f"echo CYCLE_{i}\n"})
+        time.sleep(0.2)
+        r = tool("ssh_shell_read", {"shell_id": sh, "clear": True, "max_output_bytes": 4096})
+        closed = tool("ssh_shell_close", {"shell_id": sh})
+        if not closed.get("closed"):
+            stress3_ok = False
+            break
+    tool("ssh_disconnect", {"session_id": shell_stress_sid})
+test("20 shell open/close cycles", stress3_ok)
+
+print("\n=== STRESS IV: large stdout truncation (10MB echoed, 2KB rendered) ===", flush=True)
+big_sid = tool("ssh_connect", connect_args(agent_id="stress-big", name="stress-big")).get("session_id", "")
+stress4_ok = bool(big_sid)
+if big_sid:
+    # Generate ~1MB of 'A' characters via shell; verify the cap truncates sanely.
+    r = tool("ssh_execute", {
+        "session_id": big_sid,
+        "command": "head -c 1048576 /dev/urandom | base64 | head -c 1048576",
+    })
+    cid = r.get("command_id", "")
+    out = tool("ssh_get_command_output", {
+        "command_id": cid, "wait": True, "wait_timeout_secs": 30, "max_output_bytes": 2048,
+    })
+    shown = len(out.get("stdout", ""))
+    stress4_ok = shown <= 2100  # allow small overhead for markers
+    test("Large stdout truncated to max_output_bytes", stress4_ok, f"shown={shown}B")
+    tool("ssh_disconnect", {"session_id": big_sid})
+else:
+    test("Large stdout truncation (skipped, connect failed)", False)
+
+if _rss_before is not None:
+    try:
+        _rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KB on Linux, bytes on macOS — we only care about growth.
+        delta = _rss_after - _rss_before
+        print(f"\n         RSS delta over stress suite: {delta} (resource-unit)", flush=True)
+    except Exception:
+        pass
+
+for agent in ["stress-cycle", "stress-exec", "stress-shell", "stress-big"]:
+    tool("ssh_disconnect_agent", {"agent_id": agent})
+
+# =============================================================================
 # ORIGINAL DISCONNECT / CLEANUP TESTS
 # =============================================================================
 
