@@ -7,10 +7,9 @@ cargo build --release                              # Build all binaries
 cargo build --release --bin ssh-mcp                # HTTP server only
 cargo build --release --bin ssh-mcp-stdio           # Stdio transport only
 cargo build --release --no-default-features         # Without port forwarding
-cargo test --all-features                           # Run tests (480+ tests)
+cargo test --all-features                           # Run tests (501 unit tests)
 cargo fmt --all -- --check                          # Check formatting
 cargo clippy -- -D warnings                         # Lint
-cargo dupes                                          # Code duplication detection (cargo-dupes)
 ```
 
 ## Architecture
@@ -88,11 +87,13 @@ All 16 MCP tools return a single markdown `Text<String>` — no structured JSON.
 Output-returning tools (`ssh_get_command_output`, `ssh_shell_read`, `ssh_cancel_command`) accept an optional `max_output_bytes` parameter (default 16 KiB, cap 1 MiB). `ssh_list_sessions` / `ssh_list_commands` accept `max_items` (default 500, cap 10 000). `ssh_connect` accepts `reuse: "suggest" | "auto" | "force_new"` (default `suggest`) for smart reuse detection via the identity triple (`host`, `port`, `username`).
 
 ### MCP Tools (16 total)
-- **Connection**: `ssh_connect`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
-- **Commands**: `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`
-- **Shell**: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close`
+- **Connection**: `ssh_connect` (smart reuse via `reuse="suggest"|"auto"|"force_new"`), `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
+- **Commands**: `ssh_execute` (optional `pty=true`), `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`
+- **Shell**: `ssh_shell_open` (tunable `inactivity_ttl`, `max_buffer_size`), `ssh_shell_write`, `ssh_shell_read` (head-paginated with `clear=true`), `ssh_shell_close`
 - **SFTP**: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`
 - **Network**: `ssh_forward` (feature-gated)
+
+Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget.
 
 ### Configuration
 
@@ -143,25 +144,9 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 - Methods < 30 lines, SOLID principles
 - Lock-free data structures (`DashMap`) for concurrent access
-- 480+ unit tests (`cargo test --all-features`)
+- 501 unit tests (`cargo test --all-features`) plus HTTP and stdio Python integration suites
 - Feature flag: `port_forward` (default: enabled)
 
-## v2.0.0 Migration Notes
+## v2 Migration Notes
 
-Breaking change: all MCP tool responses are now plain markdown strings
-(`Text<String>`) instead of structured JSON. Clients that parsed the
-old response fields directly must update. Legacy JSON responses can no
-longer be produced — the old `SshConnectResponse`, `SshExecuteResponse`,
-etc. structs have been removed from `src/mcp/types.rs`.
-
-Integration clients wanting the old keys can use the
-`parse_mcp_response` helper added to `scripts/test_http.py` /
-`scripts/test_stdio.py` as a reference for reconstructing them.
-
-New optional parameters (safe to omit):
-- `ssh_connect.reuse` (`suggest` | `auto` | `force_new`)
-- `ssh_get_command_output.max_output_bytes` (usize)
-- `ssh_shell_read.max_output_bytes` (usize)
-- `ssh_cancel_command.max_output_bytes` (usize)
-- `ssh_list_sessions.max_items` (usize)
-- `ssh_list_commands.max_items` (usize)
+All MCP tool responses are plain markdown `Text<String>`. Clients parsing the old JSON field shapes should use the `parse_mcp_response` helper from `scripts/test_http.py` / `scripts/test_stdio.py` as a reference implementation. New optional parameters available since v2.0: `ssh_connect.reuse`, `ssh_get_command_output.max_output_bytes`, `ssh_shell_read.max_output_bytes`, `ssh_cancel_command.max_output_bytes`, `ssh_list_sessions.max_items`, `ssh_list_commands.max_items`.
