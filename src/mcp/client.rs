@@ -621,7 +621,7 @@ async fn open_async_channel(
     status_tx: &watch::Sender<AsyncCommandStatus>,
     cancel_token: &CancellationToken,
 ) -> Option<Channel<client::Msg>> {
-    const MAX_ATTEMPTS: u32 = 10;
+    const MAX_ATTEMPTS: u32 = 25;
     let mut attempt = 0_u32;
     loop {
         if cancel_token.is_cancelled() {
