@@ -855,7 +855,11 @@ if stress_sid:
         if i % 2 == 0:
             r = tool("ssh_execute", {"session_id": stress_sid, "command": f"echo STRESS_{i}"})
             cid = r.get("command_id", "")
-            out = tool("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5, "max_output_bytes": 512})
+            # Generous wait_timeout so the per-iteration budget accommodates
+            # the post-cancel drain (handle_cancellation waits up to 2 s for
+            # the server to acknowledge CHANNEL_CLOSE) plus OpenSSH's slot
+            # reclamation under bursty execute+cancel churn.
+            out = tool("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 30, "max_output_bytes": 512})
             if f"STRESS_{i}" not in out.get("stdout", ""):
                 stress2_ok = False
                 break
