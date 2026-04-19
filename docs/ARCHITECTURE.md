@@ -1,15 +1,15 @@
 # SSH MCP Architecture
 
-This document describes the system architecture of the SSH Model Context Protocol (MCP) Server, providing a comprehensive overview of components, their relationships, and the underlying threading model.
+This document describes the system architecture of the SSH Model Context Protocol (MCP) Server, providing a comprehensive overview of components, their relationships, and the underlying threading model. Unless stated otherwise, everything here reflects the **v2.0.1** codebase, where every tool returns a markdown `Text<String>` response built by `message::builder`.
 
 [[_TOC_]]
 
 ## Overview
 
-SSH MCP is a Rust-based server that exposes SSH operations as MCP tools, enabling LLM-based systems to interact with remote servers via SSH. The system provides two transport modes:
+SSH MCP is a Rust crate that exposes SSH operations as MCP tools, enabling LLM-based systems to interact with remote servers via SSH. Two transport binaries are provided:
 
-1. **HTTP Transport** (`ssh-mcp`) - Poem-based HTTP server on port 8000
-2. **Stdio Transport** (`ssh-mcp-stdio`) - Direct stdio communication for MCP integration
+1. **HTTP Transport** (`ssh-mcp`) — Poem-based HTTP server, default port 8000, streamable HTTP endpoint.
+2. **Stdio Transport** (`ssh-mcp-stdio`) — Line-delimited JSON-RPC on stdin/stdout, logs go to stderr. Ships a small event loop (`src/bin/ssh_mcp_stdio.rs`) that intercepts `notifications/cancelled` (both `camelCase` and `snake_case`) and drops responses for cancelled IDs.
 
 <details>
 <summary>System overview diagram</summary>
@@ -22,17 +22,19 @@ flowchart TB
     end
 
     subgraph Transport["Transport Layer"]
-        HTTP["HTTP Server<br/>(Poem Framework)"]
-        STDIO["Stdio Transport"]
+        HTTP["HTTP Server<br/>(Poem, streamable_http)"]
+        STDIO["Stdio Transport<br/>(JSON-RPC, stderr logs)"]
     end
 
     subgraph Core["SSH MCP Core"]
-        MCP["McpSSHCommands<br/>(MCP Tools)"]
-        Sessions["Session Store<br/>(SESSION_STORAGE)"]
+        MCP["McpSSHCommands<br/>16 MCP Tools"]
+        Storage["Storage Layer<br/>(SESSION/COMMAND/SHELL/TRANSFER_STORAGE)"]
+        Messages["Message Layer<br/>(builder + helpers)"]
     end
 
     subgraph SSH["SSH Layer"]
-        Russh["russh<br/>(Async SSH Client)"]
+        Russh["russh 0.55<br/>(Async SSH Client)"]
+        RusshSftp["russh-sftp 2<br/>(SFTP Streaming)"]
         Agent["SSH Agent"]
     end
 
@@ -46,12 +48,15 @@ flowchart TB
     CLI --> STDIO
     HTTP --> MCP
     STDIO --> MCP
-    MCP --> Sessions
+    MCP --> Storage
+    MCP --> Messages
     MCP --> Russh
+    MCP --> RusshSftp
     Russh --> Agent
     Russh --> Server1
     Russh --> Server2
     Russh --> ServerN
+    RusshSftp --> Server1
 
     style Core fill:#e1f5fe
     style Transport fill:#fff3e0
@@ -62,195 +67,96 @@ flowchart TB
 
 ## Module Structure
 
-The codebase consists of **30 source files** organized into a modular SOLID architecture:
+The codebase consists of **28 source files** (roughly **12.9K lines** including tests) organized into a SOLID-friendly, trait-driven architecture.
 
 ### Core Modules (`src/mcp/`)
 
 | File | Lines | Visibility | Description |
 |------|-------|------------|-------------|
-| `lib.rs` | - | `pub` | Library crate root, exposes `mcp` module |
-| `mod.rs` | 42 | - | Module root, re-exports `McpSSHCommands` |
-| `types.rs` | 1646 | `pub` | Serializable response types for MCP tools (session, command, shell, transfer) |
-| `config.rs` | 669 | `pub(crate)` | Configuration resolution with environment variable support |
-| `error.rs` | 359 | `pub(crate)` | Error classification for retry logic |
-| `session.rs` | 41 | `pub` | SSH client handler |
-| `client.rs` | 900 | `pub(crate)` | SSH connection, authentication, command execution, PTY channels |
-| `forward.rs` | 155 | `pub(crate)` | Port forwarding implementation (feature-gated) |
-| `async_command.rs` | 183 | `pub(crate)` | Async command types (`RunningCommand`, `OutputBuffer`) |
-| `shell.rs` | 146 | `pub(crate)` | Interactive PTY shell types (`RunningShell`, `ChannelWriter`) |
-| `schema.rs` | 118 | `pub` | JSON schema helpers for LLM-friendly schemas |
-| `commands.rs` | 1453 | `pub` | MCP tool implementations via `#[Tools]` macro (16 tools) |
-| `sftp.rs` | 601 | `pub(crate)` | SFTP session management, streaming transfer, error classification |
-| `transfer.rs` | 341 | `pub(crate)` | Transfer tracking types (`RunningTransfer`, `TransferStatus`, `TransferDirection`) |
+| `mod.rs` | 40 | — | Module root / feature gating. |
+| `types.rs` | 230 | `pub` | Internal data carriers (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, status enums). Structured response types from v1 were removed — handlers now build markdown directly via `message::builder`. |
+| `config.rs` | 1101 | `pub(crate)` | Parameter / env / default resolution plus human-readable byte-size parser. |
+| `error.rs` | 359 | `pub(crate)` | Retryable vs non-retryable classifier. |
+| `session.rs` | 41 | `pub` | `SshClientHandler` (russh host-key handler — currently accepts all keys, ready for extension). |
+| `client.rs` | 1220 | `pub(crate)` | Address parsing, `build_client_config`, retry loop with `backon`, command execution (sync + async + async-PTY), PTY shell open, default key discovery. |
+| `async_command.rs` | 325 | `pub(crate)` | `RunningCommand` + bounded `OutputBuffer` (head-drained stdout/stderr). |
+| `shell.rs` | 152 | `pub(crate)` | `RunningShell`, `ChannelWriter`, shell capacity constants (`MAX_SHELLS_PER_SESSION = 10`). |
+| `schema.rs` | 76 | `pub` | `uint` schema helper for `schemars` (avoids `format: "uint"` which some LLMs can't parse). |
+| `forward.rs` | 168 | `pub(crate)` | Port forwarding via `channel_open_direct_tcpip` + bidirectional `tokio::io::copy` (feature-gated `port_forward`). |
+| `commands.rs` | 2272 | `pub` | `McpSSHCommands` with the 16 `#[Tools]`-annotated handlers and their orchestration helpers (reuse detection, cleanup tasks, response builders). |
+| `sftp.rs` | 740 | `pub(crate)` | `open_sftp_session`, path resolution (`~` + relative → home), streaming upload/download, `classify_transfer_error` (FILE_NOT_FOUND, PERMISSION_DENIED, ...). |
+| `transfer.rs` | 342 | `pub(crate)` | `RunningTransfer`, `TransferDirection`, `TransferStatus`, `MAX_TRANSFERS_PER_SESSION = 10`, `CHUNK_SIZE = 32 KiB`. |
 
-### Storage Layer (`src/mcp/storage/`) - SOLID: SRP, DIP
+### Storage Layer (`src/mcp/storage/`) — SOLID: SRP, DIP
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `mod.rs` | 26 | Module exports and global storage instances |
-| `traits.rs` | 168 | `SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage` trait definitions |
-| `session.rs` | 493 | `DashMapSessionStorage` with agent index and tests |
-| `command.rs` | 998 | `DashMapCommandStorage` with session index and tests |
-| `shell.rs` | 179 | `DashMapShellStorage` with session index and tests |
-| `transfer.rs` | 179 | `DashMapTransferStorage` with session index and tests |
-
-### Authentication Layer (`src/mcp/auth/`) - SOLID: OCP, SRP
+Traits live in `traits.rs`; each implementation uses `DashMap` for lock-free concurrent reads and writes, plus secondary indices for O(1) lookups.
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 36 | Module exports and usage examples |
-| `traits.rs` | 40 | `AuthStrategy` trait definition |
-| `password.rs` | 129 | `PasswordAuth` strategy with tests |
-| `key.rs` | 205 | `KeyAuth` strategy (RSA, Ed25519) with tests |
-| `agent.rs` | 139 | `AgentAuth` strategy (SSH agent) with tests |
-| `chain.rs` | 323 | `AuthChain` for trying multiple strategies with tests |
+| `mod.rs` | 12 | Module exports. |
+| `traits.rs` | 186 | `SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage` traits plus `SessionRef` / `CommandRef` read-only views. |
+| `session.rs` | 691 | `DashMapSessionStorage`, `parse_host_port`, `find_by_identity`, agent & identity indices, per-session channel semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`). |
+| `command.rs` | 1088 | `DashMapCommandStorage` with session index and running-only counter. |
+| `shell.rs` | 173 | `DashMapShellStorage` with session index. |
+| `transfer.rs` | 173 | `DashMapTransferStorage` with session index. |
 
-### Message Layer (`src/mcp/message/`) - SOLID: SRP
+Global singleton instances (`SESSION_STORAGE`, `COMMAND_STORAGE`, `SHELL_STORAGE`, `TRANSFER_STORAGE`) expose the traits to the rest of the crate via `LazyLock`.
+
+### Authentication Layer (`src/mcp/auth/`) — SOLID: OCP, SRP
+
+Strategy pattern via `AuthStrategy`, with `AuthChain` composing multiple strategies in order.
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mod.rs` | 13 | Module exports |
-| `builder.rs` | 1335 | Fluent message builders with comprehensive tests |
+| `mod.rs` | 30 | Module exports and a usage example. |
+| `traits.rs` | 40 | `AuthStrategy` trait (`authenticate`, `name`). |
+| `password.rs` | 129 | Password auth. |
+| `key.rs` | 212 | Key-file auth. Queries `best_supported_rsa_hash()` and wraps the key with `PrivateKeyWithHashAlg` so RSA keys negotiate `rsa-sha2-256` / `rsa-sha2-512` when available. |
+| `agent.rs` | 145 | SSH-agent auth. Connects via `SSH_AUTH_SOCK`, iterates all identities, negotiates RSA hash per identity. |
+| `chain.rs` | 330 | `AuthChain` — fluent builder: `.with_password`, `.with_key`, `.with_agent`. |
 
-### Module Responsibilities
+The default chain assembled in `client::build_auth_chain` is:
 
-**lib.rs** - Library Root
-- Exposes the `mcp` module for external use
-- Entry point for the library crate
+1. `PasswordAuth` (if a password was provided).
+2. `KeyAuth` for each provided / discovered key file — `key_path` when explicit, otherwise each default OpenSSH file found in `~/.ssh/` (`id_ed25519`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519_sk`, `id_rsa`, `id_dsa`).
+3. `AgentAuth` is always appended.
 
-**mod.rs** - Module Root
-- Declares and organizes submodules (including `storage`, `auth`, `message`)
-- Controls visibility (pub, pub(crate))
-- Re-exports `McpSSHCommands` for convenience
+### Message Layer (`src/mcp/message/`) — SOLID: SRP
 
-**types.rs** - Response Types
-- `SessionInfo` - Session metadata for tracking connections (includes optional `name` and `agent_id` fields)
-- `SshConnectResponse` - Connection result with retry information
-- `SshCommandResponse` - Command output with stdout, stderr, exit code, and `timed_out` flag
-- `PortForwardingResponse` - Port forwarding status (feature-gated)
-- `SessionListResponse` - List of active sessions
-- `AsyncCommandInfo`, `AsyncCommandStatus` - Async command metadata
-- `ShellInfo`, `ShellStatus` - Interactive shell metadata
-- `SshShellOpenResponse`, `SshShellReadResponse`, `SshShellCloseResponse` - Shell tool responses
+| File | Lines | Description |
+|------|-------|-------------|
+| `mod.rs` | 8 | Re-exports. |
+| `helpers.rs` | 1001 | Shared primitives: `generate_nonce()`, `truncate_utf8_safe_tail`/`head`, `sanitize_value`, `format_bytes_human`, `format_error`, `render_output_block`. |
+| `builder.rs` | 1635 | Per-tool markdown builders — see below. |
 
-**config.rs** - Configuration Management
-- Default constants using `Duration` type (`DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_COMMAND_TIMEOUT`, `DEFAULT_RETRY_DELAY`, `MAX_RETRY_DELAY`)
-- Environment variable names and parsing
-- `resolve_*` functions returning `Duration` implementing Parameter -> Env -> Default priority
+**`message::helpers`** (shared across every tool response):
 
-**error.rs** - Error Classification
-- `is_retryable_error()` - Classifies errors as transient or permanent
-- Authentication errors (non-retryable) vs connection errors (retryable)
+- `generate_nonce()` — 8-character lowercase hex, sourced from the high 32 bits of a fresh UUIDv4 (~4 billion unique values). Used as an anti-injection token in `--- stdout [nonce] ---` delimiters.
+- `truncate_utf8_safe_tail` / `truncate_utf8_safe_head` — respect UTF-8 char boundaries when cutting bytes.
+- `sanitize_value` — `Cow` wrapper; only allocates if the input contains `\n`, `\r`, or `\t` (escaped to two-char literals).
+- `format_bytes_human` — base-1024 size renderer with one decimal place (`B`, `KB`, `MB`, `GB`).
+- `format_error(tool, code, reason, detail?)` — canonical `TOOL: ERROR` / `REASON: [CODE] ...` / `DETAIL: ...` block; detail is head-truncated at 2 KiB.
+- `render_output_block(name, nonce, &[u8], max_bytes, status_hint?)` — renders an output block without materializing the whole buffer as `String`; only the truncated tail is allocated.
 
-**session.rs** - SSH Client Handler
-- `SshClientHandler` - russh client handler that accepts all host keys
+**`message::builder`** — dedicated builder for each tool response. All builders are `#[must_use]` and return `String`:
 
-**client.rs** - SSH Client Operations
-- `build_client_config()` - Builds russh configuration with compression preferences
-- `parse_address()` - Parses host and port from address string
-- `connect_to_ssh_with_retry()` - Connection with exponential backoff via backon
-- Uses `AuthChain` from auth module for authentication
-- `execute_ssh_command()` - Command execution via channel-based async I/O
-- `open_pty_shell()` - Opens PTY channel with shell for interactive sessions
-- `execute_ssh_command_async_pty()` - Execute command with PTY allocation
+- `ConnectOkBuilder` (OK / REUSED / replaced), `ConnectSuggestedBuilder` (single- and multi-match) + `SessionMatch`.
+- `ExecuteStartedBuilder`.
+- `GetCommandOutputBuilder` with `GetCommandOutputState::{Running, Completed(i32), Timeout}`.
+- `CancelCommandCancelledBuilder` + `render_cancel_command_noop`.
+- `ShellOpenBuilder`, `ShellReadBuilder` with `ShellReadState::{Open, Closed}`.
+- `TransferStartedBuilder` (+ `TransferStartDirection::{Upload, Download}`), `TransferProgressBuilder` with `TransferProgressState::{Running, Completed, Failed(&str)}`.
+- `ListSessionsBuilder`, `ListCommandsBuilder` — apply pagination markers (`COUNT: N (showing N of M)`).
+- Inline renderers for small responses: `render_disconnect_ok`, `render_disconnect_agent`, `render_shell_write_ok`, `render_shell_close_ok`, `render_forward_ok`.
 
-**forward.rs** - Port Forwarding (feature-gated)
-- `setup_port_forwarding()` - Creates TCP listener and spawns forwarder
-- `handle_port_forward_connection()` - Bidirectional I/O via direct-tcpip
+### Response Format (v2.0)
 
-**async_command.rs** - Async Command Types
-- `RunningCommand` - State for a running async command including:
-  - `cancel_token: CancellationToken` - Token to cancel the command
-  - `status_rx/status_tx: watch::channel` - Status updates
-  - `output: Arc<Mutex<OutputBuffer>>` - Output buffer for stdout/stderr collection
-  - `exit_code`, `error`, `timed_out` - Completion state
-- `OutputBuffer` - Simple struct holding `stdout: Vec<u8>` and `stderr: Vec<u8>`
-
-**commands.rs** - MCP Tools (16 total)
-- `McpSSHCommands` struct with `#[Tools]` impl
-- Uses storage traits (`SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage`) via global instances
-- Uses message builders for LLM-friendly responses
-- Session tools: `ssh_connect`, `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`
-- Command tools: `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`
-- Shell tools: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_read`, `ssh_shell_close`
-- SFTP tools: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`
-- Port forwarding: `ssh_forward`
-
-**sftp.rs** - SFTP Operations
-- `open_sftp_session()` - Opens SFTP subsystem on existing SSH handle
-- `sftp_upload_streaming()` - Streaming upload with progress tracking
-- `sftp_download_streaming()` - Streaming download with progress tracking
-- `classify_transfer_error()` - Maps raw errors to `[FILE_NOT_FOUND]`, `[REMOTE_DIR_NOT_FOUND]`, etc.
-- `resolve_local_path()` - Resolves `~` and relative paths
-
-**transfer.rs** - Transfer Tracking Types
-- `RunningTransfer` - State container for async SFTP transfers
-- `TransferStatus` - Enum: Running, Completed, Failed
-- `TransferDirection` - Enum: Upload, Download
-- `CHUNK_SIZE = 32768` - SFTP transfer chunk size
-
-### Storage Layer (storage/)
-
-**storage/traits.rs** - Storage Abstractions (DIP)
-- `SessionStorage` trait - CRUD for SSH sessions
-- `CommandStorage` trait - CRUD for async commands
-- `ShellStorage` trait - CRUD for interactive shells
-- `TransferStorage` trait - CRUD for SFTP transfers
-- `SessionRef`, `CommandRef` - Read-only reference types
-
-**storage/session.rs** - Session Storage Implementation
-- `DashMapSessionStorage` - Lock-free concurrent session storage
-- `SESSIONS_BY_AGENT` - Secondary index for agent-based queries
-- `SESSION_STORAGE` - Global instance
-
-**storage/command.rs** - Command Storage Implementation
-- `DashMapCommandStorage` - Lock-free concurrent command storage
-- `COMMANDS_BY_SESSION` - Secondary index for O(1) session lookups
-- `COMMAND_STORAGE` - Global instance
-- `MAX_ASYNC_COMMANDS_PER_SESSION = 100`
-
-**storage/shell.rs** - Shell Storage Implementation
-- `ShellStorage` trait - CRUD for interactive shell sessions
-- `DashMapShellStorage` - Lock-free concurrent shell storage
-- `SHELLS_BY_SESSION` - Secondary index for O(1) session lookups
-- `SHELL_STORAGE` - Global instance
-- `MAX_SHELLS_PER_SESSION = 10`
-
-**storage/transfer.rs** - Transfer Storage Implementation
-- `TransferStorage` trait - CRUD for SFTP transfer sessions
-- `DashMapTransferStorage` - Lock-free concurrent transfer storage
-- `TRANSFERS_BY_SESSION` - Secondary index for O(1) session lookups
-- `TRANSFER_STORAGE` - Global instance
-
-### Authentication Layer (auth/)
-
-**auth/traits.rs** - Auth Strategy Pattern (OCP)
-```rust
-#[async_trait]
-pub trait AuthStrategy: Send + Sync {
-    async fn authenticate(&self, handle: &mut Handle, username: &str) -> Result<bool, String>;
-    fn name(&self) -> &'static str;
-}
-```
-
-**auth/password.rs** - Password Authentication
-**auth/key.rs** - Key File Authentication (RSA, Ed25519)
-**auth/agent.rs** - SSH Agent Authentication
-**auth/chain.rs** - Composite Authentication
-- `AuthChain` - Tries multiple strategies in order
-- Fluent builder: `.with_password()`, `.with_key()`, `.with_agent()`
-
-### Message Layer (message/)
-
-**message/builder.rs** - Message Builders (SRP)
-- `ConnectMessageBuilder` - Connection success messages
-- `ExecuteMessageBuilder` - Command start messages
-- `AgentDisconnectMessageBuilder` - Cleanup summary messages
-- `ShellOpenMessageBuilder` - Interactive shell open messages
-- `UploadMessageBuilder` - SFTP upload messages
-- `DownloadMessageBuilder` - SFTP download messages
-- `TransferProgressMessageBuilder` - Transfer progress messages
-- Fluent builder pattern for LLM-friendly formatted responses
+- **First line** → `TOOL_NAME: STATUS` where status is one of `OK`, `REUSED`, `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`.
+- **Block layout** when the body has 4+ fields or an output block (one `KEY: value` per line).
+- **Inline layout** for ≤3 simple fields (`TOOL: STATUS | KEY: v | KEY: v`).
+- **Identifiers** use the `_ID` suffix (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`).
+- **Output blocks** — `--- stdout [a3f2b1d7] ---`, `--- stdout [a3f2b1d7] (empty) ---`, `--- stdout [a3f2b1d7] (partial, truncated: showing 16.0KB of 2.3MB) ---`. Shells use `data` instead of `stdout`/`stderr`.
+- **Errors** — `TOOL: ERROR\nREASON: [CODE] ...\nDETAIL: ...`. See [`docs/API.md`](API.md#error-format) for the code catalogue.
 
 ## Module Dependency Graph
 
@@ -261,86 +167,86 @@ pub trait AuthStrategy: Send + Sync {
 flowchart TB
     subgraph Binaries["Binary Targets"]
         main["main.rs<br/>HTTP Server"]
-        stdio["ssh_mcp_stdio.rs<br/>Stdio Transport"]
+        stdio["bin/ssh_mcp_stdio.rs<br/>Stdio Transport"]
     end
 
-    subgraph Library["Library - src/lib.rs"]
+    subgraph Library["Library (src/lib.rs)"]
         lib["lib.rs"]
     end
 
     subgraph Public["Public Modules"]
         commands["commands.rs<br/>McpSSHCommands"]
-        types["types.rs<br/>Response Types"]
-        session["session.rs<br/>Session Storage"]
+        types["types.rs<br/>SessionInfo / AsyncCommandInfo / ShellInfo"]
+        session["session.rs<br/>SshClientHandler"]
+        schema["schema.rs<br/>JSON schema helper"]
+        storage["storage (traits + DashMap impls)"]
+        message["message::{builder, helpers}"]
+        auth["auth::{traits, password, key, agent, chain}"]
     end
 
     subgraph Internal["Internal Modules"]
-        client["client.rs<br/>SSH Client Logic"]
-        config["config.rs<br/>Configuration"]
-        error["error.rs<br/>Error Classification"]
-        forward["forward.rs<br/>Port Forwarding"]
-        async_cmd["async_command.rs<br/>Async Command Storage"]
-        shell["shell.rs<br/>Interactive Shell"]
-        schema["schema.rs<br/>JSON Schema"]
-        modrs["mod.rs<br/>Module Root"]
+        client["client.rs"]
+        config["config.rs"]
+        error["error.rs"]
+        forward["forward.rs"]
+        async_cmd["async_command.rs"]
+        shell["shell.rs"]
+        sftp["sftp.rs"]
+        transfer["transfer.rs"]
     end
 
     subgraph External["External Crates"]
-        russh["russh"]
+        russh["russh 0.55"]
+        russh_sftp["russh-sftp 2"]
         backon["backon"]
-        tokio["tokio"]
-        tokio_util["tokio-util"]
+        tokio["tokio + tokio-util"]
         poem_mcp["poem-mcpserver"]
         tracing["tracing"]
     end
 
-    main --> modrs
-    stdio --> lib
-    lib --> modrs
-
-    modrs --> commands
-    modrs --> types
-    modrs --> session
-    modrs --> client
-    modrs --> config
-    modrs --> error
-    modrs --> forward
-    modrs --> async_cmd
-    modrs --> shell
-    modrs --> schema
+    main --> poem_mcp
+    main --> commands
+    stdio --> commands
+    stdio --> poem_mcp
+    lib --> commands
 
     commands --> client
-    commands --> config
-    commands --> session
-    commands --> types
+    commands --> sftp
     commands --> forward
     commands --> async_cmd
     commands --> shell
-    commands --> poem_mcp
+    commands --> storage
+    commands --> message
+    commands --> transfer
+    commands --> config
 
+    client --> auth
     client --> config
     client --> error
     client --> session
-    client --> types
     client --> async_cmd
     client --> russh
     client --> backon
-    client --> tokio
-    client --> tracing
 
-    async_cmd --> types
-    async_cmd --> tokio
-    async_cmd --> tokio_util
+    sftp --> session
+    sftp --> transfer
+    sftp --> russh_sftp
 
-    forward --> session
+    storage --> session
+    storage --> async_cmd
+    storage --> shell
+    storage --> transfer
+    storage --> types
+
+    message --> types
+
+    auth --> session
+    auth --> russh
+
     forward --> russh
     forward --> tokio
-
-    session --> types
-    session --> russh
-    session --> tokio
-
-    stdio --> tracing
+    async_cmd --> tokio
+    shell --> tokio
 
     style Binaries fill:#fce4ec
     style Library fill:#e8f5e9
@@ -353,7 +259,7 @@ flowchart TB
 
 ## Component Architecture
 
-The following diagram illustrates the relationships between the main components:
+The following diagram shows the concrete types behind the 16 tools. Note that v1's many public response structs were removed; every tool now returns `Text<String>` built by `message::builder`.
 
 <details>
 <summary>Component class diagram</summary>
@@ -361,49 +267,42 @@ The following diagram illustrates the relationships between the main components:
 ```mermaid
 classDiagram
     class McpSSHCommands {
-        +ssh_connect() StructuredContent~SshConnectResponse~
-        +ssh_execute() StructuredContent~SshExecuteResponse~
-        +ssh_get_command_output() StructuredContent~SshAsyncOutputResponse~
-        +ssh_list_commands() StructuredContent~AsyncCommandListResponse~
-        +ssh_cancel_command() StructuredContent~SshCancelCommandResponse~
-        +ssh_forward() StructuredContent~PortForwardingResponse~
-        +ssh_disconnect() Text~String~
-        +ssh_list_sessions() StructuredContent~SessionListResponse~
-        +ssh_disconnect_agent() StructuredContent~AgentDisconnectResponse~
-        +ssh_shell_open() StructuredContent~SshShellOpenResponse~
-        +ssh_shell_write() Text~String~
-        +ssh_shell_read() StructuredContent~SshShellReadResponse~
-        +ssh_shell_close() StructuredContent~SshShellCloseResponse~
+        +ssh_connect() Text
+        +ssh_disconnect() Text
+        +ssh_list_sessions() Text
+        +ssh_disconnect_agent() Text
+        +ssh_execute() Text
+        +ssh_get_command_output() Text
+        +ssh_list_commands() Text
+        +ssh_cancel_command() Text
+        +ssh_forward() Text
+        +ssh_shell_open() Text
+        +ssh_shell_write() Text
+        +ssh_shell_read() Text
+        +ssh_shell_close() Text
+        +ssh_upload() Text
+        +ssh_download() Text
+        +ssh_get_transfer_progress() Text
     }
 
     class StoredSession {
         +info: SessionInfo
-        +handle: Arc~Mutex~Handle~~
+        +handle: Arc~Handle~
+        +channel_permits: Arc~Semaphore~
     }
 
     class SessionInfo {
         +session_id: String
         +name: Option~String~
+        +agent_id: Option~String~
         +host: String
         +username: String
         +connected_at: String
         +default_timeout_secs: u64
         +retry_attempts: u32
         +compression_enabled: bool
-    }
-
-    class SshConnectResponse {
-        +session_id: String
-        +message: String
-        +authenticated: bool
-        +retry_attempts: u32
-    }
-
-    class SshCommandResponse {
-        +stdout: String
-        +stderr: String
-        +exit_code: i32
-        +timed_out: bool
+        +last_health_check: Option~String~
+        +healthy: Option~bool~
     }
 
     class RunningCommand {
@@ -415,71 +314,64 @@ classDiagram
         +exit_code: Arc~Mutex~Option~i32~~~
         +error: Arc~Mutex~Option~String~~~
         +timed_out: Arc~AtomicBool~
+        +output_read: Arc~AtomicBool~
     }
 
     class OutputBuffer {
         +stdout: Vec~u8~
         +stderr: Vec~u8~
+        +append_stdout_bounded(cap)
+        +append_stderr_bounded(cap)
     }
 
-    class AsyncCommandInfo {
-        +command_id: String
-        +session_id: String
-        +command: String
-        +status: AsyncCommandStatus
-        +started_at: String
+    class RunningShell {
+        +info: ShellInfo
+        +cancel_token: CancellationToken
+        +output: Arc~Mutex~Vec~~
+        +channel_writer: Arc~Mutex~ChannelWriter~~
+        +status_tx: watch~Sender~
+        +status_rx: watch~Receiver~
+        +last_activity: Arc~Mutex~Instant~~
+        +max_buffer_size: Arc~AtomicU64~
     }
 
-    class AsyncCommandStatus {
-        <<enumeration>>
-        Running
-        Completed
-        Cancelled
-        Failed
-    }
-
-    class PortForwardingResponse {
-        +local_address: String
-        +remote_address: String
-        +active: bool
-    }
-
-    class SessionListResponse {
-        +sessions: Vec~SessionInfo~
-        +count: usize
-    }
-
-    class SshClientHandler {
-        +check_server_key() Result~bool~
+    class RunningTransfer {
+        +info: TransferInfo
+        +cancel_token: CancellationToken
+        +bytes_transferred: Arc~AtomicU64~
+        +total_bytes: Arc~AtomicU64~
+        +status_rx: watch~Receiver~
+        +status_tx: watch~Sender~
+        +error: Arc~Mutex~Option~String~~~
     }
 
     class SESSION_STORAGE {
         <<global>>
         LazyLock~DashMapSessionStorage~
     }
-
     class COMMAND_STORAGE {
         <<global>>
         LazyLock~DashMapCommandStorage~
     }
+    class SHELL_STORAGE {
+        <<global>>
+        LazyLock~DashMapShellStorage~
+    }
+    class TRANSFER_STORAGE {
+        <<global>>
+        LazyLock~DashMapTransferStorage~
+    }
 
-    McpSSHCommands ..> StoredSession : manages
-    McpSSHCommands ..> SshConnectResponse : returns
-    McpSSHCommands ..> SshCommandResponse : returns
-    McpSSHCommands ..> RunningCommand : manages async
-    McpSSHCommands ..> PortForwardingResponse : returns
-    McpSSHCommands ..> SessionListResponse : returns
-    McpSSHCommands ..> AgentDisconnectResponse : returns
-    StoredSession *-- SessionInfo : contains
-    StoredSession --> SshClientHandler : uses
-    SESSION_STORAGE --> StoredSession : stores
-    COMMAND_STORAGE --> RunningCommand : stores
-    RunningCommand *-- AsyncCommandInfo : contains
-    RunningCommand *-- OutputBuffer : contains
-    AsyncCommandInfo --> AsyncCommandStatus : has
-
-    note for SESSION_STORAGE "DashMapSessionStorage\nDashMap (lock-free)"
-    note for COMMAND_STORAGE "DashMapCommandStorage\nDashMap (lock-free)\nMax 100 commands per session"
+    McpSSHCommands ..> StoredSession
+    McpSSHCommands ..> RunningCommand
+    McpSSHCommands ..> RunningShell
+    McpSSHCommands ..> RunningTransfer
+    StoredSession *-- SessionInfo
+    RunningCommand *-- OutputBuffer
+    SESSION_STORAGE --> StoredSession
+    COMMAND_STORAGE --> RunningCommand
+    SHELL_STORAGE --> RunningShell
+    TRANSFER_STORAGE --> RunningTransfer
 ```
 
 </details>
@@ -488,150 +380,100 @@ classDiagram
 
 | Component | Module | Description |
 |-----------|--------|-------------|
-| `McpSSHCommands` | commands.rs | Main struct implementing MCP tools via the `#[Tools]` attribute macro |
-| `SessionStorage` | storage/traits.rs | Trait for session CRUD operations (DIP) |
-| `CommandStorage` | storage/traits.rs | Trait for command CRUD operations (DIP) |
-| `DashMapSessionStorage` | storage/session.rs | Lock-free concurrent session storage with agent index |
-| `DashMapCommandStorage` | storage/command.rs | Lock-free concurrent command storage with session index |
-| `SESSION_STORAGE` | storage/session.rs | Global session storage instance (implements `SessionStorage`) |
-| `COMMAND_STORAGE` | storage/command.rs | Global command storage instance (implements `CommandStorage`) |
-| `AuthStrategy` | auth/traits.rs | Trait for authentication methods (OCP) |
-| `AuthChain` | auth/chain.rs | Composite authentication with multiple strategies |
-| `SessionInfo` | types.rs | Serializable metadata for tracking connection information |
-| `SshClientHandler` | session.rs | Implements `russh::client::Handler` for host key verification |
-| `RunningCommand` | async_command.rs | State container for async commands including output buffers and cancellation |
-| `OutputBuffer` | async_command.rs | Simple struct for collecting stdout/stderr from async commands |
-| `AsyncCommandInfo` | types.rs | Serializable metadata for async command tracking |
-| `AsyncCommandStatus` | types.rs | Enum representing command states: Running, Completed, Cancelled, Failed |
-| `ShellStorage` | storage/traits.rs | Trait for shell CRUD operations (DIP) |
-| `DashMapShellStorage` | storage/shell.rs | Lock-free concurrent shell storage with session index |
-| `SHELL_STORAGE` | storage/shell.rs | Global shell storage instance (implements `ShellStorage`) |
-| `RunningShell` | shell.rs | State container for interactive PTY shell sessions |
-| `ChannelWriter` | shell.rs | Write handle for sending input to shell PTY |
-| `ShellInfo` | types.rs | Serializable metadata for interactive shell sessions |
-| `ShellStatus` | types.rs | Enum representing shell states: Open, Closed |
-| `ConnectMessageBuilder` | message/builder.rs | Fluent builder for connection success messages |
-| `ShellOpenMessageBuilder` | message/builder.rs | Fluent builder for shell open messages |
-| `UploadMessageBuilder` | message/builder.rs | Fluent builder for SFTP upload messages |
-| `DownloadMessageBuilder` | message/builder.rs | Fluent builder for SFTP download messages |
-| `TransferProgressMessageBuilder` | message/builder.rs | Fluent builder for transfer progress messages |
-| `TransferStorage` | storage/traits.rs | Trait for SFTP transfer CRUD operations (DIP) |
-| `DashMapTransferStorage` | storage/transfer.rs | Lock-free concurrent transfer storage with session index |
-| `TRANSFER_STORAGE` | storage/transfer.rs | Global transfer storage instance (implements `TransferStorage`) |
-| `RunningTransfer` | transfer.rs | State container for async SFTP transfers |
-| `TransferStatus` | transfer.rs | Enum representing transfer states: Running, Completed, Failed |
-| `TransferDirection` | transfer.rs | Enum representing transfer direction: Upload, Download |
+| `McpSSHCommands` | `commands.rs` | MCP tool surface. Each handler returns `Result<Text<String>, String>` or `Text<String>` directly. |
+| `SshClientHandler` | `session.rs` | russh host-key handler (accepts all keys — extend for `known_hosts` verification in production). |
+| `SessionStorage` trait + `DashMapSessionStorage` | `storage/session.rs` | Primary map + agent index + identity-triple index (`host_lc`, `port`, `user`) for smart reuse. Each stored session owns a 1-permit channel semaphore. |
+| `CommandStorage` trait + `DashMapCommandStorage` | `storage/command.rs` | Primary map + per-session index; `count_running_by_session` feeds the 100-commands-per-session cap. |
+| `ShellStorage` trait + `DashMapShellStorage` | `storage/shell.rs` | Primary map + per-session index. |
+| `TransferStorage` trait + `DashMapTransferStorage` | `storage/transfer.rs` | Primary map + per-session index. |
+| `AuthStrategy` trait + `AuthChain` | `auth/*` | Strategy / chain pattern. `with_password`, `with_key`, `with_agent` fluent builder. |
+| `RunningCommand` / `OutputBuffer` | `async_command.rs` | Async command state; `OutputBuffer` drains head-first when over `SSH_COMMAND_MAX_BUFFER_SIZE` (default 10 MiB). |
+| `RunningShell` / `ChannelWriter` | `shell.rs` | Interactive PTY state. Output buffer bounded by `max_buffer_size`; shell reader task drops oldest bytes on overflow. |
+| `RunningTransfer` | `transfer.rs` | SFTP transfer state. `bytes_transferred` / `total_bytes` are atomic so progress polls are lock-free. |
+| Message builders | `message/builder.rs` | Per-tool markdown assemblers. Each carries the tool name, status, and relevant `_ID` fields. |
+| Helpers | `message/helpers.rs` | `format_error`, `render_output_block`, `generate_nonce`, sanitization, UTF-8 safe truncation. |
 
 ## Authentication Flow
 
-The client.rs module handles three authentication methods with modern RSA hash negotiation:
+`client.rs` composes an `AuthChain` and calls it inside the retry loop. Retries run only for connection-layer failures; authentication failures surface immediately.
 
 <details>
 <summary>Authentication flow diagram</summary>
 
 ```mermaid
 flowchart TB
-    subgraph Entry["Authentication Entry Point"]
-        Start["connect_to_ssh"]
+    subgraph Entry["client::connect_to_ssh"]
+        Start["build_client_config + parse_address"]
+        Connect["russh::client::connect (timeout)"]
+        BuildChain["build_auth_chain(password, key_path)"]
+        Authenticate["AuthChain.authenticate(&mut handle, username)"]
     end
 
-    subgraph Methods["Authentication Methods"]
-        Password["Password Auth"]
-        KeyFile["Key File Auth"]
-        Agent["SSH Agent Auth"]
+    subgraph Methods["Strategies (tried in order)"]
+        Password["PasswordAuth"]
+        KeyExplicit["KeyAuth (key_path)"]
+        KeyDefault["KeyAuth (default ~/.ssh/ keys)"]
+        Agent["AgentAuth"]
     end
 
-    subgraph KeyAuth["Key File Authentication"]
-        LoadKey["Load key from file"]
-        QueryHash1["Query best_supported_rsa_hash"]
-        WrapKey["Wrap key with PrivateKeyWithHashAlg"]
-        AuthKey["authenticate_publickey"]
+    subgraph KeyFlow["KeyAuth"]
+        LoadKey["keys::load_secret_key"]
+        QueryRSA["best_supported_rsa_hash"]
+        Wrap["PrivateKeyWithHashAlg"]
+        DoAuth["authenticate_publickey"]
     end
 
-    subgraph AgentAuth["SSH Agent Authentication"]
-        ConnectAgent["Connect to SSH_AUTH_SOCK"]
-        GetIdentities["Request identities from agent"]
-        LoopStart["For each identity"]
-        QueryHash2["Query best_supported_rsa_hash"]
-        TryAuth["authenticate_publickey_with"]
-        CheckResult["Check result"]
-        NextId["Try next identity"]
-        AgentSuccess["Return success"]
+    subgraph AgentFlow["AgentAuth"]
+        ConnectAgent["keys::agent::AgentClient::connect_env"]
+        ListIds["request_identities"]
+        LoopIds["For each identity"]
+        QueryAgentRSA["best_supported_rsa_hash"]
+        AgentAuthCall["authenticate_publickey_with(hash_alg)"]
     end
 
-    subgraph RSAHash["RSA Hash Negotiation"]
-        Negotiate["Server negotiates supported hashes"]
-        SelectHash["Select rsa-sha2-512 or rsa-sha2-256"]
-        FallbackSHA1["Fallback to ssh-rsa SHA1 if needed"]
-    end
+    Start --> Connect
+    Connect --> BuildChain
+    BuildChain --> Authenticate
 
-    Start --> Password
-    Start --> KeyFile
-    Start --> Agent
+    Authenticate --> Password
+    Authenticate --> KeyExplicit
+    Authenticate --> KeyDefault
+    Authenticate --> Agent
 
-    Password --> AuthSuccess
+    KeyExplicit --> KeyFlow
+    KeyDefault --> KeyFlow
+    KeyFlow --> LoadKey --> QueryRSA --> Wrap --> DoAuth
 
-    KeyFile --> LoadKey
-    LoadKey --> QueryHash1
-    QueryHash1 --> RSAHash
-    RSAHash --> WrapKey
-    WrapKey --> AuthKey
-    AuthKey --> AuthSuccess
-
-    Agent --> ConnectAgent
-    ConnectAgent --> GetIdentities
-    GetIdentities --> LoopStart
-    LoopStart --> QueryHash2
-    QueryHash2 --> RSAHash
-    RSAHash --> TryAuth
-    TryAuth --> CheckResult
-    CheckResult --> NextId
-    CheckResult --> AgentSuccess
-    NextId --> LoopStart
-    AgentSuccess --> AuthSuccess
-
-    Negotiate --> SelectHash
-    SelectHash --> FallbackSHA1
-
-    AuthSuccess["Authentication Success"]
+    Agent --> AgentFlow
+    AgentFlow --> ConnectAgent --> ListIds --> LoopIds --> QueryAgentRSA --> AgentAuthCall
 
     style Entry fill:#e3f2fd
     style Methods fill:#fff3e0
-    style KeyAuth fill:#e8f5e9
-    style AgentAuth fill:#f3e5f5
-    style RSAHash fill:#fce4ec
+    style KeyFlow fill:#e8f5e9
+    style AgentFlow fill:#f3e5f5
 ```
 
 </details>
 
 ### RSA Hash Algorithm Negotiation
 
-Modern SSH servers often disable legacy `ssh-rsa` (SHA-1) signatures for security. The client.rs module uses `best_supported_rsa_hash()` to negotiate modern algorithms:
+Both `KeyAuth` and `AgentAuth` call `handle.best_supported_rsa_hash()`. The algorithm is wrapped into the key via `keys::PrivateKeyWithHashAlg::new(key, hash_alg)` so the SSH layer signs with the server's preferred modern hash:
 
-| Priority | Algorithm | Description |
-|----------|-----------|-------------|
-| 1 | `rsa-sha2-512` | RSA with SHA-512 - strongest option |
-| 2 | `rsa-sha2-256` | RSA with SHA-256 - widely supported |
-| 3 | `ssh-rsa` | Legacy RSA with SHA-1 - fallback only |
-
-```rust
-// Query server for best supported RSA hash algorithm
-let hash_alg = handle
-    .best_supported_rsa_hash()
-    .await
-    .ok()
-    .flatten()
-    .flatten();
-
-// Wrap the key with the negotiated algorithm
-let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
-```
-
-This negotiation happens automatically for both key file and SSH agent authentication, ensuring compatibility with modern SSH servers while maintaining backward compatibility.
+| Priority | Algorithm |
+|----------|-----------|
+| 1 | `rsa-sha2-512` |
+| 2 | `rsa-sha2-256` |
+| 3 | Legacy `ssh-rsa` (SHA-1) — used only when the server does not advertise a modern option. |
 
 ## Session Storage Architecture
 
-SSH sessions are stored via the `SessionStorage` trait, enabling dependency injection and testability. The default implementation uses DashMap for lock-free concurrent access.
+`DashMapSessionStorage` holds three data structures:
+
+- **Primary map** — `session_id → StoredSession`.
+- **Agent index** — `agent_id → HashSet<session_id>` for `ssh_disconnect_agent` and agent-filtered listings.
+- **Identity index** — `(host_lc, port, username) → HashSet<session_id>` for smart reuse (`ssh_connect reuse="suggest"|"auto"|"force_new"`).
+
+Each `StoredSession` carries an `Arc<Semaphore>` with a single permit (`CHANNEL_CONCURRENCY_PER_SESSION = 1`): background command tasks acquire it before `channel_open_session()` and drop it when the channel has fully closed. This keeps rapid `execute + cancel` bursts from racing OpenSSH's `MaxSessions` budget (typically 10).
 
 <details>
 <summary>Session storage diagram</summary>
@@ -639,27 +481,27 @@ SSH sessions are stored via the `SessionStorage` trait, enabling dependency inje
 ```mermaid
 flowchart LR
     subgraph Abstraction["SessionStorage Trait"]
-        Trait["SessionStorage<br/>insert, get, remove, list"]
+        Trait["insert, get, remove, list, session_ids,<br/>update_health, register_agent, unregister_agent,<br/>get_agent_sessions, remove_agent_sessions"]
     end
 
     subgraph Implementation["DashMapSessionStorage"]
-        direction TB
         Primary["DashMap<br/>session_id → StoredSession"]
-        Secondary["SESSIONS_BY_AGENT<br/>agent_id → Set session_ids"]
-
-        Primary --> Secondary
+        SecAgent["sessions_by_agent<br/>agent_id → HashSet<session_id>"]
+        SecIdent["sessions_by_identity<br/>(host_lc, port, user) → HashSet<session_id>"]
     end
 
     subgraph Sessions["Active Sessions"]
-        S1["StoredSession 1<br/>uuid abc-123"]
-        S2["StoredSession 2<br/>uuid def-456"]
-        S3["StoredSession 3<br/>uuid ghi-789"]
+        S1["StoredSession 1"]
+        S2["StoredSession 2"]
+        S3["StoredSession 3"]
     end
 
     Trait --> Implementation
     Primary --> S1
     Primary --> S2
     Primary --> S3
+    SecAgent -.-> Primary
+    SecIdent -.-> Primary
 
     style Abstraction fill:#e3f2fd
     style Implementation fill:#e8f5e9
@@ -668,79 +510,83 @@ flowchart LR
 
 </details>
 
-### Storage Design Decisions (SOLID)
+### Storage Design Decisions
 
-1. **Trait-based abstraction (DIP)**: `SessionStorage` trait enables mocking for unit tests
-2. **`DashMap`**: Lock-free concurrent hashmap that allows multiple readers/writers without blocking
-3. **Secondary index**: `SESSIONS_BY_AGENT` enables O(1) agent-based queries for `ssh_disconnect_agent`
-4. **`Arc<Handle>`**: Session handles are wrapped in `Arc` for sharing across tasks
-5. **UUID Session IDs**: Each session receives a unique UUID v4 identifier for tracking
+1. **Trait-based abstraction (DIP).** Storage traits allow mocking in unit tests and future swap-in of alternative backends.
+2. **DashMap.** Lock-free concurrent access — readers and writers never block each other.
+3. **Multiple secondary indices.** Keep `O(1)` path for identity-triple lookups, agent cleanup, and session scans.
+4. **`Arc<Handle>`.** Each russh handle is wrapped in `Arc` so multiple async tasks can share it (the semaphore serializes channel opens, not handle reads).
+5. **UUIDv4 identifiers.** All `session_id` / `command_id` / `shell_id` / `transfer_id` values are UUIDv4 strings.
 
 ### Lock-Free Access Pattern
-
-The codebase uses storage traits for abstraction:
 
 ```rust
 use crate::mcp::storage::{SESSION_STORAGE, COMMAND_STORAGE};
 
-// Insert via trait method
-SESSION_STORAGE.insert(session_id, info, handle);
+// Insert (v2 signature)
+SESSION_STORAGE.insert(session_id, info, Arc::new(handle));
 
-// Get via trait method
+// Fetch metadata + handle
 if let Some(session_ref) = SESSION_STORAGE.get(&session_id) {
-    // session_ref contains info and handle
+    // session_ref.info     — SessionInfo clone
+    // session_ref.handle   — Arc<russh::client::Handle<SshClientHandler>>
+    // session_ref.channel_permits — Arc<Semaphore>
 }
+
+// Smart reuse lookup
+let candidates = SESSION_STORAGE.find_by_identity("host.example.com", 22, "user");
 
 // Agent-based operations
 SESSION_STORAGE.register_agent(&agent_id, &session_id);
-let sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
+let agent_sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
 ```
 
 ## Async Command Architecture
 
-The async command system enables long-running SSH commands to execute in the background while allowing clients to poll for output, check status, and cancel commands. Storage is abstracted via the `CommandStorage` trait.
+Async commands are the backbone of long-running work. Each `ssh_execute` call creates a `RunningCommand`, registers it in `COMMAND_STORAGE`, and spawns a background task that awaits the per-session channel semaphore before opening a russh channel.
 
 <details>
 <summary>Async command architecture diagram</summary>
 
 ```mermaid
 flowchart TB
-    subgraph Abstraction["CommandStorage Trait"]
-        Trait2["CommandStorage<br/>register, get, list_filtered"]
+    subgraph Trait["CommandStorage Trait"]
+        T["register, unregister, get_direct, get_ref,<br/>list_by_session, count_by_session,<br/>count_running_by_session, list_all, list_filtered"]
     end
 
     subgraph Storage["DashMapCommandStorage"]
-        direction TB
-        DashMap2["DashMap<br/>command_id → RunningCommand"]
-        SecondaryIdx["COMMANDS_BY_SESSION<br/>session_id → Set command_ids"]
-
-        DashMap2 --> SecondaryIdx
+        Map["DashMap<br/>command_id → RunningCommand"]
+        Idx["commands_by_session<br/>session_id → HashSet<command_id>"]
     end
 
-    Trait2 --> Storage
+    Trait --> Storage
 
-    subgraph RunningCmd["RunningCommand Structure"]
-        Info["AsyncCommandInfo<br/>Metadata"]
-        CancelToken["CancellationToken<br/>tokio-util"]
-        StatusChan["watch::channel<br/>Status Updates"]
-        OutputBuf["OutputBuffer<br/>stdout/stderr"]
-        ExitCode["exit_code<br/>Arc Mutex Option"]
-        Error["error<br/>Arc Mutex Option"]
-        TimedOut["timed_out<br/>Arc AtomicBool"]
+    subgraph RunningCmd["RunningCommand Shared State"]
+        Info["AsyncCommandInfo"]
+        CancelToken["CancellationToken"]
+        StatusChan["watch::channel<AsyncCommandStatus>"]
+        Output["Arc<Mutex<OutputBuffer>>"]
+        ExitCode["Arc<Mutex<Option<i32>>>"]
+        Error["Arc<Mutex<Option<String>>>"]
+        TimedOut["Arc<AtomicBool>"]
+        OutputRead["Arc<AtomicBool>"]
     end
 
-    subgraph Execution["Background Execution"]
-        Spawn["tokio::spawn"]
-        ExecAsync["execute_ssh_command_async"]
-        SSHChannel["SSH Channel I/O"]
+    subgraph Execution["Background Task"]
+        Permit["Acquire channel semaphore<br/>(serialized per session)"]
+        Exec["execute_ssh_command_async[_pty]"]
+        Cleanup["spawn_cleanup_task<br/>(TTL + post-read grace)"]
     end
 
-    DashMap2 --> RunningCmd
-    Spawn --> ExecAsync
-    ExecAsync --> SSHChannel
-    ExecAsync -.-> OutputBuf
-    ExecAsync -.-> StatusChan
-    CancelToken -.-> ExecAsync
+    Map --> RunningCmd
+    Permit --> Exec
+    Exec -.-> Output
+    Exec -.-> StatusChan
+    Exec -.-> ExitCode
+    Exec -.-> Error
+    Exec -.-> TimedOut
+    CancelToken -.-> Exec
+    OutputRead -.-> Cleanup
 
     style Storage fill:#e8f5e9
     style RunningCmd fill:#fff3e0
@@ -751,134 +597,102 @@ flowchart TB
 
 ### Async Command Flow
 
-1. **Start Command** (`ssh_execute`):
-   - Check session limit via `COMMAND_STORAGE.count_by_session()` (`MAX_ASYNC_COMMANDS_PER_SESSION = 100`)
-   - Create `RunningCommand` with status channel and cancellation token
-   - Register via `COMMAND_STORAGE.register(command_id, running_command)`
-   - Spawn background task via `tokio::spawn(execute_ssh_command_async(...))`
-   - Return `command_id` immediately to client
-
-2. **Poll for Output** (`ssh_get_command_output`):
-   - Look up command via `COMMAND_STORAGE.get_ref(&command_id)`
-   - Read current output from `OutputBuffer`
-   - Check status via `watch::Receiver`
-   - Return partial output and current status
-
-3. **Cancel Command** (`ssh_cancel_command`):
-   - Look up command via `COMMAND_STORAGE.get_ref(&command_id)`
-   - Call `cancel_token.cancel()` to signal cancellation
-   - Background task detects cancellation and exits gracefully
-   - Status updated to `Cancelled`
-
-4. **List Commands** (`ssh_list_commands`):
-   - Use `COMMAND_STORAGE.list_filtered(session_id, status)` (trait method)
-   - Return list of `AsyncCommandInfo`
+1. **`ssh_execute`** — `count_running_by_session` enforces `MAX_ASYNC_COMMANDS_PER_SESSION = 100`; `create_running_command` allocates the shared state; `register_and_spawn` calls `spawn_command_task` which awaits the semaphore before running `execute_ssh_command_async` (or the PTY variant).
+2. **`ssh_get_command_output`** — clones the `status_rx` / `output` handles, optionally waits for completion with a 300 s cap, marks `output_read` atomically, and renders via `GetCommandOutputBuilder`.
+3. **`ssh_cancel_command`** — runs `cancel_token.cancel()`, waits up to 5 s for `status_rx` to leave `Running` (so the server-side channel is confirmed closed), then pauses 100 ms more before returning — back-to-back cancel+execute bursts never race the `CHANNEL_CLOSE` ack.
+4. **`ssh_list_commands`** — filters by session/status and sorts by `started_at`; pagination applies `max_items` (default 500, cap 10 000).
+5. **Cleanup task** — spawned alongside the command. Waits for the command to leave `Running`; if `output_read` was set, cleanup happens after a 1 s grace; otherwise waits up to `SSH_COMMAND_CLEANUP_TTL` (default 60 s) before removing the entry from storage.
 
 ### Concurrency Controls
 
 | Control | Value | Purpose |
 |---------|-------|---------|
-| `MAX_ASYNC_COMMANDS_PER_SESSION` | 100 | Prevents resource exhaustion per session |
-| `Arc<Mutex<OutputBuffer>>` | - | Thread-safe output collection from background task |
-| `Arc<AtomicBool>` for `timed_out` | - | Lock-free timeout flag |
-| `watch::channel` | - | Efficient status broadcasting without locks |
-| `CommandStorage` trait | - | Abstraction for testability (DIP) |
+| `MAX_ASYNC_COMMANDS_PER_SESSION` | 100 | Running-command cap per session. |
+| `CHANNEL_CONCURRENCY_PER_SESSION` | 1 | Serializes russh channel opens on the same session (semaphore). |
+| `SSH_COMMAND_MAX_BUFFER_SIZE` | 10 MiB | Head-drained stdout/stderr bound per command. |
+| `Arc<AtomicBool>` for `timed_out` / `output_read` | — | Lock-free flags. |
+| `watch::channel` | — | Lock-free status broadcasting. |
+| `CommandStorage` trait | — | Dependency-injection seam for tests. |
 
 ### Session Cleanup
 
-When `ssh_disconnect` is called, all async commands for that session are automatically cleaned up:
-1. `COMMAND_STORAGE.list_by_session(&session_id)` retrieves all command IDs
-2. Each command's `cancel_token` is triggered
-3. Commands are removed via `COMMAND_STORAGE.unregister(&command_id)`
+`ssh_disconnect` (and the agent variant) run in this order per session:
+
+1. `cancel_session_transfers` — iterate `TRANSFER_STORAGE.list_by_session`, cancel each token, unregister entries.
+2. `close_session_shells` — iterate `SHELL_STORAGE.list_by_session`, cancel reader tasks, close `ChannelWriter`, unregister.
+3. `cancel_session_commands` — iterate `COMMAND_STORAGE.list_by_session`, cancel tokens, unregister entries. Returns the count rendered in `ssh_disconnect_agent`'s `COMMANDS:` field.
+4. `SESSION_STORAGE.remove` and `Disconnect::ByApplication` on the handle.
 
 ## Threading and Async Model
 
-The system uses Tokio's multi-threaded async runtime with native async SSH operations via russh.
+The system uses Tokio's multi-threaded async runtime. Everything is native async — there is no `spawn_blocking`.
 
 <details>
 <summary>Threading and async model diagram</summary>
 
 ```mermaid
 flowchart TB
-    subgraph Runtime["Tokio Runtime - Multi-threaded"]
-        direction TB
-
+    subgraph Runtime["Tokio Runtime (Multi-threaded)"]
         subgraph MainLoop["Main Event Loop"]
             HTTP["HTTP Request Handler"]
-            STDIO["Stdio Message Handler"]
+            STDIO["Stdio Message Handler + cancel interception"]
         end
 
         subgraph Tasks["Async Tasks"]
-            Connect["ssh_connect<br/>+ Retry Logic"]
-            Execute["ssh_execute<br/>+ Timeout"]
-            AsyncExec["ssh_execute<br/>Background Task"]
-            Forward["Port Forward<br/>Listener"]
+            Connect["ssh_connect + retry"]
+            Execute["ssh_execute (spawns bg task)"]
+            CancelCleanup["spawn_cleanup_task"]
+            ShellReader["shell_reader loop"]
+            ShellTTL["spawn_shell_inactivity_task"]
+            XferCleanup["spawn_transfer_cleanup_task"]
+            Forward["Port forward listener"]
             Disconnect["ssh_disconnect"]
         end
 
-        subgraph AsyncCommands["Async Command Management"]
-            Spawn["tokio::spawn<br/>Background Execution"]
-            Cancel["CancellationToken<br/>Graceful Cancel"]
-            Status["watch::channel<br/>Status Updates"]
+        subgraph Channels["russh Channels"]
+            ChanExec["Command channel (session)"]
+            ChanPty["PTY shell channel"]
+            ChanFwd["Direct-TCPIP channel"]
+            ChanSftp["SFTP subsystem channel"]
         end
 
-        subgraph Channels["SSH Channels"]
-            Chan1["Channel 1<br/>Session Command"]
-            Chan2["Channel 2<br/>Direct-TCPIP"]
-            ChanAsync["Channel N<br/>Async Command"]
+        subgraph Semaphore["Per-session channel semaphore<br/>(1 permit)"]
+            S["Serializes channel_open_session calls"]
         end
-    end
-
-    subgraph External["External I/O"]
-        SSHServer["SSH Server"]
-        LocalPort["Local TCP Port"]
     end
 
     HTTP --> Tasks
     STDIO --> Tasks
-    Connect --> SSHServer
-    Execute --> Chan1
-    AsyncExec --> AsyncCommands
-    Spawn --> ChanAsync
-    Cancel --> Spawn
-    Status --> Spawn
-    Forward --> Chan2
-    Forward --> LocalPort
-    Chan1 --> SSHServer
-    Chan2 --> SSHServer
-    ChanAsync --> SSHServer
+    Execute --> Semaphore
+    Execute --> ChanExec
+    ShellReader --> ChanPty
+    Forward --> ChanFwd
+    Execute --> CancelCleanup
+    Connect --> ChanExec
 
     style Runtime fill:#e8eaf6
     style Tasks fill:#fff8e1
-    style AsyncCommands fill:#e8f5e9
+    style Semaphore fill:#e3f2fd
 ```
 
 </details>
 
-### Native Async Architecture
+### Native Async Patterns
 
-Unlike implementations using blocking SSH libraries, this system uses **russh** which provides native async support:
+| Operation | Pattern |
+|-----------|---------|
+| SSH connect | `tokio::time::timeout(client::connect(...))` |
+| Retry | `backon::ExponentialBuilder` with `.with_jitter()`, capped at `MAX_RETRY_DELAY` (10 s). |
+| Synchronous exec (health checks) | `collect_sync_output` over `ChannelMsg::Data` / `ExtendedData` / `ExitStatus` / `Eof` / `Close`. |
+| Background exec | `tokio::spawn(execute_ssh_command_async)` with `tokio::select!` (`biased`, cancel token first, then timeout, then output poll). |
+| Shell reader | Dedicated task owning `ChannelReadHalf`; `ChannelWriter` stays on the write half to avoid locking. |
+| Cancellation | `tokio_util::sync::CancellationToken`. |
+| Status propagation | `tokio::sync::watch::channel` (`RunningCommand`, `RunningShell`, `RunningTransfer`). |
+| Port forwarding | `tokio::io::copy` both directions in `tokio::select!`. |
+| Serialization of SSH channels | `tokio::sync::Semaphore` per session (`CHANNEL_CONCURRENCY_PER_SESSION`). |
+| Bounded buffers | `OutputBuffer::append_*_bounded` + shell reader's `append_shell_output` drain oldest bytes when the cap is exceeded. |
 
-| Operation | Async Pattern | Notes |
-|-----------|---------------|-------|
-| SSH Connect | `tokio::time::timeout` | Wrapped with configurable timeout |
-| Retry Logic | `backon::Retryable` | Exponential backoff with jitter |
-| Command Execution | Channel-based async I/O | Non-blocking read/write via `ChannelMsg`; timeout returns partial output with `timed_out: true` |
-| Async Command Execution | `tokio::spawn` | Background task via `execute_ssh_command_async()` |
-| Async Command Cancellation | `CancellationToken` | `tokio_util::sync::CancellationToken` for graceful cancellation |
-| Async Status Updates | `watch::channel` | `tokio::sync::watch` for real-time status broadcasting |
-| Port Forwarding | `tokio::spawn` | Background task per listener |
-| Session Lock | `tokio::sync::Mutex` | Async-aware mutex |
-| Bidirectional I/O | `tokio::io::copy` + `select!` | Efficient zero-copy forwarding |
-
-### Key Differences from Blocking Libraries
-
-- **No `spawn_blocking`**: All SSH operations are natively async
-- **Channel-based I/O**: Uses russh `ChannelMsg` enum for stdout, stderr, exit status
-- **Direct-TCPIP**: Port forwarding uses `channel_open_direct_tcpip` with `into_stream()`
-- **Graceful disconnect**: Uses `Disconnect::ByApplication` for clean session termination
-
-### Retry Logic with Backoff
+## Retry Logic with Backoff
 
 <details>
 <summary>Retry logic state diagram</summary>
@@ -887,41 +701,38 @@ Unlike implementations using blocking SSH libraries, this system uses **russh** 
 stateDiagram-v2
     [*] --> Attempt1
 
-    Attempt1 --> Success: Connected
+    Attempt1 --> Success: Connected & authenticated
     Attempt1 --> CheckRetry1: Failed
 
-    CheckRetry1 --> Delay1: Retryable Error
-    CheckRetry1 --> [*]: Auth Error - Stop
+    CheckRetry1 --> Delay1: is_retryable_error -> true
+    CheckRetry1 --> [*]: Auth / permission -> stop
 
-    Delay1 --> Attempt2: Wait with backoff
+    Delay1 --> Attempt2: backoff + jitter
 
-    Attempt2 --> Success: Connected
+    Attempt2 --> Success: Connected & authenticated
     Attempt2 --> CheckRetry2: Failed
 
-    CheckRetry2 --> Delay2: Retryable Error
-    CheckRetry2 --> [*]: Auth Error - Stop
+    CheckRetry2 --> Delay2: Retryable
+    CheckRetry2 --> [*]: Not retryable
 
-    Delay2 --> Attempt3: Wait with backoff
+    Delay2 --> AttemptN: backoff + jitter
 
-    Attempt3 --> Success: Connected
-    Attempt3 --> CheckRetry3: Failed
-
-    CheckRetry3 --> Delay3: Retryable Error
-    CheckRetry3 --> [*]: Auth Error - Stop
-
-    Delay3 --> Attempt4: Wait with backoff max 10s
-
-    Attempt4 --> Success: Connected
-    Attempt4 --> [*]: Max Retries Exceeded
+    AttemptN --> Success
+    AttemptN --> [*]: Max retries exceeded
 
     Success --> [*]
 ```
 
 </details>
 
-**Retry Classification (error.rs)**:
-- **Non-retryable**: Authentication failures, permission denied, publickey errors
-- **Retryable**: Connection refused, timeout, network unreachable, broken pipe
+`error::is_retryable_error` classifies errors by case-insensitive substring match:
+
+- **Non-retryable** — any of the `AUTH_ERRORS` keywords (auth failed, permission denied, publickey, ...).
+- **Retryable** — any of the `RETRYABLE_ERRORS` keywords (connection refused, reset, timed out, timeout, network unreachable, no route to host, host is down, temporary failure, resource temporarily unavailable, handshake failed, failed to connect, broken pipe, would block).
+- **Unknown, contains "ssh"** — retryable only if the message also mentions "timeout" or "connect".
+- **Unknown, no "ssh"** — treated as retryable (conservative default).
+
+Authentication keywords are checked first so ambiguous messages like "Connection timeout during authentication failed" are classified as non-retryable.
 
 ## Binary Targets
 
@@ -932,14 +743,14 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    subgraph Binary["ssh-mcp Binary"]
-        Main["main.rs"]
+    subgraph Binary["ssh-mcp Binary (src/main.rs)"]
+        Main["main + tokio::main"]
         Route["Poem Route"]
-        Streamable["streamable_http endpoint"]
+        Streamable["streamable_http::endpoint"]
     end
 
     subgraph Server["HTTP Server"]
-        TCP["TcpListener<br/>0.0.0.0:8000"]
+        TCP["TcpListener<br/>MCP_HOST:MCP_PORT"]
         Tracing["Tracing Middleware"]
     end
 
@@ -955,11 +766,12 @@ flowchart LR
 </details>
 
 **Features:**
-- Binds to 0.0.0.0:8000 (configurable via `MCP_HOST` and `MCP_PORT`)
-- Uses Poem's streamable HTTP transport
-- Includes tracing middleware for debugging
-- Loads environment from `.env` file
-- Initializes tracing with `info` level default
+
+- Binds to `MCP_HOST:MCP_PORT` (defaults `0.0.0.0:8000`).
+- Uses Poem's `streamable_http` endpoint — supports plain JSON and SSE event streams.
+- Includes Poem's `Tracing` middleware.
+- Loads `.env` via `dotenvy`.
+- Initializes `tracing_subscriber` with `info` as default.
 
 ### Stdio Transport (`ssh-mcp-stdio`)
 
@@ -968,23 +780,26 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    subgraph Binary["ssh-mcp-stdio Binary"]
-        Main["main.rs"]
-        TracingInit["Tracing Init<br/>stderr output"]
-        Stdio["poem_mcpserver stdio"]
+    subgraph Binary["ssh-mcp-stdio Binary (bin/ssh_mcp_stdio.rs)"]
+        Loop["stdio_with_cancellation loop"]
+        Interceptor["intercept_cancel<br/>(camelCase + snake_case)"]
+        Server["McpServer with tools"]
+        Fallback["build_fallback_response"]
     end
 
     subgraph IO["Standard I/O"]
-        STDIN["stdin"]
-        STDOUT["stdout"]
-        STDERR["stderr - logs"]
+        STDIN["stdin (JSON-RPC lines)"]
+        STDOUT["stdout (responses)"]
+        STDERR["stderr (tracing)"]
     end
 
-    STDIN --> Main
-    Main --> TracingInit
-    TracingInit --> STDERR
-    Main --> Stdio
-    Stdio --> STDOUT
+    STDIN --> Loop
+    Loop --> Interceptor
+    Interceptor --> Server
+    Loop --> Fallback
+    Server --> STDOUT
+    Fallback --> STDOUT
+    Loop --> STDERR
 
     style Binary fill:#e8f5e9
     style IO fill:#fff3e0
@@ -993,11 +808,12 @@ flowchart LR
 </details>
 
 **Features:**
-- Minimal binary for direct MCP integration
-- No HTTP overhead
-- Ideal for embedding in LLM tools
-- Tracing initialized with `RUST_LOG` environment filter
-- Logs directed to stderr to avoid interfering with MCP protocol on stdout
+
+- Intercepts `notifications/cancelled` for both `request_id` (snake_case) and `requestId` (camelCase) — needed because poem-mcpserver 0.3.1 only knows the snake_case form.
+- Emits fallback responses (`resources/templates/list` → empty, `resources/read` → "Resource not found", `prompts/get` → "Prompt not found", unknown method → `-32601 Method not found`).
+- Serialises every response through a `Mutex<()>` on stdout so cancellation can drop stale responses atomically.
+- Spawns a dedicated task per incoming batch so a long `ssh_get_command_output(wait=true)` never blocks subsequent cancel notifications.
+- Logs exclusively to stderr.
 
 ## Key Dependencies
 
@@ -1006,27 +822,31 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Core["Core Dependencies"]
-        Russh["russh 0.55<br/>Async SSH Client"]
-        Tokio["tokio 1.x<br/>Async Runtime"]
-        TokioUtil["tokio-util<br/>Async Utilities"]
-        Poem["poem 3.1<br/>HTTP Framework"]
+    subgraph Core["Core"]
+        Russh["russh 0.55"]
+        RusshSftp["russh-sftp 2"]
+        Tokio["tokio 1.x (full)"]
+        TokioUtil["tokio-util 0.7"]
+        Poem["poem 3.1"]
     end
 
     subgraph MCP["MCP Integration"]
-        PoemMCP["poem-mcpserver 0.2.9<br/>MCP Protocol"]
+        PoemMCP["poem-mcpserver 0.3.1"]
     end
 
-    subgraph Utilities["Utility Crates"]
-        Backon["backon 1.x<br/>Retry Logic"]
-        Serde["serde 1.0<br/>Serialization"]
-        UUID["uuid 1.16<br/>Session IDs"]
-        DashMap2["dashmap 6<br/>Lock-free Maps"]
+    subgraph Utilities["Utilities"]
+        Backon["backon 1.x"]
+        Serde["serde 1.0"]
+        UUID["uuid 1.16"]
+        DashMap["dashmap 6"]
+        Dotenvy["dotenvy 0.15"]
+        Futures["futures 0.3"]
     end
 
     PoemMCP --> Poem
     PoemMCP --> Tokio
     Russh --> Tokio
+    RusshSftp --> Russh
     TokioUtil --> Tokio
 
     style Core fill:#e1f5fe
@@ -1038,29 +858,48 @@ flowchart TB
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| `russh` | 0.55 | Pure Rust async SSH client implementation |
-| `tokio` | 1.x | Async runtime with full features |
-| `tokio-util` | 0.7 | Async utilities including `CancellationToken` for async command cancellation |
-| `poem` | 3.1 | HTTP framework matching poem-mcpserver |
-| `poem-mcpserver` | 0.2.9 | MCP protocol implementation |
-| `backon` | 1.x | Retry logic with exponential backoff |
-| `serde` | 1.0 | JSON serialization/deserialization |
-| `uuid` | 1.16 | UUID v4 generation for session and command IDs |
-| `dashmap` | 6 | Lock-free concurrent hashmap for storage |
-| `tracing` | 0.1 | Structured logging |
-| `tracing-subscriber` | 0.3 | Tracing output and filtering |
-| `chrono` | 0.4 | Timestamp generation |
+| `russh` | 0.55 | Async SSH client. |
+| `russh-sftp` | 2 | SFTP streaming on top of russh. |
+| `async-trait` | 0.1 | Async traits for `AuthStrategy`. |
+| `tokio` | 1.x (full) | Async runtime. |
+| `tokio-util` | 0.7 | `CancellationToken`. |
+| `poem` | 3.1 | HTTP framework used by the `ssh-mcp` binary. |
+| `poem-mcpserver` | 0.3.1 | MCP protocol implementation (`streamable_http`, `#[Tools]`). |
+| `backon` | 1.x | Exponential backoff + jitter for retries. |
+| `serde` + `serde_json` | 1.0 | JSON serialization for transport. |
+| `schemars` | 1.0 | JSON schemas for tool parameters (used by `poem-mcpserver`). |
+| `uuid` | 1.16 | UUIDv4 identifiers + nonces. |
+| `dashmap` | 6 | Lock-free concurrent hashmap. |
+| `dotenvy` | 0.15 | `.env` loader. |
+| `tracing` + `tracing-subscriber` | 0.1 / 0.3 | Structured logging. |
+| `chrono` | 0.4 | RFC3339 timestamps. |
+| `futures` | 0.3 | `join_all` for the `ssh_list_sessions` health sweep. |
 
 ## Feature Flags
 
-The project supports optional features via Cargo:
-
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `port_forward` | Yes | Enables SSH port forwarding support via `ssh_forward` tool |
+| `port_forward` | Yes | Enables SSH port forwarding (`ssh_forward` tool, `src/mcp/forward.rs`). |
 
-To build without port forwarding:
+Build without port forwarding:
 
 ```bash
 cargo build --release --no-default-features
 ```
+
+When the feature is disabled, `ssh_forward` returns `SSH_FORWARD: ERROR` with `REASON: [FEATURE_DISABLED] port forwarding feature is not enabled`.
+
+## Strict Lint Profile
+
+`src/lib.rs` opts into `clippy::all + pedantic + nursery + cargo` and then `deny`s a long list of correctness-critical lints (`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_stdout`, `print_stderr`, `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, ...). `clippy.toml` sets `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`. Every `#[allow(...)]` carries a `reason = "..."` documented alongside the suppression.
+
+## Test Surface
+
+501 unit tests across the crate (see [`README.md`](../README.md#unit-test-coverage) for per-module breakdown) plus two Python integration scripts:
+
+| Script | Focus |
+|--------|-------|
+| `scripts/test_http.py` | HTTP transport suite. Exercises every tool, smart-reuse policies, chaos/concurrency scenarios, SFTP round-trip. Ships `parse_mcp_response` to convert markdown back to dict. |
+| `scripts/test_stdio.py` | Same suite against the stdio transport — also verifies the cancel notification shim in `bin/ssh_mcp_stdio.rs`. |
+
+Both scripts can be pointed at any reachable SSH server via the `SSH_HOST`, `SSH_USER`, `SSH_KEY_PATH`, `LOCAL_FILE` environment variables and default to `reuse="force_new"` so repeated runs never collide.
