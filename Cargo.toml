@@ -2,6 +2,7 @@
 name = "ssh-mcp"
 version = "3.0.0"
 edition = "2024"
+rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
 description = "SSH Model Context Protocol Server Integration with realtime resources/subscribe"
 authors = ["farchanjo"]
 default-run = "ssh-mcp"
@@ -38,6 +39,17 @@ path = "tests/lockfree_invariants.rs"
 harness = true
 
 [dependencies]
+# Toolchain choice (v4 hexagonal):
+#   * MSRV pinned to 1.85 — Rust 2024 edition baseline with AFIT (async fn in
+#     traits) and RPITIT (return-position impl Trait in trait) stable.
+#   * `trait-variant` added to enable AFIT on dyn-safe ports, replacing the
+#     v3 `async-trait` `Box<dyn Future>` pattern as ports/adapters land.
+#   * `async-trait` is kept transitionally because the v3 auth strategy chain
+#     (`src/mcp/auth/*.rs`) still uses `#[async_trait]`. Slated for removal in
+#     etapa E1 once the auth ports are migrated to the AFIT/`trait-variant`
+#     pattern. Until then both crates coexist; only `async-trait` reaches
+#     production code.
+
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [
     "server",
@@ -48,7 +60,9 @@ rmcp = { version = "1.6", default-features = false, features = [
 ] }
 
 # HTTP host for rmcp streamable-http transport
-axum = "0.7"
+# rmcp 1.6 declares `axum = "^0.8"`, so we align on the same major to share
+# the transitive copy and avoid two axum versions in the dep graph.
+axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace"] }
 
@@ -59,7 +73,10 @@ tokio-util = "0.7"
 # SSH client (async)
 russh = "0.55"
 russh-sftp = "2"
-async-trait = "0.1"
+
+# Trait abstraction (v3 -> v4 transition window)
+async-trait = "0.1"     # legacy: v3 auth chain (`src/mcp/auth/*.rs`); removed in E1
+trait-variant = "0.1"   # v4: dyn-safe AFIT pattern for ports/adapters
 
 # Lock-free primitives
 arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>
