@@ -253,8 +253,11 @@ async fn close_session_shells(session_id: &str) {
         );
         for shell_id in &shell_ids {
             if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
+                let _ = shell
+                    .input_tx
+                    .send(super::super::shell::WriteRequest::Close)
+                    .await;
                 shell.cancel_token.cancel();
-                let _ = shell.channel_writer.lock().await.close().await;
             }
         }
     }

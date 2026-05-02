@@ -16,9 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use russh::client::Msg;
 use russh::{Channel, Disconnect};
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, watch};
 use tokio::time::{self};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -28,7 +29,6 @@ use super::super::async_command::{OutputBuffer, RunningCommand};
 use super::super::client::{
     execute_ssh_command, execute_ssh_command_async, execute_ssh_command_async_pty,
 };
-use arc_swap::ArcSwap;
 use super::super::config::{
     resolve_command_cleanup_ttl, resolve_list_max_items_cap, resolve_list_max_items_default,
     resolve_output_default_bytes, resolve_output_max_bytes_cap, resolve_transfer_cleanup_ttl,
@@ -41,7 +41,9 @@ use super::super::message::builder::{
 use super::super::message::helpers::{format_error, generate_nonce};
 use super::super::session::SshClientHandler;
 use super::super::sftp::{sftp_download_streaming, sftp_upload_streaming};
-use super::super::shell::{ChannelWriter, RunningShell};
+use super::super::shell::{
+    ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms, touch_activity,
+};
 use super::super::storage::command::COMMAND_STORAGE;
 use super::super::storage::session::SESSION_STORAGE;
 use super::super::storage::shell::SHELL_STORAGE;
@@ -53,6 +55,7 @@ use super::super::transfer::{RunningTransfer, TransferDirection, TransferInfo, T
 use super::super::types::{
     AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo, ShellStatus, SshCommandResponse,
 };
+use arc_swap::ArcSwap;
 
 /// Type alias for the SSH client handle used throughout legacy helpers.
 pub(crate) type SshHandle = russh::client::Handle<SshClientHandler>;
@@ -386,13 +389,15 @@ pub(crate) fn get_running_command(command_id: &str) -> Result<CancelState, Strin
             )
         })
         .ok_or_else(|| format!("No async command with ID: {command_id}"))
-        .and_then(|(current_status, cancel_token, output_history, status_rx)| {
-            if current_status == AsyncCommandStatus::Running {
-                Ok((cancel_token, output_history, status_rx))
-            } else {
-                Err(format!("Command is not running (status: {current_status})"))
-            }
-        })
+        .and_then(
+            |(current_status, cancel_token, output_history, status_rx)| {
+                if current_status == AsyncCommandStatus::Running {
+                    Ok((cancel_token, output_history, status_rx))
+                } else {
+                    Err(format!("Command is not running (status: {current_status})"))
+                }
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +423,8 @@ pub(crate) async fn cleanup_agent_sessions(session_ids: &[String]) -> usize {
         let shell_ids = SHELL_STORAGE.list_by_session(session_id);
         for shell_id in &shell_ids {
             if let Some(shell) = SHELL_STORAGE.unregister(shell_id) {
+                let _ = shell.input_tx.send(WriteRequest::Close).await;
                 shell.cancel_token.cancel();
-                let _ = shell.channel_writer.lock().await.close().await;
             }
         }
 
@@ -512,35 +517,57 @@ pub(crate) async fn health_probe(handle: &Arc<SshHandle>) -> Result<SshCommandRe
 }
 
 // ---------------------------------------------------------------------------
-// Shell lifecycle
+// Shell lifecycle (lock-free — E8)
 // ---------------------------------------------------------------------------
 
-/// Append data to the shell buffer, truncating oldest bytes if over the max
-/// size. Bounded so long sessions don't unbounded-grow the heap.
-async fn append_shell_output(output: &Mutex<Vec<u8>>, data: &[u8], max_buffer_size: &AtomicU64) {
-    let mut buf = output.lock().await;
-    buf.extend_from_slice(data);
+/// Flush threshold for batched shell output (8 KB).
+const SHELL_FLUSH_THRESHOLD: usize = 8192;
 
-    let max_size = max_buffer_size.load(Ordering::Relaxed);
-    let target = usize::try_from(max_size).unwrap_or(usize::MAX);
-    if max_size > 0 && buf.len() > target {
-        let excess = buf.len().saturating_sub(target);
-        buf.drain(..excess);
-    }
+/// Publish the just-arrived `chunk` through `history` and broadcast the
+/// delta. The history update is performed via `ArcSwap::rcu` so concurrent
+/// `ssh_shell_read` callers (which clear the head with their own rcu) cannot
+/// clobber freshly appended bytes — and vice versa.
+///
+/// Errors on `output_tx.send` are swallowed: a missing subscriber is the
+/// steady state until `ssh_shell_subscribe` lands.
+fn publish_shell_chunk(
+    history: &ArcSwap<RingBuffer>,
+    output_tx: &broadcast::Sender<Bytes>,
+    chunk: Bytes,
+    max_buffer_size: usize,
+) {
+    history.rcu(|current| {
+        let mut combined = Vec::with_capacity(current.data.len() + chunk.len());
+        combined.extend_from_slice(&current.data);
+        combined.extend_from_slice(&chunk);
+        if max_buffer_size > 0 && combined.len() > max_buffer_size {
+            let excess = combined.len() - max_buffer_size;
+            combined.drain(..excess);
+        }
+        RingBuffer {
+            data: Bytes::from(combined),
+        }
+    });
+    let _ = output_tx.send(chunk);
 }
 
-/// Background reader that exclusively owns the channel read half. Reads
-/// from the channel without any mutex contention, allowing concurrent
-/// writes through the separate write half.
+/// Background reader that exclusively owns the channel read half. Each
+/// flushed batch is published through `history` (via `ArcSwap::rcu`) and
+/// broadcast as a `Bytes` chunk via `output_tx`. Activity is tracked
+/// atomically through `last_activity_ms`.
 async fn shell_reader(
     mut read_half: russh::ChannelReadHalf,
-    output: Arc<Mutex<Vec<u8>>>,
+    history: Arc<ArcSwap<RingBuffer>>,
+    output_tx: broadcast::Sender<Bytes>,
+    data_notify: Arc<tokio::sync::Notify>,
     cancel_token: CancellationToken,
     status_tx: watch::Sender<ShellStatus>,
     max_buffer_size: Arc<AtomicU64>,
-    last_activity: Arc<Mutex<time::Instant>>,
+    last_activity_ms: Arc<AtomicU64>,
 ) {
     use russh::ChannelMsg;
+
+    let mut local: Vec<u8> = Vec::with_capacity(4096);
 
     loop {
         tokio::select! {
@@ -551,8 +578,17 @@ async fn shell_reader(
             msg = read_half.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
-                        append_shell_output(&output, &data, &max_buffer_size).await;
-                        *last_activity.lock().await = time::Instant::now();
+                        local.extend_from_slice(&data);
+                        touch_activity(&last_activity_ms);
+                        if local.len() >= SHELL_FLUSH_THRESHOLD {
+                            flush_shell_local(
+                                &history,
+                                &output_tx,
+                                &data_notify,
+                                &mut local,
+                                &max_buffer_size,
+                            );
+                        }
                     }
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
                     Some(_) => {}
@@ -561,37 +597,119 @@ async fn shell_reader(
         }
     }
 
+    if !local.is_empty() {
+        flush_shell_local(
+            &history,
+            &output_tx,
+            &data_notify,
+            &mut local,
+            &max_buffer_size,
+        );
+    }
+
     let _ = status_tx.send(ShellStatus::Closed);
 }
 
-/// Spawn the background shell reader task.
-fn spawn_shell_reader(
-    read_half: russh::ChannelReadHalf,
-    output: &Arc<Mutex<Vec<u8>>>,
-    cancel_token: &CancellationToken,
-    status_tx: &watch::Sender<ShellStatus>,
-    max_buffer_size: &Arc<AtomicU64>,
-    last_activity: &Arc<Mutex<time::Instant>>,
+/// Flush `local` into the lock-free history and broadcast the delta.
+fn flush_shell_local(
+    history: &ArcSwap<RingBuffer>,
+    output_tx: &broadcast::Sender<Bytes>,
+    data_notify: &tokio::sync::Notify,
+    local: &mut Vec<u8>,
+    max_buffer_size: &AtomicU64,
 ) {
-    let args = (
-        Arc::clone(output),
-        cancel_token.clone(),
-        status_tx.clone(),
-        Arc::clone(max_buffer_size),
-        Arc::clone(last_activity),
-    );
+    let chunk = Bytes::copy_from_slice(local);
+    local.clear();
+    let max_size = usize::try_from(max_buffer_size.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+    publish_shell_chunk(history, output_tx, chunk, max_size);
+    data_notify.notify_waiters();
+}
+
+/// Spawn the background shell reader task.
+fn spawn_shell_reader(read_half: russh::ChannelReadHalf, shell: &RunningShell) {
+    let history = Arc::clone(&shell.history);
+    let output_tx = shell.output_tx.clone();
+    let data_notify = Arc::clone(&shell.data_notify);
+    let cancel_token = shell.cancel_token.clone();
+    let status_tx = shell.status_tx.clone();
+    let max_buffer_size = Arc::clone(&shell.max_buffer_size);
+    let last_activity_ms = Arc::clone(&shell.last_activity_ms);
     tokio::spawn(async move {
-        shell_reader(read_half, args.0, args.1, args.2, args.3, args.4).await;
+        shell_reader(
+            read_half,
+            history,
+            output_tx,
+            data_notify,
+            cancel_token,
+            status_tx,
+            max_buffer_size,
+            last_activity_ms,
+        )
+        .await;
+    });
+}
+
+/// Background writer task. Exclusively owns `ChannelWriter` (no `Mutex`) and
+/// drains `WriteRequest` frames from the input mpsc channel until either a
+/// `Close` is received, the channel is dropped, or the cancel token fires.
+async fn shell_writer(
+    writer: ChannelWriter,
+    mut input_rx: mpsc::Receiver<WriteRequest>,
+    cancel_token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel_token.cancelled() => {
+                let _ = writer.close().await;
+                break;
+            }
+            req = input_rx.recv() => {
+                match req {
+                    Some(WriteRequest::Data(bytes)) => {
+                        if let Err(e) = writer.write(&bytes).await {
+                            warn!("Shell writer task: {e}");
+                            break;
+                        }
+                    }
+                    Some(WriteRequest::Close) => {
+                        let _ = writer.close().await;
+                        break;
+                    }
+                    None => {
+                        // mpsc senders dropped — graceful shutdown.
+                        let _ = writer.close().await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the dedicated writer task that owns the `ChannelWriter` exclusively.
+fn spawn_shell_writer(
+    write_half: russh::ChannelWriteHalf<Msg>,
+    input_rx: mpsc::Receiver<WriteRequest>,
+    cancel_token: CancellationToken,
+) {
+    let writer = ChannelWriter::new(write_half);
+    tokio::spawn(async move {
+        shell_writer(writer, input_rx, cancel_token).await;
     });
 }
 
 /// Auto-close a shell after the configured inactivity TTL.
+///
+/// Uses an atomic epoch-millis counter — no mutex acquisition on the polling
+/// loop.
 fn spawn_shell_inactivity_task(
     shell_id: String,
-    last_activity: Arc<Mutex<time::Instant>>,
+    last_activity_ms: Arc<AtomicU64>,
     inactivity_ttl: Duration,
     cancel_token: CancellationToken,
 ) {
+    let ttl_ms = u64::try_from(inactivity_ttl.as_millis()).unwrap_or(u64::MAX);
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(5));
         loop {
@@ -601,16 +719,17 @@ fn spawn_shell_inactivity_task(
                 break;
             }
 
-            let elapsed = last_activity.lock().await.elapsed();
-            if elapsed >= inactivity_ttl {
+            let last = last_activity_ms.load(Ordering::Relaxed);
+            let elapsed_ms = now_ms().saturating_sub(last);
+            if elapsed_ms >= ttl_ms {
                 info!(
                     "Shell {shell_id} inactive for {}s, auto-closing (TTL: {}s)",
-                    elapsed.as_secs(),
+                    elapsed_ms / 1000,
                     inactivity_ttl.as_secs(),
                 );
                 if let Some(shell) = SHELL_STORAGE.unregister(&shell_id) {
+                    let _ = shell.input_tx.send(WriteRequest::Close).await;
                     shell.cancel_token.cancel();
-                    let _ = shell.channel_writer.lock().await.close().await;
                 }
                 break;
             }
@@ -618,30 +737,30 @@ fn spawn_shell_inactivity_task(
     });
 }
 
-/// Spawn background tasks (reader + inactivity monitor) for a shell.
+/// Spawn background tasks (reader + writer + inactivity monitor) for a shell.
 fn spawn_shell_tasks(
     shell_id: &str,
     read_half: russh::ChannelReadHalf,
+    write_half: russh::ChannelWriteHalf<Msg>,
+    input_rx: mpsc::Receiver<WriteRequest>,
     shell: &RunningShell,
     inactivity_ttl: Duration,
 ) {
-    spawn_shell_reader(
-        read_half,
-        &shell.output,
-        &shell.cancel_token,
-        &shell.status_tx,
-        &shell.max_buffer_size,
-        &shell.last_activity,
-    );
+    spawn_shell_reader(read_half, shell);
+    spawn_shell_writer(write_half, input_rx, shell.cancel_token.clone());
     spawn_shell_inactivity_task(
         shell_id.to_string(),
-        Arc::clone(&shell.last_activity),
+        Arc::clone(&shell.last_activity_ms),
         inactivity_ttl,
         shell.cancel_token.clone(),
     );
 }
 
-/// Spawn the shell reader and register the shell in storage.
+/// Capacity for the per-shell input mpsc queue. The dedicated writer task
+/// drains it; with one tool call per write request a small backlog is enough.
+const SHELL_INPUT_CHANNEL_CAP: usize = 64;
+
+/// Spawn the shell reader/writer and register the shell in storage.
 fn spawn_and_register_shell(
     shell_id: &str,
     shell_info: ShellInfo,
@@ -649,21 +768,20 @@ fn spawn_and_register_shell(
     inactivity_ttl: Duration,
     max_buffer_size: u64,
 ) {
-    let (status_tx, status_rx) = watch::channel(ShellStatus::Open);
     let (read_half, write_half) = channel.split();
+    let (input_tx, input_rx) = mpsc::channel::<WriteRequest>(SHELL_INPUT_CHANNEL_CAP);
+    let cancel_token = CancellationToken::new();
 
-    let shell = RunningShell {
-        info: shell_info,
-        cancel_token: CancellationToken::new(),
-        output: Arc::new(Mutex::new(Vec::with_capacity(4096))),
-        channel_writer: Arc::new(Mutex::new(ChannelWriter::new(write_half))),
-        status_tx,
-        status_rx,
-        last_activity: Arc::new(Mutex::new(time::Instant::now())),
-        max_buffer_size: Arc::new(AtomicU64::new(max_buffer_size)),
-    };
+    let shell = RunningShell::new(shell_info, cancel_token, input_tx, max_buffer_size);
 
-    spawn_shell_tasks(shell_id, read_half, &shell, inactivity_ttl);
+    spawn_shell_tasks(
+        shell_id,
+        read_half,
+        write_half,
+        input_rx,
+        &shell,
+        inactivity_ttl,
+    );
     SHELL_STORAGE.register(shell_id.to_string(), shell);
 }
 
