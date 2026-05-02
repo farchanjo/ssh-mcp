@@ -1,43 +1,74 @@
 //! `McpSshServer` — primary MCP entry point implementing `rmcp::ServerHandler`.
 //!
-//! In v3.0.0, this struct owns:
-//! - The `ToolRouter<Self>` aggregating the 18 SSH tools.
-//! - Resource handlers for `shell://`, `command://`, `transfer://`, `session://`,
-//!   and `forward://` URIs (subscribe-first realtime streams).
-//!
-//! The split between transport (`src/main.rs` for HTTP, `src/bin/ssh_mcp_stdio.rs`
-//! for stdio) and handler (this file) follows rmcp's recommended layout.
-//!
-//! Currently this file ships a minimal stub during the migration from
-//! `poem-mcpserver` 0.3.1 to `rmcp` 1.6 — tools and resources land in
-//! subsequent etapas (E3-E14).
+//! In v3.0.0 this struct owns:
+//! - The `ToolRouter<Self>` aggregating the SSH tools (one wired in E3, the
+//!   remaining 17 land in E4).
+//! - Resource handlers for `shell://`, `command://`, `transfer://`,
+//!   `session://`, and `forward://` URIs (subscribe-first realtime streams,
+//!   landing in E13).
 
-use rmcp::ServerHandler;
 use rmcp::handler::server::tool::ToolRouter;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+
+use super::tools::connection::{SshConnectArgs, ssh_connect_impl};
 
 /// Primary MCP server handler.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpSshServer {
     tool_router: ToolRouter<Self>,
 }
 
-impl McpSshServer {
-    /// Create a new server with an empty tool router (tools wired in E3-E4).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            tool_router: ToolRouter::default(),
-        }
-    }
-
-    /// Read-only access to the inner tool router (used by transport layers).
-    #[must_use]
-    pub const fn tool_router(&self) -> &ToolRouter<Self> {
-        &self.tool_router
+impl Default for McpSshServer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
+#[tool_router]
+impl McpSshServer {
+    /// Create a new server with the v3.0.0 tool router.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Connect to an SSH server and store the session.
+    ///
+    /// **When to use:**
+    /// - Establishing a new SSH connection to run commands, open shells, or transfer files.
+    /// - Reusing an already-connected session by passing its `session_id`.
+    ///
+    /// **Important identifiers in response:**
+    /// - `SESSION_ID`: passed to ssh_execute, ssh_shell_open, ssh_upload, ssh_download,
+    ///   ssh_disconnect, ssh_forward.
+    /// - `AGENT_ID`: optional grouping; passed to ssh_list_sessions (filter) and
+    ///   ssh_disconnect_agent (cleanup).
+    ///
+    /// **Workflow:**
+    /// 1. Call ssh_connect once per remote host.
+    /// 2. Use the returned SESSION_ID for subsequent tool calls.
+    /// 3. Call ssh_disconnect (or ssh_disconnect_agent) when done.
+    ///
+    /// **Status values:** OK, REUSED, SUGGESTED.
+    ///
+    /// **Errors:** CONNECTION_FAILED.
+    #[tool(description = "Connect to an SSH server and store the session. Returns SESSION_ID and optional AGENT_ID. Status values: OK, REUSED, SUGGESTED. Use SESSION_ID with ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward.")]
+    async fn ssh_connect(
+        &self,
+        Parameters(args): Parameters<SshConnectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        ssh_connect_impl(args).await
+    }
+}
+
+#[tool_handler]
 impl ServerHandler for McpSshServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
@@ -69,14 +100,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_server_has_default_tool_router() {
-        let server = McpSshServer::new();
-        // Confirm router is constructable; full tool wiring lands in E3-E4.
-        let _ = server.tool_router;
-    }
-
-    #[test]
-    fn server_info_reports_subscribe_capability() {
+    fn server_info_advertises_subscribe_capability() {
         let info = McpSshServer::new().get_info();
         assert!(
             info.capabilities
@@ -86,5 +110,37 @@ mod tests {
                 .unwrap_or(false),
             "resources.subscribe must be advertised as true"
         );
+    }
+
+    #[test]
+    fn server_info_advertises_resources_list_changed() {
+        let info = McpSshServer::new().get_info();
+        assert!(
+            info.capabilities
+                .resources
+                .as_ref()
+                .and_then(|r| r.list_changed)
+                .unwrap_or(false),
+            "resources.list_changed must be advertised as true"
+        );
+    }
+
+    #[test]
+    fn server_info_advertises_tool_list_changed() {
+        let info = McpSshServer::new().get_info();
+        assert!(
+            info.capabilities
+                .tools
+                .as_ref()
+                .and_then(|t| t.list_changed)
+                .unwrap_or(false),
+            "tools.list_changed must be advertised as true"
+        );
+    }
+
+    #[test]
+    fn server_info_protocol_version_is_2025_06_18() {
+        let info = McpSshServer::new().get_info();
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
     }
 }
