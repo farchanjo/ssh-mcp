@@ -41,6 +41,7 @@ pub(crate) mod error;
 pub(crate) mod forward;
 pub mod keys;
 pub mod message;
+pub mod resources;
 pub mod schema;
 pub mod server;
 pub mod session;
