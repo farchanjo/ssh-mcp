@@ -6,21 +6,28 @@
 //! `max_buffer_size`.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::{Notify, watch};
+use tokio::time::sleep;
 
 use super::super::client::open_pty_shell;
 use super::super::config::{resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size};
 use super::super::keys::{KeyModifiers, ShellKey};
 use super::super::message::builder::{
-    ShellReadBuilder, ShellReadState, render_shell_close_ok, render_shell_send_key_ok,
-    render_shell_write_ok,
+    ShellReadBuilder, ShellReadState, ShellWaitForBuilder, ShellWaitForState,
+    render_shell_close_ok, render_shell_send_key_ok, render_shell_write_ok,
 };
 use super::super::message::helpers::{format_error, generate_nonce};
-use super::super::shell::{MAX_SHELLS_PER_SESSION, RingBuffer, WriteRequest, touch_activity};
+use super::super::shell::{
+    MAX_SHELLS_PER_SESSION, RingBuffer, RunningShell, WriteRequest, touch_activity,
+};
 use super::super::storage::session::SESSION_STORAGE;
 use super::super::storage::shell::SHELL_STORAGE;
 use super::super::storage::traits::{SessionStorage, ShellStorage};
@@ -322,6 +329,41 @@ pub async fn ssh_shell_send_key_impl(
 // `ssh_shell_read`
 // ---------------------------------------------------------------------------
 
+/// Default `wait_timeout_secs` for `ssh_shell_read.wait` and
+/// `ssh_shell_wait_for`.
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
+
+/// Hard cap for `wait_timeout_secs` / `timeout_secs` (5 minutes).
+const MAX_WAIT_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of patterns accepted by `ssh_shell_wait_for`.
+const MAX_WAIT_FOR_PATTERNS: usize = 16;
+
+/// Maximum length of any single pattern in bytes.
+const MAX_WAIT_FOR_PATTERN_BYTES: usize = 1024;
+
+/// Resolved long-poll handle pulled from a `RunningShell`.
+///
+/// All fields are `Arc`/`Clone` and safe to hold across await points; the
+/// underlying DashMap `Ref` is dropped before the loop runs.
+struct ShellLongPollHandle {
+    history: Arc<ArcSwap<RingBuffer>>,
+    status_rx: watch::Receiver<ShellStatus>,
+    data_notify: Arc<Notify>,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl ShellLongPollHandle {
+    fn from_shell(shell: &RunningShell) -> Self {
+        Self {
+            history: Arc::clone(&shell.history),
+            status_rx: shell.status_rx.clone(),
+            data_notify: Arc::clone(&shell.data_notify),
+            last_activity_ms: Arc::clone(&shell.last_activity_ms),
+        }
+    }
+}
+
 /// Arguments for the `ssh_shell_read` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshShellReadArgs {
@@ -336,6 +378,21 @@ pub struct SshShellReadArgs {
     /// Maximum bytes to render. Default: `16384`. Cap: `1_048_576`. Output is
     /// rendered as the tail (most recent bytes).
     pub max_output_bytes: Option<usize>,
+
+    /// FALLBACK long-poll mode. When `true`, block until at least `min_bytes`
+    /// of new output arrive, the shell closes, or `wait_timeout_secs`
+    /// expires. Drastically reduces polling overhead when subscribe is
+    /// unavailable. **Prefer `resources/subscribe shell://<shell_id>/output`
+    /// over this.** Default: `false` (snapshot read).
+    pub wait: Option<bool>,
+
+    /// Max seconds to block when `wait=true`. Default: `30`. Cap: `300`.
+    pub wait_timeout_secs: Option<u64>,
+
+    /// Minimum bytes to wait for before returning (only with `wait=true`).
+    /// Default: `1` (any new byte returns). Set higher to batch reads.
+    /// Capped at the resolved `max_output_bytes`. Floor: `1`.
+    pub min_bytes: Option<usize>,
 }
 
 /// Implementation of `ssh_shell_read`.
@@ -344,19 +401,19 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
         shell_id,
         clear,
         max_output_bytes,
+        wait,
+        wait_timeout_secs,
+        min_bytes,
     } = args;
     let clear = clear.unwrap_or(true);
     let max_bytes = clamp_output_bytes(max_output_bytes);
+    let wait = wait.unwrap_or(false);
 
-    let lookup = SHELL_STORAGE.get_direct(&shell_id).map(|shell| {
-        (
-            Arc::clone(&shell.history),
-            shell.status_rx.clone(),
-            Arc::clone(&shell.last_activity_ms),
-        )
-    });
-    let (history, status_rx, last_activity_ms) = match lookup {
-        Some(t) => t,
+    let lookup = SHELL_STORAGE
+        .get_direct(&shell_id)
+        .map(|shell| ShellLongPollHandle::from_shell(&shell));
+    let handle = match lookup {
+        Some(h) => h,
         None => {
             return Ok(CallToolResult::error(vec![Content::text(format_error(
                 "SSH_SHELL_READ",
@@ -367,15 +424,13 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
         }
     };
 
-    let nonce = generate_nonce();
-    let status = *status_rx.borrow();
-    let state = match status {
-        ShellStatus::Open => ShellReadState::Open,
-        ShellStatus::Closed => ShellReadState::Closed,
+    let (state, snapshot) = if wait {
+        long_poll_shell_read(&handle, wait_timeout_secs, min_bytes, max_bytes).await
+    } else {
+        snapshot_shell_read(&handle)
     };
 
-    // Lock-free snapshot: load_full returns a consistent Arc<RingBuffer> view.
-    let snapshot = history.load_full();
+    let nonce = generate_nonce();
     let markdown =
         ShellReadBuilder::new(&shell_id, state, &snapshot.data, max_bytes, &nonce).build();
 
@@ -385,7 +440,7 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
         // stored a fresh buffer between our load and CAS, the closure runs
         // again with the latest state — so newly arrived bytes are
         // preserved while the head we already rendered is dropped.
-        history.rcu(|current| {
+        handle.history.rcu(|current| {
             let head = current.data.len().min(shown);
             RingBuffer {
                 data: current.data.slice(head..),
@@ -393,9 +448,340 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
         });
     }
 
-    touch_activity(&last_activity_ms);
+    touch_activity(&handle.last_activity_ms);
 
     Ok(CallToolResult::success(vec![Content::text(markdown)]))
+}
+
+/// Snapshot-mode read (no waiting). Returns the current state and buffer.
+fn snapshot_shell_read(handle: &ShellLongPollHandle) -> (ShellReadState, Arc<RingBuffer>) {
+    let snapshot = handle.history.load_full();
+    let state = match *handle.status_rx.borrow() {
+        ShellStatus::Open => ShellReadState::Open,
+        ShellStatus::Closed => ShellReadState::Closed,
+    };
+    (state, snapshot)
+}
+
+/// Long-poll-mode read. Blocks until `min_bytes` new bytes arrive, the shell
+/// closes, or the deadline expires.
+async fn long_poll_shell_read(
+    handle: &ShellLongPollHandle,
+    wait_timeout_secs: Option<u64>,
+    min_bytes: Option<usize>,
+    max_bytes: usize,
+) -> (ShellReadState, Arc<RingBuffer>) {
+    let timeout_secs = wait_timeout_secs
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+        .min(MAX_WAIT_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let target_min = min_bytes.unwrap_or(1).clamp(1, max_bytes.max(1));
+
+    let initial_snapshot = handle.history.load_full();
+    let initial_len = initial_snapshot.data.len();
+    let mut status_rx = handle.status_rx.clone();
+
+    loop {
+        let snapshot = handle.history.load_full();
+        let new_bytes = snapshot.data.len().saturating_sub(initial_len);
+        if new_bytes >= target_min {
+            return (ShellReadState::Open, snapshot);
+        }
+
+        let status_now = current_status(&status_rx);
+        match status_now {
+            ShellStatus::Closed => return (ShellReadState::Closed, snapshot),
+            ShellStatus::Open => {}
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return (ShellReadState::Timeout, snapshot);
+        }
+        let remaining = deadline - now;
+        let notified = handle.data_notify.notified();
+        tokio::select! {
+            () = notified => {},
+            () = sleep(remaining) => {
+                let final_snapshot = handle.history.load_full();
+                let final_new = final_snapshot.data.len().saturating_sub(initial_len);
+                if final_new >= target_min {
+                    return (ShellReadState::Open, final_snapshot);
+                }
+                // Status may have flipped to Closed between checks.
+                let final_state = match current_status(&status_rx) {
+                    ShellStatus::Closed => ShellReadState::Closed,
+                    ShellStatus::Open => ShellReadState::Timeout,
+                };
+                return (final_state, final_snapshot);
+            },
+            res = status_rx.changed() => {
+                // status changed; loop will re-check at the top.
+                let _ = res;
+            }
+        }
+    }
+}
+
+/// Read the current shell status by Copy to avoid holding the watch
+/// `Ref` guard across await points.
+fn current_status(rx: &watch::Receiver<ShellStatus>) -> ShellStatus {
+    let guard = rx.borrow();
+    *guard
+}
+
+// ---------------------------------------------------------------------------
+// `ssh_shell_wait_for`
+// ---------------------------------------------------------------------------
+
+/// Arguments for the `ssh_shell_wait_for` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshShellWaitForArgs {
+    /// `SHELL_ID` returned by `ssh_shell_open`.
+    pub shell_id: String,
+
+    /// 1-16 substring patterns. The first match returns immediately and the
+    /// matched pattern is reported as `MATCHED_PATTERN`. Each pattern up to
+    /// 1024 bytes.
+    pub patterns: Vec<String>,
+
+    /// Max seconds to wait. Default: `30`. Cap: `300`.
+    pub timeout_secs: Option<u64>,
+
+    /// Maximum bytes to show when matched. Default: `16384`. Cap: `1_048_576`.
+    pub max_output_bytes: Option<usize>,
+
+    /// If `true` (default), drain matched output from the shell history
+    /// (head) after returning so subsequent reads start fresh.
+    pub clear: Option<bool>,
+}
+
+/// Outcome of a single buffer scan.
+struct PatternMatch<'a> {
+    /// Index into the original `patterns` slice.
+    pattern: &'a str,
+    /// Absolute end offset (exclusive) of the match in the buffer.
+    end_offset: usize,
+}
+
+/// Scan `buffer` for the earliest occurrence of any pattern in `patterns`.
+/// Ties are broken by the order of the `patterns` slice (first wins).
+fn scan_for_first_match<'a>(buffer: &[u8], patterns: &'a [String]) -> Option<PatternMatch<'a>> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for pattern in patterns {
+        let needle = pattern.as_bytes();
+        if needle.is_empty() {
+            continue;
+        }
+        let Some(pos) = find_subslice(buffer, needle) else {
+            continue;
+        };
+        match best {
+            Some((cur, _)) if cur <= pos => {}
+            _ => best = Some((pos, pattern.as_str())),
+        }
+    }
+    best.map(|(pos, pattern)| PatternMatch {
+        pattern,
+        end_offset: pos.saturating_add(pattern.len()),
+    })
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Validate the `patterns` argument. Returns the formatted error string if
+/// invalid, otherwise `None`.
+fn validate_wait_for_patterns(patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return Some(format_error(
+            "SSH_SHELL_WAIT_FOR",
+            "EMPTY_PATTERNS",
+            "patterns must contain at least one entry",
+            None,
+        ));
+    }
+    if patterns.len() > MAX_WAIT_FOR_PATTERNS {
+        return Some(format_error(
+            "SSH_SHELL_WAIT_FOR",
+            "TOO_MANY_PATTERNS",
+            "patterns exceeds maximum of 16",
+            Some(&format!("count={}", patterns.len())),
+        ));
+    }
+    for pattern in patterns {
+        if pattern.len() > MAX_WAIT_FOR_PATTERN_BYTES {
+            return Some(format_error(
+                "SSH_SHELL_WAIT_FOR",
+                "PATTERN_TOO_LONG",
+                "individual pattern exceeds 1024 bytes",
+                Some(&format!("len={}", pattern.len())),
+            ));
+        }
+    }
+    None
+}
+
+/// Implementation of `ssh_shell_wait_for`.
+pub async fn ssh_shell_wait_for_impl(
+    args: SshShellWaitForArgs,
+) -> Result<CallToolResult, McpError> {
+    let SshShellWaitForArgs {
+        shell_id,
+        patterns,
+        timeout_secs,
+        max_output_bytes,
+        clear,
+    } = args;
+
+    if let Some(err) = validate_wait_for_patterns(&patterns) {
+        return Ok(CallToolResult::error(vec![Content::text(err)]));
+    }
+
+    let max_bytes = clamp_output_bytes(max_output_bytes);
+    let clear = clear.unwrap_or(true);
+    let timeout_secs = timeout_secs
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+        .min(MAX_WAIT_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    let lookup = SHELL_STORAGE
+        .get_direct(&shell_id)
+        .map(|shell| ShellLongPollHandle::from_shell(&shell));
+    let handle = match lookup {
+        Some(h) => h,
+        None => {
+            return Ok(CallToolResult::error(vec![Content::text(format_error(
+                "SSH_SHELL_WAIT_FOR",
+                "SHELL_NOT_FOUND",
+                "no active shell with the given ID",
+                Some(&shell_id),
+            ))]));
+        }
+    };
+
+    let (state, snapshot, drain_up_to) = wait_for_pattern_loop(&handle, &patterns, deadline).await;
+
+    let nonce = generate_nonce();
+    let data_slice: &[u8] = &snapshot.data;
+    let markdown =
+        ShellWaitForBuilder::new(&shell_id, state, data_slice, max_bytes, &nonce).build();
+
+    if clear {
+        if let Some(head_len) = drain_up_to {
+            handle.history.rcu(|current| {
+                let head = current.data.len().min(head_len);
+                RingBuffer {
+                    data: current.data.slice(head..),
+                }
+            });
+        }
+    }
+
+    touch_activity(&handle.last_activity_ms);
+
+    Ok(CallToolResult::success(vec![Content::text(markdown)]))
+}
+
+/// Loop body for `ssh_shell_wait_for`. Returns the final state, a snapshot
+/// of the buffer that should be rendered, and an optional drain-up-to offset
+/// (used only on MATCHED to chop the matched prefix off the head).
+async fn wait_for_pattern_loop(
+    handle: &ShellLongPollHandle,
+    patterns: &[String],
+    deadline: Instant,
+) -> (ShellWaitForState, Arc<RingBuffer>, Option<usize>) {
+    let max_pat_len = patterns.iter().map(String::len).max().unwrap_or(0);
+    let mut last_scanned_offset: usize = 0;
+    let mut status_rx = handle.status_rx.clone();
+
+    loop {
+        let snapshot = handle.history.load_full();
+        if let Some(found) = scan_window(&snapshot.data, last_scanned_offset, max_pat_len, patterns)
+        {
+            return (
+                ShellWaitForState::Matched {
+                    pattern: found.pattern,
+                },
+                snapshot,
+                Some(found.abs_end),
+            );
+        }
+        last_scanned_offset = snapshot.data.len();
+
+        let status_now = current_status(&status_rx);
+        match status_now {
+            ShellStatus::Closed => return (ShellWaitForState::Closed, snapshot, None),
+            ShellStatus::Open => {}
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return (ShellWaitForState::Timeout, snapshot, None);
+        }
+        let remaining = deadline - now;
+        let notified = handle.data_notify.notified();
+        tokio::select! {
+            () = notified => {},
+            () = sleep(remaining) => {
+                let final_snapshot = handle.history.load_full();
+                if let Some(found) = scan_window(
+                    &final_snapshot.data,
+                    last_scanned_offset,
+                    max_pat_len,
+                    patterns,
+                ) {
+                    return (
+                        ShellWaitForState::Matched { pattern: found.pattern },
+                        final_snapshot,
+                        Some(found.abs_end),
+                    );
+                }
+                let final_state = match current_status(&status_rx) {
+                    ShellStatus::Closed => ShellWaitForState::Closed,
+                    ShellStatus::Open => ShellWaitForState::Timeout,
+                };
+                return (final_state, final_snapshot, None);
+            },
+            res = status_rx.changed() => {
+                let _ = res;
+            }
+        }
+    }
+}
+
+/// Resolved match within the buffer, including absolute end offset.
+struct ResolvedMatch {
+    pattern: String,
+    abs_end: usize,
+}
+
+/// Scan the unscanned tail of `data` for any pattern. The window starts at
+/// `last_scanned_offset - (max_pat_len - 1)` to catch matches that straddle
+/// the previous scan boundary.
+fn scan_window(
+    data: &[u8],
+    last_scanned_offset: usize,
+    max_pat_len: usize,
+    patterns: &[String],
+) -> Option<ResolvedMatch> {
+    let scan_start = last_scanned_offset.saturating_sub(max_pat_len.saturating_sub(1));
+    if scan_start >= data.len() {
+        return None;
+    }
+    let found = scan_for_first_match(&data[scan_start..], patterns)?;
+    let abs_end = scan_start.saturating_add(found.end_offset);
+    Some(ResolvedMatch {
+        pattern: found.pattern.to_string(),
+        abs_end,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +967,262 @@ mod tests {
         #[test]
         fn cap_is_64() {
             assert_eq!(MAX_SEND_KEY_REPEAT, 64);
+        }
+    }
+
+    mod shell_read_long_poll_args {
+        use super::*;
+
+        #[tokio::test]
+        async fn missing_shell_returns_shell_not_found_with_wait() {
+            let args = SshShellReadArgs {
+                shell_id: "definitely-missing-shell-id".to_string(),
+                clear: None,
+                max_output_bytes: None,
+                wait: Some(true),
+                wait_timeout_secs: Some(1),
+                min_bytes: Some(1),
+            };
+            let call = match ssh_shell_read_impl(args).await {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(
+                body.contains("SHELL_NOT_FOUND"),
+                "expected SHELL_NOT_FOUND, got {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn deserialize_long_poll_fields() {
+            let json = serde_json::json!({
+                "shell_id": "shell-1",
+                "wait": true,
+                "wait_timeout_secs": 10,
+                "min_bytes": 64,
+            });
+            let parsed: SshShellReadArgs =
+                serde_json::from_value(json).expect("deserializes valid args");
+            assert_eq!(parsed.shell_id, "shell-1");
+            assert_eq!(parsed.wait, Some(true));
+            assert_eq!(parsed.wait_timeout_secs, Some(10));
+            assert_eq!(parsed.min_bytes, Some(64));
+        }
+    }
+
+    mod scan_for_first_match {
+        use super::*;
+
+        #[test]
+        fn returns_none_for_no_match() {
+            let patterns = vec!["foo".to_string(), "bar".to_string()];
+            let m = scan_for_first_match(b"hello world", &patterns);
+            assert!(m.is_none());
+        }
+
+        #[test]
+        fn finds_earliest_position_across_patterns() {
+            // "$ " appears at offset 6, "x" appears at offset 0.
+            let patterns = vec!["$ ".to_string(), "x".to_string()];
+            let buf = b"x foo $ ready";
+            let m = scan_for_first_match(buf, &patterns).expect("must match");
+            assert_eq!(m.pattern, "x");
+            assert_eq!(m.end_offset, 1);
+        }
+
+        #[test]
+        fn ties_break_to_first_pattern_in_list() {
+            // Both patterns start at offset 0; first one in `patterns` wins.
+            let patterns = vec!["abc".to_string(), "ab".to_string()];
+            let m = scan_for_first_match(b"abcdef", &patterns).expect("must match");
+            assert_eq!(m.pattern, "abc");
+            assert_eq!(m.end_offset, 3);
+        }
+
+        #[test]
+        fn skips_empty_pattern() {
+            let patterns = vec![String::new(), "x".to_string()];
+            let m = scan_for_first_match(b"yyx", &patterns).expect("must match");
+            assert_eq!(m.pattern, "x");
+            assert_eq!(m.end_offset, 3);
+        }
+
+        #[test]
+        fn earliest_position_wins_over_pattern_order() {
+            // "second" wins because it appears earlier at offset 0, even
+            // though "first" comes first in the patterns list.
+            let patterns = vec!["first".to_string(), "second".to_string()];
+            let m = scan_for_first_match(b"second first", &patterns).expect("must match");
+            assert_eq!(m.pattern, "second");
+            assert_eq!(m.end_offset, 6);
+        }
+    }
+
+    mod scan_window {
+        use super::*;
+
+        #[test]
+        fn straddling_boundary_is_caught() {
+            // Buffer initial scan only saw "passwo".
+            // Next buffer is "password:" — a naive scan from
+            // last_scanned_offset=6 would miss the match.
+            let patterns = vec!["password:".to_string()];
+            let max_pat_len = 9;
+            let m = scan_window(b"password:", 6, max_pat_len, &patterns)
+                .expect("must catch boundary match");
+            assert_eq!(m.pattern, "password:");
+            assert_eq!(m.abs_end, 9);
+        }
+
+        #[test]
+        fn returns_none_when_scan_start_past_buffer() {
+            let patterns = vec!["x".to_string()];
+            let m = scan_window(b"abc", 100, 1, &patterns);
+            assert!(m.is_none());
+        }
+    }
+
+    mod validate_wait_for_patterns {
+        use super::*;
+
+        #[test]
+        fn empty_patterns_rejected() {
+            let err = validate_wait_for_patterns(&[]).expect("must error");
+            assert!(err.contains("EMPTY_PATTERNS"), "got {err}");
+        }
+
+        #[test]
+        fn too_many_patterns_rejected() {
+            let patterns: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+            let err = validate_wait_for_patterns(&patterns).expect("must error");
+            assert!(err.contains("TOO_MANY_PATTERNS"), "got {err}");
+            assert!(err.contains("count=17"), "got {err}");
+        }
+
+        #[test]
+        fn pattern_too_long_rejected() {
+            let patterns = vec!["x".repeat(MAX_WAIT_FOR_PATTERN_BYTES + 1)];
+            let err = validate_wait_for_patterns(&patterns).expect("must error");
+            assert!(err.contains("PATTERN_TOO_LONG"), "got {err}");
+        }
+
+        #[test]
+        fn pattern_at_limit_accepted() {
+            let patterns = vec!["x".repeat(MAX_WAIT_FOR_PATTERN_BYTES)];
+            assert!(validate_wait_for_patterns(&patterns).is_none());
+        }
+
+        #[test]
+        fn sixteen_patterns_accepted() {
+            let patterns: Vec<String> = (0..16).map(|i| format!("p{i}")).collect();
+            assert!(validate_wait_for_patterns(&patterns).is_none());
+        }
+    }
+
+    mod wait_for_impl_validation {
+        use super::*;
+
+        #[tokio::test]
+        async fn empty_patterns_returns_error() {
+            let args = SshShellWaitForArgs {
+                shell_id: "missing".to_string(),
+                patterns: vec![],
+                timeout_secs: Some(1),
+                max_output_bytes: None,
+                clear: None,
+            };
+            let call = match ssh_shell_wait_for_impl(args).await {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(body.contains("EMPTY_PATTERNS"), "got {body}");
+        }
+
+        #[tokio::test]
+        async fn too_many_patterns_returns_error() {
+            let patterns: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+            let args = SshShellWaitForArgs {
+                shell_id: "missing".to_string(),
+                patterns,
+                timeout_secs: Some(1),
+                max_output_bytes: None,
+                clear: None,
+            };
+            let call = match ssh_shell_wait_for_impl(args).await {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(body.contains("TOO_MANY_PATTERNS"), "got {body}");
+        }
+
+        #[tokio::test]
+        async fn pattern_too_long_returns_error() {
+            let args = SshShellWaitForArgs {
+                shell_id: "missing".to_string(),
+                patterns: vec!["x".repeat(MAX_WAIT_FOR_PATTERN_BYTES + 1)],
+                timeout_secs: Some(1),
+                max_output_bytes: None,
+                clear: None,
+            };
+            let call = match ssh_shell_wait_for_impl(args).await {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(body.contains("PATTERN_TOO_LONG"), "got {body}");
+        }
+
+        #[tokio::test]
+        async fn missing_shell_returns_shell_not_found() {
+            let args = SshShellWaitForArgs {
+                shell_id: "definitely-missing-shell-id".to_string(),
+                patterns: vec!["$ ".to_string()],
+                timeout_secs: Some(1),
+                max_output_bytes: None,
+                clear: None,
+            };
+            let call = match ssh_shell_wait_for_impl(args).await {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(body.contains("SHELL_NOT_FOUND"), "got {body}");
+        }
+    }
+
+    mod wait_for_args_serde {
+        use super::*;
+
+        #[test]
+        fn deserialize_required_fields_only() {
+            let json = serde_json::json!({
+                "shell_id": "shell-1",
+                "patterns": ["$ ", "password:"],
+            });
+            let parsed: SshShellWaitForArgs = serde_json::from_value(json).expect("valid args");
+            assert_eq!(parsed.shell_id, "shell-1");
+            assert_eq!(parsed.patterns, vec!["$ ", "password:"]);
+            assert!(parsed.timeout_secs.is_none());
+            assert!(parsed.max_output_bytes.is_none());
+            assert!(parsed.clear.is_none());
+        }
+
+        #[test]
+        fn deserialize_full_payload() {
+            let json = serde_json::json!({
+                "shell_id": "shell-1",
+                "patterns": ["$ "],
+                "timeout_secs": 60,
+                "max_output_bytes": 4096,
+                "clear": false,
+            });
+            let parsed: SshShellWaitForArgs = serde_json::from_value(json).expect("valid args");
+            assert_eq!(parsed.timeout_secs, Some(60));
+            assert_eq!(parsed.max_output_bytes, Some(4096));
+            assert_eq!(parsed.clear, Some(false));
         }
     }
 }

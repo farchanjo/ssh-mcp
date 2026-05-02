@@ -29,9 +29,9 @@ use super::tools::sftp::{
     ssh_get_transfer_progress_impl, ssh_upload_impl,
 };
 use super::tools::shell::{
-    SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellSendKeyArgs, SshShellWriteArgs,
-    ssh_shell_close_impl, ssh_shell_open_impl, ssh_shell_read_impl, ssh_shell_send_key_impl,
-    ssh_shell_write_impl,
+    SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellSendKeyArgs,
+    SshShellWaitForArgs, SshShellWriteArgs, ssh_shell_close_impl, ssh_shell_open_impl,
+    ssh_shell_read_impl, ssh_shell_send_key_impl, ssh_shell_wait_for_impl, ssh_shell_write_impl,
 };
 
 /// Primary MCP server handler.
@@ -303,17 +303,53 @@ impl McpSshServer {
     /// **Notes:** with `clear=true` (default) only the rendered bytes are
     /// drained (head-based pagination).
     ///
-    /// **Status values:** open, closed.
+    /// **FALLBACK long-poll:** pass `wait=true` to block until at least
+    /// `min_bytes` of new output arrive, the shell closes, or
+    /// `wait_timeout_secs` expires (default `30`, cap `300`). This is a
+    /// fallback for clients that cannot use `resources/subscribe`. **Prefer
+    /// `resources/subscribe shell://<shell_id>/output` for continuous
+    /// realtime streaming.**
+    ///
+    /// **Status values:** OPEN, CLOSED, TIMEOUT (long-poll only).
     ///
     /// **Errors:** SHELL_NOT_FOUND.
     #[tool(
-        description = "Read buffered output from a shell by SHELL_ID. clear=true (default) drains shown bytes (head pagination). max_output_bytes default 16384, cap 1048576. Status: open, closed. Errors: SHELL_NOT_FOUND."
+        description = "Read buffered output from a shell by SHELL_ID. clear=true (default) drains shown bytes (head pagination). max_output_bytes default 16384, cap 1048576. Optional FALLBACK long-poll via wait=true (blocks until min_bytes arrive, shell closes, or wait_timeout_secs expires; default 30s, cap 300s) — prefer resources/subscribe shell://<id>/output. Status: OPEN, CLOSED, TIMEOUT. Errors: SHELL_NOT_FOUND."
     )]
     async fn ssh_shell_read(
         &self,
         Parameters(args): Parameters<SshShellReadArgs>,
     ) -> Result<CallToolResult, McpError> {
         ssh_shell_read_impl(args).await
+    }
+
+    /// Wait for a substring (or any of N substrings) to appear in the
+    /// shell output.
+    ///
+    /// **FALLBACK gated wait — prefer `resources/subscribe
+    /// shell://<id>/output` for continuous observation; use this only when
+    /// the MCP host does not support resource subscriptions, OR when you
+    /// need a single-shot guarantee that the shell reaches a known state
+    /// before proceeding (e.g., wait for `password:` prompt).**
+    ///
+    /// **Use this for:**
+    /// - Gating on prompt patterns (`$ `, `# `, `password:`)
+    /// - Branching login flows: pass `["password:", "Permission denied",
+    ///   "$ "]` and inspect MATCHED_PATTERN to choose the next action.
+    /// - Multi-step workflows where each step waits for completion marker.
+    ///
+    /// **Status values:** MATCHED, TIMEOUT, CLOSED.
+    ///
+    /// **Errors:** SHELL_NOT_FOUND, EMPTY_PATTERNS, TOO_MANY_PATTERNS,
+    /// PATTERN_TOO_LONG.
+    #[tool(
+        description = "Wait for one of up to 16 substrings to appear in shell output. FALLBACK over resources/subscribe. Status: MATCHED (returns matched_pattern + bytes), TIMEOUT (returns current buffer), CLOSED. Each pattern <=1024 bytes. Errors: SHELL_NOT_FOUND, EMPTY_PATTERNS, TOO_MANY_PATTERNS, PATTERN_TOO_LONG."
+    )]
+    async fn ssh_shell_wait_for(
+        &self,
+        Parameters(args): Parameters<SshShellWaitForArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        ssh_shell_wait_for_impl(args).await
     }
 
     /// Close an interactive shell.
@@ -429,10 +465,12 @@ impl ServerHandler for McpSshServer {
         implementation.version = env!("CARGO_PKG_VERSION").to_string();
         info.server_info = implementation;
         info.instructions = Some(
-            "SSH MCP server — 16 SSH tools and 5 resource subscribe schemes \
+            "SSH MCP server — 18 SSH tools and 5 resource subscribe schemes \
              (shell://, command://, transfer://, session://, forward://). \
              Prefer resources/subscribe + resources/read for realtime output streams \
-             over polling-based ssh_shell_read."
+             over polling-based ssh_shell_read; the long-poll variants \
+             (ssh_shell_read.wait, ssh_shell_wait_for) are FALLBACKS for clients \
+             that cannot subscribe."
                 .to_string(),
         );
         info

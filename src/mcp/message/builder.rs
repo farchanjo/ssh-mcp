@@ -760,6 +760,10 @@ pub enum ShellReadState {
     Open,
     /// Shell has been closed (background reader ended).
     Closed,
+    /// Long-poll deadline expired before `min_bytes` of new output arrived.
+    /// The shell remains open; the response carries whatever is currently
+    /// buffered.
+    Timeout,
 }
 
 /// Builder for `ssh_shell_read`.
@@ -796,6 +800,7 @@ impl<'a> ShellReadBuilder<'a> {
         let status = match self.state {
             ShellReadState::Open => "OPEN",
             ShellReadState::Closed => "CLOSED",
+            ShellReadState::Timeout => "TIMEOUT",
         };
         let data_block =
             render_output_block("data", self.nonce, self.data, self.max_output_bytes, None);
@@ -804,6 +809,80 @@ impl<'a> ShellReadBuilder<'a> {
         out.push_str(status);
         out.push_str("\nSHELL_ID: ");
         out.push_str(self.shell_id);
+        out.push('\n');
+        out.push_str(&data_block);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_shell_wait_for
+// ---------------------------------------------------------------------------
+
+/// Outcome reported by `ssh_shell_wait_for`.
+#[derive(Debug, Clone)]
+pub enum ShellWaitForState {
+    /// At least one pattern was found in the buffer. The matched pattern
+    /// label is included in the response.
+    Matched { pattern: String },
+    /// Deadline expired without any pattern matching. The current buffer
+    /// is included verbatim (subject to `max_output_bytes`).
+    Timeout,
+    /// The shell closed during the wait. Response carries whatever was
+    /// buffered.
+    Closed,
+}
+
+/// Builder for `ssh_shell_wait_for`.
+#[must_use]
+pub struct ShellWaitForBuilder<'a> {
+    shell_id: &'a str,
+    state: ShellWaitForState,
+    data: &'a [u8],
+    max_output_bytes: usize,
+    nonce: &'a str,
+}
+
+impl<'a> ShellWaitForBuilder<'a> {
+    /// Create a new builder.
+    pub const fn new(
+        shell_id: &'a str,
+        state: ShellWaitForState,
+        data: &'a [u8],
+        max_output_bytes: usize,
+        nonce: &'a str,
+    ) -> Self {
+        Self {
+            shell_id,
+            state,
+            data,
+            max_output_bytes,
+            nonce,
+        }
+    }
+
+    /// Render the markdown response.
+    #[must_use]
+    pub fn build(&self) -> String {
+        let (status, matched_pattern) = match &self.state {
+            ShellWaitForState::Matched { pattern } => ("MATCHED", Some(pattern.as_str())),
+            ShellWaitForState::Timeout => ("TIMEOUT", None),
+            ShellWaitForState::Closed => ("CLOSED", None),
+        };
+        let data_block =
+            render_output_block("data", self.nonce, self.data, self.max_output_bytes, None);
+        let bytes_returned = self.data.len().min(self.max_output_bytes);
+        let mut out = String::with_capacity(128 + data_block.len());
+        out.push_str("SSH_SHELL_WAIT_FOR: ");
+        out.push_str(status);
+        out.push_str("\nSHELL_ID: ");
+        out.push_str(self.shell_id);
+        if let Some(pattern) = matched_pattern {
+            out.push_str("\nMATCHED_PATTERN: ");
+            out.push_str(&sanitize_value(pattern));
+        }
+        out.push_str("\nBYTES_RETURNED: ");
+        out.push_str(&bytes_returned.to_string());
         out.push('\n');
         out.push_str(&data_block);
         out
@@ -1523,6 +1602,103 @@ mod tests {
                 ShellReadBuilder::new("shell-1", ShellReadState::Closed, b"", 1024, "n").build();
             assert!(m.contains("SSH_SHELL_READ: CLOSED"));
             assert!(m.contains("--- data [n] (empty) ---"));
+        }
+
+        #[test]
+        fn timeout_with_data() {
+            let m = ShellReadBuilder::new(
+                "shell-1",
+                ShellReadState::Timeout,
+                b"partial output",
+                1024,
+                "n",
+            )
+            .build();
+            assert!(m.starts_with("SSH_SHELL_READ: TIMEOUT\n"));
+            assert!(m.contains("SHELL_ID: shell-1"));
+            assert!(m.contains("--- data [n] ---"));
+            assert!(m.contains("partial output"));
+        }
+
+        #[test]
+        fn timeout_with_empty_data() {
+            let m =
+                ShellReadBuilder::new("shell-1", ShellReadState::Timeout, b"", 1024, "n").build();
+            assert!(m.contains("SSH_SHELL_READ: TIMEOUT"));
+            assert!(m.contains("--- data [n] (empty) ---"));
+        }
+    }
+
+    mod shell_wait_for_builder {
+        use super::*;
+
+        #[test]
+        fn matched_includes_pattern_and_data() {
+            let m = ShellWaitForBuilder::new(
+                "shell-1",
+                ShellWaitForState::Matched {
+                    pattern: "$ ".to_string(),
+                },
+                b"login\nuser@host:~$ ",
+                1024,
+                "nonce",
+            )
+            .build();
+            assert!(m.starts_with("SSH_SHELL_WAIT_FOR: MATCHED\n"));
+            assert!(m.contains("SHELL_ID: shell-1"));
+            assert!(m.contains("MATCHED_PATTERN: $ "));
+            assert!(m.contains("BYTES_RETURNED: 19"));
+            assert!(m.contains("--- data [nonce] ---"));
+            assert!(m.contains("user@host:~$ "));
+        }
+
+        #[test]
+        fn timeout_omits_matched_pattern() {
+            let m = ShellWaitForBuilder::new(
+                "shell-1",
+                ShellWaitForState::Timeout,
+                b"still loading",
+                1024,
+                "nonce",
+            )
+            .build();
+            assert!(m.starts_with("SSH_SHELL_WAIT_FOR: TIMEOUT\n"));
+            assert!(!m.contains("MATCHED_PATTERN"));
+            assert!(m.contains("BYTES_RETURNED: 13"));
+        }
+
+        #[test]
+        fn closed_omits_matched_pattern() {
+            let m =
+                ShellWaitForBuilder::new("shell-1", ShellWaitForState::Closed, b"", 1024, "nonce")
+                    .build();
+            assert!(m.starts_with("SSH_SHELL_WAIT_FOR: CLOSED\n"));
+            assert!(!m.contains("MATCHED_PATTERN"));
+            assert!(m.contains("BYTES_RETURNED: 0"));
+            assert!(m.contains("--- data [nonce] (empty) ---"));
+        }
+
+        #[test]
+        fn matched_pattern_sanitized() {
+            let m = ShellWaitForBuilder::new(
+                "shell-1",
+                ShellWaitForState::Matched {
+                    pattern: "line1\nline2".to_string(),
+                },
+                b"data",
+                1024,
+                "n",
+            )
+            .build();
+            assert!(m.contains("MATCHED_PATTERN: line1\\nline2"));
+        }
+
+        #[test]
+        fn bytes_returned_capped_by_max_output_bytes() {
+            let buf = vec![b'x'; 500];
+            let m = ShellWaitForBuilder::new("shell-1", ShellWaitForState::Timeout, &buf, 100, "n")
+                .build();
+            assert!(m.contains("BYTES_RETURNED: 100"));
         }
     }
 
