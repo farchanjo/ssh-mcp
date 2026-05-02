@@ -152,12 +152,22 @@ pub const NOTIFY_KEEPALIVE_S_MIN: u64 = 5;
 /// Cap for the keepalive interval.
 pub const NOTIFY_KEEPALIVE_S_MAX: u64 = 300;
 
+/// Default interval (seconds) at which the binary scans the subscription
+/// registry for peers whose transport has closed.
+pub const DEFAULT_PEER_GC_INTERVAL_S: u64 = 30;
+/// Floor for the peer GC interval (seconds).
+pub const PEER_GC_INTERVAL_S_MIN: u64 = 5;
+/// Cap for the peer GC interval (seconds).
+pub const PEER_GC_INTERVAL_S_MAX: u64 = 300;
+
 /// Environment variable name for the subscription debounce window.
 pub const NOTIFY_DEBOUNCE_MS_ENV_VAR: &str = "SSH_NOTIFY_DEBOUNCE_MS";
 /// Environment variable name for the subscription force-flush interval.
 pub const NOTIFY_FORCE_FLUSH_MS_ENV_VAR: &str = "SSH_NOTIFY_FORCE_FLUSH_MS";
 /// Environment variable name for the subscription keepalive interval.
 pub const NOTIFY_KEEPALIVE_S_ENV_VAR: &str = "SSH_NOTIFY_KEEPALIVE_S";
+/// Environment variable name for the binary peer-GC scan interval.
+pub const PEER_GC_INTERVAL_S_ENV_VAR: &str = "SSH_MCP_PEER_GC_INTERVAL_S";
 
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
@@ -582,6 +592,21 @@ pub fn resolve_notify_keepalive_s() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_NOTIFY_KEEPALIVE_S);
     raw.clamp(NOTIFY_KEEPALIVE_S_MIN, NOTIFY_KEEPALIVE_S_MAX)
+}
+
+/// Resolve the peer-GC scan interval (seconds).
+///
+/// The binary entry points (`ssh-mcp` and `ssh-mcp-stdio`) spawn a periodic
+/// task that walks `SUBSCRIPTION_REGISTRY` and drops peers whose rmcp
+/// transport has closed. This resolver reads `SSH_MCP_PEER_GC_INTERVAL_S`
+/// (default 30) and clamps to `[PEER_GC_INTERVAL_S_MIN, PEER_GC_INTERVAL_S_MAX]`.
+#[must_use]
+pub fn resolve_peer_gc_interval_s() -> u64 {
+    let raw = env::var(PEER_GC_INTERVAL_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PEER_GC_INTERVAL_S);
+    raw.clamp(PEER_GC_INTERVAL_S_MIN, PEER_GC_INTERVAL_S_MAX)
 }
 
 #[cfg(test)]
@@ -1746,6 +1771,63 @@ mod tests {
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe { remove_env(NOTIFY_KEEPALIVE_S_ENV_VAR) };
                 assert_eq!(result, NOTIFY_KEEPALIVE_S_MAX);
+            }
+        }
+
+        mod peer_gc_interval_s {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
+                let result = resolve_peer_gc_interval_s();
+                assert_eq!(result, DEFAULT_PEER_GC_INTERVAL_S);
+            }
+
+            #[test]
+            fn test_uses_env_when_in_range() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(PEER_GC_INTERVAL_S_ENV_VAR, "120") };
+                let result = resolve_peer_gc_interval_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
+                assert_eq!(result, 120);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(PEER_GC_INTERVAL_S_ENV_VAR, "1") };
+                let result = resolve_peer_gc_interval_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
+                assert_eq!(result, PEER_GC_INTERVAL_S_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(PEER_GC_INTERVAL_S_ENV_VAR, "999999") };
+                let result = resolve_peer_gc_interval_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
+                assert_eq!(result, PEER_GC_INTERVAL_S_MAX);
+            }
+
+            #[test]
+            fn test_invalid_value_falls_back_to_default() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(PEER_GC_INTERVAL_S_ENV_VAR, "not-a-number") };
+                let result = resolve_peer_gc_interval_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
+                assert_eq!(result, DEFAULT_PEER_GC_INTERVAL_S);
             }
         }
     }

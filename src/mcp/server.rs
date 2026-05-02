@@ -10,10 +10,16 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities,
-    ServerInfo,
+    CallToolResult, ErrorData as McpError, Implementation, ListResourcesResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+
+use crate::mcp::resources::{
+    list_resources_impl, peer_id_for, read_resource_impl, subscribe_impl, unsubscribe_impl,
+};
 
 use super::tools::connection::{
     SshConnectArgs, SshDisconnectAgentArgs, SshDisconnectArgs, SshListSessionsArgs,
@@ -467,13 +473,47 @@ impl ServerHandler for McpSshServer {
         info.instructions = Some(
             "SSH MCP server — 18 SSH tools and 5 resource subscribe schemes \
              (shell://, command://, transfer://, session://, forward://). \
-             Prefer resources/subscribe + resources/read for realtime output streams \
-             over polling-based ssh_shell_read; the long-poll variants \
+             Prefer `resources/subscribe shell://<shell_id>/output` for realtime \
+             PTY streams over polling-based ssh_shell_read; the long-poll variants \
              (ssh_shell_read.wait, ssh_shell_wait_for) are FALLBACKS for clients \
-             that cannot subscribe."
+             that cannot subscribe. Use resources/list to enumerate active shells, \
+             commands, transfers, and sessions."
                 .to_string(),
         );
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(list_resources_impl())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        read_resource_impl(request, &context.peer).await
+    }
+
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        subscribe_impl(request, context.peer).await
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let peer_id = peer_id_for(&context.peer);
+        unsubscribe_impl(request, &peer_id).await
     }
 }
 
@@ -524,5 +564,37 @@ mod tests {
     fn server_info_protocol_version_is_2025_06_18() {
         let info = McpSshServer::new().get_info();
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
+    }
+
+    #[test]
+    fn instructions_mention_resources_subscribe_and_shell_scheme() {
+        let info = McpSshServer::new().get_info();
+        let instructions = info
+            .instructions
+            .as_deref()
+            .expect("get_info() must populate instructions");
+        assert!(
+            instructions.contains("subscribe"),
+            "instructions must mention `subscribe`: {instructions}"
+        );
+        assert!(
+            instructions.contains("shell://"),
+            "instructions must reference the `shell://` scheme: {instructions}"
+        );
+    }
+
+    #[test]
+    fn tool_router_advertises_eighteen_tools() {
+        let server = McpSshServer::new();
+        // 18 = 4 connection + 4 commands + 6 shell + 3 sftp + 1 forward
+        // (the forward tool is feature-gated; it ships under the default
+        // feature set used by `cargo test`).
+        let tools = server.tool_router.list_all();
+        assert_eq!(
+            tools.len(),
+            18,
+            "tool_router must advertise 18 tools, found {}",
+            tools.len()
+        );
     }
 }
