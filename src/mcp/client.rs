@@ -857,7 +857,13 @@ async fn collect_async_output(
         }
     }
 
-    flush_local_buffers(&mut local_stdout, &mut local_stderr, &mut owned, command, max);
+    flush_local_buffers(
+        &mut local_stdout,
+        &mut local_stderr,
+        &mut owned,
+        command,
+        max,
+    );
     let _ = channel.close().await;
     exit_code
 }
@@ -911,9 +917,7 @@ fn publish_stdout(
 ) {
     let chunk = Bytes::copy_from_slice(local);
     owned.append_stdout_slice(local, max_buffer);
-    command
-        .output_history
-        .store(Arc::new(owned.clone()));
+    command.output_history.store(Arc::new(owned.clone()));
     let _ = command.output_tx.send(OutputChunk::Stdout(chunk));
 }
 
@@ -926,9 +930,7 @@ fn publish_stderr(
 ) {
     let chunk = Bytes::copy_from_slice(local);
     owned.append_stderr_slice(local, max_buffer);
-    command
-        .output_history
-        .store(Arc::new(owned.clone()));
+    command.output_history.store(Arc::new(owned.clone()));
     let _ = command.output_tx.send(OutputChunk::Stderr(chunk));
 }
 

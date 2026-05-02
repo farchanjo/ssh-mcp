@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::time;
 
 use super::super::client::open_pty_shell;
 use super::super::config::{resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size};
@@ -18,7 +18,7 @@ use super::super::message::builder::{
     ShellReadBuilder, ShellReadState, render_shell_close_ok, render_shell_write_ok,
 };
 use super::super::message::helpers::{format_error, generate_nonce};
-use super::super::shell::MAX_SHELLS_PER_SESSION;
+use super::super::shell::{MAX_SHELLS_PER_SESSION, RingBuffer, WriteRequest, touch_activity};
 use super::super::storage::session::SESSION_STORAGE;
 use super::super::storage::shell::SHELL_STORAGE;
 use super::super::storage::traits::{SessionStorage, ShellStorage};
@@ -138,13 +138,10 @@ pub struct SshShellWriteArgs {
 /// Implementation of `ssh_shell_write`.
 pub async fn ssh_shell_write_impl(args: SshShellWriteArgs) -> Result<CallToolResult, McpError> {
     let SshShellWriteArgs { shell_id, input } = args;
-    let lookup = SHELL_STORAGE.get_direct(&shell_id).map(|shell| {
-        (
-            Arc::clone(&shell.channel_writer),
-            Arc::clone(&shell.last_activity),
-        )
-    });
-    let (channel_writer, last_activity) = match lookup {
+    let lookup = SHELL_STORAGE
+        .get_direct(&shell_id)
+        .map(|shell| (shell.input_tx.clone(), Arc::clone(&shell.last_activity_ms)));
+    let (input_tx, last_activity_ms) = match lookup {
         Some(pair) => pair,
         None => {
             return Ok(CallToolResult::error(vec![Content::text(format_error(
@@ -156,16 +153,17 @@ pub async fn ssh_shell_write_impl(args: SshShellWriteArgs) -> Result<CallToolRes
         }
     };
 
-    if let Err(e) = channel_writer.lock().await.write(input.as_bytes()).await {
+    let payload = Bytes::copy_from_slice(input.as_bytes());
+    if let Err(e) = input_tx.send(WriteRequest::Data(payload)).await {
         return Ok(CallToolResult::error(vec![Content::text(format_error(
             "SSH_SHELL_WRITE",
             "WRITE_FAILED",
-            &e,
+            &format!("shell writer task closed: {e}"),
             None,
         ))]));
     }
 
-    *last_activity.lock().await = time::Instant::now();
+    touch_activity(&last_activity_ms);
 
     Ok(CallToolResult::success(vec![Content::text(
         render_shell_write_ok(&shell_id, input.len()),
@@ -204,12 +202,12 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
 
     let lookup = SHELL_STORAGE.get_direct(&shell_id).map(|shell| {
         (
-            Arc::clone(&shell.output),
+            Arc::clone(&shell.history),
             shell.status_rx.clone(),
-            Arc::clone(&shell.last_activity),
+            Arc::clone(&shell.last_activity_ms),
         )
     });
-    let (output_arc, status_rx, last_activity) = match lookup {
+    let (history, status_rx, last_activity_ms) = match lookup {
         Some(t) => t,
         None => {
             return Ok(CallToolResult::error(vec![Content::text(format_error(
@@ -228,20 +226,26 @@ pub async fn ssh_shell_read_impl(args: SshShellReadArgs) -> Result<CallToolResul
         ShellStatus::Closed => ShellReadState::Closed,
     };
 
-    let markdown = {
-        let mut guard = output_arc.lock().await;
-        let markdown = ShellReadBuilder::new(&shell_id, state, &guard, max_bytes, &nonce).build();
-        if clear {
-            let shown = guard.len().min(max_bytes);
-            guard.drain(..shown);
-            if guard.capacity() > guard.len().saturating_mul(4) {
-                guard.shrink_to_fit();
-            }
-        }
-        markdown
-    };
+    // Lock-free snapshot: load_full returns a consistent Arc<RingBuffer> view.
+    let snapshot = history.load_full();
+    let markdown =
+        ShellReadBuilder::new(&shell_id, state, &snapshot.data, max_bytes, &nonce).build();
 
-    *last_activity.lock().await = time::Instant::now();
+    if clear {
+        let shown = snapshot.data.len().min(max_bytes);
+        // rcu retries on contention with the reader task: if the reader
+        // stored a fresh buffer between our load and CAS, the closure runs
+        // again with the latest state — so newly arrived bytes are
+        // preserved while the head we already rendered is dropped.
+        history.rcu(|current| {
+            let head = current.data.len().min(shown);
+            RingBuffer {
+                data: current.data.slice(head..),
+            }
+        });
+    }
+
+    touch_activity(&last_activity_ms);
 
     Ok(CallToolResult::success(vec![Content::text(markdown)]))
 }
@@ -272,8 +276,8 @@ pub async fn ssh_shell_close_impl(args: SshShellCloseArgs) -> Result<CallToolRes
         }
     };
 
+    let _ = shell.input_tx.send(WriteRequest::Close).await;
     shell.cancel_token.cancel();
-    let _ = shell.channel_writer.lock().await.close().await;
 
     tracing::info!("Closed interactive shell: {shell_id}");
 
