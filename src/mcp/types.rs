@@ -133,6 +133,57 @@ pub struct ShellInfo {
     pub opened_at: String,
 }
 
+/// Live transition event broadcast by `RunningTransfer`. Subscribers consume
+/// these via `progress_tx` to drive the future `transfer://<id>/progress`
+/// MCP resource (E13).
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressEvent {
+    /// Transfer made progress — `bytes_transferred` was just updated.
+    Tick {
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    /// Transfer terminated successfully.
+    Completed { bytes_transferred: u64 },
+    /// Transfer failed (the failure reason is on `RunningTransfer.error`).
+    Failed,
+    /// Transfer was cancelled by caller.
+    Cancelled,
+}
+
+/// Live health event broadcast by a `SessionRef`. Subscribers consume these
+/// via `health_tx` to drive the future `session://<id>/health` MCP resource.
+#[derive(Debug, Clone, Copy)]
+pub enum HealthEvent {
+    /// Health check passed at this timestamp (epoch milliseconds).
+    Healthy { at_ms: u64 },
+    /// Health check failed at this timestamp (epoch milliseconds).
+    Unhealthy { at_ms: u64 },
+    /// Session was disconnected.
+    Disconnected,
+}
+
+/// Live event broadcast by an active port-forwarder.
+///
+/// Subscribers consume these via `events_tx` to drive the future
+/// `forward://<id>/events` MCP resource (E13). Per-connection eventing
+/// is feature-gated and may be stubbed until the wiring lands in E13.
+#[cfg(feature = "port_forward")]
+#[derive(Debug, Clone)]
+pub enum ForwardEvent {
+    /// Local connection accepted from the given remote address.
+    Accept { client_addr: String, at_ms: u64 },
+    /// Forwarded connection closed; aggregated byte counts are reported.
+    Close {
+        client_addr: String,
+        bytes_in: u64,
+        bytes_out: u64,
+        at_ms: u64,
+    },
+    /// Forwarder task shut down — no further events will be emitted.
+    Stopped,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

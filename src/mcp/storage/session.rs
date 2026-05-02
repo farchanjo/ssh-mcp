@@ -10,10 +10,11 @@ use std::sync::LazyLock;
 
 use dashmap::DashMap;
 use russh::client;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, broadcast};
 
+use crate::mcp::config::resolve_session_broadcast_cap;
 use crate::mcp::session::SshClientHandler;
-use crate::mcp::types::SessionInfo;
+use crate::mcp::types::{HealthEvent, SessionInfo};
 
 use super::traits::{SessionRef, SessionStorage};
 
@@ -35,6 +36,9 @@ pub struct StoredSession {
     /// this SSH session. Acquired before `channel_open_session()` and
     /// released when the channel fully closes.
     pub channel_permits: Arc<Semaphore>,
+    /// Live broadcast of health-check events for this session. Subscribers
+    /// (future MCP resource readers) join via `health_tx.subscribe()`.
+    pub health_tx: broadcast::Sender<HealthEvent>,
 }
 
 /// Normalized identity triple used to look up equivalent sessions.
@@ -131,12 +135,15 @@ impl SessionStorage for DashMapSessionStorage {
             .or_default()
             .insert(session_id.clone());
         let channel_permits = Arc::new(Semaphore::new(CHANNEL_CONCURRENCY_PER_SESSION));
+        let cap = resolve_session_broadcast_cap();
+        let (health_tx, _health_rx) = broadcast::channel(cap);
         self.sessions.insert(
             session_id,
             StoredSession {
                 info,
                 handle,
                 channel_permits,
+                health_tx,
             },
         );
     }
@@ -146,6 +153,7 @@ impl SessionStorage for DashMapSessionStorage {
             info: entry.info.clone(),
             handle: Arc::clone(&entry.handle),
             channel_permits: Arc::clone(&entry.channel_permits),
+            health_tx: entry.health_tx.clone(),
         })
     }
 
@@ -160,11 +168,15 @@ impl SessionStorage for DashMapSessionStorage {
                     self.sessions_by_identity.remove(&triple);
                 }
             }
+            // Notify any subscribers that the session is going away. Send
+            // failures (no subscribers) are intentionally ignored.
+            let _ = stored.health_tx.send(HealthEvent::Disconnected);
         }
         removed.map(|stored| SessionRef {
             info: stored.info,
             handle: stored.handle,
             channel_permits: stored.channel_permits,
+            health_tx: stored.health_tx,
         })
     }
 

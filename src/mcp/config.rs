@@ -107,6 +107,30 @@ pub const SHELL_BROADCAST_CAP_MAX: usize = 65_536;
 /// Floor for the per-shell broadcast channel capacity.
 pub const SHELL_BROADCAST_CAP_MIN: usize = 16;
 
+/// Default broadcast channel capacity for per-transfer progress events.
+pub const DEFAULT_TRANSFER_BROADCAST_CAP: usize = 256;
+/// Hard cap on the per-transfer broadcast channel capacity.
+pub const TRANSFER_BROADCAST_CAP_MAX: usize = 4096;
+/// Floor for the per-transfer broadcast channel capacity.
+pub const TRANSFER_BROADCAST_CAP_MIN: usize = 8;
+
+/// Default broadcast channel capacity for per-session health events.
+pub const DEFAULT_SESSION_BROADCAST_CAP: usize = 256;
+/// Hard cap on the per-session broadcast channel capacity.
+pub const SESSION_BROADCAST_CAP_MAX: usize = 4096;
+/// Floor for the per-session broadcast channel capacity.
+pub const SESSION_BROADCAST_CAP_MIN: usize = 8;
+
+/// Default broadcast channel capacity for per-forwarder events.
+#[cfg(feature = "port_forward")]
+pub const DEFAULT_FORWARD_BROADCAST_CAP: usize = 256;
+/// Hard cap on the per-forwarder broadcast channel capacity.
+#[cfg(feature = "port_forward")]
+pub const FORWARD_BROADCAST_CAP_MAX: usize = 4096;
+/// Floor for the per-forwarder broadcast channel capacity.
+#[cfg(feature = "port_forward")]
+pub const FORWARD_BROADCAST_CAP_MIN: usize = 8;
+
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
 /// Environment variable name for the per-command output buffer cap.
@@ -126,6 +150,13 @@ pub const LIST_MAX_ITEMS_CAP_ENV_VAR: &str = "SSH_MCP_LIST_MAX_ITEMS_CAP";
 pub const COMMAND_BROADCAST_CAP_ENV_VAR: &str = "SSH_COMMAND_BROADCAST_CAP";
 /// Environment variable for the per-shell broadcast channel capacity.
 pub const SHELL_BROADCAST_CAP_ENV_VAR: &str = "SSH_SHELL_BROADCAST_CAP";
+/// Environment variable for the per-transfer broadcast channel capacity.
+pub const TRANSFER_BROADCAST_CAP_ENV_VAR: &str = "SSH_TRANSFER_BROADCAST_CAP";
+/// Environment variable for the per-session health broadcast channel capacity.
+pub const SESSION_BROADCAST_CAP_ENV_VAR: &str = "SSH_SESSION_BROADCAST_CAP";
+/// Environment variable for the per-forwarder events broadcast channel capacity.
+#[cfg(feature = "port_forward")]
+pub const FORWARD_BROADCAST_CAP_ENV_VAR: &str = "SSH_FORWARD_BROADCAST_CAP";
 
 /// Resolve the connection timeout value with priority: parameter -> env var -> default
 #[must_use]
@@ -439,6 +470,51 @@ pub fn resolve_shell_broadcast_cap() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SHELL_BROADCAST_CAP);
     raw.clamp(SHELL_BROADCAST_CAP_MIN, SHELL_BROADCAST_CAP_MAX)
+}
+
+/// Resolve the broadcast channel capacity for per-transfer progress events.
+///
+/// Reads `SSH_TRANSFER_BROADCAST_CAP` (default 256) and clamps the value to
+/// `[TRANSFER_BROADCAST_CAP_MIN, TRANSFER_BROADCAST_CAP_MAX]`. Used by
+/// `RunningTransfer::new` so SFTP progress subscribers share a sane envelope.
+#[must_use]
+pub fn resolve_transfer_broadcast_cap() -> usize {
+    let raw = env::var(TRANSFER_BROADCAST_CAP_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TRANSFER_BROADCAST_CAP);
+    raw.clamp(TRANSFER_BROADCAST_CAP_MIN, TRANSFER_BROADCAST_CAP_MAX)
+}
+
+/// Resolve the broadcast channel capacity for per-session health events.
+///
+/// Reads `SSH_SESSION_BROADCAST_CAP` (default 256) and clamps the value to
+/// `[SESSION_BROADCAST_CAP_MIN, SESSION_BROADCAST_CAP_MAX]`. Used by
+/// `SessionStorage::insert` so future `session://<id>/health` resource
+/// subscribers share a sane envelope.
+#[must_use]
+pub fn resolve_session_broadcast_cap() -> usize {
+    let raw = env::var(SESSION_BROADCAST_CAP_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SESSION_BROADCAST_CAP);
+    raw.clamp(SESSION_BROADCAST_CAP_MIN, SESSION_BROADCAST_CAP_MAX)
+}
+
+/// Resolve the broadcast channel capacity for per-forwarder events.
+///
+/// Reads `SSH_FORWARD_BROADCAST_CAP` (default 256) and clamps the value to
+/// `[FORWARD_BROADCAST_CAP_MIN, FORWARD_BROADCAST_CAP_MAX]`. Used by the
+/// port-forward state so future `forward://<id>/events` resource subscribers
+/// share a sane envelope.
+#[cfg(feature = "port_forward")]
+#[must_use]
+pub fn resolve_forward_broadcast_cap() -> usize {
+    let raw = env::var(FORWARD_BROADCAST_CAP_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FORWARD_BROADCAST_CAP);
+    raw.clamp(FORWARD_BROADCAST_CAP_MIN, FORWARD_BROADCAST_CAP_MAX)
 }
 
 #[cfg(test)]
@@ -1277,6 +1353,205 @@ mod tests {
                 assert_eq!(DEFAULT_SHELL_BROADCAST_CAP, 1024);
                 assert_eq!(SHELL_BROADCAST_CAP_MAX, 65_536);
                 assert_eq!(SHELL_BROADCAST_CAP_MIN, 16);
+            }
+        }
+
+        mod transfer_broadcast_cap {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(TRANSFER_BROADCAST_CAP_ENV_VAR) };
+                let result = resolve_transfer_broadcast_cap();
+                assert_eq!(result, DEFAULT_TRANSFER_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_uses_env_var_when_in_range() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(TRANSFER_BROADCAST_CAP_ENV_VAR, "512") };
+                let result = resolve_transfer_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(TRANSFER_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, 512);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(TRANSFER_BROADCAST_CAP_ENV_VAR, "1") };
+                let result = resolve_transfer_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(TRANSFER_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, TRANSFER_BROADCAST_CAP_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(TRANSFER_BROADCAST_CAP_ENV_VAR, "9999999") };
+                let result = resolve_transfer_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(TRANSFER_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, TRANSFER_BROADCAST_CAP_MAX);
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(TRANSFER_BROADCAST_CAP_ENV_VAR, "not-a-number") };
+                let result = resolve_transfer_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(TRANSFER_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, DEFAULT_TRANSFER_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_constants_are_consistent() {
+                assert!(TRANSFER_BROADCAST_CAP_MIN <= DEFAULT_TRANSFER_BROADCAST_CAP);
+                assert!(DEFAULT_TRANSFER_BROADCAST_CAP <= TRANSFER_BROADCAST_CAP_MAX);
+                assert_eq!(DEFAULT_TRANSFER_BROADCAST_CAP, 256);
+                assert_eq!(TRANSFER_BROADCAST_CAP_MAX, 4096);
+                assert_eq!(TRANSFER_BROADCAST_CAP_MIN, 8);
+            }
+        }
+
+        mod session_broadcast_cap {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SESSION_BROADCAST_CAP_ENV_VAR) };
+                let result = resolve_session_broadcast_cap();
+                assert_eq!(result, DEFAULT_SESSION_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_uses_env_var_when_in_range() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SESSION_BROADCAST_CAP_ENV_VAR, "1024") };
+                let result = resolve_session_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SESSION_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, 1024);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SESSION_BROADCAST_CAP_ENV_VAR, "1") };
+                let result = resolve_session_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SESSION_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, SESSION_BROADCAST_CAP_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SESSION_BROADCAST_CAP_ENV_VAR, "9999999") };
+                let result = resolve_session_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SESSION_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, SESSION_BROADCAST_CAP_MAX);
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(SESSION_BROADCAST_CAP_ENV_VAR, "not-a-number") };
+                let result = resolve_session_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(SESSION_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, DEFAULT_SESSION_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_constants_are_consistent() {
+                assert!(SESSION_BROADCAST_CAP_MIN <= DEFAULT_SESSION_BROADCAST_CAP);
+                assert!(DEFAULT_SESSION_BROADCAST_CAP <= SESSION_BROADCAST_CAP_MAX);
+                assert_eq!(DEFAULT_SESSION_BROADCAST_CAP, 256);
+                assert_eq!(SESSION_BROADCAST_CAP_MAX, 4096);
+                assert_eq!(SESSION_BROADCAST_CAP_MIN, 8);
+            }
+        }
+
+        #[cfg(feature = "port_forward")]
+        mod forward_broadcast_cap {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(FORWARD_BROADCAST_CAP_ENV_VAR) };
+                let result = resolve_forward_broadcast_cap();
+                assert_eq!(result, DEFAULT_FORWARD_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_uses_env_var_when_in_range() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(FORWARD_BROADCAST_CAP_ENV_VAR, "1024") };
+                let result = resolve_forward_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(FORWARD_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, 1024);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(FORWARD_BROADCAST_CAP_ENV_VAR, "1") };
+                let result = resolve_forward_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(FORWARD_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, FORWARD_BROADCAST_CAP_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(FORWARD_BROADCAST_CAP_ENV_VAR, "9999999") };
+                let result = resolve_forward_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(FORWARD_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, FORWARD_BROADCAST_CAP_MAX);
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(FORWARD_BROADCAST_CAP_ENV_VAR, "not-a-number") };
+                let result = resolve_forward_broadcast_cap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(FORWARD_BROADCAST_CAP_ENV_VAR) };
+                assert_eq!(result, DEFAULT_FORWARD_BROADCAST_CAP);
+            }
+
+            #[test]
+            fn test_constants_are_consistent() {
+                assert!(FORWARD_BROADCAST_CAP_MIN <= DEFAULT_FORWARD_BROADCAST_CAP);
+                assert!(DEFAULT_FORWARD_BROADCAST_CAP <= FORWARD_BROADCAST_CAP_MAX);
+                assert_eq!(DEFAULT_FORWARD_BROADCAST_CAP, 256);
+                assert_eq!(FORWARD_BROADCAST_CAP_MAX, 4096);
+                assert_eq!(FORWARD_BROADCAST_CAP_MIN, 8);
             }
         }
     }

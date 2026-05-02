@@ -256,13 +256,12 @@ pub async fn ssh_get_transfer_progress_impl(
     }
 
     let body = build_transfer_progress_response(
-        transfer_id,
+        &transfer_id,
         &status_rx,
         &bytes_transferred,
         &total_bytes_arc,
         &error,
         &transfer_info,
-    )
-    .await;
+    );
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
