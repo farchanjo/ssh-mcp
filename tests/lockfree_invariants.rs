@@ -136,7 +136,11 @@ impl<T: Clone> OnceModel<T> {
 
     /// Returns true when the caller stored the value (i.e. won the race).
     fn set(&self, value: T) -> bool {
-        if self.set_flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if self
+            .set_flag
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             let mut guard = self.value.lock().unwrap();
             *guard = Some(value);
             true
@@ -167,10 +171,18 @@ fn oncemodel_only_first_set_wins() {
 
         let r1 = h1.join().unwrap();
         let r2 = h2.join().unwrap();
-        assert!(r1 ^ r2, "exactly one set call must succeed, got ({r1}, {r2})");
+        assert!(
+            r1 ^ r2,
+            "exactly one set call must succeed, got ({r1}, {r2})"
+        );
 
-        let value = cell.get().expect("a value must be visible after both joins");
-        assert!(value == 10 || value == 20, "value must be one of the writers' inputs");
+        let value = cell
+            .get()
+            .expect("a value must be visible after both joins");
+        assert!(
+            value == 10 || value == 20,
+            "value must be one of the writers' inputs"
+        );
     });
 }
 
@@ -231,7 +243,10 @@ fn cursor_fetch_max_with_compensate_truncation() {
         //   max(0, 50, 75) followed by saturating_sub(30) at any point.
         // Every reachable value is bounded by 75 (max cursor) and never
         // negative (saturating sub).
-        assert!(final_value <= 75, "cursor exceeded reader max: {final_value}");
+        assert!(
+            final_value <= 75,
+            "cursor exceeded reader max: {final_value}"
+        );
     });
 }
 
@@ -259,7 +274,10 @@ fn cursor_double_compensation_saturates_at_zero() {
         h2.join().unwrap();
         // Saturating subs never wrap; the floor is 0.
         let final_value = cursor.load(Ordering::SeqCst);
-        assert!(final_value <= 20, "cursor must never exceed initial value: {final_value}");
+        assert!(
+            final_value <= 20,
+            "cursor must never exceed initial value: {final_value}"
+        );
     });
 }
 

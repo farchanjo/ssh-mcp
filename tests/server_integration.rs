@@ -129,10 +129,7 @@ fn server_clone_preserves_get_info() {
     let cloned = original.clone();
     let original_info = original.get_info();
     let cloned_info = cloned.get_info();
-    assert_eq!(
-        original_info.server_info.name,
-        cloned_info.server_info.name
-    );
+    assert_eq!(original_info.server_info.name, cloned_info.server_info.name);
     assert_eq!(
         original_info.server_info.version,
         cloned_info.server_info.version

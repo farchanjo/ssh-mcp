@@ -1551,10 +1551,7 @@ mod tests {
         #[test]
         fn write_block() {
             let m = render_shell_write_ok("shell-1", 42);
-            assert_eq!(
-                m,
-                "SSH_SHELL_WRITE: OK\nSHELL_ID: shell-1\nBYTES_SENT: 42"
-            );
+            assert_eq!(m, "SSH_SHELL_WRITE: OK\nSHELL_ID: shell-1\nBYTES_SENT: 42");
         }
 
         #[test]

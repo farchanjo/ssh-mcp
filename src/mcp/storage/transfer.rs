@@ -196,7 +196,9 @@ mod tests {
             assert_eq!(storage.count_by_session(&session_id), 1);
             assert!(storage.get_direct(&xfer_id).is_some());
 
-            let removed = storage.unregister(&xfer_id).expect("must return owned transfer");
+            let removed = storage
+                .unregister(&xfer_id)
+                .expect("must return owned transfer");
             assert_eq!(removed.info.transfer_id, xfer_id);
             assert_eq!(storage.count_by_session(&session_id), 0);
             assert!(storage.get_direct(&xfer_id).is_none());
