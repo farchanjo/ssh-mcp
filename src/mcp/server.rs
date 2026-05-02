@@ -29,8 +29,9 @@ use super::tools::sftp::{
     ssh_get_transfer_progress_impl, ssh_upload_impl,
 };
 use super::tools::shell::{
-    SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellWriteArgs, ssh_shell_close_impl,
-    ssh_shell_open_impl, ssh_shell_read_impl, ssh_shell_write_impl,
+    SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellSendKeyArgs, SshShellWriteArgs,
+    ssh_shell_close_impl, ssh_shell_open_impl, ssh_shell_read_impl, ssh_shell_send_key_impl,
+    ssh_shell_write_impl,
 };
 
 /// Primary MCP server handler.
@@ -243,19 +244,55 @@ impl McpSshServer {
 
     /// Send raw input to an interactive shell.
     ///
+    /// **Prefer `ssh_shell_send_key` for named keystrokes** (ctrl_c,
+    /// arrow_up, f-keys, modifiers); use `ssh_shell_write` only for plain
+    /// text input or non-standard escape sequences.
+    ///
     /// **When to use:** type a command (append `\n` for Enter), send a
     /// control character (`\x03` = Ctrl+C, `\x04` = Ctrl+D), or send an
     /// escape sequence (`\x1b[A` = arrow up).
     ///
     /// **Errors:** SHELL_NOT_FOUND, WRITE_FAILED.
     #[tool(
-        description = "Send raw input bytes to a shell by SHELL_ID. Append \\n for Enter, send \\x03 for Ctrl+C, etc. Errors: SHELL_NOT_FOUND, WRITE_FAILED."
+        description = "Send raw input bytes to a shell by SHELL_ID. Prefer ssh_shell_send_key for named keystrokes (ctrl_c, arrow_up, f-keys, modifiers); use ssh_shell_write for plain text or non-standard escape sequences. Append \\n for Enter, send \\x03 for Ctrl+C, etc. Errors: SHELL_NOT_FOUND, WRITE_FAILED."
     )]
     async fn ssh_shell_write(
         &self,
         Parameters(args): Parameters<SshShellWriteArgs>,
     ) -> Result<CallToolResult, McpError> {
         ssh_shell_write_impl(args).await
+    }
+
+    /// Send a named keystroke to an interactive shell.
+    ///
+    /// Convenience wrapper over `ssh_shell_write` that maps semantic key
+    /// names (e.g. `ctrl_c`, `arrow_up`, `f5`) to xterm-compatible byte
+    /// sequences. Use this instead of crafting escape sequences manually.
+    ///
+    /// **Use this for:**
+    /// - Interrupting running commands (`ctrl_c`, `ctrl_z`).
+    /// - Navigating shell history (`arrow_up`, `arrow_down`).
+    /// - Editing input lines (`ctrl_a`, `ctrl_e`, `ctrl_u`, `ctrl_w`,
+    ///   `home`, `end`).
+    /// - Sending function keys to TUIs (`f1..f12`).
+    /// - Back-tab in completion menus (`shift+tab`).
+    ///
+    /// **Modifier rules:**
+    /// - Allowed on: arrows, navigation keys, F1-F12.
+    /// - `tab` accepts `shift` only (produces back-tab `\x1b[Z`).
+    /// - Rejected on `ctrl_*`, `enter`, `escape`, `backspace`, `space` →
+    ///   `MODIFIER_NOT_ALLOWED`.
+    ///
+    /// **Errors:** `SHELL_NOT_FOUND`, `MODIFIER_NOT_ALLOWED`,
+    /// `INVALID_REPEAT`, `WRITE_FAILED`.
+    #[tool(
+        description = "Send a named keystroke (ctrl_c, arrow_up, f5, etc.) to an interactive shell. Modifier rules: arrows/nav/F-keys accept shift+alt+ctrl; tab accepts shift only (back-tab); ctrl_*/enter/escape/backspace/space reject modifiers (MODIFIER_NOT_ALLOWED). Repeat 1..=64."
+    )]
+    async fn ssh_shell_send_key(
+        &self,
+        Parameters(args): Parameters<SshShellSendKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        ssh_shell_send_key_impl(args).await
     }
 
     /// Read accumulated output from an interactive shell.
