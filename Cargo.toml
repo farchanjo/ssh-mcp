@@ -1,8 +1,8 @@
 [package]
 name = "ssh-mcp"
-version = "2.0.1"
+version = "3.0.0"
 edition = "2024"
-description = "SSH Model Context Protocol Server Integration"
+description = "SSH Model Context Protocol Server Integration with realtime resources/subscribe"
 authors = ["farchanjo"]
 default-run = "ssh-mcp"
 license = "MIT"
@@ -22,11 +22,22 @@ path = "src/main.rs"
 name = "ssh_mcp"
 path = "src/lib.rs"
 
-# Dependencies for SSH features and stateful connections
 [dependencies]
-# Web and MCP
-poem = "3.1"                                                                # Match version used by poem-mcpserver
-poem-mcpserver = { version = "0.3.1", features = ["streamable-http"] }
+# MCP — official Anthropic Rust SDK with resources/subscribe + notifications
+rmcp = { version = "1.6", default-features = false, features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+
+# HTTP host for rmcp streamable-http transport
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Async runtime
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 
@@ -35,24 +46,99 @@ russh = "0.55"
 russh-sftp = "2"
 async-trait = "0.1"
 
+# Lock-free primitives
+arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>
+bytes = "1.10"              # COW byte slices for broadcast / history
+
 # Serialization and data handling
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-schemars = "1.0"                                   # Required by poem-mcpserver
+schemars = "1.0"
 
 # Utilities
 backon = "1"                                                            # Retry with backoff
-chrono = "0.4"                                                          # For timestamps
+chrono = "0.4"                                                          # Timestamps
 dashmap = "6"                                                           # Lock-free concurrent hashmap
-dotenvy = "0.15"                                                        # For environment variables
-futures = "0.3"                                                         # Async utilities (join_all)
-tracing = "0.1"                                                         # Tracing for debugging
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }     # Tracing implementation with env filter
-uuid = { version = "1.16", features = ["v4", "serde"] }                 # For unique identifiers
+dotenvy = "0.15"                                                        # Env var loading
+futures = "0.3"                                                         # Async utilities
+tracing = "0.1"                                                         # Tracing
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+
+[dev-dependencies]
+loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
 
 [features]
-# Default features
 default = ["port_forward"]
+port_forward = []           # Port forwarding support
 
-# Optional features
-port_forward = [] # Port forwarding support
+[lints.clippy]
+# Layer A — forbid (cannot be downgraded)
+unwrap_used      = { level = "forbid", priority = 1 }
+expect_used      = { level = "forbid", priority = 1 }
+panic            = { level = "forbid", priority = 1 }
+todo             = { level = "forbid", priority = 1 }
+unimplemented    = { level = "forbid", priority = 1 }
+dbg_macro        = { level = "forbid", priority = 1 }
+exit             = { level = "forbid", priority = 1 }
+mem_forget       = { level = "forbid", priority = 1 }
+infinite_loop    = { level = "forbid", priority = 1 }
+print_stdout     = { level = "forbid", priority = 1 }
+print_stderr     = { level = "forbid", priority = 1 }
+
+# Layer B — deny
+all      = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery  = { level = "deny", priority = -1 }
+cargo    = { level = "deny", priority = -1 }
+
+# Quality denies
+wildcard_enum_match_arm         = "deny"
+as_conversions                  = "deny"
+clone_on_ref_ptr                = "deny"
+map_err_ignore                  = "deny"
+implicit_clone                  = "deny"
+if_then_some_else_none          = "deny"
+rc_mutex                        = "deny"
+empty_structs_with_brackets     = "deny"
+redundant_type_annotations      = "deny"
+same_name_method                = "deny"
+tests_outside_test_module       = "deny"
+large_include_file              = "deny"
+renamed_function_params         = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+ref_patterns                    = "deny"
+format_push_string              = "deny"
+string_lit_as_bytes             = "deny"
+unseparated_literal_suffix      = "deny"
+semicolon_inside_block          = "deny"
+needless_raw_strings            = "deny"
+needless_raw_string_hashes      = "deny"
+missing_asserts_for_indexing    = "deny"
+pub_use                         = "deny"
+absolute_paths                  = "deny"
+allow_attributes_without_reason = "deny"
+
+# v3 lock-free invariants
+await_holding_lock              = "deny"
+await_holding_refcell_ref       = "deny"
+significant_drop_in_scrutinee   = "deny"
+significant_drop_tightening     = "deny"
+mutex_atomic                    = "deny"
+mutex_integer                   = "deny"
+
+# Allowed
+multiple_crate_versions = "allow"
+
+[lints.rust]
+unsafe_code                = "forbid"
+unused_imports             = "deny"
+unused_mut                 = "deny"
+unused_must_use            = "deny"
+unused_assignments         = "deny"
+unreachable_code           = "deny"
+unreachable_patterns       = "deny"
+unused_lifetimes           = "deny"
+# Re-enabled in E2 (post-tools-migration) once commands.rs is rebuilt against rmcp:
+#   dead_code, unused_variables, unused_qualifications,
+#   trivial_numeric_casts, trivial_casts, let_underscore_drop
