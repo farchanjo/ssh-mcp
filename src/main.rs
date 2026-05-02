@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use dotenvy::dotenv;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use ssh_mcp::mcp::server::McpSshServer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -45,7 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = StreamableHttpService::new(
         || Ok(McpSshServer::new()),
-        Arc::new(rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default()),
+        Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        ),
         StreamableHttpServerConfig::default(),
     );
 

@@ -26,9 +26,16 @@
 //! v2.0 used `Option<String>` (e.g., [`ReusePolicy`]).
 
 pub mod connection;
+pub mod execute;
+pub mod forward;
+pub(crate) mod legacy_helpers;
+pub mod sftp;
+pub mod shell;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use super::types::AsyncCommandStatus;
 
 /// Reuse policy applied by `ssh_connect` when an existing session shares the
 /// same `(host, port, username)` identity triple.
@@ -59,6 +66,37 @@ impl ReusePolicy {
             Self::Suggest => "suggest",
             Self::Auto => "auto",
             Self::ForceNew => "force_new",
+        }
+    }
+}
+
+/// Async command status filter used by `ssh_list_commands`.
+///
+/// Replaces the v2.0.1 `Option<String>` filter (which silently ignored
+/// invalid values) with a tagged enum that errors at deserialization time
+/// for typos such as `"runing"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    /// The command is currently executing.
+    Running,
+    /// The command terminated successfully.
+    Completed,
+    /// The command was cancelled by the caller.
+    Cancelled,
+    /// The command failed (transport error, channel error, ...).
+    Failed,
+}
+
+impl CommandStatus {
+    /// Convert to the internal [`AsyncCommandStatus`] used by storage.
+    #[must_use]
+    pub const fn into_legacy(self) -> AsyncCommandStatus {
+        match self {
+            Self::Running => AsyncCommandStatus::Running,
+            Self::Completed => AsyncCommandStatus::Completed,
+            Self::Cancelled => AsyncCommandStatus::Cancelled,
+            Self::Failed => AsyncCommandStatus::Failed,
         }
     }
 }

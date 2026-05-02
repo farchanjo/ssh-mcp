@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
 use russh::Disconnect;
 use schemars::JsonSchema;
@@ -31,7 +32,7 @@ use super::super::config::{
     resolve_retry_delay,
 };
 use super::super::message::builder::{
-    ConnectOkBuilder, ConnectSuggestedBuilder, SessionMatch,
+    ConnectOkBuilder, ConnectSuggestedBuilder, SessionMatch, render_disconnect_ok,
 };
 use super::super::message::helpers::format_error;
 use super::super::session::SshClientHandler;
@@ -44,6 +45,10 @@ use super::super::storage::traits::{
 use super::super::storage::transfer::TRANSFER_STORAGE;
 use super::super::types::{SessionInfo, SshCommandResponse};
 use super::ReusePolicy;
+use super::legacy_helpers::{
+    build_agent_disconnect_response, clamp_list_items, cleanup_agent_sessions,
+    err_session_not_found, health_probe, process_health_results,
+};
 
 /// Type alias for the SSH client handle used throughout this module.
 type SshHandle = russh::client::Handle<SshClientHandler>;
@@ -447,6 +452,138 @@ pub async fn ssh_connect_impl(args: SshConnectArgs) -> Result<CallToolResult, Mc
     Ok(CallToolResult::success(vec![Content::text(response)]))
 }
 
+// ===========================================================================
+// `ssh_disconnect` — close one session and free its resources.
+// ===========================================================================
+
+/// Arguments for the `ssh_disconnect` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshDisconnectArgs {
+    /// `SESSION_ID` returned by `ssh_connect` to close.
+    pub session_id: String,
+}
+
+/// Implementation of `ssh_disconnect`.
+///
+/// Cancels every running async command, closes every interactive shell, and
+/// aborts every in-flight SFTP transfer for the session before tearing down
+/// the SSH transport.
+pub async fn ssh_disconnect_impl(args: SshDisconnectArgs) -> Result<CallToolResult, McpError> {
+    let SshDisconnectArgs { session_id } = args;
+    info!("Disconnecting SSH session: {session_id}");
+
+    cancel_session_transfers(&session_id);
+    close_session_shells(&session_id).await;
+    cancel_session_commands(&session_id);
+
+    if let Some(session_ref) = SESSION_STORAGE.remove(&session_id) {
+        if let Some(agent_id) = &session_ref.info.agent_id {
+            SESSION_STORAGE.unregister_agent(agent_id, &session_id);
+        }
+        if let Err(e) = session_ref
+            .handle
+            .disconnect(Disconnect::ByApplication, "Session closed by user", "en")
+            .await
+        {
+            warn!("Error during disconnect: {e}");
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            render_disconnect_ok(&session_id),
+        )]))
+    } else {
+        Ok(CallToolResult::error(vec![Content::text(
+            err_session_not_found("SSH_DISCONNECT", &session_id),
+        )]))
+    }
+}
+
+// ===========================================================================
+// `ssh_list_sessions` — health-checked list with optional agent filter.
+// ===========================================================================
+
+/// Arguments for the `ssh_list_sessions` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshListSessionsArgs {
+    /// Optional `AGENT_ID` to scope the listing to sessions owned by a single
+    /// agent. When omitted, returns sessions from every agent on this server.
+    pub agent_id: Option<String>,
+
+    /// Maximum number of sessions to return. Default: `500`. Cap: `10 000`.
+    /// Env: `SSH_MCP_LIST_MAX_ITEMS`.
+    pub max_items: Option<usize>,
+}
+
+/// Implementation of `ssh_list_sessions`.
+pub async fn ssh_list_sessions_impl(args: SshListSessionsArgs) -> Result<CallToolResult, McpError> {
+    let SshListSessionsArgs {
+        agent_id,
+        max_items,
+    } = args;
+    let max = clamp_list_items(max_items);
+
+    let session_ids_to_check: Vec<String> = agent_id.as_ref().map_or_else(
+        || SESSION_STORAGE.session_ids(),
+        |aid| SESSION_STORAGE.get_agent_sessions(aid),
+    );
+
+    let health_futures: Vec<_> = session_ids_to_check
+        .into_iter()
+        .filter_map(|session_id| {
+            SESSION_STORAGE
+                .get(&session_id)
+                .map(|sr| (session_id, Arc::clone(&sr.handle), sr.info))
+        })
+        .map(|(session_id, handle_arc, info)| async move {
+            let now = chrono::Utc::now().to_rfc3339();
+            let result = health_probe(&handle_arc).await;
+            (session_id, info, now, result)
+        })
+        .collect();
+
+    let results = join_all(health_futures).await;
+    let body = process_health_results(results, max);
+    Ok(CallToolResult::success(vec![Content::text(body)]))
+}
+
+// ===========================================================================
+// `ssh_disconnect_agent` — bulk disconnect every session owned by an agent.
+// ===========================================================================
+
+/// Arguments for the `ssh_disconnect_agent` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshDisconnectAgentArgs {
+    /// The `AGENT_ID` (set in `ssh_connect`) whose sessions should be
+    /// disconnected. Sessions owned by other agents are not affected.
+    pub agent_id: String,
+}
+
+/// Implementation of `ssh_disconnect_agent`.
+pub async fn ssh_disconnect_agent_impl(
+    args: SshDisconnectAgentArgs,
+) -> Result<CallToolResult, McpError> {
+    let SshDisconnectAgentArgs { agent_id } = args;
+    info!("Disconnecting all sessions for agent: {agent_id}");
+
+    let session_ids = SESSION_STORAGE.remove_agent_sessions(&agent_id);
+
+    if session_ids.is_empty() {
+        return Ok(CallToolResult::success(vec![Content::text(
+            build_agent_disconnect_response(&agent_id, 0, 0),
+        )]));
+    }
+
+    let total_commands_cancelled = cleanup_agent_sessions(&session_ids).await;
+    let sessions_disconnected = session_ids.len();
+
+    info!(
+        "Disconnected {sessions_disconnected} sessions, cancelled {total_commands_cancelled} commands for agent {agent_id}"
+    );
+
+    Ok(CallToolResult::success(vec![Content::text(
+        build_agent_disconnect_response(&agent_id, sessions_disconnected, total_commands_cancelled),
+    )]))
+}
+
 /// Tool description (en-US) shared with the rmcp `#[tool]` macro registration.
 pub const SSH_CONNECT_DESCRIPTION: &str = "Connect to an SSH server and store the session.
 
@@ -480,7 +617,10 @@ mod tests {
 
     #[test]
     fn format_host_includes_non_default_port() {
-        assert_eq!(format_host_for_display("example.com", 2222), "example.com:2222");
+        assert_eq!(
+            format_host_for_display("example.com", 2222),
+            "example.com:2222"
+        );
     }
 
     #[test]
