@@ -65,25 +65,35 @@ impl McpSshServer {
     /// Connect to an SSH server and store the session.
     ///
     /// **When to use:**
-    /// - Establishing a new SSH connection to run commands, open shells, or transfer files.
-    /// - Reusing an already-connected session by passing its `session_id`.
+    /// - Establish a new SSH connection to run commands, open shells, or transfer files.
+    /// - Reuse an already-connected session by passing its `session_id`.
     ///
     /// **Important identifiers in response:**
-    /// - `SESSION_ID`: passed to ssh_execute, ssh_shell_open, ssh_upload, ssh_download,
-    ///   ssh_disconnect, ssh_forward.
-    /// - `AGENT_ID`: optional grouping; passed to ssh_list_sessions (filter) and
-    ///   ssh_disconnect_agent (cleanup).
+    /// - `SESSION_ID`: pass to ssh_execute, ssh_shell_open, ssh_upload,
+    ///   ssh_download, ssh_disconnect, ssh_forward.
+    /// - `AGENT_ID`: optional grouping; pass to ssh_list_sessions (filter)
+    ///   and ssh_disconnect_agent (bulk cleanup).
     ///
     /// **Workflow:**
     /// 1. Call ssh_connect once per remote host.
     /// 2. Use the returned SESSION_ID for subsequent tool calls.
     /// 3. Call ssh_disconnect (or ssh_disconnect_agent) when done.
     ///
-    /// **Status values:** OK, REUSED, SUGGESTED.
+    /// **Limits:** `timeout_secs` default 30 (env SSH_CONNECT_TIMEOUT);
+    /// `max_retries` default 3 (env SSH_MAX_RETRIES); `retry_delay_ms`
+    /// default 1000 capped at 10s (env SSH_RETRY_DELAY_MS).
     ///
-    /// **Errors:** CONNECTION_FAILED.
+    /// **Status values:**
+    /// - `OK`: brand-new session created.
+    /// - `REUSED`: existing healthy session returned (reuse=auto, or
+    ///   `session_id` provided).
+    /// - `SUGGESTED`: matching session(s) exist; LLM picks one or retries
+    ///   with `reuse="force_new"`.
+    ///
+    /// **Errors:**
+    /// - `CONNECTION_FAILED`: handshake failed or all retries exhausted.
     #[tool(
-        description = "Connect to an SSH server and store the session. Returns SESSION_ID and optional AGENT_ID. Status values: OK, REUSED, SUGGESTED. Use SESSION_ID with ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward."
+        description = "Connect to an SSH server and store the session. Returns SESSION_ID (and optional AGENT_ID). Status: OK, REUSED, SUGGESTED. reuse=suggest (default), auto, force_new. Use SESSION_ID with ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward. Errors: CONNECTION_FAILED."
     )]
     async fn ssh_connect(
         &self,
@@ -94,13 +104,20 @@ impl McpSshServer {
 
     /// Disconnect a single SSH session and free its resources.
     ///
-    /// **When to use:** done with a session and want a clean teardown.
+    /// **When to use:**
+    /// - Done with a session and want a clean teardown.
     ///
-    /// **Workflow:** automatically cancels every running async command,
-    /// closes every interactive shell, and aborts every in-flight SFTP
-    /// transfer for the session before disconnecting the SSH transport.
+    /// **Important identifiers in response:**
+    /// - `SESSION_ID`: echoed back for traceability.
     ///
-    /// **Errors:** SESSION_NOT_FOUND.
+    /// **Workflow:**
+    /// 1. Cancel every running async command for the session.
+    /// 2. Close every interactive shell.
+    /// 3. Abort every in-flight SFTP transfer.
+    /// 4. Disconnect the SSH transport.
+    ///
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
     #[tool(
         description = "Disconnect a single SSH session by SESSION_ID. Cancels all running commands, closes all shells, and aborts all transfers for the session. Errors: SESSION_NOT_FOUND."
     )]
@@ -113,14 +130,21 @@ impl McpSshServer {
 
     /// List active SSH sessions with health-check metadata.
     ///
-    /// **When to use:** discover available SESSION_IDs or audit which agents
-    /// own which sessions.
+    /// **When to use:**
+    /// - Discover available SESSION_IDs.
+    /// - Audit which agents own which sessions.
     ///
-    /// **Workflow:** runs an `echo 1` health probe against each session and
-    /// removes any that fail before returning. Pass `agent_id` to filter to
-    /// a single agent.
+    /// **Important identifiers in response:**
+    /// - `SESSION_ID`: pass to other tools.
+    /// - `AGENT_ID`: optional owning agent (when set at connect time).
+    ///
+    /// **Workflow:** runs an `echo 1` health probe against each candidate
+    /// session and removes any that fail before returning. Pass `agent_id`
+    /// to filter to a single agent.
+    ///
+    /// **Limits:** `max_items` default 500, cap 10000.
     #[tool(
-        description = "List active SSH sessions with health-check metadata. Optional agent_id filter. Returns SESSION_ID, host, username, agent_id, healthy, last_health_check."
+        description = "List active SSH sessions with health-check metadata. Optional agent_id filter (AGENT_ID). max_items default 500, cap 10000. Returns SESSION_ID, host, username, agent_id, healthy, last_health_check."
     )]
     async fn ssh_list_sessions(
         &self,
@@ -131,11 +155,20 @@ impl McpSshServer {
 
     /// Bulk-disconnect every session owned by an agent.
     ///
-    /// **When to use:** at agent shutdown to release every resource the
-    /// agent allocated. Sessions owned by other agents are not affected.
+    /// **When to use:**
+    /// - At agent shutdown to release every resource the agent allocated.
     ///
-    /// **Workflow:** cancels commands, closes shells, aborts transfers, and
-    /// disconnects each session that belongs to `agent_id`.
+    /// **Important identifiers in response:**
+    /// - `AGENT`: echoed back for traceability.
+    /// - `SESSIONS`: count of sessions disconnected.
+    /// - `COMMANDS`: count of running commands cancelled.
+    ///
+    /// **Workflow:**
+    /// 1. Enumerate sessions owned by `agent_id`.
+    /// 2. Cancel running commands, close shells, abort transfers per session.
+    /// 3. Disconnect each session's SSH transport.
+    ///
+    /// Sessions owned by other agents are not affected.
     #[tool(
         description = "Disconnect ALL sessions for a specific AGENT_ID (bulk cleanup). Cancels commands, closes shells, aborts transfers for every owned session. Other agents' sessions are unaffected."
     )]
@@ -148,21 +181,27 @@ impl McpSshServer {
 
     /// Execute a shell command asynchronously on a session.
     ///
-    /// **When to use:** any command — short or long-running. Returns
-    /// immediately with a COMMAND_ID for polling.
+    /// **When to use:**
+    /// - Any command — short or long-running.
+    /// - Returns immediately with a COMMAND_ID; output is polled separately.
     ///
     /// **Important identifiers in response:**
-    /// - `COMMAND_ID`: passed to ssh_get_command_output and ssh_cancel_command.
+    /// - `COMMAND_ID`: pass to ssh_get_command_output and ssh_cancel_command.
+    /// - `SESSION_ID`: echoed back for traceability.
     ///
     /// **Workflow:**
-    /// 1. ssh_execute → COMMAND_ID.
-    /// 2. ssh_get_command_output(command_id, wait=true) → final result.
+    /// 1. ssh_execute -> COMMAND_ID.
+    /// 2. ssh_get_command_output(command_id, wait=true) -> final result.
     ///
-    /// **Limits:** up to 100 concurrent multiplexed commands per session.
+    /// **Limits:**
+    /// - Up to 100 concurrent multiplexed commands per session.
+    /// - `timeout_secs` default 180 (env SSH_COMMAND_TIMEOUT).
     ///
-    /// **Errors:** SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED.
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
+    /// - `MAX_COMMANDS_EXCEEDED`: per-session running-command cap reached.
     #[tool(
-        description = "Execute a command asynchronously. Returns COMMAND_ID immediately. Pass pty=true for commands needing a TTY (sudo, top). Poll with ssh_get_command_output. Errors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED."
+        description = "Execute a command asynchronously. Returns COMMAND_ID immediately. Pass pty=true for commands needing a TTY (sudo, top). Up to 100 concurrent commands per session. Poll with ssh_get_command_output. Errors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED."
     )]
     async fn ssh_execute(
         &self,
@@ -173,14 +212,27 @@ impl McpSshServer {
 
     /// Read the current output and status of an async command.
     ///
-    /// **When to use:** poll for progress (`wait=false`) or block until
-    /// completion (`wait=true`).
+    /// **When to use:**
+    /// - Poll for progress (`wait=false`).
+    /// - Block until completion (`wait=true`).
     ///
-    /// **Status values:** running, completed, cancelled, failed, timeout.
+    /// **Important identifiers in response:**
+    /// - `COMMAND_ID`: echoed back; use it on subsequent polls.
+    /// - `EXIT`: present only on COMPLETED.
     ///
-    /// **Errors:** COMMAND_NOT_FOUND, COMMAND_FAILED.
+    /// **Limits:** stdout/stderr capped by `max_output_bytes` (default 16384,
+    /// cap 1048576); content is head-truncated, tail (most recent output)
+    /// preserved.
+    ///
+    /// **Status values:**
+    /// - `RUNNING`: command still executing; output marked `(partial)`.
+    /// - `COMPLETED`: command finished; `EXIT` line present.
+    /// - `TIMEOUT`: long-poll deadline expired (only when `wait=true`).
+    ///
+    /// **Errors:**
+    /// - `COMMAND_NOT_FOUND`: no async command with the given ID.
     #[tool(
-        description = "Read output and status of an async command by COMMAND_ID. Set wait=true to block until completion (cap 300s). Status: running, completed, cancelled, failed, timeout. Errors: COMMAND_NOT_FOUND."
+        description = "Read output and status of an async command by COMMAND_ID. Set wait=true to block until completion (default 30s, cap 300s). Status: RUNNING, COMPLETED, TIMEOUT. max_output_bytes default 16384, cap 1048576 (head-truncated, tail preserved). Errors: COMMAND_NOT_FOUND."
     )]
     async fn ssh_get_command_output(
         &self,
@@ -191,13 +243,17 @@ impl McpSshServer {
 
     /// List async commands across one or all sessions.
     ///
-    /// **When to use:** monitor multiple concurrent operations or check
-    /// what is still running before disconnecting a session.
+    /// **When to use:**
+    /// - Monitor multiple concurrent operations.
+    /// - Check what is still running before disconnecting a session.
     ///
-    /// **Filters:** optional `session_id` and/or `status` (running,
-    /// completed, cancelled, failed).
+    /// **Important identifiers in response:**
+    /// - `COMMAND_ID`: pass to ssh_get_command_output / ssh_cancel_command.
+    /// - `SESSION_ID`: owning session for each command.
+    ///
+    /// **Limits:** `max_items` default 500, cap 10000.
     #[tool(
-        description = "List async commands. Optional filters: session_id, status (running|completed|cancelled|failed). Returns COMMAND_IDs and metadata."
+        description = "List async commands across one or all sessions. Optional filters: session_id (SESSION_ID); status (input enum: running|completed|cancelled|failed). max_items default 500, cap 10000. Returns COMMAND_IDs, owning SESSION_ID, status, started_at."
     )]
     async fn ssh_list_commands(
         &self,
@@ -208,16 +264,26 @@ impl McpSshServer {
 
     /// Cancel a running async command.
     ///
-    /// **When to use:** stop a long-running command that is no longer
-    /// needed, or abort one taking too long.
+    /// **When to use:**
+    /// - Stop a long-running command that is no longer needed.
+    /// - Abort a command taking too long.
     ///
-    /// **Notes:** only running commands can be cancelled. Returns the
-    /// output collected so far.
+    /// **Important identifiers in response:**
+    /// - `COMMAND_ID`: echoed back for traceability.
     ///
-    /// **Errors:** COMMAND_NOT_FOUND. Already-finished commands return a
-    /// no-op success response.
+    /// **Limits:** stdout/stderr capped by `max_output_bytes` (default 16384,
+    /// cap 1048576); content head-truncated, tail (most recent output)
+    /// preserved.
+    ///
+    /// **Status values:**
+    /// - `CANCELLED`: command was running and the cancellation signal was
+    ///   sent; partial stdout/stderr returned.
+    /// - `NOOP`: command was not in a running state (already finished).
+    ///
+    /// **Errors:**
+    /// - `COMMAND_NOT_FOUND`: no async command with the given ID.
     #[tool(
-        description = "Cancel a running async command by COMMAND_ID. Returns partial stdout/stderr collected before cancellation. Errors: COMMAND_NOT_FOUND. Already-finished commands return a no-op success."
+        description = "Cancel a running async command by COMMAND_ID. Returns CANCELLED with partial stdout/stderr (head-truncated to max_output_bytes; default 16384, cap 1048576) or NOOP if not running. Errors: COMMAND_NOT_FOUND."
     )]
     async fn ssh_cancel_command(
         &self,
@@ -228,18 +294,28 @@ impl McpSshServer {
 
     /// Open an interactive PTY shell on a session.
     ///
-    /// **When to use:** Serial Over LAN (SOL/IPMI/OOB), multi-step
-    /// workflows that need persistent shell state, or commands requiring
-    /// terminal interaction. For SOL/IPMI use `term="vt100"` with 80×24.
+    /// **When to use:**
+    /// - Serial Over LAN (SOL/IPMI/OOB) consoles — use `term="vt100"` 80x24.
+    /// - Multi-step workflows that need persistent shell state.
+    /// - Commands requiring terminal interaction.
     ///
     /// **Important identifiers in response:**
-    /// - `SHELL_ID`: passed to ssh_shell_write, ssh_shell_read, ssh_shell_close.
+    /// - `SHELL_ID`: pass to ssh_shell_write, ssh_shell_send_key,
+    ///   ssh_shell_read, ssh_shell_wait_for, ssh_shell_close.
     ///
-    /// **Limits:** up to 10 shells per session.
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling.**
     ///
-    /// **Errors:** SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, CHANNEL_FAILED.
+    /// **Limits:**
+    /// - Up to 10 shells per session.
+    /// - `inactivity_ttl` default 600s (env SSH_SHELL_INACTIVITY_TTL).
+    /// - `max_buffer_size` default `10m` (env SSH_SHELL_MAX_BUFFER_SIZE).
+    ///
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
+    /// - `MAX_SHELLS_EXCEEDED`: 10 shells already open on this session.
+    /// - `CHANNEL_FAILED`: russh failed to open the PTY channel.
     #[tool(
-        description = "Open an interactive PTY shell. Returns SHELL_ID. Defaults: term=xterm 80x24. For SOL/IPMI use term=vt100. Errors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, CHANNEL_FAILED."
+        description = "Open an interactive PTY shell. Returns SHELL_ID. Defaults: term=xterm 80x24 (use vt100 for SOL/IPMI). Up to 10 shells per session. Prefer resources/subscribe shell://<id>/output (realtime push) over polling. Errors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, CHANNEL_FAILED."
     )]
     async fn ssh_shell_open(
         &self,
@@ -248,19 +324,24 @@ impl McpSshServer {
         ssh_shell_open_impl(args).await
     }
 
-    /// Send raw input to an interactive shell.
+    /// Send raw input bytes to an interactive shell.
     ///
-    /// **Prefer `ssh_shell_send_key` for named keystrokes** (ctrl_c,
-    /// arrow_up, f-keys, modifiers); use `ssh_shell_write` only for plain
-    /// text input or non-standard escape sequences.
+    /// **When to use:**
+    /// - Type a command line (append `\n` for Enter).
+    /// - Send a control character (`\x03` = Ctrl+C, `\x04` = Ctrl+D).
+    /// - Send a non-standard escape sequence (`\x1b[A` = arrow up).
     ///
-    /// **When to use:** type a command (append `\n` for Enter), send a
-    /// control character (`\x03` = Ctrl+C, `\x04` = Ctrl+D), or send an
-    /// escape sequence (`\x1b[A` = arrow up).
+    /// **Prefer `ssh_shell_send_key`** for named keystrokes (ctrl_c,
+    /// arrow_up, f-keys, modifiers). Use `ssh_shell_write` only for plain
+    /// text or non-standard escape sequences.
     ///
-    /// **Errors:** SHELL_NOT_FOUND, WRITE_FAILED.
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling.**
+    ///
+    /// **Errors:**
+    /// - `SHELL_NOT_FOUND`: no active shell with the given ID.
+    /// - `WRITE_FAILED`: the background shell writer task closed.
     #[tool(
-        description = "Send raw input bytes to a shell by SHELL_ID. Prefer ssh_shell_send_key for named keystrokes (ctrl_c, arrow_up, f-keys, modifiers); use ssh_shell_write for plain text or non-standard escape sequences. Append \\n for Enter, send \\x03 for Ctrl+C, etc. Errors: SHELL_NOT_FOUND, WRITE_FAILED."
+        description = "Send raw input bytes to a shell by SHELL_ID. Prefer ssh_shell_send_key for named keystrokes (ctrl_c, arrow_up, f-keys); use ssh_shell_write for plain text or non-standard escape sequences. Append \\n for Enter, \\x03 for Ctrl+C, etc. Prefer resources/subscribe shell://<id>/output (realtime push) over polling. Errors: SHELL_NOT_FOUND, WRITE_FAILED."
     )]
     async fn ssh_shell_write(
         &self,
@@ -275,24 +356,33 @@ impl McpSshServer {
     /// names (e.g. `ctrl_c`, `arrow_up`, `f5`) to xterm-compatible byte
     /// sequences. Use this instead of crafting escape sequences manually.
     ///
-    /// **Use this for:**
-    /// - Interrupting running commands (`ctrl_c`, `ctrl_z`).
-    /// - Navigating shell history (`arrow_up`, `arrow_down`).
-    /// - Editing input lines (`ctrl_a`, `ctrl_e`, `ctrl_u`, `ctrl_w`,
-    ///   `home`, `end`).
-    /// - Sending function keys to TUIs (`f1..f12`).
+    /// **When to use:**
+    /// - Interrupt running commands (`ctrl_c`, `ctrl_z`).
+    /// - Navigate shell history (`arrow_up`, `arrow_down`).
+    /// - Edit input lines (`ctrl_a`, `ctrl_e`, `ctrl_u`, `ctrl_w`, `home`, `end`).
+    /// - Send function keys to TUIs (`f1..f12`).
     /// - Back-tab in completion menus (`shift+tab`).
     ///
-    /// **Modifier rules:**
-    /// - Allowed on: arrows, navigation keys, F1-F12.
-    /// - `tab` accepts `shift` only (produces back-tab `\x1b[Z`).
-    /// - Rejected on `ctrl_*`, `enter`, `escape`, `backspace`, `space` →
-    ///   `MODIFIER_NOT_ALLOWED`.
+    /// **Important identifiers in response:**
+    /// - `SHELL_ID`: echoed back for traceability.
     ///
-    /// **Errors:** `SHELL_NOT_FOUND`, `MODIFIER_NOT_ALLOWED`,
-    /// `INVALID_REPEAT`, `WRITE_FAILED`.
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling** to observe the shell after sending the key.
+    ///
+    /// **Modifier rules:**
+    /// - Allowed on arrows, navigation keys, F1-F12 (any of `shift`, `alt`, `ctrl`).
+    /// - `tab` accepts `shift` only (produces back-tab `\x1b[Z`).
+    /// - Rejected on `ctrl_*`, `enter`, `escape`, `backspace`, `space`.
+    ///
+    /// **Limits:**
+    /// - `repeat` range 1..=64.
+    ///
+    /// **Errors:**
+    /// - `SHELL_NOT_FOUND`: no active shell with the given ID.
+    /// - `MODIFIER_NOT_ALLOWED`: modifier rejected for the given key.
+    /// - `INVALID_REPEAT`: repeat outside 1..=64.
+    /// - `WRITE_FAILED`: the background shell writer task closed.
     #[tool(
-        description = "Send a named keystroke (ctrl_c, arrow_up, f5, etc.) to an interactive shell. Modifier rules: arrows/nav/F-keys accept shift+alt+ctrl; tab accepts shift only (back-tab); ctrl_*/enter/escape/backspace/space reject modifiers (MODIFIER_NOT_ALLOWED). Repeat 1..=64."
+        description = "Send a named keystroke (ctrl_c, arrow_up, f5, etc.) to a shell by SHELL_ID. Modifier rules: arrows/nav/F-keys accept shift+alt+ctrl; tab accepts shift only (back-tab); ctrl_*/enter/escape/backspace/space reject modifiers. Repeat 1..=64. Prefer resources/subscribe shell://<id>/output (realtime push) over polling. Errors: SHELL_NOT_FOUND, MODIFIER_NOT_ALLOWED, INVALID_REPEAT, WRITE_FAILED."
     )]
     async fn ssh_shell_send_key(
         &self,
@@ -303,24 +393,31 @@ impl McpSshServer {
 
     /// Read accumulated output from an interactive shell.
     ///
-    /// **When to use:** after writing input, give the shell a beat, then
-    /// call this to retrieve the new output.
+    /// **When to use:**
+    /// - Snapshot read: pull whatever has been buffered so far.
+    /// - FALLBACK long-poll (`wait=true`): block until at least `min_bytes`
+    ///   of new output arrive, the shell closes, or `wait_timeout_secs`
+    ///   expires.
     ///
-    /// **Notes:** with `clear=true` (default) only the rendered bytes are
-    /// drained (head-based pagination).
+    /// **Important identifiers in response:**
+    /// - `SHELL_ID`: echoed back for traceability.
     ///
-    /// **FALLBACK long-poll:** pass `wait=true` to block until at least
-    /// `min_bytes` of new output arrive, the shell closes, or
-    /// `wait_timeout_secs` expires (default `30`, cap `300`). This is a
-    /// fallback for clients that cannot use `resources/subscribe`. **Prefer
-    /// `resources/subscribe shell://<shell_id>/output` for continuous
-    /// realtime streaming.**
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling.** The long-poll mode here is a fallback for clients that cannot subscribe.
     ///
-    /// **Status values:** OPEN, CLOSED, TIMEOUT (long-poll only).
+    /// **Limits:**
+    /// - `max_output_bytes` default 16384, cap 1048576 (tail rendered).
+    /// - `wait_timeout_secs` default 30, cap 300.
+    /// - `min_bytes` floor 1, capped at resolved `max_output_bytes`.
     ///
-    /// **Errors:** SHELL_NOT_FOUND.
+    /// **Status values:**
+    /// - `OPEN`: shell still alive; data block carries the rendered bytes.
+    /// - `CLOSED`: background reader ended; remaining buffer is returned.
+    /// - `TIMEOUT`: long-poll deadline expired (only when `wait=true`).
+    ///
+    /// **Errors:**
+    /// - `SHELL_NOT_FOUND`: no active shell with the given ID.
     #[tool(
-        description = "Read buffered output from a shell by SHELL_ID. clear=true (default) drains shown bytes (head pagination). max_output_bytes default 16384, cap 1048576. Optional FALLBACK long-poll via wait=true (blocks until min_bytes arrive, shell closes, or wait_timeout_secs expires; default 30s, cap 300s) — prefer resources/subscribe shell://<id>/output. Status: OPEN, CLOSED, TIMEOUT. Errors: SHELL_NOT_FOUND."
+        description = "Read buffered output from a shell by SHELL_ID. clear=true (default) drains shown bytes (head pagination). max_output_bytes default 16384, cap 1048576. Optional FALLBACK long-poll via wait=true (default 30s, cap 300s; min_bytes floor 1). Prefer resources/subscribe shell://<id>/output (realtime push) over polling. Status: OPEN, CLOSED, TIMEOUT. Errors: SHELL_NOT_FOUND."
     )]
     async fn ssh_shell_read(
         &self,
@@ -329,27 +426,37 @@ impl McpSshServer {
         ssh_shell_read_impl(args).await
     }
 
-    /// Wait for a substring (or any of N substrings) to appear in the
-    /// shell output.
+    /// Wait for one of up to 16 substring patterns to appear in shell output.
     ///
-    /// **FALLBACK gated wait — prefer `resources/subscribe
-    /// shell://<id>/output` for continuous observation; use this only when
-    /// the MCP host does not support resource subscriptions, OR when you
-    /// need a single-shot guarantee that the shell reaches a known state
-    /// before proceeding (e.g., wait for `password:` prompt).**
+    /// **When to use:**
+    /// - Gate on prompt patterns (`$ `, `# `, `password:`).
+    /// - Branch login flows: pass `["password:", "Permission denied", "$ "]`
+    ///   and inspect `MATCHED_PATTERN` to choose the next action.
+    /// - Multi-step workflows where each step waits for a completion marker.
     ///
-    /// **Use this for:**
-    /// - Gating on prompt patterns (`$ `, `# `, `password:`)
-    /// - Branching login flows: pass `["password:", "Permission denied",
-    ///   "$ "]` and inspect MATCHED_PATTERN to choose the next action.
-    /// - Multi-step workflows where each step waits for completion marker.
+    /// **Important identifiers in response:**
+    /// - `SHELL_ID`: echoed back for traceability.
+    /// - `MATCHED_PATTERN`: present only on MATCHED — the pattern that hit.
     ///
-    /// **Status values:** MATCHED, TIMEOUT, CLOSED.
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling** for continuous observation; use this for single-shot prompt gating only.
     ///
-    /// **Errors:** SHELL_NOT_FOUND, EMPTY_PATTERNS, TOO_MANY_PATTERNS,
-    /// PATTERN_TOO_LONG.
+    /// **Limits:**
+    /// - 1..=16 patterns; each pattern up to 1024 bytes.
+    /// - `timeout_secs` default 30, cap 300.
+    /// - `max_output_bytes` default 16384, cap 1048576.
+    ///
+    /// **Status values:**
+    /// - `MATCHED`: pattern found; matched prefix drained when `clear=true`.
+    /// - `TIMEOUT`: deadline expired without any match; current buffer returned.
+    /// - `CLOSED`: shell closed during the wait.
+    ///
+    /// **Errors:**
+    /// - `SHELL_NOT_FOUND`: no active shell with the given ID.
+    /// - `EMPTY_PATTERNS`: no patterns supplied.
+    /// - `TOO_MANY_PATTERNS`: more than 16 patterns supplied.
+    /// - `PATTERN_TOO_LONG`: a pattern exceeded 1024 bytes.
     #[tool(
-        description = "Wait for one of up to 16 substrings to appear in shell output. FALLBACK over resources/subscribe. Status: MATCHED (returns matched_pattern + bytes), TIMEOUT (returns current buffer), CLOSED. Each pattern <=1024 bytes. Errors: SHELL_NOT_FOUND, EMPTY_PATTERNS, TOO_MANY_PATTERNS, PATTERN_TOO_LONG."
+        description = "Wait for one of up to 16 substring patterns in shell output by SHELL_ID. timeout_secs default 30, cap 300. Each pattern <=1024 bytes. Status: MATCHED (with MATCHED_PATTERN), TIMEOUT (current buffer), CLOSED. Prefer resources/subscribe shell://<id>/output (realtime push) over polling — use this for single-shot prompt gating. Errors: SHELL_NOT_FOUND, EMPTY_PATTERNS, TOO_MANY_PATTERNS, PATTERN_TOO_LONG."
     )]
     async fn ssh_shell_wait_for(
         &self,
@@ -358,14 +465,24 @@ impl McpSshServer {
         ssh_shell_wait_for_impl(args).await
     }
 
-    /// Close an interactive shell.
+    /// Close an interactive shell and release its PTY channel.
     ///
-    /// **When to use:** the workflow is complete and you want to release
-    /// the PTY channel.
+    /// **When to use:**
+    /// - The workflow is complete and you want to release the PTY channel.
     ///
-    /// **Errors:** SHELL_NOT_FOUND.
+    /// **Important identifiers in response:**
+    /// - `SHELL_ID`: echoed back for traceability.
+    ///
+    /// **Prefer `resources/subscribe shell://<id>/output` (realtime push) over polling** while the shell is still alive; this tool finalises the lifecycle.
+    ///
+    /// **Workflow:** stops the background reader, sends a Close request to
+    /// the writer task, and removes the shell from storage. Active
+    /// subscribers receive a final closed event.
+    ///
+    /// **Errors:**
+    /// - `SHELL_NOT_FOUND`: no active shell with the given ID.
     #[tool(
-        description = "Close an interactive shell by SHELL_ID. Stops the background reader and closes the PTY channel. Errors: SHELL_NOT_FOUND."
+        description = "Close an interactive shell by SHELL_ID. Stops the background reader and closes the PTY channel. Prefer resources/subscribe shell://<id>/output (realtime push) over polling while the shell is alive. Errors: SHELL_NOT_FOUND."
     )]
     async fn ssh_shell_close(
         &self,
@@ -376,18 +493,22 @@ impl McpSshServer {
 
     /// Upload a local file to a remote path via SFTP.
     ///
-    /// **When to use:** push a file to the remote host. Streams in 32 KiB
-    /// chunks for bounded memory.
+    /// **When to use:**
+    /// - Push a file to the remote host. Streams in 32 KiB chunks for bounded memory.
     ///
     /// **Important identifiers in response:**
-    /// - `TRANSFER_ID`: passed to ssh_get_transfer_progress.
+    /// - `TRANSFER_ID`: pass to ssh_get_transfer_progress.
+    /// - `SESSION_ID`: echoed back for traceability.
     ///
-    /// **Limits:** up to 10 transfers per session.
+    /// **Limits:** up to 10 concurrent transfers per session.
     ///
-    /// **Errors:** SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED,
-    /// LOCAL_FILE_ERROR, LOCAL_NOT_FILE.
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
+    /// - `MAX_TRANSFERS_EXCEEDED`: per-session transfer cap reached.
+    /// - `LOCAL_FILE_ERROR`: cannot stat the local file.
+    /// - `LOCAL_NOT_FILE`: local path is not a regular file.
     #[tool(
-        description = "Upload a local file to remote_path via SFTP. Returns TRANSFER_ID immediately; poll with ssh_get_transfer_progress. Errors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, LOCAL_FILE_ERROR, LOCAL_NOT_FILE."
+        description = "Upload a local file to remote_path via SFTP. Returns TRANSFER_ID immediately; poll with ssh_get_transfer_progress. Up to 10 transfers per session. Errors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, LOCAL_FILE_ERROR, LOCAL_NOT_FILE."
     )]
     async fn ssh_upload(
         &self,
@@ -398,18 +519,22 @@ impl McpSshServer {
 
     /// Download a remote file to a local path via SFTP.
     ///
-    /// **When to use:** pull a file from the remote host. Streams in 32 KiB
-    /// chunks for bounded memory.
+    /// **When to use:**
+    /// - Pull a file from the remote host. Streams in 32 KiB chunks for bounded memory.
     ///
     /// **Important identifiers in response:**
-    /// - `TRANSFER_ID`: passed to ssh_get_transfer_progress.
+    /// - `TRANSFER_ID`: pass to ssh_get_transfer_progress.
+    /// - `SESSION_ID`: echoed back for traceability.
     ///
-    /// **Limits:** up to 10 transfers per session.
+    /// **Limits:** up to 10 concurrent transfers per session.
     ///
-    /// **Errors:** SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED,
-    /// SFTP_OPEN_FAILED, REMOTE_METADATA_ERROR.
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
+    /// - `MAX_TRANSFERS_EXCEEDED`: per-session transfer cap reached.
+    /// - `SFTP_OPEN_FAILED`: failed to open the SFTP subsystem.
+    /// - `REMOTE_METADATA_ERROR`: failed to stat the remote file.
     #[tool(
-        description = "Download a remote file from remote_path to local_path via SFTP. Returns TRANSFER_ID immediately; poll with ssh_get_transfer_progress. Errors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_OPEN_FAILED, REMOTE_METADATA_ERROR."
+        description = "Download a remote file from remote_path to local_path via SFTP. Returns TRANSFER_ID immediately; poll with ssh_get_transfer_progress. Up to 10 transfers per session. Errors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_OPEN_FAILED, REMOTE_METADATA_ERROR."
     )]
     async fn ssh_download(
         &self,
@@ -420,14 +545,26 @@ impl McpSshServer {
 
     /// Read the current progress of an SFTP transfer.
     ///
-    /// **When to use:** monitor an upload/download by polling
-    /// (`wait=false`) or block until completion (`wait=true`).
+    /// **When to use:**
+    /// - Monitor an upload/download by polling (`wait=false`).
+    /// - Block until termination (`wait=true`).
     ///
-    /// **Status values:** running, completed, failed, cancelled.
+    /// **Important identifiers in response:**
+    /// - `TRANSFER_ID`: echoed back for traceability.
     ///
-    /// **Errors:** TRANSFER_NOT_FOUND.
+    /// **Limits:** `wait_timeout_secs` default 30, cap 300. Terminated
+    /// transfers are cleaned from storage after `SSH_TRANSFER_CLEANUP_TTL`
+    /// (default 300s).
+    ///
+    /// **Status values:**
+    /// - `RUNNING`: transfer in progress; `PROGRESS` line shows percent.
+    /// - `COMPLETED`: 100% transferred.
+    /// - `FAILED`: terminated with an error; `REASON` line carries detail.
+    ///
+    /// **Errors:**
+    /// - `TRANSFER_NOT_FOUND`: no transfer with the given ID (or already cleaned up).
     #[tool(
-        description = "Read SFTP transfer progress by TRANSFER_ID. Set wait=true to block until termination (cap 300s). Status: running, completed, failed, cancelled. Errors: TRANSFER_NOT_FOUND."
+        description = "Read SFTP transfer progress by TRANSFER_ID. Set wait=true to block until termination (default 30s, cap 300s). Status: RUNNING, COMPLETED, FAILED. Terminated transfers cleaned after SSH_TRANSFER_CLEANUP_TTL (default 300s). Errors: TRANSFER_NOT_FOUND."
     )]
     async fn ssh_get_transfer_progress(
         &self,
@@ -438,13 +575,23 @@ impl McpSshServer {
 
     /// Set up local-to-remote TCP port forwarding through an SSH session.
     ///
-    /// **When to use:** expose a remote port (e.g. internal database) on a
-    /// local port (e.g. 8080). Available only with the `port_forward`
-    /// Cargo feature (default).
+    /// **When to use:**
+    /// - Expose a remote port (e.g. internal database) on a local port
+    ///   (e.g. 8080).
     ///
-    /// **Errors:** SESSION_NOT_FOUND, FORWARD_FAILED, FEATURE_DISABLED.
+    /// **Important identifiers in response:**
+    /// - `LOCAL`: local listening address (`host:port`).
+    /// - `REMOTE`: remote target (`host:port`).
+    ///
+    /// **Limits:** available only with the `port_forward` Cargo feature
+    /// (default-on).
+    ///
+    /// **Errors:**
+    /// - `SESSION_NOT_FOUND`: no session with the given ID.
+    /// - `FORWARD_FAILED`: listener bind or russh stream-open failed.
+    /// - `FEATURE_DISABLED`: build was compiled without `port_forward`.
     #[tool(
-        description = "Local-to-remote TCP port forwarding through an SSH session. Listens on local_port and forwards to remote_address:remote_port. Errors: SESSION_NOT_FOUND, FORWARD_FAILED, FEATURE_DISABLED."
+        description = "Local-to-remote TCP port forwarding through an SSH session by SESSION_ID. Listens on local_port and forwards to remote_address:remote_port. Feature-gated (port_forward). Errors: SESSION_NOT_FOUND, FORWARD_FAILED, FEATURE_DISABLED."
     )]
     async fn ssh_forward(
         &self,

@@ -43,18 +43,16 @@ use super::legacy_helpers::{
 /// Arguments for the `ssh_execute` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshExecuteArgs {
-    /// `SESSION_ID` returned from `ssh_connect`.
+    /// SESSION_ID returned from ssh_connect.
     pub session_id: String,
 
     /// Shell command to execute on the remote host.
     pub command: String,
 
-    /// Command timeout in seconds. Default: `180`. Env: `SSH_COMMAND_TIMEOUT`.
+    /// Command timeout in seconds. Default: 180. Env: SSH_COMMAND_TIMEOUT.
     pub timeout_secs: Option<u64>,
 
-    /// Allocate a pseudo-terminal (PTY) for the command. Use for commands that
-    /// require a controlling terminal (e.g. `sudo`, `top`). All output is
-    /// merged into stdout in PTY mode (no stderr separation).
+    /// Allocate a pseudo-terminal (PTY) for the command. Default: false. Use for commands that require a controlling terminal (e.g. `sudo`, `top`). All output is merged into stdout in PTY mode (no stderr separation).
     pub pty: Option<bool>,
 }
 
@@ -117,20 +115,16 @@ pub async fn ssh_execute_impl(args: SshExecuteArgs) -> Result<CallToolResult, Mc
 /// Arguments for the `ssh_get_command_output` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshGetCommandOutputArgs {
-    /// `COMMAND_ID` returned from `ssh_execute`.
+    /// COMMAND_ID returned from ssh_execute.
     pub command_id: String,
 
-    /// Block until the command completes (or `wait_timeout_secs` elapses).
-    /// Default: `false` (poll once and return).
+    /// Block until completion or wait_timeout_secs expires. Default: false.
     pub wait: Option<bool>,
 
-    /// Maximum seconds to wait when `wait=true`. Default: `30`. Capped at
-    /// `300` (5 minutes).
+    /// Maximum seconds to block when wait=true. Default: 30. Cap: 300.
     pub wait_timeout_secs: Option<u64>,
 
-    /// Maximum bytes to render for stdout/stderr. Default: `16384`. Cap:
-    /// `1_048_576`. Content is truncated head-side (oldest output dropped),
-    /// preserving the most recent tail. Env: `SSH_MCP_OUTPUT_DEFAULT_BYTES`.
+    /// Maximum bytes shown in stdout/stderr. Default: 16384. Cap: 1048576. Content head-truncated; tail (most recent output) preserved. Env: SSH_MCP_OUTPUT_DEFAULT_BYTES / SSH_MCP_OUTPUT_MAX_BYTES_CAP.
     pub max_output_bytes: Option<usize>,
 }
 
@@ -196,15 +190,13 @@ pub async fn ssh_get_command_output_impl(
 /// Arguments for the `ssh_list_commands` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshListCommandsArgs {
-    /// Filter by `SESSION_ID`. When omitted, returns commands across all
-    /// sessions.
+    /// SESSION_ID returned from ssh_connect. Optional filter; when omitted returns commands across all sessions.
     pub session_id: Option<String>,
 
-    /// Filter by command status. When omitted, returns every status.
+    /// Filter by command status. Values: `running`, `completed`, `cancelled`, `failed`. When omitted returns every status.
     pub status: Option<CommandStatus>,
 
-    /// Maximum number of commands to return. Default: `500`. Cap: `10 000`.
-    /// Env: `SSH_MCP_LIST_MAX_ITEMS`.
+    /// Maximum entries returned. Default: 500. Cap: 10000. Env: SSH_MCP_LIST_MAX_ITEMS / SSH_MCP_LIST_MAX_ITEMS_CAP.
     pub max_items: Option<usize>,
 }
 
@@ -237,11 +229,10 @@ pub async fn ssh_list_commands_impl(args: SshListCommandsArgs) -> Result<CallToo
 /// Arguments for the `ssh_cancel_command` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshCancelCommandArgs {
-    /// `COMMAND_ID` of the command to cancel.
+    /// COMMAND_ID returned from ssh_execute.
     pub command_id: String,
 
-    /// Maximum bytes to render for stdout/stderr in the response. Default:
-    /// `16384`. Cap: `1_048_576`.
+    /// Maximum bytes shown in stdout/stderr. Default: 16384. Cap: 1048576. Content head-truncated; tail (most recent output) preserved. Env: SSH_MCP_OUTPUT_DEFAULT_BYTES / SSH_MCP_OUTPUT_MAX_BYTES_CAP.
     pub max_output_bytes: Option<usize>,
 }
 

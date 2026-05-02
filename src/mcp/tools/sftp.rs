@@ -32,11 +32,10 @@ use super::legacy_helpers::{
 /// Arguments for the `ssh_upload` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshUploadArgs {
-    /// `SESSION_ID` returned by `ssh_connect`.
+    /// SESSION_ID returned from ssh_connect.
     pub session_id: String,
 
-    /// Local file path to upload. Relative paths resolve against the home
-    /// directory.
+    /// Local file path to upload. Relative paths resolve against the home directory.
     pub local_path: String,
 
     /// Remote destination path on the SSH server.
@@ -117,14 +116,13 @@ pub async fn ssh_upload_impl(args: SshUploadArgs) -> Result<CallToolResult, McpE
 /// Arguments for the `ssh_download` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshDownloadArgs {
-    /// `SESSION_ID` returned by `ssh_connect`.
+    /// SESSION_ID returned from ssh_connect.
     pub session_id: String,
 
     /// Remote file path to download from the SSH server.
     pub remote_path: String,
 
-    /// Local destination path. Relative paths resolve against the home
-    /// directory.
+    /// Local destination path. Relative paths resolve against the home directory.
     pub local_path: String,
 }
 
@@ -206,14 +204,13 @@ pub async fn ssh_download_impl(args: SshDownloadArgs) -> Result<CallToolResult, 
 /// Arguments for the `ssh_get_transfer_progress` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshGetTransferProgressArgs {
-    /// `TRANSFER_ID` returned by `ssh_upload` or `ssh_download`.
+    /// TRANSFER_ID returned from ssh_upload or ssh_download.
     pub transfer_id: String,
 
-    /// Block until the transfer terminates (or `wait_timeout_secs` elapses).
-    /// Default: `false`.
+    /// Block until completion or wait_timeout_secs expires. Default: false.
     pub wait: Option<bool>,
 
-    /// Maximum seconds to wait when `wait=true`. Default: `30`. Cap: `300`.
+    /// Maximum seconds to block when wait=true. Default: 30. Cap: 300.
     pub wait_timeout_secs: Option<u64>,
 }
 

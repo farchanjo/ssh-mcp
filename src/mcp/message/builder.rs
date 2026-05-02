@@ -6,12 +6,13 @@
 //!
 //! # Format overview
 //!
-//! - First line: `TOOL_NAME: STATUS` (where status is `OK`, `REUSED`,
-//!   `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`,
-//!   `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`).
-//! - Block layout: `KEY: value` per line when there are ≥ 4 fields or an
-//!   embedded output block (`--- name [nonce] --- ... `) is present.
-//! - Inline layout: `TOOL: STATUS | KEY: v | KEY: v` when ≤ 3 simple fields.
+//! - First line: `TOOL_NAME: STATUS` (where status is uppercase
+//!   `SCREAMING_SNAKE_CASE` — `OK`, `REUSED`, `SUGGESTED`, `STARTED`,
+//!   `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `NOOP`,
+//!   `OPEN`, `CLOSED`, `MATCHED`, `ERROR`).
+//! - Block layout (uniform): `KEY: value` per line, one field per line.
+//!   The inline `KEY: value | KEY: value` separator was removed in v3.0
+//!   (E6) to keep responses uniform and easier to parse line-by-line.
 //! - Identifiers use the `_ID` suffix (`SESSION_ID`, `COMMAND_ID`,
 //!   `SHELL_ID`, `TRANSFER_ID`).
 
@@ -239,11 +240,11 @@ fn extract_time(ts: &str) -> &str {
 // ssh_disconnect
 // ---------------------------------------------------------------------------
 
-/// Inline response for `ssh_disconnect: OK`.
+/// Block response for `ssh_disconnect: OK`.
 #[must_use]
 pub fn render_disconnect_ok(session_id: &str) -> String {
     let mut out = String::with_capacity(48);
-    out.push_str("SSH_DISCONNECT: OK | SESSION_ID: ");
+    out.push_str("SSH_DISCONNECT: OK\nSESSION_ID: ");
     out.push_str(session_id);
     out
 }
@@ -270,7 +271,7 @@ impl<'a> ListSessionsBuilder<'a> {
     #[must_use]
     pub fn build(&self) -> String {
         if self.sessions.is_empty() && self.total == 0 {
-            return String::from("SSH_LIST_SESSIONS: OK | COUNT: 0");
+            return String::from("SSH_LIST_SESSIONS: OK\nCOUNT: 0");
         }
         let mut out = String::with_capacity(64 + self.sessions.len() * 128);
         out.push_str("SSH_LIST_SESSIONS: OK\nCOUNT: ");
@@ -349,15 +350,15 @@ fn append_separator_if(out: &mut String, yes: bool) {
 // ssh_disconnect_agent
 // ---------------------------------------------------------------------------
 
-/// Inline response for `ssh_disconnect_agent: OK`.
+/// Block response for `ssh_disconnect_agent: OK`.
 #[must_use]
 pub fn render_disconnect_agent(agent_id: &str, sessions: usize, commands: usize) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_DISCONNECT_AGENT: OK | AGENT: ");
+    out.push_str("SSH_DISCONNECT_AGENT: OK\nAGENT: ");
     out.push_str(&sanitize_value(agent_id));
-    out.push_str(" | SESSIONS: ");
+    out.push_str("\nSESSIONS: ");
     out.push_str(&sessions.to_string());
-    out.push_str(" | COMMANDS: ");
+    out.push_str("\nCOMMANDS: ");
     out.push_str(&commands.to_string());
     out
 }
@@ -522,7 +523,7 @@ impl<'a> ListCommandsBuilder<'a> {
     #[must_use]
     pub fn build(&self) -> String {
         if self.commands.is_empty() && self.total == 0 {
-            return String::from("SSH_LIST_COMMANDS: OK | COUNT: 0");
+            return String::from("SSH_LIST_COMMANDS: OK\nCOUNT: 0");
         }
         let mut out = String::with_capacity(64 + self.commands.len() * 128);
         out.push_str("SSH_LIST_COMMANDS: OK\nCOUNT: ");
@@ -624,13 +625,13 @@ impl<'a> CancelCommandCancelledBuilder<'a> {
     }
 }
 
-/// Inline response for `ssh_cancel_command: NOOP` (command not running).
+/// Block response for `ssh_cancel_command: NOOP` (command not running).
 #[must_use]
 pub fn render_cancel_command_noop(command_id: &str, reason: &str) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_CANCEL_COMMAND: NOOP | COMMAND_ID: ");
+    out.push_str("SSH_CANCEL_COMMAND: NOOP\nCOMMAND_ID: ");
     out.push_str(command_id);
-    out.push_str(" | REASON: ");
+    out.push_str("\nREASON: ");
     out.push_str(&sanitize_value(reason));
     out
 }
@@ -701,22 +702,22 @@ impl ShellOpenBuilder {
 // ssh_shell_write / ssh_shell_close
 // ---------------------------------------------------------------------------
 
-/// Inline response for `ssh_shell_write: OK`.
+/// Block response for `ssh_shell_write: OK`.
 #[must_use]
 pub fn render_shell_write_ok(shell_id: &str, bytes: usize) -> String {
     let mut out = String::with_capacity(80);
-    out.push_str("SSH_SHELL_WRITE: OK | SHELL_ID: ");
+    out.push_str("SSH_SHELL_WRITE: OK\nSHELL_ID: ");
     out.push_str(shell_id);
-    out.push_str(" | BYTES_SENT: ");
+    out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes.to_string());
     out
 }
 
-/// Inline response for `ssh_shell_close: OK`.
+/// Block response for `ssh_shell_close: OK`.
 #[must_use]
 pub fn render_shell_close_ok(shell_id: &str) -> String {
     let mut out = String::with_capacity(64);
-    out.push_str("SSH_SHELL_CLOSE: OK | SHELL_ID: ");
+    out.push_str("SSH_SHELL_CLOSE: OK\nSHELL_ID: ");
     out.push_str(shell_id);
     out
 }
@@ -1023,21 +1024,21 @@ impl<'a> TransferProgressBuilder<'a> {
         };
         let percent = compute_percent(self.bytes_transferred, self.total_bytes);
         match self.state {
-            TransferProgressState::Running => self.render_inline("RUNNING", dir_upper, percent),
-            TransferProgressState::Completed => self.render_inline("COMPLETED", dir_upper, percent),
+            TransferProgressState::Running => self.render_block("RUNNING", dir_upper, percent),
+            TransferProgressState::Completed => self.render_block("COMPLETED", dir_upper, percent),
             TransferProgressState::Failed(reason) => self.render_failed(dir_upper, percent, reason),
         }
     }
 
-    fn render_inline(&self, status: &str, dir: &str, percent: u8) -> String {
-        let mut out = String::with_capacity(128);
+    fn render_block(&self, status: &str, dir: &str, percent: u8) -> String {
+        let mut out = String::with_capacity(160);
         out.push_str("SSH_GET_TRANSFER_PROGRESS: ");
         out.push_str(status);
-        out.push_str(" | TRANSFER_ID: ");
+        out.push_str("\nTRANSFER_ID: ");
         out.push_str(self.transfer_id);
-        out.push_str(" | ");
+        out.push_str("\nDIRECTION: ");
         out.push_str(dir);
-        out.push(' ');
+        out.push_str("\nPROGRESS: ");
         out.push_str(&percent.to_string());
         out.push_str("% (");
         out.push_str(&self.bytes_transferred.to_string());
@@ -1084,15 +1085,15 @@ fn compute_percent(transferred: u64, total: u64) -> u8 {
 // ssh_forward
 // ---------------------------------------------------------------------------
 
-/// Inline response for `ssh_forward: OK`.
+/// Block response for `ssh_forward: OK`.
 #[must_use]
 pub fn render_forward_ok(local: &str, remote: &str, active: bool) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_FORWARD: OK | LOCAL: ");
+    out.push_str("SSH_FORWARD: OK\nLOCAL: ");
     out.push_str(&sanitize_value(local));
-    out.push_str(" | REMOTE: ");
+    out.push_str("\nREMOTE: ");
     out.push_str(&sanitize_value(remote));
-    out.push_str(" | ACTIVE: ");
+    out.push_str("\nACTIVE: ");
     out.push_str(if active { "true" } else { "false" });
     out
 }
@@ -1235,9 +1236,9 @@ mod tests {
         use super::*;
 
         #[test]
-        fn inline_format() {
+        fn block_format() {
             let m = render_disconnect_ok("sess-abc");
-            assert_eq!(m, "SSH_DISCONNECT: OK | SESSION_ID: sess-abc");
+            assert_eq!(m, "SSH_DISCONNECT: OK\nSESSION_ID: sess-abc");
         }
     }
 
@@ -1261,9 +1262,9 @@ mod tests {
         }
 
         #[test]
-        fn empty_list_inline() {
+        fn empty_list_block() {
             let m = ListSessionsBuilder::new(&[], 0).build();
-            assert_eq!(m, "SSH_LIST_SESSIONS: OK | COUNT: 0");
+            assert_eq!(m, "SSH_LIST_SESSIONS: OK\nCOUNT: 0");
         }
 
         #[test]
@@ -1306,19 +1307,19 @@ mod tests {
         use super::*;
 
         #[test]
-        fn inline_format() {
+        fn block_format() {
             let m = render_disconnect_agent("my-agent", 3, 5);
             assert_eq!(
                 m,
-                "SSH_DISCONNECT_AGENT: OK | AGENT: my-agent | SESSIONS: 3 | COMMANDS: 5"
+                "SSH_DISCONNECT_AGENT: OK\nAGENT: my-agent\nSESSIONS: 3\nCOMMANDS: 5"
             );
         }
 
         #[test]
         fn zero_counts_still_rendered() {
             let m = render_disconnect_agent("agent", 0, 0);
-            assert!(m.contains("SESSIONS: 0"));
-            assert!(m.contains("COMMANDS: 0"));
+            assert!(m.contains("\nSESSIONS: 0"));
+            assert!(m.contains("\nCOMMANDS: 0"));
         }
     }
 
@@ -1450,9 +1451,9 @@ mod tests {
         }
 
         #[test]
-        fn empty_inline() {
+        fn empty_block() {
             let m = ListCommandsBuilder::new(&[], 0).build();
-            assert_eq!(m, "SSH_LIST_COMMANDS: OK | COUNT: 0");
+            assert_eq!(m, "SSH_LIST_COMMANDS: OK\nCOUNT: 0");
         }
 
         #[test]
@@ -1501,11 +1502,11 @@ mod tests {
         }
 
         #[test]
-        fn noop_inline() {
+        fn noop_block() {
             let m = render_cancel_command_noop("cmd-1", "not running");
             assert_eq!(
                 m,
-                "SSH_CANCEL_COMMAND: NOOP | COMMAND_ID: cmd-1 | REASON: not running"
+                "SSH_CANCEL_COMMAND: NOOP\nCOMMAND_ID: cmd-1\nREASON: not running"
             );
         }
 
@@ -1548,18 +1549,18 @@ mod tests {
         use super::*;
 
         #[test]
-        fn write_inline() {
+        fn write_block() {
             let m = render_shell_write_ok("shell-1", 42);
             assert_eq!(
                 m,
-                "SSH_SHELL_WRITE: OK | SHELL_ID: shell-1 | BYTES_SENT: 42"
+                "SSH_SHELL_WRITE: OK\nSHELL_ID: shell-1\nBYTES_SENT: 42"
             );
         }
 
         #[test]
-        fn close_inline() {
+        fn close_block() {
             let m = render_shell_close_ok("shell-1");
-            assert_eq!(m, "SSH_SHELL_CLOSE: OK | SHELL_ID: shell-1");
+            assert_eq!(m, "SSH_SHELL_CLOSE: OK\nSHELL_ID: shell-1");
         }
 
         #[test]
@@ -1753,7 +1754,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn running_inline() {
+        fn running_block() {
             let m = TransferProgressBuilder::new(
                 "xfer-1",
                 TransferStartDirection::Upload,
@@ -1764,12 +1765,12 @@ mod tests {
             .build();
             assert_eq!(
                 m,
-                "SSH_GET_TRANSFER_PROGRESS: RUNNING | TRANSFER_ID: xfer-1 | UPLOAD 50% (524288/1048576 bytes)"
+                "SSH_GET_TRANSFER_PROGRESS: RUNNING\nTRANSFER_ID: xfer-1\nDIRECTION: UPLOAD\nPROGRESS: 50% (524288/1048576 bytes)"
             );
         }
 
         #[test]
-        fn completed_inline_100_percent() {
+        fn completed_block_100_percent() {
             let m = TransferProgressBuilder::new(
                 "xfer-1",
                 TransferStartDirection::Download,
@@ -1778,8 +1779,9 @@ mod tests {
                 TransferProgressState::Completed,
             )
             .build();
-            assert!(m.contains("COMPLETED"));
-            assert!(m.contains("DOWNLOAD 100%"));
+            assert!(m.starts_with("SSH_GET_TRANSFER_PROGRESS: COMPLETED\n"));
+            assert!(m.contains("DIRECTION: DOWNLOAD"));
+            assert!(m.contains("PROGRESS: 100%"));
         }
 
         #[test]
@@ -1817,18 +1819,18 @@ mod tests {
         use super::*;
 
         #[test]
-        fn active_inline() {
+        fn active_block() {
             let m = render_forward_ok("127.0.0.1:8080", "localhost:3306", true);
             assert_eq!(
                 m,
-                "SSH_FORWARD: OK | LOCAL: 127.0.0.1:8080 | REMOTE: localhost:3306 | ACTIVE: true"
+                "SSH_FORWARD: OK\nLOCAL: 127.0.0.1:8080\nREMOTE: localhost:3306\nACTIVE: true"
             );
         }
 
         #[test]
         fn inactive_renders_false() {
             let m = render_forward_ok("a", "b", false);
-            assert!(m.contains("ACTIVE: false"));
+            assert!(m.contains("\nACTIVE: false"));
         }
     }
 
