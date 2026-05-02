@@ -101,13 +101,17 @@ impl CommandStorage for DashMapCommandStorage {
         // The trait returns Option<Arc<RunningCommand>> for API consistency,
         // but in practice, get_direct() is preferred for direct field access.
         self.commands.get(command_id).map(|entry| {
-            // Clone the RunningCommand's Arc-wrapped fields
+            // Clone the RunningCommand's lock-free fields. Every shared piece
+            // of state is `Arc`-backed (`ArcSwap`, `OnceCell`, `AtomicBool`)
+            // or natively cloneable (`broadcast::Sender`, `watch::Sender`/`Receiver`,
+            // `CancellationToken`), so there is no `Mutex` to take.
             Arc::new(RunningCommand {
                 info: entry.info.clone(),
                 cancel_token: entry.cancel_token.clone(),
                 status_rx: entry.status_rx.clone(),
                 status_tx: entry.status_tx.clone(),
-                output: Arc::clone(&entry.output),
+                output_history: Arc::clone(&entry.output_history),
+                output_tx: entry.output_tx.clone(),
                 exit_code: Arc::clone(&entry.exit_code),
                 error: Arc::clone(&entry.error),
                 timed_out: Arc::clone(&entry.timed_out),
@@ -124,7 +128,8 @@ impl CommandStorage for DashMapCommandStorage {
                 cancel_token: entry.cancel_token.clone(),
                 status_rx: entry.status_rx.clone(),
                 status_tx: entry.status_tx.clone(),
-                output: Arc::clone(&entry.output),
+                output_history: Arc::clone(&entry.output_history),
+                output_tx: entry.output_tx.clone(),
                 exit_code: Arc::clone(&entry.exit_code),
                 error: Arc::clone(&entry.error),
                 timed_out: Arc::clone(&entry.timed_out),
@@ -198,12 +203,14 @@ mod tests {
     use super::*;
     use crate::mcp::async_command::OutputBuffer;
     use crate::mcp::types::AsyncCommandStatus;
+    use arc_swap::ArcSwap;
     use std::sync::atomic::AtomicBool;
-    use tokio::sync::{Mutex, watch};
+    use tokio::sync::{OnceCell, broadcast, watch};
     use tokio_util::sync::CancellationToken;
 
     fn create_test_command(command_id: &str, session_id: &str) -> RunningCommand {
         let (tx, rx) = watch::channel(AsyncCommandStatus::Running);
+        let (output_tx, _output_rx) = broadcast::channel(64);
         RunningCommand {
             info: AsyncCommandInfo {
                 command_id: command_id.to_string(),
@@ -215,9 +222,10 @@ mod tests {
             cancel_token: CancellationToken::new(),
             status_rx: rx,
             status_tx: tx,
-            output: Arc::new(Mutex::new(OutputBuffer::default())),
-            exit_code: Arc::new(Mutex::new(None)),
-            error: Arc::new(Mutex::new(None)),
+            output_history: Arc::new(ArcSwap::from_pointee(OutputBuffer::default())),
+            output_tx,
+            exit_code: Arc::new(OnceCell::new()),
+            error: Arc::new(OnceCell::new()),
             timed_out: Arc::new(AtomicBool::new(false)),
             output_read: Arc::new(AtomicBool::new(false)),
         }
@@ -229,6 +237,7 @@ mod tests {
         status: AsyncCommandStatus,
     ) -> RunningCommand {
         let (tx, rx) = watch::channel(status);
+        let (output_tx, _output_rx) = broadcast::channel(64);
         RunningCommand {
             info: AsyncCommandInfo {
                 command_id: command_id.to_string(),
@@ -240,9 +249,10 @@ mod tests {
             cancel_token: CancellationToken::new(),
             status_rx: rx,
             status_tx: tx,
-            output: Arc::new(Mutex::new(OutputBuffer::default())),
-            exit_code: Arc::new(Mutex::new(None)),
-            error: Arc::new(Mutex::new(None)),
+            output_history: Arc::new(ArcSwap::from_pointee(OutputBuffer::default())),
+            output_tx,
+            exit_code: Arc::new(OnceCell::new()),
+            error: Arc::new(OnceCell::new()),
             timed_out: Arc::new(AtomicBool::new(false)),
             output_read: Arc::new(AtomicBool::new(false)),
         }

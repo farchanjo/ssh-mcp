@@ -151,14 +151,14 @@ pub async fn ssh_get_command_output_impl(
     let lookup = COMMAND_STORAGE.get_direct(&command_id).map(|cmd| {
         (
             cmd.status_rx.clone(),
-            Arc::clone(&cmd.output),
+            Arc::clone(&cmd.output_history),
             Arc::clone(&cmd.exit_code),
             Arc::clone(&cmd.error),
             Arc::clone(&cmd.timed_out),
             Arc::clone(&cmd.output_read),
         )
     });
-    let (status_rx, output, exit_code, error, timed_out, output_read) = match lookup {
+    let (status_rx, output_history, exit_code, error, timed_out, output_read) = match lookup {
         Some(t) => t,
         None => {
             return Ok(CallToolResult::error(vec![Content::text(format_error(
@@ -178,9 +178,14 @@ pub async fn ssh_get_command_output_impl(
     output_read.store(true, Ordering::SeqCst);
 
     let body = build_command_output_response(
-        command_id, &status_rx, &output, &exit_code, &error, &timed_out, max_bytes,
-    )
-    .await;
+        command_id,
+        &status_rx,
+        &output_history,
+        &exit_code,
+        &error,
+        &timed_out,
+        max_bytes,
+    );
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
 
@@ -249,7 +254,7 @@ pub async fn ssh_cancel_command_impl(
         max_output_bytes,
     } = args;
     let max_bytes = clamp_output_bytes(max_output_bytes);
-    let (cancel_token, output, status_rx) = match get_running_command(&command_id) {
+    let (cancel_token, output_history, status_rx) = match get_running_command(&command_id) {
         Ok(x) => x,
         Err(e) => {
             if e.contains("No async command") {
@@ -275,15 +280,14 @@ pub async fn ssh_cancel_command_impl(
 
     info!("Cancelled async command: {command_id}");
     let nonce = generate_nonce();
-    let guard = output.lock().await;
+    let snapshot = output_history.load_full();
     let body = CancelCommandCancelledBuilder::new(
         &command_id,
-        &guard.stdout,
-        &guard.stderr,
+        &snapshot.stdout,
+        &snapshot.stderr,
         max_bytes,
         &nonce,
     )
     .build();
-    drop(guard);
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
