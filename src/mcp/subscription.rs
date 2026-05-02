@@ -678,8 +678,7 @@ mod tests {
                 ResourceKind::Forward,
             ] {
                 let uri = format_uri(kind, "abc-123");
-                let (parsed_kind, parsed_id) =
-                    parse_uri(&uri).expect("round trip must succeed");
+                let (parsed_kind, parsed_id) = parse_uri(&uri).expect("round trip must succeed");
                 assert_eq!(parsed_kind, kind);
                 assert_eq!(parsed_id, "abc-123");
             }

@@ -920,10 +920,7 @@ fn publish_stdout(
     let before = owned.stdout.len();
     owned.append_stdout_slice(local, max_buffer);
     let after = owned.stdout.len();
-    let dropped = chunk
-        .len()
-        .saturating_add(before)
-        .saturating_sub(after);
+    let dropped = chunk.len().saturating_add(before).saturating_sub(after);
     if dropped > 0 {
         let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
         let uri = format!("command://{}/output", command.info.command_id);
@@ -948,10 +945,7 @@ fn publish_stderr(
     let before = owned.stderr.len();
     owned.append_stderr_slice(local, max_buffer);
     let after = owned.stderr.len();
-    let dropped = chunk
-        .len()
-        .saturating_add(before)
-        .saturating_sub(after);
+    let dropped = chunk.len().saturating_add(before).saturating_sub(after);
     if dropped > 0 {
         let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
         let uri = format!("command://{}/output", command.info.command_id);

@@ -412,7 +412,9 @@ mod tests {
 
         #[test]
         fn resource_temporarily_unavailable_with_punctuation() {
-            assert!(is_retryable_error("Error: Resource temporarily unavailable!"));
+            assert!(is_retryable_error(
+                "Error: Resource temporarily unavailable!"
+            ));
         }
 
         #[test]
@@ -430,9 +432,7 @@ mod tests {
 
         #[test]
         fn connection_refused_with_address_retryable() {
-            assert!(is_retryable_error(
-                "connection refused at 192.168.1.1:22"
-            ));
+            assert!(is_retryable_error("connection refused at 192.168.1.1:22"));
         }
 
         #[test]

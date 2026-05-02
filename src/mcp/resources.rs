@@ -188,7 +188,9 @@ pub fn parse_resource_uri(uri: &str) -> Result<ParsedResourceUri, ParseError> {
         .split_once("://")
         .ok_or_else(|| ParseError::BadScheme(uri.to_string()))?;
     let kind = parse_scheme(scheme)?;
-    let (path, query) = rest.split_once('?').map_or((rest, None), |(p, q)| (p, Some(q)));
+    let (path, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(p, q)| (p, Some(q)));
     let (id, sub_path) = path.split_once('/').ok_or(ParseError::MissingId)?;
     if id.is_empty() {
         return Err(ParseError::MissingId);
@@ -270,7 +272,12 @@ fn collect_shell_resources(out: &mut Vec<Resource>) {
             "PTY output buffer for shell {} ({}, {}x{}).",
             info.shell_id, info.term_type, info.cols, info.rows
         );
-        out.push(make_resource(uri, name, description, mime_of(ResourceKind::Shell)));
+        out.push(make_resource(
+            uri,
+            name,
+            description,
+            mime_of(ResourceKind::Shell),
+        ));
     }
 }
 
@@ -282,7 +289,12 @@ fn collect_command_resources(out: &mut Vec<Resource>) {
             "Async command output stream — status {}, command: {}",
             info.status, info.command
         );
-        out.push(make_resource(uri, name, description, mime_of(ResourceKind::Command)));
+        out.push(make_resource(
+            uri,
+            name,
+            description,
+            mime_of(ResourceKind::Command),
+        ));
     }
 }
 
@@ -297,19 +309,32 @@ fn collect_transfer_resources(out: &mut Vec<Resource>) {
             "SFTP {} progress for transfer {}.",
             info.direction, info.transfer_id
         );
-        out.push(make_resource(uri, name, description, mime_of(ResourceKind::Transfer)));
+        out.push(make_resource(
+            uri,
+            name,
+            description,
+            mime_of(ResourceKind::Transfer),
+        ));
     }
 }
 
 fn collect_session_resources(out: &mut Vec<Resource>) {
     for info in SESSION_STORAGE.list() {
         let uri = resource_uri(ResourceKind::Session, &info.session_id);
-        let name = format!("Session {} ({}@{})", info.session_id, info.username, info.host);
+        let name = format!(
+            "Session {} ({}@{})",
+            info.session_id, info.username, info.host
+        );
         let description = format!(
             "SSH session health snapshot for {}@{}.",
             info.username, info.host
         );
-        out.push(make_resource(uri, name, description, mime_of(ResourceKind::Session)));
+        out.push(make_resource(
+            uri,
+            name,
+            description,
+            mime_of(ResourceKind::Session),
+        ));
     }
 }
 
@@ -374,7 +399,12 @@ fn read_shell(
         "closed"
     };
     let meta = build_text_meta(&meta_for_byte_view(parsed.kind, &view, status));
-    Ok(text_resource_contents(uri, mime_of(parsed.kind), view.text, meta))
+    Ok(text_resource_contents(
+        uri,
+        mime_of(parsed.kind),
+        view.text,
+        meta,
+    ))
 }
 
 fn read_command(
@@ -398,7 +428,12 @@ fn read_command(
         .get_ref(&parsed.id)
         .map_or_else(|| "unknown".to_string(), |c| c.info.status.to_string());
     let meta = build_text_meta(&meta_for_byte_view(parsed.kind, &view, &status));
-    Ok(text_resource_contents(uri, mime_of(parsed.kind), view.text, meta))
+    Ok(text_resource_contents(
+        uri,
+        mime_of(parsed.kind),
+        view.text,
+        meta,
+    ))
 }
 
 /// Result of slicing a byte-stream resource (shell / command output) for a
@@ -432,7 +467,11 @@ fn byte_stream_view(
         cursor,
         buffer_len,
         last_seq: SUBSCRIPTION_REGISTRY.current_seq(parsed.kind, &parsed.id),
-        truncated_since_last_read: compute_truncated_since(previous_cursor, buffer_len, slice.len()),
+        truncated_since_last_read: compute_truncated_since(
+            previous_cursor,
+            buffer_len,
+            slice.len(),
+        ),
         keepalive: trimmed.is_empty() && start == previous_cursor,
     }
 }
@@ -477,7 +516,13 @@ fn read_transfer(parsed: &ParsedResourceUri, uri: &str) -> Result<ResourceConten
         "error": error,
         "last_seq": last_seq,
     });
-    Ok(point_in_time_contents(parsed.kind, uri, &payload, last_seq, &status.to_string()))
+    Ok(point_in_time_contents(
+        parsed.kind,
+        uri,
+        &payload,
+        last_seq,
+        &status.to_string(),
+    ))
 }
 
 fn read_session(parsed: &ParsedResourceUri, uri: &str) -> Result<ResourceContents, McpError> {
@@ -500,7 +545,13 @@ fn read_session(parsed: &ParsedResourceUri, uri: &str) -> Result<ResourceContent
         "compression_enabled": info.compression_enabled,
         "last_seq": last_seq,
     });
-    Ok(point_in_time_contents(parsed.kind, uri, &payload, last_seq, healthy_str))
+    Ok(point_in_time_contents(
+        parsed.kind,
+        uri,
+        &payload,
+        last_seq,
+        healthy_str,
+    ))
 }
 
 fn point_in_time_contents(
@@ -811,9 +862,9 @@ mod tests {
                 assert_eq!(expected, "output");
                 assert_eq!(got, "progress");
             }
-            ParseError::BadScheme(_)
-            | ParseError::MissingId
-            | ParseError::BadCursor(_) => panic!("wrong variant: {err:?}"),
+            ParseError::BadScheme(_) | ParseError::MissingId | ParseError::BadCursor(_) => {
+                panic!("wrong variant: {err:?}")
+            }
         }
     }
 
@@ -822,9 +873,9 @@ mod tests {
         let err = parse_resource_uri("shell://abc/output?cursor=banana").unwrap_err();
         match err {
             ParseError::BadCursor(value) => assert_eq!(value, "banana"),
-            ParseError::BadScheme(_)
-            | ParseError::MissingId
-            | ParseError::BadSubPath { .. } => panic!("wrong variant: {err:?}"),
+            ParseError::BadScheme(_) | ParseError::MissingId | ParseError::BadSubPath { .. } => {
+                panic!("wrong variant: {err:?}")
+            }
         }
     }
 
@@ -937,7 +988,10 @@ mod tests {
             truncated_since_last_read: 64,
             keepalive: true,
         });
-        assert_eq!(meta.get("truncated_since_last_read"), Some(&Value::from(64_u64)));
+        assert_eq!(
+            meta.get("truncated_since_last_read"),
+            Some(&Value::from(64_u64))
+        );
         assert_eq!(meta.get("keepalive"), Some(&Value::from(true)));
         assert_eq!(meta.get("command_status"), Some(&Value::from("running")));
     }
@@ -1102,8 +1156,8 @@ mod tests {
         #[test]
         fn cursor_value_overflow_is_bad_cursor() {
             // u64::MAX + 1 doesn't fit -> BadCursor.
-            let err = parse_resource_uri("shell://abc/output?cursor=99999999999999999999")
-                .unwrap_err();
+            let err =
+                parse_resource_uri("shell://abc/output?cursor=99999999999999999999").unwrap_err();
             match err {
                 ParseError::BadCursor(value) => {
                     assert_eq!(value, "99999999999999999999");
@@ -1142,10 +1196,7 @@ mod tests {
 
         #[test]
         fn parse_error_equality() {
-            assert_eq!(
-                ParseError::MissingId,
-                ParseError::MissingId
-            );
+            assert_eq!(ParseError::MissingId, ParseError::MissingId);
             assert_eq!(
                 ParseError::BadCursor("x".to_string()),
                 ParseError::BadCursor("x".to_string())
