@@ -22,6 +22,21 @@ path = "src/main.rs"
 name = "ssh_mcp"
 path = "src/lib.rs"
 
+# Loom-based concurrency invariant tests. The test functions are gated
+# `#[cfg(loom)]` so the default `cargo test` skips them.
+#
+# NOTE: full loom mode (`RUSTFLAGS="--cfg loom"`) currently fails to build the
+# wider workspace because russh / axum reach for `tokio::net::TcpStream`,
+# which tokio gates with `#![cfg(not(loom))]`. The test file therefore
+# documents the lock-free invariants (ArcSwap-style swap, OnceCell-style
+# write-once, fetch_max + saturating_sub cursor, slow-subscriber recovery)
+# and is ready to run once the loom incompatibility in upstream crates is
+# resolved.
+[[test]]
+name = "lockfree_invariants"
+path = "tests/lockfree_invariants.rs"
+harness = true
+
 [dependencies]
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [

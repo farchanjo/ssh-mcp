@@ -170,4 +170,164 @@ mod tests {
         let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
         assert!(storage.get_direct(&unique_id).is_none());
     }
+
+    mod e15_extra {
+        use super::*;
+        use crate::mcp::transfer::{TransferDirection, TransferInfo};
+
+        fn make_transfer(transfer_id: &str, session_id: &str) -> RunningTransfer {
+            let info = TransferInfo {
+                transfer_id: transfer_id.to_string(),
+                session_id: session_id.to_string(),
+                direction: TransferDirection::Upload,
+                local_path: "/tmp/x".to_string(),
+                remote_path: "/r/x".to_string(),
+                started_at: "2025-01-01T00:00:00Z".to_string(),
+            };
+            RunningTransfer::new(info, 1024, 32)
+        }
+
+        #[test]
+        fn register_and_unregister_round_trip() {
+            let storage = DashMapTransferStorage::new();
+            let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+            let xfer_id = format!("xfer-{}", uuid::Uuid::new_v4());
+            storage.register(xfer_id.clone(), make_transfer(&xfer_id, &session_id));
+            assert_eq!(storage.count_by_session(&session_id), 1);
+            assert!(storage.get_direct(&xfer_id).is_some());
+
+            let removed = storage.unregister(&xfer_id).expect("must return owned transfer");
+            assert_eq!(removed.info.transfer_id, xfer_id);
+            assert_eq!(storage.count_by_session(&session_id), 0);
+            assert!(storage.get_direct(&xfer_id).is_none());
+        }
+
+        #[test]
+        fn count_by_session_grows_with_each_register() {
+            let storage = DashMapTransferStorage::new();
+            let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+            let mut ids = Vec::new();
+            for i in 0..5_usize {
+                let xfer_id = format!("xfer-{i}-{}", uuid::Uuid::new_v4());
+                storage.register(xfer_id.clone(), make_transfer(&xfer_id, &session_id));
+                ids.push(xfer_id);
+            }
+            assert_eq!(storage.count_by_session(&session_id), 5);
+            for id in &ids {
+                storage.unregister(id);
+            }
+        }
+
+        #[test]
+        fn list_by_session_returns_all_registered_ids() {
+            let storage = DashMapTransferStorage::new();
+            let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+            let id1 = format!("xfer-1-{}", uuid::Uuid::new_v4());
+            let id2 = format!("xfer-2-{}", uuid::Uuid::new_v4());
+            storage.register(id1.clone(), make_transfer(&id1, &session_id));
+            storage.register(id2.clone(), make_transfer(&id2, &session_id));
+            let listed = storage.list_by_session(&session_id);
+            assert_eq!(listed.len(), 2);
+            assert!(listed.contains(&id1));
+            assert!(listed.contains(&id2));
+            storage.unregister(&id1);
+            storage.unregister(&id2);
+        }
+
+        #[test]
+        fn unregister_cleans_secondary_index() {
+            let storage = DashMapTransferStorage::new();
+            let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+            let xfer_id = format!("xfer-{}", uuid::Uuid::new_v4());
+            storage.register(xfer_id.clone(), make_transfer(&xfer_id, &session_id));
+            assert_eq!(storage.count_by_session(&session_id), 1);
+            storage.unregister(&xfer_id);
+            assert_eq!(storage.count_by_session(&session_id), 0);
+            assert!(storage.list_by_session(&session_id).is_empty());
+        }
+
+        #[test]
+        fn list_filtered_returns_only_matching_session() {
+            let storage = DashMapTransferStorage::new();
+            let s1 = format!("sess-1-{}", uuid::Uuid::new_v4());
+            let s2 = format!("sess-2-{}", uuid::Uuid::new_v4());
+            let id1 = format!("xfer-1-{}", uuid::Uuid::new_v4());
+            let id2 = format!("xfer-2-{}", uuid::Uuid::new_v4());
+            storage.register(id1.clone(), make_transfer(&id1, &s1));
+            storage.register(id2.clone(), make_transfer(&id2, &s2));
+
+            let only_s1 = storage.list_filtered(Some(&s1));
+            assert_eq!(only_s1.len(), 1);
+            assert_eq!(only_s1[0].transfer_id, id1);
+
+            storage.unregister(&id1);
+            storage.unregister(&id2);
+        }
+
+        #[test]
+        fn list_filtered_with_no_filter_includes_registered_entry() {
+            let storage = DashMapTransferStorage::new();
+            let s = format!("sess-{}", uuid::Uuid::new_v4());
+            let id = format!("xfer-{}", uuid::Uuid::new_v4());
+            storage.register(id.clone(), make_transfer(&id, &s));
+            let all = storage.list_filtered(None);
+            assert!(all.iter().any(|info| info.transfer_id == id));
+            storage.unregister(&id);
+        }
+
+        #[test]
+        fn double_unregister_returns_none_second_time() {
+            let storage = DashMapTransferStorage::new();
+            let s = format!("sess-{}", uuid::Uuid::new_v4());
+            let id = format!("xfer-{}", uuid::Uuid::new_v4());
+            storage.register(id.clone(), make_transfer(&id, &s));
+            assert!(storage.unregister(&id).is_some());
+            assert!(storage.unregister(&id).is_none());
+        }
+
+        #[test]
+        fn multiple_sessions_isolated() {
+            let storage = DashMapTransferStorage::new();
+            let s1 = format!("sess-A-{}", uuid::Uuid::new_v4());
+            let s2 = format!("sess-B-{}", uuid::Uuid::new_v4());
+            for i in 0..3_usize {
+                let id = format!("xfer-A-{i}-{}", uuid::Uuid::new_v4());
+                storage.register(id.clone(), make_transfer(&id, &s1));
+            }
+            for i in 0..2_usize {
+                let id = format!("xfer-B-{i}-{}", uuid::Uuid::new_v4());
+                storage.register(id.clone(), make_transfer(&id, &s2));
+            }
+            assert_eq!(storage.count_by_session(&s1), 3);
+            assert_eq!(storage.count_by_session(&s2), 2);
+
+            for id in storage.list_by_session(&s1) {
+                storage.unregister(&id);
+            }
+            for id in storage.list_by_session(&s2) {
+                storage.unregister(&id);
+            }
+        }
+
+        #[test]
+        fn list_filtered_for_unknown_session_is_empty() {
+            let storage = DashMapTransferStorage::new();
+            let unknown = format!("unknown-{}", uuid::Uuid::new_v4());
+            assert!(storage.list_filtered(Some(&unknown)).is_empty());
+        }
+
+        #[test]
+        fn fixture_lifecycle_register_get_drop() {
+            let storage = DashMapTransferStorage::new();
+            let s = format!("sess-{}", uuid::Uuid::new_v4());
+            let id = format!("xfer-{}", uuid::Uuid::new_v4());
+            storage.register(id.clone(), make_transfer(&id, &s));
+            // Limit the borrow scope so unregister can take the entry.
+            {
+                let guard = storage.get_direct(&id).expect("must exist");
+                assert_eq!(guard.info.transfer_id, id);
+            }
+            storage.unregister(&id);
+        }
+    }
 }

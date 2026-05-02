@@ -598,4 +598,126 @@ mod tests {
         let reg = SubscriptionRegistry::new();
         assert!(reg.snapshot_subscribers("shell://nope/output").is_empty());
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn next_seq_each_kind_independent() {
+            let reg = SubscriptionRegistry::new();
+            assert_eq!(reg.next_seq(ResourceKind::Shell, "id"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Command, "id"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Transfer, "id"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Session, "id"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Forward, "id"), 1);
+        }
+
+        #[test]
+        fn next_seq_each_id_independent() {
+            let reg = SubscriptionRegistry::new();
+            assert_eq!(reg.next_seq(ResourceKind::Shell, "alpha"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Shell, "beta"), 1);
+            assert_eq!(reg.next_seq(ResourceKind::Shell, "alpha"), 2);
+        }
+
+        #[test]
+        fn current_seq_matches_after_burst_allocations() {
+            let reg = SubscriptionRegistry::new();
+            for _ in 0..50_usize {
+                let _ = reg.next_seq(ResourceKind::Command, "burst");
+            }
+            assert_eq!(reg.current_seq(ResourceKind::Command, "burst"), 50);
+        }
+
+        #[test]
+        fn peer_progress_returns_independent_arc_for_different_peers() {
+            let reg = SubscriptionRegistry::new();
+            let a = reg.peer_progress("peer-A", "shell://x/output");
+            let b = reg.peer_progress("peer-B", "shell://x/output");
+            assert!(!Arc::ptr_eq(&a, &b));
+            a.byte_cursor.store(10, Ordering::Relaxed);
+            b.byte_cursor.store(20, Ordering::Relaxed);
+            assert_eq!(a.byte_cursor.load(Ordering::Relaxed), 10);
+            assert_eq!(b.byte_cursor.load(Ordering::Relaxed), 20);
+        }
+
+        #[test]
+        fn peer_progress_for_same_peer_different_uri_is_independent() {
+            let reg = SubscriptionRegistry::new();
+            let p1 = reg.peer_progress("peer-A", "shell://x/output");
+            let p2 = reg.peer_progress("peer-A", "shell://y/output");
+            assert!(!Arc::ptr_eq(&p1, &p2));
+        }
+
+        #[test]
+        fn compensate_truncation_no_progress_does_not_panic() {
+            let reg = SubscriptionRegistry::new();
+            // No registered peer_progress entries — the loop body is a no-op.
+            reg.compensate_truncation("shell://no-one/output", 100);
+        }
+
+        #[test]
+        fn compensate_truncation_does_not_affect_unrelated_uris() {
+            let reg = SubscriptionRegistry::new();
+            let p1 = reg.peer_progress("peer-1", "shell://a/output");
+            let p2 = reg.peer_progress("peer-1", "command://a/output");
+            p1.byte_cursor.store(100, Ordering::Relaxed);
+            p2.byte_cursor.store(100, Ordering::Relaxed);
+            reg.compensate_truncation("shell://a/output", 30);
+            assert_eq!(p1.byte_cursor.load(Ordering::Relaxed), 70);
+            assert_eq!(p2.byte_cursor.load(Ordering::Relaxed), 100);
+        }
+
+        #[test]
+        fn parse_uri_round_trip_for_shell_command_transfer_session_forward() {
+            for kind in [
+                ResourceKind::Shell,
+                ResourceKind::Command,
+                ResourceKind::Transfer,
+                ResourceKind::Session,
+                ResourceKind::Forward,
+            ] {
+                let uri = format_uri(kind, "abc-123");
+                let (parsed_kind, parsed_id) =
+                    parse_uri(&uri).expect("round trip must succeed");
+                assert_eq!(parsed_kind, kind);
+                assert_eq!(parsed_id, "abc-123");
+            }
+        }
+
+        #[test]
+        fn parse_uri_handles_id_with_no_suffix() {
+            // `shell://abc` — no trailing `/output`; the parser still accepts
+            // and returns just the id portion.
+            let parsed = parse_uri("shell://abc");
+            assert!(parsed.is_some());
+            let (kind, id) = parsed.expect("parse_uri should succeed");
+            assert_eq!(kind, ResourceKind::Shell);
+            assert_eq!(id, "abc");
+        }
+
+        #[test]
+        fn parse_uri_returns_none_when_separator_missing() {
+            assert!(parse_uri("not-a-uri").is_none());
+            assert!(parse_uri("").is_none());
+            assert!(parse_uri("scheme:no-double-slash").is_none());
+        }
+
+        #[test]
+        fn snapshot_subscribers_returns_empty_clone_for_unknown_uri() {
+            let reg = SubscriptionRegistry::new();
+            let snap = reg.snapshot_subscribers("shell://does-not-exist/output");
+            assert!(snap.is_empty());
+        }
+
+        #[test]
+        fn poke_with_no_subscribers_is_silent_noop() {
+            let reg = SubscriptionRegistry::new();
+            // Should not panic and should not allocate a waker.
+            reg.poke(ResourceKind::Forward, "id");
+            // Confirm: still no waker registered for that key.
+            let key = (ResourceKind::Forward, "id".to_string());
+            assert!(reg.wakers.get(&key).is_none());
+        }
+    }
 }

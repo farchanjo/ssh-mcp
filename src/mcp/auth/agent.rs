@@ -142,4 +142,33 @@ mod tests {
         let auth = AgentAuth::new();
         requires_auth_strategy(&auth);
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn agent_auth_is_const_constructible() {
+            // `new` is `const fn` — the result can be assigned to a const.
+            const _AGENT: AgentAuth = AgentAuth::new();
+        }
+
+        #[test]
+        fn agent_auth_unit_struct_size_is_zero() {
+            // Unit-like struct: zero-sized.
+            assert_eq!(std::mem::size_of::<AgentAuth>(), 0);
+        }
+
+        #[test]
+        fn agent_auth_in_box_dyn_strategy() {
+            let boxed: Box<dyn AuthStrategy> = Box::new(AgentAuth::new());
+            assert_eq!(boxed.name(), "agent");
+        }
+
+        #[test]
+        fn agent_auth_name_is_static_str() {
+            let auth = AgentAuth::new();
+            let n: &'static str = auth.name();
+            assert_eq!(n, "agent");
+        }
+    }
 }

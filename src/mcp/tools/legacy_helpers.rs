@@ -1097,3 +1097,163 @@ pub(crate) fn build_transfer_progress_response(
 
     TransferProgressBuilder::new(transfer_id, direction, transferred, total, state).build()
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests use unwrap on values constructed in the test itself"
+)]
+mod tests {
+    use super::*;
+
+    mod clamp_output_bytes {
+        use super::*;
+
+        #[test]
+        fn requested_below_default_returns_request() {
+            // The default is 16 KiB; cap is 1 MiB.
+            let v = clamp_output_bytes(Some(64));
+            assert_eq!(v, 64);
+        }
+
+        #[test]
+        fn requested_above_cap_is_clamped() {
+            let huge = 10 * 1024 * 1024;
+            let v = clamp_output_bytes(Some(huge));
+            // Must not exceed the resolved cap.
+            assert!(v <= huge);
+            assert_eq!(v, resolve_output_max_bytes_cap());
+        }
+
+        #[test]
+        fn none_uses_default() {
+            let default = resolve_output_default_bytes();
+            assert_eq!(clamp_output_bytes(None), default);
+        }
+
+        #[test]
+        fn requested_zero_passes_through() {
+            // Zero is a valid request and is below default & cap.
+            assert_eq!(clamp_output_bytes(Some(0)), 0);
+        }
+
+        #[test]
+        fn requested_exactly_at_cap_is_returned() {
+            let cap = resolve_output_max_bytes_cap();
+            assert_eq!(clamp_output_bytes(Some(cap)), cap);
+        }
+    }
+
+    mod clamp_list_items {
+        use super::*;
+
+        #[test]
+        fn requested_in_range_returned() {
+            assert_eq!(clamp_list_items(Some(50)), 50);
+        }
+
+        #[test]
+        fn requested_zero_clamped_to_one() {
+            // Floor is 1.
+            assert_eq!(clamp_list_items(Some(0)), 1);
+        }
+
+        #[test]
+        fn requested_above_cap_clamped() {
+            let v = clamp_list_items(Some(1_000_000));
+            assert_eq!(v, resolve_list_max_items_cap());
+        }
+
+        #[test]
+        fn none_uses_default() {
+            assert_eq!(clamp_list_items(None), resolve_list_max_items_default());
+        }
+    }
+
+    mod err_session_not_found {
+        use super::*;
+
+        #[test]
+        fn includes_tool_name_in_first_line() {
+            let e = err_session_not_found("SSH_EXECUTE", "sess-1");
+            assert!(e.starts_with("SSH_EXECUTE: ERROR"));
+        }
+
+        #[test]
+        fn includes_session_not_found_code() {
+            let e = err_session_not_found("SSH_X", "sess-1");
+            assert!(e.contains("[SESSION_NOT_FOUND]"));
+        }
+
+        #[test]
+        fn includes_session_id_in_detail() {
+            let e = err_session_not_found("SSH_X", "sess-abc-123");
+            assert!(e.contains("sess-abc-123"));
+        }
+
+        #[test]
+        fn empty_session_id_still_renders() {
+            let e = err_session_not_found("SSH_X", "");
+            // DETAIL line should be omitted when empty.
+            assert!(!e.contains("DETAIL"));
+        }
+    }
+
+    mod cancel_session_transfers {
+        use super::*;
+
+        #[test]
+        fn empty_session_is_noop() {
+            let unique_session = format!("nonexistent-{}", uuid::Uuid::new_v4());
+            cancel_session_transfers(&unique_session);
+            assert_eq!(TRANSFER_STORAGE.count_by_session(&unique_session), 0);
+        }
+    }
+
+    mod cancel_session_commands {
+        use super::*;
+
+        #[test]
+        fn empty_session_returns_zero() {
+            let unique_session = format!("nonexistent-{}", uuid::Uuid::new_v4());
+            let count = cancel_session_commands(&unique_session);
+            assert_eq!(count, 0);
+        }
+    }
+
+    mod build_agent_disconnect_response {
+        use super::*;
+
+        #[test]
+        fn builds_well_formed_response() {
+            let response = build_agent_disconnect_response("agent-1", 3, 5);
+            assert!(response.contains("agent-1"));
+            assert!(response.contains("3") || response.contains("SESSIONS"));
+            assert!(response.contains("5") || response.contains("COMMANDS"));
+        }
+
+        #[test]
+        fn zero_sessions_zero_commands() {
+            let response = build_agent_disconnect_response("agent-x", 0, 0);
+            assert!(response.contains("agent-x"));
+        }
+    }
+
+    mod health_event_now_ms {
+        use super::*;
+
+        #[test]
+        fn returns_nonzero_for_current_time() {
+            let now = health_event_now_ms();
+            assert!(now > 0);
+        }
+
+        #[test]
+        fn second_call_does_not_decrease() {
+            let a = health_event_now_ms();
+            let b = health_event_now_ms();
+            assert!(b >= a);
+        }
+    }
+}
