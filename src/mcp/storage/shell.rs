@@ -170,4 +170,81 @@ mod tests {
         let unique_id = format!("nonexistent-{}", uuid::Uuid::new_v4());
         assert!(storage.get_direct(&unique_id).is_none());
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn list_all_returns_empty_vec() {
+            let storage = DashMapShellStorage::new();
+            assert_eq!(storage.list_all().len(), 0);
+        }
+
+        #[test]
+        fn count_by_session_for_unknown_returns_zero() {
+            let storage = DashMapShellStorage::new();
+            for _ in 0..10_usize {
+                let unknown = format!("unknown-{}", uuid::Uuid::new_v4());
+                assert_eq!(storage.count_by_session(&unknown), 0);
+            }
+        }
+
+        #[test]
+        fn list_by_session_for_unknown_returns_empty() {
+            let storage = DashMapShellStorage::new();
+            let unknown = format!("unknown-{}", uuid::Uuid::new_v4());
+            assert_eq!(storage.list_by_session(&unknown).len(), 0);
+        }
+
+        #[test]
+        fn list_filtered_with_none_returns_empty_when_no_shells() {
+            let storage = DashMapShellStorage::new();
+            let listed = storage.list_filtered(None);
+            assert_eq!(listed.len(), 0);
+        }
+
+        #[test]
+        fn list_filtered_with_unknown_session_returns_empty() {
+            let storage = DashMapShellStorage::new();
+            let unknown = format!("unknown-{}", uuid::Uuid::new_v4());
+            assert_eq!(storage.list_filtered(Some(&unknown)).len(), 0);
+        }
+
+        #[test]
+        fn unregister_unknown_id_is_none_repeatedly() {
+            let storage = DashMapShellStorage::new();
+            for _ in 0..5_usize {
+                let id = format!("unknown-{}", uuid::Uuid::new_v4());
+                assert!(storage.unregister(&id).is_none());
+            }
+        }
+
+        #[test]
+        fn get_direct_unknown_id_is_none() {
+            let storage = DashMapShellStorage::new();
+            let id = format!("unknown-{}", uuid::Uuid::new_v4());
+            assert!(storage.get_direct(&id).is_none());
+        }
+
+        #[test]
+        fn default_storage_is_independent_from_global() {
+            // Verify a fresh instance is empty regardless of SHELL_STORAGE state.
+            let storage = DashMapShellStorage::new();
+            assert_eq!(storage.list_all().len(), 0);
+        }
+
+        #[test]
+        fn distinct_storage_instances_isolated() {
+            let s1 = DashMapShellStorage::new();
+            let s2 = DashMapShellStorage::new();
+            assert_eq!(s1.list_all().len(), 0);
+            assert_eq!(s2.list_all().len(), 0);
+        }
+
+        #[test]
+        fn empty_session_id_count_is_zero() {
+            let storage = DashMapShellStorage::new();
+            assert_eq!(storage.count_by_session(""), 0);
+        }
+    }
 }

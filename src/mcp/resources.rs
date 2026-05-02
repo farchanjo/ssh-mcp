@@ -966,4 +966,224 @@ mod tests {
         let parsed = p("shell://abc/output?other=1&z=2");
         assert_eq!(parsed.cursor, CursorRequest::Snapshot);
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn resource_uri_emits_shell_scheme() {
+            assert_eq!(resource_uri(ResourceKind::Shell, "x"), "shell://x/output");
+        }
+
+        #[test]
+        fn resource_uri_emits_command_scheme() {
+            assert_eq!(
+                resource_uri(ResourceKind::Command, "x"),
+                "command://x/output"
+            );
+        }
+
+        #[test]
+        fn resource_uri_emits_transfer_scheme() {
+            assert_eq!(
+                resource_uri(ResourceKind::Transfer, "x"),
+                "transfer://x/progress"
+            );
+        }
+
+        #[test]
+        fn resource_uri_emits_session_scheme() {
+            assert_eq!(
+                resource_uri(ResourceKind::Session, "x"),
+                "session://x/health"
+            );
+        }
+
+        #[test]
+        fn resource_uri_emits_forward_scheme() {
+            assert_eq!(
+                resource_uri(ResourceKind::Forward, "x"),
+                "forward://x/events"
+            );
+        }
+
+        #[test]
+        fn resource_uri_round_trip_with_auto_cursor() {
+            let parsed = p("shell://abc/output?cursor=auto");
+            // Build a NEW URI from parsed; round-trip drops the cursor (the
+            // canonical URI has no query string).
+            let uri = resource_uri(parsed.kind, &parsed.id);
+            assert_eq!(uri, "shell://abc/output");
+        }
+
+        #[test]
+        fn parse_error_display_has_diagnostic_text() {
+            let err = parse_resource_uri("ftp://x/output").unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("ftp"));
+            assert!(text.contains("expected one of"));
+        }
+
+        #[test]
+        fn parse_error_display_for_missing_id() {
+            let err = parse_resource_uri("shell:///output").unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("missing"));
+        }
+
+        #[test]
+        fn parse_error_display_for_bad_subpath() {
+            let err = parse_resource_uri("shell://abc/progress").unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("output"));
+            assert!(text.contains("progress"));
+        }
+
+        #[test]
+        fn parse_error_display_for_bad_cursor() {
+            let err = parse_resource_uri("shell://abc/output?cursor=banana").unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("banana"));
+            assert!(text.contains("auto"));
+        }
+
+        #[test]
+        fn parse_command_with_explicit_cursor() {
+            let parsed = p("command://cmd-99/output?cursor=12345");
+            assert_eq!(parsed.kind, ResourceKind::Command);
+            assert_eq!(parsed.id, "cmd-99");
+            assert_eq!(parsed.cursor, CursorRequest::At(12345));
+        }
+
+        #[test]
+        fn parse_transfer_extra_query_pairs_tolerated() {
+            let parsed = p("transfer://xfer-1/progress?other=1&zzz=2");
+            assert_eq!(parsed.kind, ResourceKind::Transfer);
+            assert_eq!(parsed.cursor, CursorRequest::Snapshot);
+        }
+
+        #[test]
+        fn parse_session_extra_query_pairs_tolerated() {
+            // Health is point-in-time; cursor should still default to Snapshot.
+            let parsed = p("session://sess-7/health?ignored=value");
+            assert_eq!(parsed.kind, ResourceKind::Session);
+            assert_eq!(parsed.cursor, CursorRequest::Snapshot);
+        }
+
+        #[test]
+        fn url_encoded_id_is_passed_through_verbatim() {
+            // The parser does NOT decode URL-encoded IDs. Document this
+            // behaviour so future changes are intentional.
+            let parsed = p("shell://abc%2F123/output");
+            assert_eq!(parsed.id, "abc%2F123");
+        }
+
+        #[test]
+        fn empty_query_string_is_snapshot() {
+            // `?` with no key/value is treated as Snapshot — the loop never
+            // finds a `cursor=` prefix.
+            let parsed = p("shell://abc/output?");
+            assert_eq!(parsed.cursor, CursorRequest::Snapshot);
+        }
+
+        #[test]
+        fn cursor_value_zero_is_snapshot() {
+            let parsed = p("shell://abc/output?cursor=0");
+            assert_eq!(parsed.cursor, CursorRequest::Snapshot);
+        }
+
+        #[test]
+        fn cursor_value_max_u64_is_at_max() {
+            let uri = format!("shell://abc/output?cursor={}", u64::MAX);
+            let parsed = p(&uri);
+            assert_eq!(parsed.cursor, CursorRequest::At(u64::MAX));
+        }
+
+        #[test]
+        fn cursor_value_overflow_is_bad_cursor() {
+            // u64::MAX + 1 doesn't fit -> BadCursor.
+            let err = parse_resource_uri("shell://abc/output?cursor=99999999999999999999")
+                .unwrap_err();
+            match err {
+                ParseError::BadCursor(value) => {
+                    assert_eq!(value, "99999999999999999999");
+                }
+                ParseError::BadScheme(_)
+                | ParseError::MissingId
+                | ParseError::BadSubPath { .. } => panic!("wrong variant: {err:?}"),
+            }
+        }
+
+        #[test]
+        fn cursor_value_negative_is_bad_cursor() {
+            let err = parse_resource_uri("shell://abc/output?cursor=-1").unwrap_err();
+            match err {
+                ParseError::BadCursor(value) => assert_eq!(value, "-1"),
+                ParseError::BadScheme(_)
+                | ParseError::MissingId
+                | ParseError::BadSubPath { .. } => panic!("wrong variant: {err:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_resource_uri_with_id_containing_dashes_and_dots() {
+            let parsed = p("shell://abc-123.def/output");
+            assert_eq!(parsed.id, "abc-123.def");
+        }
+
+        #[test]
+        fn ensure_resource_exists_session_known_does_not_panic_on_unknown() {
+            // We can't easily inject a known session here, but we can assert
+            // unknown sessions return resource_not_found cleanly.
+            let id = format!("ghost-{}", uuid::Uuid::new_v4());
+            let err = ensure_resource_exists(ResourceKind::Session, &id).unwrap_err();
+            assert!(err.message.contains("session"));
+        }
+
+        #[test]
+        fn parse_error_equality() {
+            assert_eq!(
+                ParseError::MissingId,
+                ParseError::MissingId
+            );
+            assert_eq!(
+                ParseError::BadCursor("x".to_string()),
+                ParseError::BadCursor("x".to_string())
+            );
+            assert_ne!(
+                ParseError::BadCursor("x".to_string()),
+                ParseError::BadCursor("y".to_string())
+            );
+        }
+
+        #[test]
+        fn build_meta_status_keys_match_kind() {
+            // Exercise every status_meta_key branch.
+            for kind in [
+                ResourceKind::Shell,
+                ResourceKind::Command,
+                ResourceKind::Transfer,
+                ResourceKind::Session,
+                ResourceKind::Forward,
+            ] {
+                let meta = build_meta(&MetaInputs {
+                    kind,
+                    cursor: 0,
+                    buffer_size: 0,
+                    last_seq: 0,
+                    status: "ok",
+                    truncated_since_last_read: 0,
+                    keepalive: false,
+                });
+                let expected_key = match kind {
+                    ResourceKind::Shell => "shell_status",
+                    ResourceKind::Command => "command_status",
+                    ResourceKind::Transfer => "transfer_status",
+                    ResourceKind::Session => "session_status",
+                    ResourceKind::Forward => "forward_status",
+                };
+                assert!(meta.contains_key(expected_key));
+            }
+        }
+    }
 }

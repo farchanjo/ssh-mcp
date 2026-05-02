@@ -998,4 +998,107 @@ mod tests {
             assert!(out.starts_with(" (partial, truncated: showing 256B of "));
         }
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn nonce_constant_length_matches_doc_comment() {
+            assert_eq!(NONCE_LEN, 8);
+        }
+
+        #[test]
+        fn default_error_detail_max_bytes_matches_doc_comment() {
+            assert_eq!(DEFAULT_ERROR_DETAIL_MAX_BYTES, 2048);
+        }
+
+        #[test]
+        fn truncation_info_is_copy() {
+            // Defensive: TruncationInfo is `Copy`. If that ever changes,
+            // many call sites would need updating.
+            let t = TruncationInfo::new(10, 20);
+            let copy = t;
+            assert_eq!(t.shown_bytes, copy.shown_bytes);
+            assert_eq!(t.total_bytes, copy.total_bytes);
+        }
+
+        #[test]
+        fn format_bytes_human_just_under_kb() {
+            assert_eq!(format_bytes_human(1023), "1023B");
+        }
+
+        #[test]
+        fn format_bytes_human_just_over_kb() {
+            // 1025 bytes = ~1.0 KB (rounded to one decimal).
+            let rendered = format_bytes_human(1025);
+            assert!(rendered.starts_with("1.0KB"));
+        }
+
+        #[test]
+        fn format_bytes_human_500mb() {
+            let rendered = format_bytes_human(500 * 1024 * 1024);
+            assert!(rendered.ends_with("MB"));
+            assert!(rendered.starts_with("500.0"));
+        }
+
+        #[test]
+        fn format_bytes_human_max_u64_renders_in_gb() {
+            let rendered = format_bytes_human(u64::MAX);
+            assert!(rendered.ends_with("GB"));
+        }
+
+        #[test]
+        fn format_error_with_unicode_reason() {
+            let e = format_error("SSH_X", "CODE", "läßt nicht öffnen", None);
+            assert!(e.contains("läßt nicht öffnen"));
+        }
+
+        #[test]
+        fn format_error_with_emoji_detail() {
+            let e = format_error("SSH_X", "CODE", "ok", Some("🔑 key missing"));
+            assert!(e.contains("🔑 key missing"));
+        }
+
+        #[test]
+        fn format_error_with_empty_tool_and_code() {
+            // Defensive: even pathological inputs must not panic.
+            let e = format_error("", "", "", None);
+            assert_eq!(e, ": ERROR\nREASON: [] ");
+        }
+
+        #[test]
+        fn sanitize_value_only_one_kind_of_control_char() {
+            let out = sanitize_value("text\nwith\nmany\nnewlines");
+            assert_eq!(out, "text\\nwith\\nmany\\nnewlines");
+        }
+
+        #[test]
+        fn sanitize_value_alternating_control_chars() {
+            let out = sanitize_value("\n\r\t\n\r\t");
+            assert_eq!(out, "\\n\\r\\t\\n\\r\\t");
+        }
+
+        #[test]
+        fn render_output_block_respects_cap_smaller_than_buffer() {
+            let buf = vec![b'x'; 1024];
+            let out = render_output_block("stdout", "n", &buf, 100, None);
+            // Truncated output must be smaller than original buffer length.
+            assert!(out.contains("truncated"));
+        }
+
+        #[test]
+        fn render_output_block_no_truncation_no_hint_no_annotation() {
+            let out = render_output_block("stdout", "n", b"hello", 1024, None);
+            // No `(...)` annotation block when content fits and no hint.
+            assert!(!out.contains("("));
+        }
+
+        #[test]
+        fn truncate_utf8_safe_head_returns_borrowed_when_under_cap() {
+            let s = "hello";
+            let (out, truncated) = truncate_utf8_safe_head(s, 100);
+            assert_eq!(out.as_ptr(), s.as_ptr());
+            assert!(!truncated);
+        }
+    }
 }

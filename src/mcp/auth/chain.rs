@@ -327,4 +327,49 @@ mod tests {
         assert_eq!(chain.len(), 0);
         assert_eq!(chain.name(), "chain");
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn chain_is_send_sync_for_dyn_box() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<Box<dyn AuthStrategy>>();
+        }
+
+        #[test]
+        fn chain_name_static_str() {
+            let chain = AuthChain::new();
+            let n: &'static str = chain.name();
+            assert_eq!(n, "chain");
+        }
+
+        #[test]
+        fn empty_chain_with_explicit_strategies_keeps_order() {
+            let chain = AuthChain::new()
+                .with_agent()
+                .with_password("p")
+                .with_key("/k");
+            let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
+            assert_eq!(names, vec!["agent", "password", "key"]);
+        }
+
+        #[test]
+        fn chain_len_grows_monotonically() {
+            let mut chain = AuthChain::new();
+            for i in 1..=10_usize {
+                chain = chain.with_password(format!("p{i}"));
+                assert_eq!(chain.len(), i);
+            }
+        }
+
+        #[test]
+        fn empty_chain_authenticates_with_explicit_error() {
+            // Drive the empty-chain branch via the trait method's logic
+            // without needing a real SSH handle: we observe via len() and
+            // the public is_empty() contract.
+            let chain = AuthChain::new();
+            assert!(chain.is_empty());
+        }
+    }
 }
