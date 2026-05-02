@@ -227,6 +227,30 @@ impl SubscriptionRegistry {
             .remove(&(peer_id.to_string(), uri.to_string()));
     }
 
+    /// Walk every subscriber and drop the ones whose rmcp transport has
+    /// closed. Returns the number of peers dropped. Used by the binary
+    /// entry points (`ssh-mcp` and `ssh-mcp-stdio`) as a periodic GC pass
+    /// since rmcp 1.6 does not surface a peer-disconnect callback.
+    pub fn gc_closed_peers(&self) -> usize {
+        // Snapshot a unique set of (peer_id, peer) pairs before mutating —
+        // `drop_peer` re-acquires the same shards, so we must release the
+        // outer guards first.
+        let mut closed_peer_ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in &self.subscribers {
+            for handle in entry.value() {
+                if seen.insert(handle.peer_id.clone()) && handle.peer.is_transport_closed() {
+                    closed_peer_ids.push(handle.peer_id.clone());
+                }
+            }
+        }
+        let dropped = closed_peer_ids.len();
+        for peer_id in closed_peer_ids {
+            self.drop_peer(&peer_id);
+        }
+        dropped
+    }
+
     /// Drop every subscription owned by `peer_id` across all URIs. Stops
     /// debouncer tasks that are now empty.
     pub fn drop_peer(&self, peer_id: &str) {
@@ -430,6 +454,37 @@ async fn broadcast_resource_updated(uri: &str) {
             );
         }
     }
+}
+
+/// Spawn a background task that periodically drops peers whose rmcp
+/// transport has closed. rmcp 1.6 does not raise a callback on peer
+/// disconnect, so the binary entry points poll instead. The task exits
+/// cleanly when `cancel` is triggered.
+pub fn spawn_peer_gc(
+    interval_secs: u64,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drain the immediate first tick so the first real scan happens
+        // after the configured interval.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    debug!("peer GC: shutdown signal received, exiting");
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let dropped = SUBSCRIPTION_REGISTRY.gc_closed_peers();
+                    if dropped > 0 {
+                        debug!("peer GC: dropped {dropped} closed peers");
+                    }
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

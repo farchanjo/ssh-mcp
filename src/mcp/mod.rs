@@ -35,7 +35,7 @@
 pub(crate) mod async_command;
 pub mod auth;
 pub(crate) mod client;
-pub(crate) mod config;
+pub mod config;
 pub(crate) mod error;
 #[cfg(feature = "port_forward")]
 pub(crate) mod forward;
