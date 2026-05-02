@@ -28,6 +28,7 @@ use super::super::async_command::{OutputBuffer, RunningCommand};
 use super::super::client::{
     execute_ssh_command, execute_ssh_command_async, execute_ssh_command_async_pty,
 };
+use arc_swap::ArcSwap;
 use super::super::config::{
     resolve_command_cleanup_ttl, resolve_list_max_items_cap, resolve_list_max_items_default,
     resolve_output_default_bytes, resolve_output_max_bytes_cap, resolve_transfer_cleanup_ttl,
@@ -155,87 +156,44 @@ pub(crate) async fn wait_for_transfer_completion(rx: &mut watch::Receiver<Transf
 // Async command lifecycle
 // ---------------------------------------------------------------------------
 
-/// Create a `RunningCommand` with shared state.
+/// Create a `RunningCommand` with lock-free shared state.
 fn create_running_command(
     command_id: &str,
     session_id: &str,
     command: &str,
     started_at: &str,
 ) -> RunningCommand {
-    let (status_tx, status_rx) = watch::channel(AsyncCommandStatus::Running);
-
-    RunningCommand {
-        info: AsyncCommandInfo {
-            command_id: command_id.to_string(),
-            session_id: session_id.to_string(),
-            command: command.to_string(),
-            status: AsyncCommandStatus::Running,
-            started_at: started_at.to_string(),
-        },
-        cancel_token: CancellationToken::new(),
-        status_rx,
-        status_tx,
-        output: Arc::new(Mutex::new(OutputBuffer::with_capacity(4096, 1024))),
-        exit_code: Arc::new(Mutex::new(None)),
-        error: Arc::new(Mutex::new(None)),
-        timed_out: Arc::new(AtomicBool::new(false)),
-        output_read: Arc::new(AtomicBool::new(false)),
-    }
+    RunningCommand::new(AsyncCommandInfo {
+        command_id: command_id.to_string(),
+        session_id: session_id.to_string(),
+        command: command.to_string(),
+        status: AsyncCommandStatus::Running,
+        started_at: started_at.to_string(),
+    })
 }
 
 /// Spawn the background command execution task.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "passes through shared state to async task"
-)]
 fn spawn_command_task(
     use_pty: bool,
     handle_arc: Arc<SshHandle>,
-    command: String,
+    command_text: String,
     cmd_timeout: Duration,
-    output: Arc<Mutex<OutputBuffer>>,
-    status_tx: watch::Sender<AsyncCommandStatus>,
-    cancel_token: CancellationToken,
-    exit_code: Arc<Mutex<Option<i32>>>,
-    error: Arc<Mutex<Option<String>>>,
-    timed_out: Arc<AtomicBool>,
+    command: Arc<RunningCommand>,
     channel_permits: Arc<Semaphore>,
 ) {
     tokio::spawn(async move {
         // Hold permit for the entire channel lifecycle.
         let Ok(_permit) = channel_permits.acquire_owned().await else {
-            *error.lock().await = Some(String::from(
+            let _ = command.error.set(String::from(
                 "Failed to acquire channel permit (session semaphore closed)",
             ));
-            let _ = status_tx.send(AsyncCommandStatus::Failed);
+            let _ = command.status_tx.send(AsyncCommandStatus::Failed);
             return;
         };
         if use_pty {
-            execute_ssh_command_async_pty(
-                handle_arc,
-                command,
-                cmd_timeout,
-                output,
-                status_tx,
-                cancel_token,
-                exit_code,
-                error,
-                timed_out,
-            )
-            .await;
+            execute_ssh_command_async_pty(handle_arc, command_text, cmd_timeout, command).await;
         } else {
-            execute_ssh_command_async(
-                handle_arc,
-                command,
-                cmd_timeout,
-                output,
-                status_tx,
-                cancel_token,
-                exit_code,
-                error,
-                timed_out,
-            )
-            .await;
+            execute_ssh_command_async(handle_arc, command_text, cmd_timeout, command).await;
         }
         // Permit dropped here -> slot freed.
     });
@@ -278,11 +236,26 @@ fn spawn_cleanup_task(
     });
 }
 
+/// Build a shallow clone of a `RunningCommand` that shares all underlying
+/// state (Arc/`broadcast::Sender`/watch/`CancellationToken`) with the
+/// original. Used when both the storage entry and the background spawn task
+/// must reference the same command without locks.
+fn shallow_clone_command(cmd: &RunningCommand) -> RunningCommand {
+    RunningCommand {
+        info: cmd.info.clone(),
+        cancel_token: cmd.cancel_token.clone(),
+        status_rx: cmd.status_rx.clone(),
+        status_tx: cmd.status_tx.clone(),
+        output_history: Arc::clone(&cmd.output_history),
+        output_tx: cmd.output_tx.clone(),
+        exit_code: Arc::clone(&cmd.exit_code),
+        error: Arc::clone(&cmd.error),
+        timed_out: Arc::clone(&cmd.timed_out),
+        output_read: Arc::clone(&cmd.output_read),
+    }
+}
+
 /// Register the command in storage and spawn the execution task.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "command spawn needs full shared state plus the channel semaphore"
-)]
 fn register_and_spawn(
     command_id: &str,
     session_id: &str,
@@ -293,12 +266,7 @@ fn register_and_spawn(
     cmd_timeout: Duration,
     channel_permits: Arc<Semaphore>,
 ) {
-    let status_tx = running_cmd.status_tx.clone();
-    let output = Arc::clone(&running_cmd.output);
-    let exit_code = Arc::clone(&running_cmd.exit_code);
-    let error = Arc::clone(&running_cmd.error);
-    let timed_out = Arc::clone(&running_cmd.timed_out);
-    let cancel_token = running_cmd.cancel_token.clone();
+    let task_handle = Arc::new(shallow_clone_command(&running_cmd));
 
     COMMAND_STORAGE.register(command_id.to_string(), running_cmd);
     info!("Starting async command {command_id} on session {session_id}: {command}");
@@ -308,12 +276,7 @@ fn register_and_spawn(
         handle_arc,
         command.to_string(),
         cmd_timeout,
-        output,
-        status_tx,
-        cancel_token,
-        exit_code,
-        error,
-        timed_out,
+        task_handle,
         channel_permits,
     );
 }
@@ -354,27 +317,22 @@ pub(crate) fn register_and_spawn_command(
 
 /// Build the output response markdown for a command.
 ///
-/// Acquires several mutexes; each lock is taken in its own narrow scope so
-/// only one mutex is held at a time, avoiding `await_holding_lock`.
-pub(crate) async fn build_command_output_response(
+/// Reads the lock-free state without taking any mutex. The output snapshot
+/// comes from `ArcSwap::load_full`, while terminal `exit_code` / `error`
+/// values come from `OnceCell::get`.
+pub(crate) fn build_command_output_response(
     command_id: String,
     status_rx: &watch::Receiver<AsyncCommandStatus>,
-    output: &Mutex<OutputBuffer>,
-    exit_code: &Mutex<Option<i32>>,
-    error: &Mutex<Option<String>>,
+    output_history: &ArcSwap<OutputBuffer>,
+    exit_code: &tokio::sync::OnceCell<i32>,
+    error: &tokio::sync::OnceCell<String>,
     timed_out: &AtomicBool,
     max_output_bytes: usize,
 ) -> String {
     let status = *status_rx.borrow();
     let timed_out_val = timed_out.load(Ordering::SeqCst);
-    let exit_code_val = {
-        let guard = exit_code.lock().await;
-        *guard
-    };
-    let error_val = {
-        let guard = error.lock().await;
-        guard.clone()
-    };
+    let exit_code_val: Option<i32> = exit_code.get().copied();
+    let error_val: Option<String> = error.get().cloned();
 
     if matches!(status, AsyncCommandStatus::Failed) {
         let reason = error_val.as_deref().unwrap_or("command failed");
@@ -395,12 +353,12 @@ pub(crate) async fn build_command_output_response(
     };
 
     let nonce = generate_nonce();
-    let guard = output.lock().await;
+    let snapshot = output_history.load_full();
     GetCommandOutputBuilder::new(
         &command_id,
         state,
-        &guard.stdout,
-        &guard.stderr,
+        &snapshot.stdout,
+        &snapshot.stderr,
         max_output_bytes,
         &nonce,
     )
@@ -410,7 +368,7 @@ pub(crate) async fn build_command_output_response(
 /// State needed to cancel a running command and retrieve its output.
 pub(crate) type CancelState = (
     CancellationToken,
-    Arc<Mutex<OutputBuffer>>,
+    Arc<ArcSwap<OutputBuffer>>,
     watch::Receiver<AsyncCommandStatus>,
 );
 
@@ -423,14 +381,14 @@ pub(crate) fn get_running_command(command_id: &str) -> Result<CancelState, Strin
             (
                 current_status,
                 cmd.cancel_token.clone(),
-                Arc::clone(&cmd.output),
+                Arc::clone(&cmd.output_history),
                 cmd.status_rx.clone(),
             )
         })
         .ok_or_else(|| format!("No async command with ID: {command_id}"))
-        .and_then(|(current_status, cancel_token, output, status_rx)| {
+        .and_then(|(current_status, cancel_token, output_history, status_rx)| {
             if current_status == AsyncCommandStatus::Running {
-                Ok((cancel_token, output, status_rx))
+                Ok((cancel_token, output_history, status_rx))
             } else {
                 Err(format!("Command is not running (status: {current_status})"))
             }
