@@ -60,58 +60,43 @@ type SshHandle = russh::client::Handle<SshClientHandler>;
 /// (rmcp inspects the doc comments via the `schemars` derive).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshConnectArgs {
-    /// Optional `SESSION_ID` returned by a previous `ssh_connect`. When provided
-    /// and the session is still alive (health check `echo 1`), this short-circuits
-    /// the full reuse evaluation and returns the existing session as `REUSED`.
+    /// Optional SESSION_ID returned by a previous ssh_connect. When provided and the session is still alive (health-check `echo 1`), short-circuits reuse evaluation and returns it as REUSED.
     pub session_id: Option<String>,
 
-    /// SSH server address in the form `"host:port"` (e.g. `"192.168.1.1:22"`,
-    /// `"example.com:2222"`). The port defaults to `22` if omitted.
+    /// SSH server address in the form `host:port` (e.g. `192.168.1.1:22`, `example.com:2222`). Port defaults to 22 when omitted.
     pub address: String,
 
     /// SSH username for authentication.
     pub username: String,
 
-    /// Password for password-based authentication. Optional when `key_path`
-    /// or an SSH agent (env `SSH_AUTH_SOCK`) is available.
+    /// Password for password-based authentication. Optional when `key_path` or an SSH agent (env `SSH_AUTH_SOCK`) is available.
     pub password: Option<String>,
 
-    /// Path to a private key file for key-based authentication. Optional.
-    /// Authentication chain order: key → password → agent.
+    /// Path to a private key file for key-based authentication. Optional. Authentication chain order: key -> password -> agent.
     pub key_path: Option<String>,
 
-    /// Connection timeout in seconds. Default: `30`. Env: `SSH_CONNECT_TIMEOUT`.
+    /// Connection timeout in seconds. Default: 30. Env: SSH_CONNECT_TIMEOUT.
     pub timeout_secs: Option<u64>,
 
-    /// Maximum retry attempts for transient connection failures. Default: `3`.
-    /// Env: `SSH_MAX_RETRIES`.
+    /// Maximum retry attempts for transient connection failures. Default: 3. Env: SSH_MAX_RETRIES.
     pub max_retries: Option<u32>,
 
-    /// Initial delay between retries in milliseconds (exponential backoff,
-    /// capped at 10 s). Default: `1000`. Env: `SSH_RETRY_DELAY_MS`.
+    /// Initial delay between retries in milliseconds (exponential backoff, capped at 10s). Default: 1000. Env: SSH_RETRY_DELAY_MS.
     pub retry_delay_ms: Option<u64>,
 
-    /// Enable zlib compression for the SSH transport. Default: `true`.
-    /// Env: `SSH_COMPRESSION`.
+    /// Enable zlib compression for the SSH transport. Default: true. Env: SSH_COMPRESSION.
     pub compress: Option<bool>,
 
-    /// Optional human-readable name for the session (e.g.,
-    /// `"production-db"`, `"staging-server"`). Surfaces in
-    /// `ssh_list_sessions` to help disambiguate identical hosts.
+    /// Optional human-readable name for the session (e.g. `production-db`, `staging-server`). Surfaces in ssh_list_sessions to help disambiguate identical hosts.
     pub name: Option<String>,
 
-    /// Keep the session open indefinitely (disables inactivity timeout).
-    /// Default: `false`. Set `true` for long-lived backends or daemons.
+    /// Keep the session open indefinitely (disables inactivity timeout). Default: false. Set true for long-lived backends or daemons.
     pub persistent: Option<bool>,
 
-    /// Optional agent identifier for grouping sessions
-    /// (e.g., `"claude-code-instance-abc123"`). Use `ssh_disconnect_agent`
-    /// to bulk-disconnect all sessions for an agent.
+    /// Optional AGENT_ID for grouping sessions (e.g. `claude-code-instance-abc123`). Use ssh_disconnect_agent to bulk-disconnect all sessions for an agent.
     pub agent_id: Option<String>,
 
-    /// Reuse policy applied when an existing session matches the
-    /// `(host, port, username)` identity triple. See [`ReusePolicy`].
-    /// Default: `Suggest`.
+    /// Reuse policy applied when an existing session matches the `(host, port, username)` identity triple. Values: `suggest` (default), `auto`, `force_new`.
     pub reuse: Option<ReusePolicy>,
 }
 
@@ -492,7 +477,7 @@ pub async fn ssh_connect_impl(args: SshConnectArgs) -> Result<CallToolResult, Mc
 /// Arguments for the `ssh_disconnect` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshDisconnectArgs {
-    /// `SESSION_ID` returned by `ssh_connect` to close.
+    /// SESSION_ID returned from ssh_connect.
     pub session_id: String,
 }
 
@@ -537,12 +522,10 @@ pub async fn ssh_disconnect_impl(args: SshDisconnectArgs) -> Result<CallToolResu
 /// Arguments for the `ssh_list_sessions` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshListSessionsArgs {
-    /// Optional `AGENT_ID` to scope the listing to sessions owned by a single
-    /// agent. When omitted, returns sessions from every agent on this server.
+    /// AGENT_ID returned from ssh_connect. Optional filter; when omitted returns sessions from every agent on this server.
     pub agent_id: Option<String>,
 
-    /// Maximum number of sessions to return. Default: `500`. Cap: `10 000`.
-    /// Env: `SSH_MCP_LIST_MAX_ITEMS`.
+    /// Maximum entries returned. Default: 500. Cap: 10000. Env: SSH_MCP_LIST_MAX_ITEMS / SSH_MCP_LIST_MAX_ITEMS_CAP.
     pub max_items: Option<usize>,
 }
 
@@ -585,8 +568,7 @@ pub async fn ssh_list_sessions_impl(args: SshListSessionsArgs) -> Result<CallToo
 /// Arguments for the `ssh_disconnect_agent` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshDisconnectAgentArgs {
-    /// The `AGENT_ID` (set in `ssh_connect`) whose sessions should be
-    /// disconnected. Sessions owned by other agents are not affected.
+    /// AGENT_ID returned from ssh_connect. All sessions owned by this agent are disconnected; sessions owned by other agents are not affected.
     pub agent_id: String,
 }
 

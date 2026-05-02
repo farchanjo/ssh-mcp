@@ -29,14 +29,13 @@ use super::legacy_helpers::err_session_not_found;
 /// Arguments for the `ssh_forward` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshForwardArgs {
-    /// `SESSION_ID` returned by `ssh_connect`.
+    /// SESSION_ID returned from ssh_connect.
     pub session_id: String,
 
     /// Local TCP port to listen on (e.g. `8080`).
     pub local_port: u16,
 
-    /// Remote host on the server side to forward to (e.g. `"localhost"` or
-    /// `"10.0.0.1"`).
+    /// Remote host on the server side to forward to (e.g. `localhost` or `10.0.0.1`).
     pub remote_address: String,
 
     /// Remote TCP port to forward to (e.g. `3306` for MySQL).
