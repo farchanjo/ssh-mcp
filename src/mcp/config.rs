@@ -131,6 +131,34 @@ pub const FORWARD_BROADCAST_CAP_MAX: usize = 4096;
 #[cfg(feature = "port_forward")]
 pub const FORWARD_BROADCAST_CAP_MIN: usize = 8;
 
+/// Default debounce window (milliseconds) for the subscription registry.
+pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 50;
+/// Floor for the debounce window.
+pub const NOTIFY_DEBOUNCE_MS_MIN: u64 = 5;
+/// Cap for the debounce window.
+pub const NOTIFY_DEBOUNCE_MS_MAX: u64 = 5_000;
+
+/// Default force-flush interval (milliseconds) for the subscription registry.
+pub const DEFAULT_NOTIFY_FORCE_FLUSH_MS: u64 = 1_000;
+/// Floor for the force-flush interval.
+pub const NOTIFY_FORCE_FLUSH_MS_MIN: u64 = 100;
+/// Cap for the force-flush interval.
+pub const NOTIFY_FORCE_FLUSH_MS_MAX: u64 = 60_000;
+
+/// Default keepalive interval (seconds) for the subscription registry.
+pub const DEFAULT_NOTIFY_KEEPALIVE_S: u64 = 30;
+/// Floor for the keepalive interval.
+pub const NOTIFY_KEEPALIVE_S_MIN: u64 = 5;
+/// Cap for the keepalive interval.
+pub const NOTIFY_KEEPALIVE_S_MAX: u64 = 300;
+
+/// Environment variable name for the subscription debounce window.
+pub const NOTIFY_DEBOUNCE_MS_ENV_VAR: &str = "SSH_NOTIFY_DEBOUNCE_MS";
+/// Environment variable name for the subscription force-flush interval.
+pub const NOTIFY_FORCE_FLUSH_MS_ENV_VAR: &str = "SSH_NOTIFY_FORCE_FLUSH_MS";
+/// Environment variable name for the subscription keepalive interval.
+pub const NOTIFY_KEEPALIVE_S_ENV_VAR: &str = "SSH_NOTIFY_KEEPALIVE_S";
+
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
 /// Environment variable name for the per-command output buffer cap.
@@ -515,6 +543,45 @@ pub fn resolve_forward_broadcast_cap() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_FORWARD_BROADCAST_CAP);
     raw.clamp(FORWARD_BROADCAST_CAP_MIN, FORWARD_BROADCAST_CAP_MAX)
+}
+
+/// Resolve the subscription debounce window (milliseconds).
+///
+/// Reads `SSH_NOTIFY_DEBOUNCE_MS` (default 50) and clamps to
+/// `[NOTIFY_DEBOUNCE_MS_MIN, NOTIFY_DEBOUNCE_MS_MAX]`.
+#[must_use]
+pub fn resolve_notify_debounce_ms() -> u64 {
+    let raw = env::var(NOTIFY_DEBOUNCE_MS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NOTIFY_DEBOUNCE_MS);
+    raw.clamp(NOTIFY_DEBOUNCE_MS_MIN, NOTIFY_DEBOUNCE_MS_MAX)
+}
+
+/// Resolve the subscription force-flush interval (milliseconds).
+///
+/// Reads `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1000) and clamps to
+/// `[NOTIFY_FORCE_FLUSH_MS_MIN, NOTIFY_FORCE_FLUSH_MS_MAX]`.
+#[must_use]
+pub fn resolve_notify_force_flush_ms() -> u64 {
+    let raw = env::var(NOTIFY_FORCE_FLUSH_MS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NOTIFY_FORCE_FLUSH_MS);
+    raw.clamp(NOTIFY_FORCE_FLUSH_MS_MIN, NOTIFY_FORCE_FLUSH_MS_MAX)
+}
+
+/// Resolve the subscription keepalive interval (seconds).
+///
+/// Reads `SSH_NOTIFY_KEEPALIVE_S` (default 30) and clamps to
+/// `[NOTIFY_KEEPALIVE_S_MIN, NOTIFY_KEEPALIVE_S_MAX]`.
+#[must_use]
+pub fn resolve_notify_keepalive_s() -> u64 {
+    let raw = env::var(NOTIFY_KEEPALIVE_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NOTIFY_KEEPALIVE_S);
+    raw.clamp(NOTIFY_KEEPALIVE_S_MIN, NOTIFY_KEEPALIVE_S_MAX)
 }
 
 #[cfg(test)]
@@ -1552,6 +1619,133 @@ mod tests {
                 assert_eq!(DEFAULT_FORWARD_BROADCAST_CAP, 256);
                 assert_eq!(FORWARD_BROADCAST_CAP_MAX, 4096);
                 assert_eq!(FORWARD_BROADCAST_CAP_MIN, 8);
+            }
+        }
+
+        mod notify_debounce_ms {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_DEBOUNCE_MS_ENV_VAR) };
+                let result = resolve_notify_debounce_ms();
+                assert_eq!(result, DEFAULT_NOTIFY_DEBOUNCE_MS);
+            }
+
+            #[test]
+            fn test_uses_env_var_when_in_range() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_DEBOUNCE_MS_ENV_VAR, "200") };
+                let result = resolve_notify_debounce_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_DEBOUNCE_MS_ENV_VAR) };
+                assert_eq!(result, 200);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_DEBOUNCE_MS_ENV_VAR, "0") };
+                let result = resolve_notify_debounce_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_DEBOUNCE_MS_ENV_VAR) };
+                assert_eq!(result, NOTIFY_DEBOUNCE_MS_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_DEBOUNCE_MS_ENV_VAR, "999999") };
+                let result = resolve_notify_debounce_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_DEBOUNCE_MS_ENV_VAR) };
+                assert_eq!(result, NOTIFY_DEBOUNCE_MS_MAX);
+            }
+
+            #[test]
+            fn test_ignores_invalid_env_var() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_DEBOUNCE_MS_ENV_VAR, "abc") };
+                let result = resolve_notify_debounce_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_DEBOUNCE_MS_ENV_VAR) };
+                assert_eq!(result, DEFAULT_NOTIFY_DEBOUNCE_MS);
+            }
+        }
+
+        mod notify_force_flush_ms {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_FORCE_FLUSH_MS_ENV_VAR) };
+                let result = resolve_notify_force_flush_ms();
+                assert_eq!(result, DEFAULT_NOTIFY_FORCE_FLUSH_MS);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_FORCE_FLUSH_MS_ENV_VAR, "10") };
+                let result = resolve_notify_force_flush_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_FORCE_FLUSH_MS_ENV_VAR) };
+                assert_eq!(result, NOTIFY_FORCE_FLUSH_MS_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_FORCE_FLUSH_MS_ENV_VAR, "9999999") };
+                let result = resolve_notify_force_flush_ms();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_FORCE_FLUSH_MS_ENV_VAR) };
+                assert_eq!(result, NOTIFY_FORCE_FLUSH_MS_MAX);
+            }
+        }
+
+        mod notify_keepalive_s {
+            use super::*;
+
+            #[test]
+            fn test_default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_KEEPALIVE_S_ENV_VAR) };
+                let result = resolve_notify_keepalive_s();
+                assert_eq!(result, DEFAULT_NOTIFY_KEEPALIVE_S);
+            }
+
+            #[test]
+            fn test_clamps_to_floor() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_KEEPALIVE_S_ENV_VAR, "1") };
+                let result = resolve_notify_keepalive_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_KEEPALIVE_S_ENV_VAR) };
+                assert_eq!(result, NOTIFY_KEEPALIVE_S_MIN);
+            }
+
+            #[test]
+            fn test_clamps_to_cap() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { set_env(NOTIFY_KEEPALIVE_S_ENV_VAR, "999999") };
+                let result = resolve_notify_keepalive_s();
+                // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
+                unsafe { remove_env(NOTIFY_KEEPALIVE_S_ENV_VAR) };
+                assert_eq!(result, NOTIFY_KEEPALIVE_S_MAX);
             }
         }
     }

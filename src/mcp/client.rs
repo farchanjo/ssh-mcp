@@ -57,6 +57,7 @@ use crate::mcp::auth::traits::AuthStrategy;
 use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
+use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
 
 /// Build russh client configuration with the specified settings.
@@ -916,9 +917,24 @@ fn publish_stdout(
     max_buffer: usize,
 ) {
     let chunk = Bytes::copy_from_slice(local);
+    let before = owned.stdout.len();
     owned.append_stdout_slice(local, max_buffer);
+    let after = owned.stdout.len();
+    let dropped = chunk
+        .len()
+        .saturating_add(before)
+        .saturating_sub(after);
+    if dropped > 0 {
+        let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
+        let uri = format!("command://{}/output", command.info.command_id);
+        SUBSCRIPTION_REGISTRY.compensate_truncation(&uri, dropped_u64);
+    }
     command.output_history.store(Arc::new(owned.clone()));
-    let _ = command.output_tx.send(OutputChunk::Stdout(chunk));
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Stdout { seq, data: chunk });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
 }
 
 /// Publish a stderr batch: broadcast the delta and store a fresh snapshot.
@@ -929,9 +945,24 @@ fn publish_stderr(
     max_buffer: usize,
 ) {
     let chunk = Bytes::copy_from_slice(local);
+    let before = owned.stderr.len();
     owned.append_stderr_slice(local, max_buffer);
+    let after = owned.stderr.len();
+    let dropped = chunk
+        .len()
+        .saturating_add(before)
+        .saturating_sub(after);
+    if dropped > 0 {
+        let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
+        let uri = format!("command://{}/output", command.info.command_id);
+        SUBSCRIPTION_REGISTRY.compensate_truncation(&uri, dropped_u64);
+    }
     command.output_history.store(Arc::new(owned.clone()));
-    let _ = command.output_tx.send(OutputChunk::Stderr(chunk));
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Stderr { seq, data: chunk });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
 }
 
 /// Flush remaining local buffers to the lock-free output state.
@@ -955,7 +986,11 @@ fn flush_local_buffers(
 /// Broadcast the terminal `Closed` frame. Errors are intentionally ignored:
 /// no subscribers means there's nobody to notify.
 fn broadcast_close(command: &Arc<RunningCommand>, exit_code: Option<i32>) {
-    let _ = command.output_tx.send(OutputChunk::Closed(exit_code));
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Closed { seq, exit_code });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
 }
 
 #[cfg(test)]

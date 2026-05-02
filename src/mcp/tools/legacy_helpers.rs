@@ -52,6 +52,7 @@ use super::super::storage::traits::{
     CommandStorage, SessionStorage, ShellStorage, TransferStorage,
 };
 use super::super::storage::transfer::TRANSFER_STORAGE;
+use super::super::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use super::super::transfer::{RunningTransfer, TransferDirection, TransferInfo, TransferStatus};
 use super::super::types::{
     AsyncCommandInfo, AsyncCommandStatus, HealthEvent, SessionInfo, ShellInfo, ShellStatus,
@@ -507,18 +508,24 @@ pub(crate) fn process_health_results(
             SESSION_STORAGE.update_health(id, last_check.clone(), info.healthy.unwrap_or(false));
         }
         if let Some(session_ref) = SESSION_STORAGE.get(id) {
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, id);
             let _ = session_ref.health_tx.send(HealthEvent::Healthy {
+                seq,
                 at_ms: health_event_now_ms(),
             });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, id);
         }
     }
 
     for id in &dead_session_ids {
         warn!("Removing dead session {id} from storage");
         if let Some(session_ref) = SESSION_STORAGE.get(id) {
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, id);
             let _ = session_ref.health_tx.send(HealthEvent::Unhealthy {
+                seq,
                 at_ms: health_event_now_ms(),
             });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, id);
         }
         // remove() already broadcasts `HealthEvent::Disconnected`.
         SESSION_STORAGE.remove(id);
@@ -554,11 +561,13 @@ const SHELL_FLUSH_THRESHOLD: usize = 8192;
 /// Errors on `output_tx.send` are swallowed: a missing subscriber is the
 /// steady state until `ssh_shell_subscribe` lands.
 fn publish_shell_chunk(
+    shell_id: &str,
     history: &ArcSwap<RingBuffer>,
     output_tx: &broadcast::Sender<Bytes>,
     chunk: Bytes,
     max_buffer_size: usize,
 ) {
+    let mut bytes_dropped: u64 = 0;
     history.rcu(|current| {
         let mut combined = Vec::with_capacity(current.data.len() + chunk.len());
         combined.extend_from_slice(&current.data);
@@ -566,19 +575,30 @@ fn publish_shell_chunk(
         if max_buffer_size > 0 && combined.len() > max_buffer_size {
             let excess = combined.len() - max_buffer_size;
             combined.drain(..excess);
+            bytes_dropped = u64::try_from(excess).unwrap_or(u64::MAX);
         }
         RingBuffer {
             data: Bytes::from(combined),
         }
     });
+    if bytes_dropped > 0 {
+        let uri = format!("shell://{shell_id}/output");
+        SUBSCRIPTION_REGISTRY.compensate_truncation(&uri, bytes_dropped);
+    }
     let _ = output_tx.send(chunk);
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Shell, shell_id);
 }
 
 /// Background reader that exclusively owns the channel read half. Each
 /// flushed batch is published through `history` (via `ArcSwap::rcu`) and
 /// broadcast as a `Bytes` chunk via `output_tx`. Activity is tracked
 /// atomically through `last_activity_ms`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shell reader needs every shared primitive plumbed in directly"
+)]
 async fn shell_reader(
+    shell_id: String,
     mut read_half: russh::ChannelReadHalf,
     history: Arc<ArcSwap<RingBuffer>>,
     output_tx: broadcast::Sender<Bytes>,
@@ -605,6 +625,7 @@ async fn shell_reader(
                         touch_activity(&last_activity_ms);
                         if local.len() >= SHELL_FLUSH_THRESHOLD {
                             flush_shell_local(
+                                &shell_id,
                                 &history,
                                 &output_tx,
                                 &data_notify,
@@ -622,6 +643,7 @@ async fn shell_reader(
 
     if !local.is_empty() {
         flush_shell_local(
+            &shell_id,
             &history,
             &output_tx,
             &data_notify,
@@ -635,6 +657,7 @@ async fn shell_reader(
 
 /// Flush `local` into the lock-free history and broadcast the delta.
 fn flush_shell_local(
+    shell_id: &str,
     history: &ArcSwap<RingBuffer>,
     output_tx: &broadcast::Sender<Bytes>,
     data_notify: &tokio::sync::Notify,
@@ -644,12 +667,13 @@ fn flush_shell_local(
     let chunk = Bytes::copy_from_slice(local);
     local.clear();
     let max_size = usize::try_from(max_buffer_size.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
-    publish_shell_chunk(history, output_tx, chunk, max_size);
+    publish_shell_chunk(shell_id, history, output_tx, chunk, max_size);
     data_notify.notify_waiters();
 }
 
 /// Spawn the background shell reader task.
 fn spawn_shell_reader(read_half: russh::ChannelReadHalf, shell: &RunningShell) {
+    let shell_id = shell.info.shell_id.clone();
     let history = Arc::clone(&shell.history);
     let output_tx = shell.output_tx.clone();
     let data_notify = Arc::clone(&shell.data_notify);
@@ -659,6 +683,7 @@ fn spawn_shell_reader(read_half: russh::ChannelReadHalf, shell: &RunningShell) {
     let last_activity_ms = Arc::clone(&shell.last_activity_ms);
     tokio::spawn(async move {
         shell_reader(
+            shell_id,
             read_half,
             history,
             output_tx,
@@ -878,6 +903,7 @@ fn create_and_register_transfer(
     let xfer = RunningTransfer::new(info, total_bytes, cap);
 
     let shared = TransferShared {
+        transfer_id: transfer_id.to_string(),
         bytes_transferred: Arc::clone(&xfer.bytes_transferred),
         total_bytes: Arc::clone(&xfer.total_bytes),
         progress_tx: xfer.progress_tx.clone(),

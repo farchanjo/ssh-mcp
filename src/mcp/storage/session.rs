@@ -14,6 +14,7 @@ use tokio::sync::{Semaphore, broadcast};
 
 use crate::mcp::config::resolve_session_broadcast_cap;
 use crate::mcp::session::SshClientHandler;
+use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use crate::mcp::types::{HealthEvent, SessionInfo};
 
 use super::traits::{SessionRef, SessionStorage};
@@ -170,7 +171,9 @@ impl SessionStorage for DashMapSessionStorage {
             }
             // Notify any subscribers that the session is going away. Send
             // failures (no subscribers) are intentionally ignored.
-            let _ = stored.health_tx.send(HealthEvent::Disconnected);
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, session_id);
+            let _ = stored.health_tx.send(HealthEvent::Disconnected { seq });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, session_id);
         }
         removed.map(|stored| SessionRef {
             info: stored.info,

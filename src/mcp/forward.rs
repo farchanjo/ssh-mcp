@@ -35,6 +35,7 @@ use tracing::{debug, error};
 
 use super::config::resolve_forward_broadcast_cap;
 use super::session::SshClientHandler;
+use super::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use super::types::ForwardEvent;
 
 /// Per-forwarder live state. Carries a broadcast channel that future MCP
@@ -103,6 +104,10 @@ pub async fn setup_port_forwarding(
     // caller and stored alongside the listener.
     let forward_handle = ForwardHandle::new();
     let events_tx = forward_handle.events_tx;
+    // Stable forward identifier — bound to the actual local socket address.
+    // Once E13 stores `ForwardHandle` in a `ForwardStorage`, this id will
+    // graduate to the storage key.
+    let forward_id = local_addr.to_string();
 
     tokio::spawn(async move {
         run_accept_loop(
@@ -111,6 +116,7 @@ pub async fn setup_port_forwarding(
             &remote_addr_owned,
             remote_port,
             events_tx,
+            forward_id,
         )
         .await;
     });
@@ -129,6 +135,7 @@ async fn run_accept_loop(
     remote_address: &str,
     remote_port: u16,
     events_tx: broadcast::Sender<ForwardEvent>,
+    forward_id: String,
 ) {
     debug!("Port forwarding active on {:?}", listener.local_addr());
 
@@ -152,7 +159,9 @@ async fn run_accept_loop(
     }
 
     // Notify subscribers — send failures (no subscribers) are ignored.
-    let _ = events_tx.send(ForwardEvent::Stopped);
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Forward, &forward_id);
+    let _ = events_tx.send(ForwardEvent::Stopped { seq });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Forward, &forward_id);
 }
 
 /// Spawns a task to handle a single forwarded connection.
