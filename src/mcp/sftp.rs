@@ -20,12 +20,38 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::File as SftpFile;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use super::session::SshClientHandler;
 use super::transfer::{CHUNK_SIZE, TransferStatus};
+use super::types::ProgressEvent;
+
+/// Bag of lock-free shared state plumbed into the streaming SFTP loops.
+///
+/// Replaces the previous `Mutex<Option<String>>` for `error` with a
+/// write-once `OnceCell` and adds the broadcast/notify primitives that
+/// power the future `transfer://<id>/progress` MCP resource.
+pub struct TransferShared {
+    /// Cumulative byte counter incremented after each successful chunk.
+    pub bytes_transferred: Arc<AtomicU64>,
+    /// Total bytes the transfer is attempting to move (may be 0 for streams
+    /// without a known size — e.g. some download metadata cases).
+    pub total_bytes: Arc<AtomicU64>,
+    /// Live broadcast of `ProgressEvent`s. Send failures are ignored —
+    /// no subscribers is the steady state until E13 wires the resource.
+    pub progress_tx: broadcast::Sender<ProgressEvent>,
+    /// Wake source for intra-server long-poll progress readers.
+    pub data_notify: Arc<Notify>,
+    /// Token to cancel the transfer.
+    pub cancel_token: CancellationToken,
+    /// Watch sender for terminal status transitions.
+    pub status_tx: watch::Sender<TransferStatus>,
+    /// Write-once failure reason. Set only when the transfer ends in
+    /// `Failed`.
+    pub error: Arc<OnceCell<String>>,
+}
 
 /// Classify a raw transfer error into a structured, AI-identifiable error message.
 ///
@@ -152,91 +178,114 @@ fn home_dir() -> Option<PathBuf> {
 /// Stream a local file to a remote path via SFTP.
 ///
 /// Reads the local file in 32KB chunks and writes to the remote file,
-/// updating the progress counter after each chunk.
-///
-/// # Arguments
-///
-/// * `handle` - SSH session handle
-/// * `local_path` - Resolved local file path
-/// * `remote_path` - Remote destination path
-/// * `bytes_transferred` - Atomic counter for tracking progress
-/// * `cancel_token` - Token to signal cancellation
-/// * `status_tx` - Channel to send status updates
-/// * `error` - Shared storage for error messages
+/// emitting a `ProgressEvent::Tick` after each chunk and a terminal
+/// `Completed` / `Failed` / `Cancelled` event before returning.
 pub async fn sftp_upload_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     local_path: PathBuf,
     remote_path: String,
-    bytes_transferred: Arc<AtomicU64>,
-    cancel_token: CancellationToken,
-    status_tx: watch::Sender<TransferStatus>,
-    error: Arc<Mutex<Option<String>>>,
+    shared: TransferShared,
 ) {
     let result = sftp_upload_inner(
         &handle,
         &local_path,
         &remote_path,
-        &bytes_transferred,
-        &cancel_token,
+        &shared.bytes_transferred,
+        &shared.cancel_token,
+        &shared.progress_tx,
+        &shared.data_notify,
+        &shared.total_bytes,
     )
     .await;
 
-    handle_transfer_result(
-        result,
-        "upload",
-        &local_path,
-        &remote_path,
-        &bytes_transferred,
-        &status_tx,
-        &error,
-    )
-    .await;
+    handle_transfer_result(result, "upload", &local_path, &remote_path, &shared);
 }
 
-/// Handles the result of a transfer operation, logging and updating status.
-async fn handle_transfer_result(
+/// Handle the result of a transfer operation: log, update status, set
+/// error (write-once), and broadcast the terminal `ProgressEvent`.
+fn handle_transfer_result(
     result: Result<bool, String>,
     direction: &str,
     local_path: &Path,
     remote_path: &str,
-    bytes_transferred: &Arc<AtomicU64>,
-    status_tx: &watch::Sender<TransferStatus>,
-    error_store: &Arc<Mutex<Option<String>>>,
+    shared: &TransferShared,
 ) {
     match result {
-        Ok(true) => {
-            info!(
-                "SFTP {direction} cancelled: {remote_path} <-> {}",
-                local_path.display()
-            );
-            let _ = status_tx.send(TransferStatus::Cancelled);
-        }
-        Ok(false) => {
-            let bytes = bytes_transferred.load(Ordering::SeqCst);
-            info!(
-                "SFTP {direction} completed: {remote_path} <-> {} ({bytes} bytes)",
-                local_path.display()
-            );
-            let _ = status_tx.send(TransferStatus::Completed);
-        }
-        Err(e) => {
-            error!(
-                "SFTP {direction} failed: {remote_path} <-> {}: {e}",
-                local_path.display()
-            );
-            *error_store.lock().await = Some(e);
-            let _ = status_tx.send(TransferStatus::Failed);
-        }
+        Ok(true) => finalize_cancelled(direction, local_path, remote_path, shared),
+        Ok(false) => finalize_completed(direction, local_path, remote_path, shared),
+        Err(e) => finalize_failed(direction, local_path, remote_path, shared, e),
     }
 }
 
+/// Terminal-state handler for `Cancelled` transfers.
+fn finalize_cancelled(
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+    shared: &TransferShared,
+) {
+    info!(
+        "SFTP {direction} cancelled: {remote_path} <-> {}",
+        local_path.display()
+    );
+    let _ = shared.status_tx.send(TransferStatus::Cancelled);
+    let _ = shared.progress_tx.send(ProgressEvent::Cancelled);
+    shared.data_notify.notify_waiters();
+}
+
+/// Terminal-state handler for successfully `Completed` transfers.
+fn finalize_completed(
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+    shared: &TransferShared,
+) {
+    let bytes = shared.bytes_transferred.load(Ordering::SeqCst);
+    info!(
+        "SFTP {direction} completed: {remote_path} <-> {} ({bytes} bytes)",
+        local_path.display()
+    );
+    let _ = shared.status_tx.send(TransferStatus::Completed);
+    let _ = shared.progress_tx.send(ProgressEvent::Completed {
+        bytes_transferred: bytes,
+    });
+    shared.data_notify.notify_waiters();
+}
+
+/// Terminal-state handler for `Failed` transfers; sets the write-once error.
+fn finalize_failed(
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+    shared: &TransferShared,
+    err: String,
+) {
+    error!(
+        "SFTP {direction} failed: {remote_path} <-> {}: {err}",
+        local_path.display()
+    );
+    // Write-once: a second `set` returns `Err`, which we deliberately
+    // discard — there is no second writer in this code path.
+    let _ = shared.error.set(err);
+    let _ = shared.status_tx.send(TransferStatus::Failed);
+    let _ = shared.progress_tx.send(ProgressEvent::Failed);
+    shared.data_notify.notify_waiters();
+}
+
 /// Inner upload logic, returns Ok(true) if cancelled, Ok(false) if completed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "lock-free streaming requires plumbing every shared primitive into the chunk loop"
+)]
 async fn sftp_upload_inner(
     handle: &Arc<client::Handle<SshClientHandler>>,
     local_path: &Path,
     remote_path: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    total_bytes: &Arc<AtomicU64>,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
     let mut local_file = open_local_file(local_path).await?;
@@ -249,6 +298,9 @@ async fn sftp_upload_inner(
         remote_path,
         bytes_transferred,
         cancel_token,
+        progress_tx,
+        data_notify,
+        total_bytes,
     )
     .await?;
 
@@ -292,6 +344,10 @@ async fn flush_remote_file(remote_file: &mut SftpFile, remote_path: &str) -> Res
 /// Reads chunks from a local file and writes them to a remote SFTP file.
 ///
 /// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "lock-free streaming requires plumbing every shared primitive into the chunk loop"
+)]
 async fn upload_chunks(
     local_file: &mut File,
     remote_file: &mut SftpFile,
@@ -299,6 +355,9 @@ async fn upload_chunks(
     remote_path: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    total_bytes: &Arc<AtomicU64>,
 ) -> Result<bool, String> {
     let mut buf = vec![0_u8; CHUNK_SIZE];
 
@@ -321,7 +380,25 @@ async fn upload_chunks(
 
         write_to_sftp_file(remote_file, &buf[..n], remote_path).await?;
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
+        emit_tick(progress_tx, data_notify, bytes_transferred, total_bytes);
     }
+}
+
+/// Send a `ProgressEvent::Tick` and wake intra-server long-poll readers.
+///
+/// Send failures are intentionally swallowed: there may be no subscriber
+/// yet (steady state until E13 wires `transfer://<id>/progress`).
+fn emit_tick(
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    bytes_transferred: &AtomicU64,
+    total_bytes: &AtomicU64,
+) {
+    let _ = progress_tx.send(ProgressEvent::Tick {
+        bytes_transferred: bytes_transferred.load(Ordering::Relaxed),
+        total_bytes: total_bytes.load(Ordering::Relaxed),
+    });
+    data_notify.notify_waiters();
 }
 
 /// Write a buffer to an SFTP file.
@@ -341,54 +418,43 @@ async fn write_to_sftp_file(
 /// Stream a remote file to a local path via SFTP.
 ///
 /// Reads the remote file in 32KB chunks and writes to the local file,
-/// updating the progress counter after each chunk.
-///
-/// # Arguments
-///
-/// * `handle` - SSH session handle
-/// * `remote_path` - Remote source path
-/// * `local_path` - Resolved local destination path
-/// * `bytes_transferred` - Atomic counter for tracking progress
-/// * `cancel_token` - Token to signal cancellation
-/// * `status_tx` - Channel to send status updates
-/// * `error` - Shared storage for error messages
+/// emitting a `ProgressEvent::Tick` after each chunk and a terminal
+/// `Completed` / `Failed` / `Cancelled` event before returning.
 pub async fn sftp_download_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     remote_path: String,
     local_path: PathBuf,
-    bytes_transferred: Arc<AtomicU64>,
-    cancel_token: CancellationToken,
-    status_tx: watch::Sender<TransferStatus>,
-    error: Arc<Mutex<Option<String>>>,
+    shared: TransferShared,
 ) {
     let result = sftp_download_inner(
         &handle,
         &remote_path,
         &local_path,
-        &bytes_transferred,
-        &cancel_token,
+        &shared.bytes_transferred,
+        &shared.cancel_token,
+        &shared.progress_tx,
+        &shared.data_notify,
+        &shared.total_bytes,
     )
     .await;
 
-    handle_transfer_result(
-        result,
-        "download",
-        &local_path,
-        &remote_path,
-        &bytes_transferred,
-        &status_tx,
-        &error,
-    )
-    .await;
+    handle_transfer_result(result, "download", &local_path, &remote_path, &shared);
 }
 
 /// Inner download logic, returns Ok(true) if cancelled, Ok(false) if completed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "lock-free streaming requires plumbing every shared primitive into the chunk loop"
+)]
 async fn sftp_download_inner(
     handle: &Arc<client::Handle<SshClientHandler>>,
     remote_path: &str,
     local_path: &Path,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    total_bytes: &Arc<AtomicU64>,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
     let mut remote_file = open_remote_file(&sftp, remote_path).await?;
@@ -401,6 +467,9 @@ async fn sftp_download_inner(
         local_path,
         bytes_transferred,
         cancel_token,
+        progress_tx,
+        data_notify,
+        total_bytes,
     )
     .await?;
 
@@ -441,6 +510,10 @@ async fn flush_local_file(local_file: &mut File, local_path: &Path) -> Result<()
 /// Reads chunks from a remote SFTP file and writes them to a local file.
 ///
 /// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "lock-free streaming requires plumbing every shared primitive into the chunk loop"
+)]
 async fn download_chunks(
     remote_file: &mut SftpFile,
     local_file: &mut File,
@@ -448,6 +521,9 @@ async fn download_chunks(
     local_path: &Path,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    total_bytes: &Arc<AtomicU64>,
 ) -> Result<bool, String> {
     let mut buf = vec![0_u8; CHUNK_SIZE];
 
@@ -473,6 +549,7 @@ async fn download_chunks(
         })?;
 
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
+        emit_tick(progress_tx, data_notify, bytes_transferred, total_bytes);
     }
 }
 

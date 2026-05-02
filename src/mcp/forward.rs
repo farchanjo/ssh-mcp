@@ -30,9 +30,42 @@ use russh::Channel;
 use russh::client::{self, Msg};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 use tracing::{debug, error};
 
+use super::config::resolve_forward_broadcast_cap;
 use super::session::SshClientHandler;
+use super::types::ForwardEvent;
+
+/// Per-forwarder live state. Carries a broadcast channel that future MCP
+/// resource subscribers (`forward://<id>/events`) and intra-server
+/// long-poll readers consume.
+///
+/// Per-connection accept/close eventing is intentionally stubbed in E9 —
+/// only `Stopped` is emitted when the accept loop exits. Full per-connection
+/// wiring will land in E13.
+pub struct ForwardHandle {
+    /// Live broadcast of forwarder events. Subscribers join via
+    /// `events_tx.subscribe()`.
+    pub events_tx: broadcast::Sender<ForwardEvent>,
+}
+
+impl ForwardHandle {
+    /// Build a fresh `ForwardHandle` with a broadcast channel sized via
+    /// [`resolve_forward_broadcast_cap`].
+    #[must_use]
+    pub fn new() -> Self {
+        let cap = resolve_forward_broadcast_cap();
+        let (events_tx, _events_rx) = broadcast::channel(cap);
+        Self { events_tx }
+    }
+}
+
+impl Default for ForwardHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Sets up port forwarding from a local port to a remote destination via SSH.
 ///
@@ -65,26 +98,44 @@ pub async fn setup_port_forwarding(
         .map_err(|e| format!("Failed to get local address: {e}"))?;
 
     let remote_addr_owned = remote_address.to_string();
+    // Construct a fresh per-forwarder broadcast channel. Once E13 wires
+    // `forward://<id>/events`, this `ForwardHandle` will be returned to the
+    // caller and stored alongside the listener.
+    let forward_handle = ForwardHandle::new();
+    let events_tx = forward_handle.events_tx;
 
     tokio::spawn(async move {
-        run_accept_loop(listener, handle_arc, &remote_addr_owned, remote_port).await;
+        run_accept_loop(
+            listener,
+            handle_arc,
+            &remote_addr_owned,
+            remote_port,
+            events_tx,
+        )
+        .await;
     });
 
     Ok(local_addr)
 }
 
 /// Accepts incoming TCP connections and spawns forwarding tasks for each.
+///
+/// Emits `ForwardEvent::Stopped` on the broadcast channel when the accept
+/// loop exits. Per-connection `Accept` / `Close` events are not yet emitted
+/// — that will land in E13 alongside `forward://<id>/events`.
 async fn run_accept_loop(
     listener: TcpListener,
     handle_arc: Arc<client::Handle<SshClientHandler>>,
     remote_address: &str,
     remote_port: u16,
+    events_tx: broadcast::Sender<ForwardEvent>,
 ) {
     debug!("Port forwarding active on {:?}", listener.local_addr());
 
     loop {
         match listener.accept().await {
             Ok((local_stream, client_addr)) => {
+                // TODO(E13): emit Accept/Close per connection.
                 debug!("New connection from {client_addr} to forwarded port");
                 spawn_forward_task(
                     Arc::clone(&handle_arc),
@@ -99,6 +150,9 @@ async fn run_accept_loop(
             }
         }
     }
+
+    // Notify subscribers — send failures (no subscribers) are ignored.
+    let _ = events_tx.send(ForwardEvent::Stopped);
 }
 
 /// Spawns a task to handle a single forwarded connection.

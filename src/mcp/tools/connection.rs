@@ -16,7 +16,7 @@
 //!   verbatim from v2.0 `commands.rs` (now parked at `commands_legacy.rs.txt`).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
 use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
@@ -43,7 +43,7 @@ use super::super::storage::traits::{
     CommandStorage, SessionRef, SessionStorage, ShellStorage, TransferStorage,
 };
 use super::super::storage::transfer::TRANSFER_STORAGE;
-use super::super::types::{SessionInfo, SshCommandResponse};
+use super::super::types::{HealthEvent, SessionInfo, SshCommandResponse};
 use super::ReusePolicy;
 use super::legacy_helpers::{
     build_agent_disconnect_response, clamp_list_items, cleanup_agent_sessions,
@@ -114,6 +114,16 @@ pub struct SshConnectArgs {
     pub reuse: Option<ReusePolicy>,
 }
 
+/// Current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Falls back to `0` when the system clock is set before 1970, which is
+/// fine for the timestamps consumed by `HealthEvent`.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Format a `host:port` pair for display when the port is not the default 22.
 fn format_host_for_display(host_lc: &str, port: u16) -> String {
     if port == 22 {
@@ -156,6 +166,9 @@ fn build_reuse_response(
     match result {
         Ok(response) if !response.timed_out && response.exit_code == 0 => {
             SESSION_STORAGE.update_health(sid, now, true);
+            let _ = session_ref
+                .health_tx
+                .send(HealthEvent::Healthy { at_ms: now_ms() });
             info!("Reusing healthy session {sid}");
             Some(
                 ConnectOkBuilder::new(sid, &session_ref.info.username, &session_ref.info.host)
@@ -164,8 +177,9 @@ fn build_reuse_response(
                     .build(),
             )
         }
-        _ => {
+        Ok(_) | Err(_) => {
             warn!("Session {sid} is dead, removing");
+            // The remove() path already emits `HealthEvent::Disconnected`.
             SESSION_STORAGE.remove(sid);
             None
         }
@@ -200,6 +214,9 @@ async fn evaluate_identity_matches(host: &str, port: u16, username: &str) -> Ide
         let is_healthy = matches!(&health, Ok(r) if !r.timed_out && r.exit_code == 0);
         if is_healthy {
             SESSION_STORAGE.update_health(&sid, now, true);
+            let _ = session_ref
+                .health_tx
+                .send(HealthEvent::Healthy { at_ms: now_ms() });
             healthy.push(SessionMatch {
                 session_id: sid,
                 host: format!("{}@{}", session_ref.info.username, session_ref.info.host),
@@ -210,6 +227,9 @@ async fn evaluate_identity_matches(host: &str, port: u16, username: &str) -> Ide
             });
         } else {
             replaced += 1;
+            let _ = session_ref
+                .health_tx
+                .send(HealthEvent::Unhealthy { at_ms: now_ms() });
             cancel_session_transfers(&sid);
             close_session_shells(&sid).await;
             cancel_session_commands(&sid);

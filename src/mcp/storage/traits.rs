@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use dashmap::mapref::one::Ref;
 use russh::client;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, broadcast};
 
 use crate::mcp::async_command::RunningCommand;
 use crate::mcp::session::SshClientHandler;
 use crate::mcp::shell::RunningShell;
 use crate::mcp::transfer::{RunningTransfer, TransferInfo};
-use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo};
+use crate::mcp::types::{
+    AsyncCommandInfo, AsyncCommandStatus, HealthEvent, SessionInfo, ShellInfo,
+};
 
 /// Reference to a stored session for read-only access.
 pub struct SessionRef {
@@ -21,6 +23,10 @@ pub struct SessionRef {
     pub handle: Arc<client::Handle<SshClientHandler>>,
     /// Semaphore limiting concurrent SSH channels on this session.
     pub channel_permits: Arc<Semaphore>,
+    /// Live broadcast of health-check events. Subscribers consume these via
+    /// `health_tx.subscribe()` to drive the future
+    /// `session://<id>/health` MCP resource (E13).
+    pub health_tx: broadcast::Sender<HealthEvent>,
 }
 
 /// Trait for session storage operations.

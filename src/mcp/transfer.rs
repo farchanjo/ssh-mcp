@@ -3,10 +3,15 @@
 //! This module provides types for tracking file upload/download progress.
 //! Transfers run asynchronously and can be polled for progress or cancelled.
 //!
-//! # Architecture
+//! # Architecture (E9)
 //!
-//! - `RunningTransfer`: Contains all state for an active transfer including
-//!   progress counters, cancellation token, and status.
+//! - `RunningTransfer`: Lock-free state for an in-flight upload/download.
+//!   Terminal `error` uses `tokio::sync::OnceCell` for write-once semantics,
+//!   replacing the previous `Mutex<Option<String>>`. Live progress is fanned
+//!   out through a `broadcast::Sender<ProgressEvent>` (capacity from
+//!   `SSH_TRANSFER_BROADCAST_CAP`) and a `Notify` so future MCP resources
+//!   (`transfer://<id>/progress`) and intra-server long-poll readers can
+//!   subscribe without taking any lock.
 //! - Storage is handled by `storage::TransferStorage` trait implementations.
 
 use std::fmt;
@@ -15,8 +20,10 @@ use std::sync::atomic::AtomicU64;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
+
+use super::types::ProgressEvent;
 
 /// Direction of an SFTP file transfer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -79,23 +86,63 @@ pub struct TransferInfo {
     pub started_at: String,
 }
 
-/// State for a running file transfer
+/// State for a running file transfer.
+///
+/// All fields are lock-free: progress counters use `AtomicU64`, the terminal
+/// failure reason uses `OnceCell`, and live updates fan out through a
+/// broadcast channel + `Notify`. The previous `Mutex<Option<String>>`
+/// guarding `error` was eliminated in E9.
 pub struct RunningTransfer {
-    /// Transfer metadata
+    /// Transfer metadata.
     pub info: TransferInfo,
-    /// Token to cancel the transfer
+    /// Token to cancel the transfer.
     pub cancel_token: CancellationToken,
-    /// Bytes transferred so far (atomic for lock-free reads)
+    /// Bytes transferred so far (atomic for lock-free reads).
     pub bytes_transferred: Arc<AtomicU64>,
-    /// Total bytes to transfer (atomic, set before transfer starts)
+    /// Total bytes to transfer (atomic, set before transfer starts).
     pub total_bytes: Arc<AtomicU64>,
-    /// Receiver for status updates
+    /// Receiver for status updates.
     pub status_rx: watch::Receiver<TransferStatus>,
-    /// Sender for status updates (kept alive to prevent channel closure)
+    /// Sender for status updates (kept alive to prevent channel closure).
     #[allow(dead_code, reason = "kept alive to prevent watch channel closure")]
     pub status_tx: watch::Sender<TransferStatus>,
-    /// Error message if transfer failed
-    pub error: Arc<Mutex<Option<String>>>,
+    /// Write-once: failure reason (set when the transfer status flips to
+    /// `Failed`). Replaces the previous `Mutex<Option<String>>`.
+    pub error: Arc<OnceCell<String>>,
+    /// Live broadcast of progress / terminal events. New subscribers join via
+    /// `progress_tx.subscribe()`. Capacity is resolved from
+    /// `SSH_TRANSFER_BROADCAST_CAP` via
+    /// `super::config::resolve_transfer_broadcast_cap`.
+    pub progress_tx: broadcast::Sender<ProgressEvent>,
+    /// Wake source for intra-server long-poll progress readers. Notified
+    /// after every successful chunk plus on terminal events.
+    pub data_notify: Arc<Notify>,
+}
+
+impl RunningTransfer {
+    /// Build a `RunningTransfer` with fresh lock-free primitives.
+    ///
+    /// The `broadcast_cap` argument is the resolved capacity; callers should
+    /// pass `super::config::resolve_transfer_broadcast_cap()` so the
+    /// `SSH_TRANSFER_BROADCAST_CAP` env var is honoured (default 256, floor
+    /// 8, hard cap 4096). Status starts as `Running` and `error` starts
+    /// empty.
+    #[must_use]
+    pub fn new(info: TransferInfo, total_bytes: u64, broadcast_cap: usize) -> Self {
+        let (status_tx, status_rx) = watch::channel(TransferStatus::Running);
+        let (progress_tx, _progress_rx) = broadcast::channel(broadcast_cap);
+        Self {
+            info,
+            cancel_token: CancellationToken::new(),
+            bytes_transferred: Arc::new(AtomicU64::new(0)),
+            total_bytes: Arc::new(AtomicU64::new(total_bytes)),
+            status_rx,
+            status_tx,
+            error: Arc::new(OnceCell::new()),
+            progress_tx,
+            data_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// Maximum number of concurrent transfers per session
@@ -326,17 +373,95 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_error_storage() {
-            let error = Arc::new(Mutex::new(None::<String>));
+        async fn test_error_storage_oncecell_write_once() {
+            let error: Arc<OnceCell<String>> = Arc::new(OnceCell::new());
+            assert!(error.get().is_none());
 
-            let error_clone = error.clone();
+            let error_clone = Arc::clone(&error);
             let handle = tokio::spawn(async move {
-                *error_clone.lock().await = Some("connection lost".to_string());
+                let _ = error_clone.set("connection lost".to_string());
             });
 
             handle.await.unwrap();
-            let val = error.lock().await;
-            assert_eq!(val.as_deref(), Some("connection lost"));
+            assert_eq!(error.get().map(String::as_str), Some("connection lost"));
+
+            // Second set is a no-op (write-once semantics).
+            assert!(error.set("ignored".to_string()).is_err());
+            assert_eq!(error.get().map(String::as_str), Some("connection lost"));
+        }
+
+        #[tokio::test]
+        async fn test_running_transfer_new_has_lock_free_state() {
+            let info = TransferInfo {
+                transfer_id: "xfer-1".to_string(),
+                session_id: "sess-1".to_string(),
+                direction: TransferDirection::Upload,
+                local_path: "/tmp/x".to_string(),
+                remote_path: "/r/x".to_string(),
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+            let xfer = RunningTransfer::new(info, 1024, 256);
+
+            assert_eq!(
+                xfer.bytes_transferred
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                xfer.total_bytes.load(std::sync::atomic::Ordering::SeqCst),
+                1024
+            );
+            assert!(xfer.error.get().is_none());
+            assert_eq!(*xfer.status_rx.borrow(), TransferStatus::Running);
+        }
+
+        #[tokio::test]
+        async fn test_progress_event_broadcast_delivers_tick() {
+            let info = TransferInfo {
+                transfer_id: "xfer-2".to_string(),
+                session_id: "sess-2".to_string(),
+                direction: TransferDirection::Download,
+                local_path: "/tmp/y".to_string(),
+                remote_path: "/r/y".to_string(),
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+            let xfer = RunningTransfer::new(info, 4096, 32);
+
+            let mut sub = xfer.progress_tx.subscribe();
+            let _ = xfer.progress_tx.send(ProgressEvent::Tick {
+                bytes_transferred: 32,
+                total_bytes: 4096,
+            });
+            let event = sub.recv().await.unwrap();
+            match event {
+                ProgressEvent::Tick {
+                    bytes_transferred,
+                    total_bytes,
+                } => {
+                    assert_eq!(bytes_transferred, 32);
+                    assert_eq!(total_bytes, 4096);
+                }
+                ProgressEvent::Completed { .. }
+                | ProgressEvent::Failed
+                | ProgressEvent::Cancelled => {
+                    panic!("expected Tick variant");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_progress_event_completed_variant_carries_bytes() {
+            let evt = ProgressEvent::Completed {
+                bytes_transferred: 8192,
+            };
+            match evt {
+                ProgressEvent::Completed { bytes_transferred } => {
+                    assert_eq!(bytes_transferred, 8192);
+                }
+                ProgressEvent::Tick { .. } | ProgressEvent::Failed | ProgressEvent::Cancelled => {
+                    panic!("wrong variant")
+                }
+            }
         }
     }
 }

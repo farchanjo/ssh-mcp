@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use russh::client::Msg;
 use russh::{Channel, Disconnect};
-use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{OnceCell, Semaphore, broadcast, mpsc, watch};
 use tokio::time::{self};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -31,7 +31,8 @@ use super::super::client::{
 };
 use super::super::config::{
     resolve_command_cleanup_ttl, resolve_list_max_items_cap, resolve_list_max_items_default,
-    resolve_output_default_bytes, resolve_output_max_bytes_cap, resolve_transfer_cleanup_ttl,
+    resolve_output_default_bytes, resolve_output_max_bytes_cap, resolve_transfer_broadcast_cap,
+    resolve_transfer_cleanup_ttl,
 };
 use super::super::message::builder::{
     ExecuteStartedBuilder, GetCommandOutputBuilder, GetCommandOutputState, ListSessionsBuilder,
@@ -40,7 +41,7 @@ use super::super::message::builder::{
 };
 use super::super::message::helpers::{format_error, generate_nonce};
 use super::super::session::SshClientHandler;
-use super::super::sftp::{sftp_download_streaming, sftp_upload_streaming};
+use super::super::sftp::{TransferShared, sftp_download_streaming, sftp_upload_streaming};
 use super::super::shell::{
     ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms, touch_activity,
 };
@@ -53,7 +54,8 @@ use super::super::storage::traits::{
 use super::super::storage::transfer::TRANSFER_STORAGE;
 use super::super::transfer::{RunningTransfer, TransferDirection, TransferInfo, TransferStatus};
 use super::super::types::{
-    AsyncCommandInfo, AsyncCommandStatus, SessionInfo, ShellInfo, ShellStatus, SshCommandResponse,
+    AsyncCommandInfo, AsyncCommandStatus, HealthEvent, SessionInfo, ShellInfo, ShellStatus,
+    SshCommandResponse,
 };
 use arc_swap::ArcSwap;
 
@@ -477,6 +479,16 @@ fn classify_sessions(
     (healthy_sessions, dead_session_ids)
 }
 
+/// Current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Falls back to `0` when the system clock is set before 1970.
+fn health_event_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Process health check results and update storage, returning the
 /// `SSH_LIST_SESSIONS` markdown.
 pub(crate) fn process_health_results(
@@ -494,10 +506,21 @@ pub(crate) fn process_health_results(
         if let Some(last_check) = &info.last_health_check {
             SESSION_STORAGE.update_health(id, last_check.clone(), info.healthy.unwrap_or(false));
         }
+        if let Some(session_ref) = SESSION_STORAGE.get(id) {
+            let _ = session_ref.health_tx.send(HealthEvent::Healthy {
+                at_ms: health_event_now_ms(),
+            });
+        }
     }
 
     for id in &dead_session_ids {
         warn!("Removing dead session {id} from storage");
+        if let Some(session_ref) = SESSION_STORAGE.get(id) {
+            let _ = session_ref.health_tx.send(HealthEvent::Unhealthy {
+                at_ms: health_event_now_ms(),
+            });
+        }
+        // remove() already broadcasts `HealthEvent::Disconnected`.
         SESSION_STORAGE.remove(id);
     }
 
@@ -832,15 +855,8 @@ pub(crate) fn register_shell(
 // SFTP transfer lifecycle
 // ---------------------------------------------------------------------------
 
-/// Shared state returned by transfer registration.
-struct TransferSharedState {
-    cancel_token: CancellationToken,
-    bytes_transferred: Arc<AtomicU64>,
-    status_tx: watch::Sender<TransferStatus>,
-    error: Arc<Mutex<Option<String>>>,
-}
-
-/// Create shared state, register a transfer, and return handles for the task.
+/// Create a transfer with lock-free shared state, register it in storage,
+/// and return a `TransferShared` ready to plumb into the streaming task.
 fn create_and_register_transfer(
     transfer_id: &str,
     session_id: &str,
@@ -849,40 +865,34 @@ fn create_and_register_transfer(
     remote_path: &str,
     started_at: &str,
     total_bytes: u64,
-) -> TransferSharedState {
-    let (status_tx, status_rx) = watch::channel(TransferStatus::Running);
-    let bytes_transferred = Arc::new(AtomicU64::new(0));
-    let cancel_token = CancellationToken::new();
-    let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+) -> TransferShared {
+    let info = TransferInfo {
+        transfer_id: transfer_id.to_string(),
+        session_id: session_id.to_string(),
+        direction,
+        local_path: local_path.to_string(),
+        remote_path: remote_path.to_string(),
+        started_at: started_at.to_string(),
+    };
+    let cap = resolve_transfer_broadcast_cap();
+    let xfer = RunningTransfer::new(info, total_bytes, cap);
 
-    TRANSFER_STORAGE.register(
-        transfer_id.to_string(),
-        RunningTransfer {
-            info: TransferInfo {
-                transfer_id: transfer_id.to_string(),
-                session_id: session_id.to_string(),
-                direction,
-                local_path: local_path.to_string(),
-                remote_path: remote_path.to_string(),
-                started_at: started_at.to_string(),
-            },
-            cancel_token: cancel_token.clone(),
-            bytes_transferred: Arc::clone(&bytes_transferred),
-            total_bytes: Arc::new(AtomicU64::new(total_bytes)),
-            status_rx: status_rx.clone(),
-            status_tx: status_tx.clone(),
-            error: Arc::clone(&error),
-        },
-    );
+    let shared = TransferShared {
+        bytes_transferred: Arc::clone(&xfer.bytes_transferred),
+        total_bytes: Arc::clone(&xfer.total_bytes),
+        progress_tx: xfer.progress_tx.clone(),
+        data_notify: Arc::clone(&xfer.data_notify),
+        cancel_token: xfer.cancel_token.clone(),
+        status_tx: xfer.status_tx.clone(),
+        error: Arc::clone(&xfer.error),
+    };
+    let cleanup_rx = xfer.status_rx.clone();
 
-    spawn_transfer_cleanup_task(transfer_id.to_string(), status_rx);
+    TRANSFER_STORAGE.register(transfer_id.to_string(), xfer);
 
-    TransferSharedState {
-        cancel_token,
-        bytes_transferred,
-        status_tx,
-        error,
-    }
+    spawn_transfer_cleanup_task(transfer_id.to_string(), cleanup_rx);
+
+    shared
 }
 
 /// Remove a terminated transfer from storage after `SSH_TRANSFER_CLEANUP_TTL`.
@@ -905,16 +915,13 @@ fn spawn_upload_task(
     handle_arc: Arc<SshHandle>,
     resolved_path: &Path,
     remote_path: String,
-    state: TransferSharedState,
+    shared: TransferShared,
 ) {
     tokio::spawn(sftp_upload_streaming(
         handle_arc,
         resolved_path.to_path_buf(),
         remote_path,
-        state.bytes_transferred,
-        state.cancel_token,
-        state.status_tx,
-        state.error,
+        shared,
     ));
 }
 
@@ -923,16 +930,13 @@ fn spawn_download_task(
     handle_arc: Arc<SshHandle>,
     remote_path: &str,
     resolved_path: &Path,
-    state: TransferSharedState,
+    shared: TransferShared,
 ) {
     tokio::spawn(sftp_download_streaming(
         handle_arc,
         remote_path.to_string(),
         resolved_path.to_path_buf(),
-        state.bytes_transferred,
-        state.cancel_token,
-        state.status_tx,
-        state.error,
+        shared,
     ));
 }
 
@@ -949,7 +953,7 @@ pub(crate) fn start_upload(
     let started_at = chrono::Utc::now().to_rfc3339();
     let local_path = resolved_path.to_string_lossy().into_owned();
 
-    let state = create_and_register_transfer(
+    let shared = create_and_register_transfer(
         &transfer_id,
         &session_id,
         TransferDirection::Upload,
@@ -962,7 +966,7 @@ pub(crate) fn start_upload(
     info!(
         "Starting SFTP upload {transfer_id} on session {session_id}: {local_path} -> {remote_path} ({total_bytes} bytes)"
     );
-    spawn_upload_task(handle_arc, resolved_path, remote_path.clone(), state);
+    spawn_upload_task(handle_arc, resolved_path, remote_path.clone(), shared);
 
     TransferStartedBuilder::new(
         TransferStartDirection::Upload,
@@ -989,7 +993,7 @@ pub(crate) fn start_download(
     let started_at = chrono::Utc::now().to_rfc3339();
     let local_path = resolved_path.to_string_lossy().into_owned();
 
-    let state = create_and_register_transfer(
+    let shared = create_and_register_transfer(
         &transfer_id,
         &session_id,
         TransferDirection::Download,
@@ -1002,7 +1006,7 @@ pub(crate) fn start_download(
     info!(
         "Starting SFTP download {transfer_id} on session {session_id}: {remote_path} -> {local_path} ({total_bytes} bytes)"
     );
-    spawn_download_task(handle_arc, &remote_path, resolved_path, state);
+    spawn_download_task(handle_arc, &remote_path, resolved_path, shared);
 
     TransferStartedBuilder::new(
         TransferStartDirection::Download,
@@ -1017,21 +1021,22 @@ pub(crate) fn start_download(
 }
 
 /// Build the transfer progress response markdown.
-pub(crate) async fn build_transfer_progress_response(
-    transfer_id: String,
+///
+/// Reads the lock-free state without taking any mutex: `error` is fetched
+/// via `OnceCell::get`, status via `watch::Receiver::borrow`, and the
+/// progress counters via atomic loads.
+pub(crate) fn build_transfer_progress_response(
+    transfer_id: &str,
     status_rx: &watch::Receiver<TransferStatus>,
     bytes_transferred: &AtomicU64,
     total_bytes_arc: &AtomicU64,
-    error: &Mutex<Option<String>>,
+    error: &OnceCell<String>,
     info: &TransferInfo,
 ) -> String {
     let status = *status_rx.borrow();
     let transferred = bytes_transferred.load(Ordering::SeqCst);
     let total = total_bytes_arc.load(Ordering::SeqCst);
-    let error_val = {
-        let guard = error.lock().await;
-        guard.clone()
-    };
+    let error_val: Option<&str> = error.get().map(String::as_str);
 
     let direction = match info.direction {
         TransferDirection::Upload => TransferStartDirection::Upload,
@@ -1042,9 +1047,9 @@ pub(crate) async fn build_transfer_progress_response(
         TransferStatus::Running => TransferProgressState::Running,
         TransferStatus::Completed => TransferProgressState::Completed,
         TransferStatus::Failed => {
-            let reason = error_val.as_deref().unwrap_or("transfer failed");
+            let reason = error_val.unwrap_or("transfer failed");
             return TransferProgressBuilder::new(
-                &transfer_id,
+                transfer_id,
                 direction,
                 transferred,
                 total,
@@ -1054,7 +1059,7 @@ pub(crate) async fn build_transfer_progress_response(
         }
         TransferStatus::Cancelled => {
             return TransferProgressBuilder::new(
-                &transfer_id,
+                transfer_id,
                 direction,
                 transferred,
                 total,
@@ -1064,5 +1069,5 @@ pub(crate) async fn build_transfer_progress_response(
         }
     };
 
-    TransferProgressBuilder::new(&transfer_id, direction, transferred, total, state).build()
+    TransferProgressBuilder::new(transfer_id, direction, transferred, total, state).build()
 }
