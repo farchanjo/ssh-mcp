@@ -131,7 +131,9 @@ mutex_integer                   = "deny"
 multiple_crate_versions = "allow"
 
 [lints.rust]
-unsafe_code                = "forbid"
+# `deny` (not `forbid`) so tests can opt-in via per-module `#[allow(unsafe_code, reason = "...")]`
+# for env-var manipulation; production code remains forbidden by default.
+unsafe_code                = "deny"
 unused_imports             = "deny"
 unused_mut                 = "deny"
 unused_must_use            = "deny"

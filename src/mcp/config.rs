@@ -400,6 +400,10 @@ pub fn resolve_list_max_items_cap() -> usize {
     clippy::unwrap_used,
     reason = "test assertions and mutex locks may use unwrap"
 )]
+#[allow(
+    unsafe_code,
+    reason = "Rust 2024 requires unsafe for env::set_var; tests serialize via ENV_TEST_MUTEX"
+)]
 mod tests {
     use std::sync::{LazyLock, Mutex as StdMutex};
 

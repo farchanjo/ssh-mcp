@@ -46,5 +46,6 @@ pub mod session;
 pub(crate) mod sftp;
 pub(crate) mod shell;
 pub mod storage;
+pub mod tools;
 pub(crate) mod transfer;
 pub mod types;
