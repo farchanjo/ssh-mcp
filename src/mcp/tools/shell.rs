@@ -14,8 +14,10 @@ use serde::Deserialize;
 
 use super::super::client::open_pty_shell;
 use super::super::config::{resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size};
+use super::super::keys::{KeyModifiers, ShellKey};
 use super::super::message::builder::{
-    ShellReadBuilder, ShellReadState, render_shell_close_ok, render_shell_write_ok,
+    ShellReadBuilder, ShellReadState, render_shell_close_ok, render_shell_send_key_ok,
+    render_shell_write_ok,
 };
 use super::super::message::helpers::{format_error, generate_nonce};
 use super::super::shell::{MAX_SHELLS_PER_SESSION, RingBuffer, WriteRequest, touch_activity};
@@ -24,6 +26,9 @@ use super::super::storage::shell::SHELL_STORAGE;
 use super::super::storage::traits::{SessionStorage, ShellStorage};
 use super::super::types::ShellStatus;
 use super::legacy_helpers::{clamp_output_bytes, err_session_not_found, register_shell};
+
+/// Maximum allowed `repeat` value for `ssh_shell_send_key`.
+const MAX_SEND_KEY_REPEAT: u8 = 64;
 
 // ---------------------------------------------------------------------------
 // `ssh_shell_open`
@@ -171,6 +176,149 @@ pub async fn ssh_shell_write_impl(args: SshShellWriteArgs) -> Result<CallToolRes
 }
 
 // ---------------------------------------------------------------------------
+// `ssh_shell_send_key`
+// ---------------------------------------------------------------------------
+
+/// Arguments for the `ssh_shell_send_key` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshShellSendKeyArgs {
+    /// `SHELL_ID` returned from `ssh_shell_open`.
+    pub shell_id: String,
+
+    /// Named keystroke to send. See [`ShellKey`] for the allowed values.
+    pub key: ShellKey,
+
+    /// Apply Shift modifier. Valid on: arrows, navigation keys, F1-F12,
+    /// and `tab`. Default: `false`.
+    pub shift: Option<bool>,
+
+    /// Apply Alt modifier. Valid on: arrows, navigation keys, F1-F12.
+    /// Default: `false`.
+    pub alt: Option<bool>,
+
+    /// Apply Ctrl modifier. Valid on: arrows, navigation keys, F1-F12.
+    /// Default: `false`.
+    pub ctrl: Option<bool>,
+
+    /// Repeat the keystroke `N` times. Default: `1`. Range: `1..=64`.
+    pub repeat: Option<u8>,
+}
+
+/// Format the active modifiers as a `+`-joined label, or `None` when no
+/// modifier is set. Used by the response builder to render the
+/// `MODIFIERS:` line.
+fn format_modifiers_label(mods: KeyModifiers) -> Option<String> {
+    if mods.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<&'static str> = Vec::with_capacity(3);
+    if mods.shift {
+        parts.push("shift");
+    }
+    if mods.alt {
+        parts.push("alt");
+    }
+    if mods.ctrl {
+        parts.push("ctrl");
+    }
+    Some(parts.join("+"))
+}
+
+/// Implementation of `ssh_shell_send_key`.
+pub async fn ssh_shell_send_key_impl(
+    args: SshShellSendKeyArgs,
+) -> Result<CallToolResult, McpError> {
+    let SshShellSendKeyArgs {
+        shell_id,
+        key,
+        shift,
+        alt,
+        ctrl,
+        repeat,
+    } = args;
+
+    let repeat = repeat.unwrap_or(1);
+    if repeat == 0 || repeat > MAX_SEND_KEY_REPEAT {
+        return Ok(CallToolResult::error(vec![Content::text(format_error(
+            "SSH_SHELL_SEND_KEY",
+            "INVALID_REPEAT",
+            "repeat must be between 1 and 64 inclusive",
+            Some(&format!("requested={repeat}")),
+        ))]));
+    }
+
+    let mods = KeyModifiers {
+        shift: shift.unwrap_or(false),
+        alt: alt.unwrap_or(false),
+        ctrl: ctrl.unwrap_or(false),
+    };
+
+    let payload = match key.encode(mods) {
+        Ok(cow) => cow.into_owned(),
+        Err(e) => match e {
+            super::super::keys::EncodeError::ModifierNotAllowed {
+                key_label,
+                requested,
+            } => {
+                let detail =
+                    format_modifiers_label(requested).unwrap_or_else(|| "(none)".to_string());
+                return Ok(CallToolResult::error(vec![Content::text(format_error(
+                    "SSH_SHELL_SEND_KEY",
+                    "MODIFIER_NOT_ALLOWED",
+                    &format!("key '{key_label}' rejects the requested modifier combination"),
+                    Some(&format!("requested={detail}")),
+                ))]));
+            }
+        },
+    };
+
+    let lookup = SHELL_STORAGE
+        .get_direct(&shell_id)
+        .map(|shell| (shell.input_tx.clone(), Arc::clone(&shell.last_activity_ms)));
+    let (input_tx, last_activity_ms) = match lookup {
+        Some(pair) => pair,
+        None => {
+            return Ok(CallToolResult::error(vec![Content::text(format_error(
+                "SSH_SHELL_SEND_KEY",
+                "SHELL_NOT_FOUND",
+                "no active shell with the given ID",
+                Some(&shell_id),
+            ))]));
+        }
+    };
+
+    let payload_bytes = Bytes::copy_from_slice(&payload);
+    let chunk_len = payload_bytes.len();
+    for _ in 0..repeat {
+        if let Err(e) = input_tx
+            .send(WriteRequest::Data(payload_bytes.clone()))
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format_error(
+                "SSH_SHELL_SEND_KEY",
+                "WRITE_FAILED",
+                &format!("shell writer task closed: {e}"),
+                None,
+            ))]));
+        }
+    }
+
+    touch_activity(&last_activity_ms);
+
+    let total_bytes = chunk_len.saturating_mul(usize::from(repeat));
+    let modifiers_label = format_modifiers_label(mods);
+    Ok(CallToolResult::success(vec![Content::text(
+        render_shell_send_key_ok(
+            &shell_id,
+            key.label(),
+            modifiers_label.as_deref(),
+            repeat,
+            total_bytes,
+        ),
+    )]))
+}
+
+// ---------------------------------------------------------------------------
 // `ssh_shell_read`
 // ---------------------------------------------------------------------------
 
@@ -284,4 +432,155 @@ pub async fn ssh_shell_close_impl(args: SshShellCloseArgs) -> Result<CallToolRes
     Ok(CallToolResult::success(vec![Content::text(
         render_shell_close_ok(&shell_id),
     )]))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod format_modifiers_label {
+        use super::*;
+
+        #[test]
+        fn empty_returns_none() {
+            let mods = KeyModifiers::default();
+            assert_eq!(format_modifiers_label(mods), None);
+        }
+
+        #[test]
+        fn shift_only() {
+            let mods = KeyModifiers {
+                shift: true,
+                alt: false,
+                ctrl: false,
+            };
+            assert_eq!(format_modifiers_label(mods).as_deref(), Some("shift"));
+        }
+
+        #[test]
+        fn shift_and_ctrl_joined_with_plus() {
+            let mods = KeyModifiers {
+                shift: true,
+                alt: false,
+                ctrl: true,
+            };
+            assert_eq!(format_modifiers_label(mods).as_deref(), Some("shift+ctrl"));
+        }
+
+        #[test]
+        fn all_three_modifiers_in_canonical_order() {
+            let mods = KeyModifiers {
+                shift: true,
+                alt: true,
+                ctrl: true,
+            };
+            assert_eq!(
+                format_modifiers_label(mods).as_deref(),
+                Some("shift+alt+ctrl")
+            );
+        }
+
+        #[test]
+        fn alt_and_ctrl_joined() {
+            let mods = KeyModifiers {
+                shift: false,
+                alt: true,
+                ctrl: true,
+            };
+            assert_eq!(format_modifiers_label(mods).as_deref(), Some("alt+ctrl"));
+        }
+    }
+
+    mod send_key_impl_validation {
+        use super::*;
+
+        async fn assert_invalid_repeat(repeat: u8) {
+            let args = SshShellSendKeyArgs {
+                shell_id: "missing".to_string(),
+                key: ShellKey::CtrlC,
+                shift: None,
+                alt: None,
+                ctrl: None,
+                repeat: Some(repeat),
+            };
+            let result = ssh_shell_send_key_impl(args).await;
+            let call = match result {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok with error CallToolResult, got {e:?}"),
+            };
+            // CallToolResult on error embeds isError=true and the formatted text.
+            let body = format!("{call:?}");
+            assert!(
+                body.contains("INVALID_REPEAT"),
+                "expected INVALID_REPEAT, got {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rejects_repeat_zero() {
+            assert_invalid_repeat(0).await;
+        }
+
+        #[tokio::test]
+        async fn rejects_repeat_above_cap() {
+            assert_invalid_repeat(65).await;
+        }
+
+        #[tokio::test]
+        async fn rejects_modifier_on_ctrl_c() {
+            let args = SshShellSendKeyArgs {
+                shell_id: "missing".to_string(),
+                key: ShellKey::CtrlC,
+                shift: Some(true),
+                alt: None,
+                ctrl: None,
+                repeat: Some(1),
+            };
+            let result = ssh_shell_send_key_impl(args).await;
+            let call = match result {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok with error CallToolResult, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(
+                body.contains("MODIFIER_NOT_ALLOWED"),
+                "expected MODIFIER_NOT_ALLOWED, got {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_shell_returns_shell_not_found() {
+            let args = SshShellSendKeyArgs {
+                shell_id: "definitely-missing-shell-id".to_string(),
+                key: ShellKey::ArrowUp,
+                shift: None,
+                alt: None,
+                ctrl: None,
+                repeat: Some(1),
+            };
+            let result = ssh_shell_send_key_impl(args).await;
+            let call = match result {
+                Ok(c) => c,
+                Err(e) => panic!("expected Ok with error CallToolResult, got {e:?}"),
+            };
+            let body = format!("{call:?}");
+            assert!(
+                body.contains("SHELL_NOT_FOUND"),
+                "expected SHELL_NOT_FOUND, got {body}"
+            );
+        }
+    }
+
+    mod max_send_key_repeat {
+        use super::*;
+
+        #[test]
+        fn cap_is_64() {
+            assert_eq!(MAX_SEND_KEY_REPEAT, 64);
+        }
+    }
 }

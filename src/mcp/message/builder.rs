@@ -721,6 +721,34 @@ pub fn render_shell_close_ok(shell_id: &str) -> String {
     out
 }
 
+/// Block response for `ssh_shell_send_key: OK`.
+///
+/// `modifiers_label` is rendered verbatim (already formatted as
+/// `"shift+ctrl"` or similar). Pass `None` to omit the line entirely.
+#[must_use]
+pub fn render_shell_send_key_ok(
+    shell_id: &str,
+    key_label: &str,
+    modifiers_label: Option<&str>,
+    repeat: u8,
+    bytes_sent: usize,
+) -> String {
+    let mut out = String::with_capacity(128);
+    out.push_str("SSH_SHELL_SEND_KEY: OK\nSHELL_ID: ");
+    out.push_str(shell_id);
+    out.push_str("\nKEY: ");
+    out.push_str(key_label);
+    if let Some(label) = modifiers_label {
+        out.push_str("\nMODIFIERS: ");
+        out.push_str(label);
+    }
+    out.push_str("\nREPEAT: ");
+    out.push_str(&repeat.to_string());
+    out.push_str("\nBYTES_SENT: ");
+    out.push_str(&bytes_sent.to_string());
+    out
+}
+
 // ---------------------------------------------------------------------------
 // ssh_shell_read
 // ---------------------------------------------------------------------------
@@ -1453,6 +1481,25 @@ mod tests {
         fn close_inline() {
             let m = render_shell_close_ok("shell-1");
             assert_eq!(m, "SSH_SHELL_CLOSE: OK | SHELL_ID: shell-1");
+        }
+
+        #[test]
+        fn send_key_no_modifiers_omits_line() {
+            let m = render_shell_send_key_ok("shell-1", "ctrl_c", None, 1, 1);
+            assert!(m.starts_with("SSH_SHELL_SEND_KEY: OK\n"));
+            assert!(m.contains("SHELL_ID: shell-1"));
+            assert!(m.contains("KEY: ctrl_c"));
+            assert!(!m.contains("MODIFIERS"));
+            assert!(m.contains("REPEAT: 1"));
+            assert!(m.contains("BYTES_SENT: 1"));
+        }
+
+        #[test]
+        fn send_key_with_modifiers_includes_line() {
+            let m = render_shell_send_key_ok("shell-1", "arrow_up", Some("shift+ctrl"), 3, 18);
+            assert!(m.contains("MODIFIERS: shift+ctrl"));
+            assert!(m.contains("REPEAT: 3"));
+            assert!(m.contains("BYTES_SENT: 18"));
         }
     }
 
