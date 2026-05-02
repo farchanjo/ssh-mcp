@@ -43,6 +43,7 @@ use super::super::storage::traits::{
     CommandStorage, SessionRef, SessionStorage, ShellStorage, TransferStorage,
 };
 use super::super::storage::transfer::TRANSFER_STORAGE;
+use super::super::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use super::super::types::{HealthEvent, SessionInfo, SshCommandResponse};
 use super::ReusePolicy;
 use super::legacy_helpers::{
@@ -166,9 +167,12 @@ fn build_reuse_response(
     match result {
         Ok(response) if !response.timed_out && response.exit_code == 0 => {
             SESSION_STORAGE.update_health(sid, now, true);
-            let _ = session_ref
-                .health_tx
-                .send(HealthEvent::Healthy { at_ms: now_ms() });
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, sid);
+            let _ = session_ref.health_tx.send(HealthEvent::Healthy {
+                seq,
+                at_ms: now_ms(),
+            });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, sid);
             info!("Reusing healthy session {sid}");
             Some(
                 ConnectOkBuilder::new(sid, &session_ref.info.username, &session_ref.info.host)
@@ -214,9 +218,12 @@ async fn evaluate_identity_matches(host: &str, port: u16, username: &str) -> Ide
         let is_healthy = matches!(&health, Ok(r) if !r.timed_out && r.exit_code == 0);
         if is_healthy {
             SESSION_STORAGE.update_health(&sid, now, true);
-            let _ = session_ref
-                .health_tx
-                .send(HealthEvent::Healthy { at_ms: now_ms() });
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, &sid);
+            let _ = session_ref.health_tx.send(HealthEvent::Healthy {
+                seq,
+                at_ms: now_ms(),
+            });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, &sid);
             healthy.push(SessionMatch {
                 session_id: sid,
                 host: format!("{}@{}", session_ref.info.username, session_ref.info.host),
@@ -227,9 +234,12 @@ async fn evaluate_identity_matches(host: &str, port: u16, username: &str) -> Ide
             });
         } else {
             replaced += 1;
-            let _ = session_ref
-                .health_tx
-                .send(HealthEvent::Unhealthy { at_ms: now_ms() });
+            let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Session, &sid);
+            let _ = session_ref.health_tx.send(HealthEvent::Unhealthy {
+                seq,
+                at_ms: now_ms(),
+            });
+            SUBSCRIPTION_REGISTRY.poke(ResourceKind::Session, &sid);
             cancel_session_transfers(&sid);
             close_session_shells(&sid).await;
             cancel_session_commands(&sid);

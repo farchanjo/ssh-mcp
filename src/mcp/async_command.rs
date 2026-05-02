@@ -99,15 +99,34 @@ fn drain_head_if_over(buf: &mut Vec<u8>, max_size: usize) {
 /// Subscribers consume chunks in order; when they fall behind, the broadcast
 /// channel surfaces `RecvError::Lagged`. Recovery is to load a fresh
 /// snapshot from `RunningCommand::output_history` and continue subscribing.
+///
+/// Each chunk carries a `seq` allocated by
+/// [`crate::mcp::subscription::SubscriptionRegistry::next_seq`] so a
+/// subscriber that recovers from `Lagged` can detect gaps.
 #[derive(Debug, Clone)]
 pub enum OutputChunk {
     /// Stdout bytes appended since the previous frame.
-    Stdout(Bytes),
+    Stdout {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Bytes appended since the previous frame.
+        data: Bytes,
+    },
     /// Stderr bytes appended since the previous frame.
-    Stderr(Bytes),
+    Stderr {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Bytes appended since the previous frame.
+        data: Bytes,
+    },
     /// Terminal frame. `exit_code` is `None` when the command was cancelled,
     /// failed before producing an exit status, or timed out.
-    Closed(Option<i32>),
+    Closed {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Exit code (`None` when missing — see variant docs).
+        exit_code: Option<i32>,
+    },
 }
 
 /// State for a running async command.
@@ -398,11 +417,17 @@ mod tests {
             // Broadcast channel accepts subscribers.
             let mut sub = cmd.output_tx.subscribe();
             cmd.output_tx
-                .send(OutputChunk::Stdout(Bytes::from_static(b"hello")))
+                .send(OutputChunk::Stdout {
+                    seq: 1,
+                    data: Bytes::from_static(b"hello"),
+                })
                 .unwrap();
             match sub.recv().await {
-                Ok(OutputChunk::Stdout(bytes)) => assert_eq!(bytes.as_ref(), b"hello"),
-                Ok(OutputChunk::Stderr(_) | OutputChunk::Closed(_)) | Err(_) => {
+                Ok(OutputChunk::Stdout { seq, data }) => {
+                    assert_eq!(seq, 1);
+                    assert_eq!(data.as_ref(), b"hello");
+                }
+                Ok(OutputChunk::Stderr { .. } | OutputChunk::Closed { .. }) | Err(_) => {
                     panic!("expected stdout chunk");
                 }
             }
@@ -410,10 +435,16 @@ mod tests {
 
         #[tokio::test]
         async fn test_output_chunk_closed_carries_exit_code() {
-            let chunk = OutputChunk::Closed(Some(0));
+            let chunk = OutputChunk::Closed {
+                seq: 1,
+                exit_code: Some(0),
+            };
             match chunk {
-                OutputChunk::Closed(code) => assert_eq!(code, Some(0)),
-                OutputChunk::Stdout(_) | OutputChunk::Stderr(_) => panic!("wrong variant"),
+                OutputChunk::Closed { seq, exit_code } => {
+                    assert_eq!(seq, 1);
+                    assert_eq!(exit_code, Some(0));
+                }
+                OutputChunk::Stdout { .. } | OutputChunk::Stderr { .. } => panic!("wrong variant"),
             }
         }
 

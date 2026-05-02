@@ -429,21 +429,24 @@ mod tests {
 
             let mut sub = xfer.progress_tx.subscribe();
             let _ = xfer.progress_tx.send(ProgressEvent::Tick {
+                seq: 1,
                 bytes_transferred: 32,
                 total_bytes: 4096,
             });
             let event = sub.recv().await.unwrap();
             match event {
                 ProgressEvent::Tick {
+                    seq,
                     bytes_transferred,
                     total_bytes,
                 } => {
+                    assert_eq!(seq, 1);
                     assert_eq!(bytes_transferred, 32);
                     assert_eq!(total_bytes, 4096);
                 }
                 ProgressEvent::Completed { .. }
-                | ProgressEvent::Failed
-                | ProgressEvent::Cancelled => {
+                | ProgressEvent::Failed { .. }
+                | ProgressEvent::Cancelled { .. } => {
                     panic!("expected Tick variant");
                 }
             }
@@ -452,13 +455,20 @@ mod tests {
         #[tokio::test]
         async fn test_progress_event_completed_variant_carries_bytes() {
             let evt = ProgressEvent::Completed {
+                seq: 1,
                 bytes_transferred: 8192,
             };
             match evt {
-                ProgressEvent::Completed { bytes_transferred } => {
+                ProgressEvent::Completed {
+                    seq,
+                    bytes_transferred,
+                } => {
+                    assert_eq!(seq, 1);
                     assert_eq!(bytes_transferred, 8192);
                 }
-                ProgressEvent::Tick { .. } | ProgressEvent::Failed | ProgressEvent::Cancelled => {
+                ProgressEvent::Tick { .. }
+                | ProgressEvent::Failed { .. }
+                | ProgressEvent::Cancelled { .. } => {
                     panic!("wrong variant")
                 }
             }

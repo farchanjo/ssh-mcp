@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use super::session::SshClientHandler;
+use super::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use super::transfer::{CHUNK_SIZE, TransferStatus};
 use super::types::ProgressEvent;
 
@@ -34,6 +35,9 @@ use super::types::ProgressEvent;
 /// write-once `OnceCell` and adds the broadcast/notify primitives that
 /// power the future `transfer://<id>/progress` MCP resource.
 pub struct TransferShared {
+    /// Stable transfer identifier used by the subscription registry to
+    /// allocate sequence numbers and wake the debouncer.
+    pub transfer_id: String,
     /// Cumulative byte counter incremented after each successful chunk.
     pub bytes_transferred: Arc<AtomicU64>,
     /// Total bytes the transfer is attempting to move (may be 0 for streams
@@ -190,6 +194,7 @@ pub async fn sftp_upload_streaming(
         &handle,
         &local_path,
         &remote_path,
+        &shared.transfer_id,
         &shared.bytes_transferred,
         &shared.cancel_token,
         &shared.progress_tx,
@@ -229,7 +234,9 @@ fn finalize_cancelled(
         local_path.display()
     );
     let _ = shared.status_tx.send(TransferStatus::Cancelled);
-    let _ = shared.progress_tx.send(ProgressEvent::Cancelled);
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Transfer, &shared.transfer_id);
+    let _ = shared.progress_tx.send(ProgressEvent::Cancelled { seq });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Transfer, &shared.transfer_id);
     shared.data_notify.notify_waiters();
 }
 
@@ -246,9 +253,12 @@ fn finalize_completed(
         local_path.display()
     );
     let _ = shared.status_tx.send(TransferStatus::Completed);
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Transfer, &shared.transfer_id);
     let _ = shared.progress_tx.send(ProgressEvent::Completed {
+        seq,
         bytes_transferred: bytes,
     });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Transfer, &shared.transfer_id);
     shared.data_notify.notify_waiters();
 }
 
@@ -268,7 +278,9 @@ fn finalize_failed(
     // discard — there is no second writer in this code path.
     let _ = shared.error.set(err);
     let _ = shared.status_tx.send(TransferStatus::Failed);
-    let _ = shared.progress_tx.send(ProgressEvent::Failed);
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Transfer, &shared.transfer_id);
+    let _ = shared.progress_tx.send(ProgressEvent::Failed { seq });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Transfer, &shared.transfer_id);
     shared.data_notify.notify_waiters();
 }
 
@@ -281,6 +293,7 @@ async fn sftp_upload_inner(
     handle: &Arc<client::Handle<SshClientHandler>>,
     local_path: &Path,
     remote_path: &str,
+    transfer_id: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
     progress_tx: &broadcast::Sender<ProgressEvent>,
@@ -296,6 +309,7 @@ async fn sftp_upload_inner(
         &mut remote_file,
         local_path,
         remote_path,
+        transfer_id,
         bytes_transferred,
         cancel_token,
         progress_tx,
@@ -353,6 +367,7 @@ async fn upload_chunks(
     remote_file: &mut SftpFile,
     local_path: &Path,
     remote_path: &str,
+    transfer_id: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
     progress_tx: &broadcast::Sender<ProgressEvent>,
@@ -380,7 +395,13 @@ async fn upload_chunks(
 
         write_to_sftp_file(remote_file, &buf[..n], remote_path).await?;
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
-        emit_tick(progress_tx, data_notify, bytes_transferred, total_bytes);
+        emit_tick(
+            transfer_id,
+            progress_tx,
+            data_notify,
+            bytes_transferred,
+            total_bytes,
+        );
     }
 }
 
@@ -389,15 +410,19 @@ async fn upload_chunks(
 /// Send failures are intentionally swallowed: there may be no subscriber
 /// yet (steady state until E13 wires `transfer://<id>/progress`).
 fn emit_tick(
+    transfer_id: &str,
     progress_tx: &broadcast::Sender<ProgressEvent>,
     data_notify: &Notify,
     bytes_transferred: &AtomicU64,
     total_bytes: &AtomicU64,
 ) {
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Transfer, transfer_id);
     let _ = progress_tx.send(ProgressEvent::Tick {
+        seq,
         bytes_transferred: bytes_transferred.load(Ordering::Relaxed),
         total_bytes: total_bytes.load(Ordering::Relaxed),
     });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Transfer, transfer_id);
     data_notify.notify_waiters();
 }
 
@@ -430,6 +455,7 @@ pub async fn sftp_download_streaming(
         &handle,
         &remote_path,
         &local_path,
+        &shared.transfer_id,
         &shared.bytes_transferred,
         &shared.cancel_token,
         &shared.progress_tx,
@@ -450,6 +476,7 @@ async fn sftp_download_inner(
     handle: &Arc<client::Handle<SshClientHandler>>,
     remote_path: &str,
     local_path: &Path,
+    transfer_id: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
     progress_tx: &broadcast::Sender<ProgressEvent>,
@@ -465,6 +492,7 @@ async fn sftp_download_inner(
         &mut local_file,
         remote_path,
         local_path,
+        transfer_id,
         bytes_transferred,
         cancel_token,
         progress_tx,
@@ -519,6 +547,7 @@ async fn download_chunks(
     local_file: &mut File,
     remote_path: &str,
     local_path: &Path,
+    transfer_id: &str,
     bytes_transferred: &Arc<AtomicU64>,
     cancel_token: &CancellationToken,
     progress_tx: &broadcast::Sender<ProgressEvent>,
@@ -549,7 +578,13 @@ async fn download_chunks(
         })?;
 
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
-        emit_tick(progress_tx, data_notify, bytes_transferred, total_bytes);
+        emit_tick(
+            transfer_id,
+            progress_tx,
+            data_notify,
+            bytes_transferred,
+            total_bytes,
+        );
     }
 }
 
