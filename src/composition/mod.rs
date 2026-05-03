@@ -23,6 +23,7 @@
 
 pub mod fixtures;
 pub mod prod;
+pub mod status_sinks;
 
 use std::sync::Arc;
 

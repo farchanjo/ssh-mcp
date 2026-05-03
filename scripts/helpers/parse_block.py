@@ -149,6 +149,18 @@ def parse_block(text: str) -> dict:
         if k in blocks and k not in result:
             result[k] = blocks[k]
 
+    # Wire-key aliases. The v3 markdown shape uses short keys
+    # (`EXIT:`, `SESSIONS:`, `COMMANDS:`) for brevity; tests address them
+    # via their long-form domain names. Re-publish under both.
+    _ALIASES = (
+        ("exit", "exit_code"),
+        ("sessions", "sessions_disconnected"),
+        ("commands", "commands_cancelled"),
+    )
+    for short_key, long_key in _ALIASES:
+        if short_key in result and long_key not in result:
+            result[long_key] = result[short_key]
+
     return result
 
 

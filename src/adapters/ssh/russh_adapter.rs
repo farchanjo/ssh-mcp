@@ -71,6 +71,9 @@ use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::ssh::internal::shell::{
     ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms,
 };
+use crate::adapters::ssh::internal::status_sink::{
+    NoopCommandStatusSink, NoopShellStatusSink, SharedCommandStatusSink, SharedShellStatusSink,
+};
 use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
@@ -231,6 +234,17 @@ pub struct RusshAdapter {
     /// Populated on `connect` and drained on `disconnect` so SFTP tools
     /// see every session opened through this adapter.
     sftp_handle_registry: SshHandleRegistry,
+    /// Bridge that pumps live `RunningCommand` status transitions into
+    /// the domain `CommandRepository`. Defaults to a no-op when the
+    /// adapter is built without a composition root (tests, fixtures).
+    /// The composition root replaces it via
+    /// [`Self::with_command_status_sink`] so `ssh_get_command_output`
+    /// can observe terminal state.
+    command_status_sink: SharedCommandStatusSink,
+    /// Bridge that pumps explicit shell `Closed` notifications into the
+    /// domain `ShellRepository`. Defaults to a no-op for the same
+    /// reason as [`Self::command_status_sink`].
+    shell_status_sink: SharedShellStatusSink,
 }
 
 impl fmt::Debug for RusshAdapter {
@@ -241,6 +255,8 @@ impl fmt::Debug for RusshAdapter {
             .field("commands", &self.commands.len())
             .field("shells", &self.shells.len())
             .field("sftp_handle_registry", &self.sftp_handle_registry)
+            .field("command_status_sink", &"<dyn CommandStatusSink>")
+            .field("shell_status_sink", &"<dyn ShellStatusSink>")
             .finish()
     }
 }
@@ -258,6 +274,8 @@ impl RusshAdapter {
             commands: Arc::new(DashMap::new()),
             shells: Arc::new(DashMap::new()),
             sftp_handle_registry: SshHandleRegistry::new(),
+            command_status_sink: Arc::new(NoopCommandStatusSink),
+            shell_status_sink: Arc::new(NoopShellStatusSink),
         }
     }
 
@@ -275,6 +293,27 @@ impl RusshAdapter {
     #[must_use]
     pub fn with_sftp_registry(mut self, registry: SshHandleRegistry) -> Self {
         self.sftp_handle_registry = registry;
+        self
+    }
+
+    /// Wire a bridge that pumps live `RunningCommand` status transitions
+    /// into the domain `CommandRepository`. The composition root supplies
+    /// the production sink built on top of the shared
+    /// [`crate::adapters::repo::dashmap::command::DashMapCommandRepo`];
+    /// tests / fixtures keep the no-op default so `RunningCommand`
+    /// teardown is identical to the v4.1 baseline.
+    #[must_use]
+    pub fn with_command_status_sink(mut self, sink: SharedCommandStatusSink) -> Self {
+        self.command_status_sink = sink;
+        self
+    }
+
+    /// Wire a bridge that pumps explicit shell `Closed` notifications
+    /// into the domain `ShellRepository`. Mirrors
+    /// [`Self::with_command_status_sink`].
+    #[must_use]
+    pub fn with_shell_status_sink(mut self, sink: SharedShellStatusSink) -> Self {
+        self.shell_status_sink = sink;
         self
     }
 
@@ -448,6 +487,80 @@ impl RusshAdapter {
         }
     }
 
+    /// Spawn the watcher task that pumps the live `RunningCommand`
+    /// terminal status into the domain `CommandRepository` via the
+    /// configured [`SharedCommandStatusSink`]. The task subscribes to
+    /// `RunningCommand.status_rx`, waits for the first terminal value,
+    /// reads `exit_code` / `error` snapshots from the same struct (the
+    /// driver guarantees those `OnceCell`s are set **before** the watch
+    /// transitions), and dispatches the right `mark_*` call. The sink
+    /// itself is allowed to be a no-op (default for tests) so this
+    /// spawn is harmless when no repo bridge is wired.
+    fn spawn_status_watcher(
+        sink: SharedCommandStatusSink,
+        command_id: CommandId,
+        running: Arc<RunningCommand>,
+    ) {
+        tokio::spawn(async move {
+            let mut rx = running.status_rx.clone();
+            // The driver sends terminal frames after wiring the OnceCells,
+            // so we just wait for the first non-Running value.
+            loop {
+                let current = *rx.borrow_and_update();
+                if matches!(
+                    current,
+                    AsyncCommandStatus::Completed
+                        | AsyncCommandStatus::Failed
+                        | AsyncCommandStatus::Cancelled
+                ) {
+                    Self::dispatch_status_terminal(&sink, &command_id, &running, current).await;
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    debug!(
+                        command_id = %command_id,
+                        "command status watcher: channel closed before terminal frame"
+                    );
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Translate an `AsyncCommandStatus` terminal value into the
+    /// matching sink call. Pulled out so the watcher loop stays narrow
+    /// and the mapping is easy to audit. Match is exhaustive — `Running`
+    /// is unreachable because the caller filters it out, but we still
+    /// emit a `debug!` instead of `panic!` so a future status variant
+    /// surfaces a log line rather than tearing the runtime down.
+    async fn dispatch_status_terminal(
+        sink: &SharedCommandStatusSink,
+        command_id: &CommandId,
+        running: &Arc<RunningCommand>,
+        status: AsyncCommandStatus,
+    ) {
+        match status {
+            AsyncCommandStatus::Completed => {
+                let exit_code = running.exit_code.get().copied().unwrap_or(0_i32);
+                let timed_out = running.timed_out.load(Ordering::SeqCst);
+                sink.mark_completed(command_id, exit_code, timed_out).await;
+            }
+            AsyncCommandStatus::Failed => {
+                let error = running.error.get().cloned();
+                sink.mark_failed(command_id, error).await;
+            }
+            AsyncCommandStatus::Cancelled => {
+                sink.mark_cancelled(command_id).await;
+            }
+            AsyncCommandStatus::Running => {
+                debug!(
+                    command_id = %command_id,
+                    "command status watcher: unexpected Running terminal value (no-op)"
+                );
+            }
+        }
+    }
+
     /// Internal: register a freshly spawned async command, cancelling
     /// the spawned task on a race.
     fn register_async_command(
@@ -597,6 +710,10 @@ impl SshClientPort for RusshAdapter {
         // unblock the select arm if the queue was already drained.
         let _ = input_tx.send(WriteRequest::Close).await;
         cancel_token.cancel();
+        // Pump the explicit `Closed` notification into the domain repo
+        // so `read_shell` long-polls observe the terminal state without
+        // having to wait for a downstream entity-removal path.
+        self.shell_status_sink.mark_closed(shell_id).await;
         Ok(())
     }
 
@@ -728,15 +845,13 @@ impl RusshAdapter {
             None => self.lookup_default_timeout(&session_id)?,
         };
         let started_at = Utc::now();
-        let info = AsyncCommandInfo {
-            command_id: command_id.as_str().to_string(),
-            session_id: session_id.as_str().to_string(),
-            command: command.clone(),
-            status: AsyncCommandStatus::Running,
-            started_at: started_at.to_rfc3339(),
-        };
-        let running = Arc::new(RunningCommand::new(info));
-        Self::spawn_async_driver(handle, command.clone(), timeout, Arc::clone(&running), pty);
+        let running = Arc::new(RunningCommand::new(build_async_command_info(
+            &command_id,
+            &session_id,
+            command.as_str(),
+            started_at,
+        )));
+        self.spawn_async_with_pump(&command_id, &command, handle, timeout, &running, pty);
         let record = CommandRecord {
             session_id: session_id.clone(),
             running,
@@ -744,6 +859,26 @@ impl RusshAdapter {
         self.register_async_command(&command_id, record)?;
         let entity = CommandEntity::new(command_id, session_id, command, started_at);
         Ok(CommandHandle { entity })
+    }
+
+    /// Spawn both the russh driver and the status watcher for a freshly
+    /// minted async command. Pulled out of [`Self::do_execute_async`] so
+    /// the parent body stays under the `too-many-lines` threshold.
+    fn spawn_async_with_pump(
+        &self,
+        command_id: &CommandId,
+        command: &str,
+        handle: SshHandle,
+        timeout: Duration,
+        running: &Arc<RunningCommand>,
+        pty: bool,
+    ) {
+        Self::spawn_async_driver(handle, command.to_string(), timeout, Arc::clone(running), pty);
+        Self::spawn_status_watcher(
+            Arc::clone(&self.command_status_sink),
+            command_id.clone(),
+            Arc::clone(running),
+        );
     }
 
     /// Body of [`SshClientPort::open_shell`] kept on a private method
@@ -850,8 +985,12 @@ const SHELL_INPUT_CHANNEL_CAP: usize = 64;
 const SHELL_READER_LOCAL_CAP: usize = 4096;
 
 /// Local-buffer high-water mark that triggers an early flush into
-/// [`RunningShell::history`]. Mirrors v3's `SHELL_FLUSH_THRESHOLD`.
-const SHELL_FLUSH_THRESHOLD: usize = 4096;
+/// [`RunningShell::history`]. Set to `1` so every inbound PTY frame is
+/// republished immediately — interactive shell consumers (`ssh_shell_read`
+/// long-poll, `ssh_shell_wait_for`, `shell://` resource subscribers) need
+/// per-frame visibility, not the v3 4 KiB batch (which assumed the
+/// inbound `notify` waker flushed periodically). v4.2 fix.
+const SHELL_FLUSH_THRESHOLD: usize = 1;
 
 /// Spawn the dedicated writer task that owns the russh write half
 /// exclusively. Drains [`WriteRequest`] frames from `input_rx` until
@@ -1014,6 +1153,24 @@ fn flush_shell_buffer(
     });
     let _ = output_tx.send(chunk);
     data_notify.notify_waiters();
+}
+
+/// Build an [`AsyncCommandInfo`] payload for the lock-free async-command
+/// record. Pulled out so [`RusshAdapter::do_execute_async`] stays under
+/// the project's `too-many-lines` threshold.
+fn build_async_command_info(
+    command_id: &CommandId,
+    session_id: &SessionId,
+    command: &str,
+    started_at: DateTime<Utc>,
+) -> AsyncCommandInfo {
+    AsyncCommandInfo {
+        command_id: command_id.as_str().to_string(),
+        session_id: session_id.as_str().to_string(),
+        command: command.to_string(),
+        status: AsyncCommandStatus::Running,
+        started_at: started_at.to_rfc3339(),
+    }
 }
 
 /// Build a [`ShellInfo`] payload for the lock-free shell record.
