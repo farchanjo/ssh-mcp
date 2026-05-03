@@ -521,8 +521,14 @@ pub async fn run_http() -> Result<(), RuntimeError> {
     // exists but the SSH/SFTP runtime adapters still poke the legacy
     // global directly, so the spawn stays here until the runtime
     // migration completes.
+    //
+    // TODO(v4.5): the HTTP entry point creates one `McpSshServer` (and
+    // therefore one `PeerTable`) per session via the rmcp factory, so
+    // the GC pump does not own a single table to prune. The stale
+    // entries are reclaimed naturally when the session-scoped server
+    // drops; we still pass `None` here so the GC pump compiles uniformly.
     let gc_interval = resolve_peer_gc_interval_s();
-    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone());
+    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), None);
     info!("peer GC task spawned (interval = {gc_interval}s)");
 
     axum::serve(listener, app)
@@ -546,11 +552,16 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
     tracing::info!("starting ssh-mcp stdio transport (v4 hexagonal)");
 
     let gc_cancel = CancellationToken::new();
+    // Stdio runs a single `McpSshServer` for the whole process — share
+    // its `PeerTable` with the GC pump so closed peers in the v4 side
+    // table are pruned alongside the legacy registry.
+    let server = build_server();
+    let peer_table = Arc::clone(server.peer_table());
     let gc_interval = resolve_peer_gc_interval_s();
-    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone());
+    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), Some(peer_table));
     tracing::info!("peer GC task spawned (interval = {gc_interval}s)");
 
-    let service = build_server().serve(stdio()).await?;
+    let service = server.serve(stdio()).await?;
     let waiting_result = service.waiting().await;
 
     gc_cancel.cancel();

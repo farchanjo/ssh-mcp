@@ -47,6 +47,7 @@ use tracing::debug;
 use crate::adapters::config::internal::{
     resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
+use crate::adapters::notifier::rmcp_peer::PeerTable;
 
 /// Resource scheme handled by the subscription registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -456,13 +457,22 @@ async fn broadcast_resource_updated(uri: &str) {
     }
 }
 
-/// Spawn a background task that periodically drops peers whose rmcp
-/// transport has closed. rmcp 1.6 does not raise a callback on peer
-/// disconnect, so the binary entry points poll instead. The task exits
-/// cleanly when `cancel` is triggered.
+/// Spawn the periodic peer-GC pump.
+///
+/// rmcp 1.6 does not raise a callback on peer disconnect, so the binary
+/// entry points poll instead. The task exits cleanly when `cancel` is
+/// triggered.
+///
+/// `peer_table` is the v4 [`PeerTable`] shared between the rmcp resource
+/// handlers and the
+/// [`crate::adapters::notifier::rmcp_adapter::RmcpNotifier`]. When
+/// supplied the GC pass also prunes its closed peers so the v4 side
+/// table stays in sync with the legacy [`SUBSCRIPTION_REGISTRY`] ahead
+/// of the runtime migration.
 pub fn spawn_peer_gc(
     interval_secs: u64,
     cancel: tokio_util::sync::CancellationToken,
+    peer_table: Option<Arc<PeerTable>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -478,8 +488,13 @@ pub fn spawn_peer_gc(
                 }
                 _ = ticker.tick() => {
                     let dropped = SUBSCRIPTION_REGISTRY.gc_closed_peers();
-                    if dropped > 0 {
-                        debug!("peer GC: dropped {dropped} closed peers");
+                    let table_dropped = peer_table
+                        .as_deref()
+                        .map_or(0, PeerTable::gc_closed_peers);
+                    if dropped > 0 || table_dropped > 0 {
+                        debug!(
+                            "peer GC: dropped {dropped} legacy peers, {table_dropped} v4 peers"
+                        );
                     }
                 }
             }
