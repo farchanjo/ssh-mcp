@@ -501,7 +501,10 @@ mod tests {
             FakeSshCall::Connect { .. }
             | FakeSshCall::Disconnect { .. }
             | FakeSshCall::Execute { .. }
-            | FakeSshCall::HealthCheck { .. } => None,
+            | FakeSshCall::HealthCheck { .. }
+            | FakeSshCall::OpenShell { .. }
+            | FakeSshCall::WriteShell { .. }
+            | FakeSshCall::CloseShell { .. } => None,
         });
         let (pty, cmd_id, sess_id) = executed.expect("execute_async must be recorded");
         assert!(pty, "pty flag must propagate from request to ssh port");
@@ -524,7 +527,10 @@ mod tests {
             FakeSshCall::Connect { .. }
             | FakeSshCall::Disconnect { .. }
             | FakeSshCall::Execute { .. }
-            | FakeSshCall::HealthCheck { .. } => None,
+            | FakeSshCall::HealthCheck { .. }
+            | FakeSshCall::OpenShell { .. }
+            | FakeSshCall::WriteShell { .. }
+            | FakeSshCall::CloseShell { .. } => None,
         });
         assert_eq!(timeout, Some(Some(Duration::from_secs(7))));
     }
@@ -547,7 +553,10 @@ mod tests {
             FakeSshCall::Connect { .. }
             | FakeSshCall::Disconnect { .. }
             | FakeSshCall::Execute { .. }
-            | FakeSshCall::HealthCheck { .. } => None,
+            | FakeSshCall::HealthCheck { .. }
+            | FakeSshCall::OpenShell { .. }
+            | FakeSshCall::WriteShell { .. }
+            | FakeSshCall::CloseShell { .. } => None,
         });
         assert_eq!(timeout, Some(Some(Duration::from_secs(45))));
     }
@@ -659,7 +668,10 @@ mod tests {
             FakeSshCall::Connect { .. }
             | FakeSshCall::Disconnect { .. }
             | FakeSshCall::Execute { .. }
-            | FakeSshCall::HealthCheck { .. } => false,
+            | FakeSshCall::HealthCheck { .. }
+            | FakeSshCall::OpenShell { .. }
+            | FakeSshCall::WriteShell { .. }
+            | FakeSshCall::CloseShell { .. } => false,
         });
         assert!(
             session_match,

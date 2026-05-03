@@ -1,9 +1,9 @@
 //! Test-only [`SshClientPort`] adapter with scripted, deterministic outcomes.
 //!
 //! [`FakeSshClient`] records every call (`connect`, `execute`, `disconnect`,
-//! `health_check`) into a shared log so tests can assert the orchestration
-//! issued exactly the operations expected. Outcomes are scripted per call
-//! kind via two queues:
+//! `health_check`, `open_shell`, `write_shell`, `close_shell`) into a shared
+//! log so tests can assert the orchestration issued exactly the operations
+//! expected. Outcomes are scripted per call kind via FIFO queues:
 //!
 //! - **Connect outcomes**: pushed via [`FakeSshClient::queue_connect_ok`] /
 //!   [`FakeSshClient::queue_connect_error`] in FIFO order. Each `connect`
@@ -19,9 +19,23 @@
 //!   [`FakeSshClient::queue_execute_async_error`] in FIFO order. Each
 //!   `execute_async` call pops the head; an empty queue defaults to a
 //!   success that mints a [`CommandHandle`] from the supplied request.
+//! - **`open_shell` outcomes**: pushed via
+//!   [`FakeSshClient::queue_open_shell_ok`] /
+//!   [`FakeSshClient::queue_open_shell_error`] in FIFO order. Each
+//!   `open_shell` call pops the head; an empty queue defaults to a success
+//!   that mints a [`ShellEntity`] from the supplied terminal description.
+//! - **`write_shell` outcomes**: pushed via
+//!   [`FakeSshClient::queue_write_shell_ok`] /
+//!   [`FakeSshClient::queue_write_shell_error`] in FIFO order. Each
+//!   `write_shell` call pops the head; an empty queue defaults to success
+//!   reporting `bytes.len()` written.
+//! - **`close_shell` outcomes**: pushed via
+//!   [`FakeSshClient::queue_close_shell_ok`] /
+//!   [`FakeSshClient::queue_close_shell_error`] in FIFO order. Each
+//!   `close_shell` call pops the head; an empty queue defaults to success.
 //!
-//! Other port methods (`execute`, `cancel`, `open_shell`) are not exercised
-//! by the H10/H12a use cases but the trait surface is satisfied with benign
+//! The remaining port methods (`execute`, `cancel`) are not exercised by the
+//! current crop of use cases but the trait surface is satisfied with benign
 //! defaults so accidental usage in tests surfaces immediately rather than
 //! silently passing.
 //!
@@ -38,10 +52,19 @@ use chrono::Utc;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
-use crate::domain::ids::{CommandId, SessionId};
+use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
 use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
+
+/// Default rolling buffer size handed back by [`FakeSshClient::open_shell`]
+/// when a test does not customise it. Mirrors the production default in
+/// `russh_adapter::DEFAULT_SHELL_BUFFER_SIZE` so tests stay representative.
+const FAKE_SHELL_DEFAULT_BUFFER_BYTES: u64 = 10_u64.saturating_mul(1024).saturating_mul(1024);
+
+/// Default inactivity TTL handed back by [`FakeSshClient::open_shell`].
+/// Mirrors the production default of 300 seconds (`SSH_INACTIVITY_TIMEOUT`).
+const FAKE_SHELL_DEFAULT_INACTIVITY_TTL: Duration = Duration::from_secs(300);
 
 /// Single recorded interaction for assertion purposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +112,38 @@ pub enum FakeSshCall {
         /// Probed session.
         session_id: SessionId,
     },
+    /// `open_shell(session_id, terminal)` was invoked. The H13 shell
+    /// open use case hands the terminal description through unchanged
+    /// so the call log captures the negotiated `TERM` value and the
+    /// initial PTY geometry alongside the owning session.
+    OpenShell {
+        /// Session that owns the spawned shell.
+        session_id: SessionId,
+        /// Negotiated `TERM` value.
+        term: String,
+        /// Initial PTY width in columns.
+        cols: u32,
+        /// Initial PTY height in rows.
+        rows: u32,
+    },
+    /// `write_shell(shell_id, bytes)` was invoked. The H13 shell write
+    /// and key-press use cases route every input frame through the same
+    /// trait method so the call log captures the target shell together
+    /// with the verbatim bytes — tests can therefore assert both the
+    /// payload and its byte count without owning a copy of the buffer.
+    WriteShell {
+        /// Target shell.
+        shell_id: ShellId,
+        /// Verbatim bytes handed to the port.
+        bytes: Bytes,
+    },
+    /// `close_shell(shell_id)` was invoked. The H13 shell close use case
+    /// fires this method exactly once per shell teardown so the call log
+    /// captures the target id without any extra payload.
+    CloseShell {
+        /// Shell that was torn down.
+        shell_id: ShellId,
+    },
 }
 
 /// Scripted outcome for a `connect` call.
@@ -129,6 +184,39 @@ enum ExecuteAsyncOutcome {
     Err(DomainError),
 }
 
+/// Scripted outcome for an `open_shell` call. The fake mints the
+/// returned [`ShellEntity`] from the queued shell id together with the
+/// session id and terminal description supplied by the caller, so tests
+/// only need to seed the queue with the id (or an explicit error).
+#[derive(Debug, Clone)]
+enum OpenShellOutcome {
+    /// `open_shell` succeeds and binds the supplied [`ShellId`].
+    Ok { shell_id: ShellId },
+    /// `open_shell` fails with the supplied domain error.
+    Err(DomainError),
+}
+
+/// Scripted outcome for a `write_shell` call. The success variant mirrors
+/// the contract of [`crate::ports::ssh_client::SshClientPort::write_shell`]
+/// — the port returns the number of bytes the writer accepted, which is
+/// exactly `bytes.len()` for the production adapter.
+#[derive(Debug, Clone)]
+enum WriteShellOutcome {
+    /// `write_shell` succeeds and reports `bytes.len()` written.
+    Ok,
+    /// `write_shell` fails with the supplied domain error.
+    Err(DomainError),
+}
+
+/// Scripted outcome for a `close_shell` call.
+#[derive(Debug, Clone)]
+enum CloseShellOutcome {
+    /// `close_shell` succeeds.
+    Ok,
+    /// `close_shell` fails with the supplied domain error.
+    Err(DomainError),
+}
+
 /// Test [`SshClientPort`] adapter. Cloneable; clones share the same
 /// scripted state and the same call log via [`Arc`].
 #[derive(Debug, Clone, Default)]
@@ -148,6 +236,19 @@ struct FakeSshClientInner {
     /// defaults to success so tests that only care about call recording do
     /// not need to seed the queue first.
     execute_async_queue: Mutex<Vec<ExecuteAsyncOutcome>>,
+    /// Scripted `open_shell` outcomes, popped FIFO. An empty queue
+    /// defaults to a success that mints a deterministic shell id of the
+    /// shape `<session>-shell-<n>` (n = `shell_open_counter` + 1).
+    open_shell_queue: Mutex<Vec<OpenShellOutcome>>,
+    /// Scripted `write_shell` outcomes, popped FIFO.
+    write_shell_queue: Mutex<Vec<WriteShellOutcome>>,
+    /// Scripted `close_shell` outcomes, popped FIFO.
+    close_shell_queue: Mutex<Vec<CloseShellOutcome>>,
+    /// Monotonic counter used to mint default shell ids when the
+    /// `open_shell_queue` is empty. Starts at zero and increments after
+    /// each defaulted call so the issued ids stay unique within a single
+    /// test process.
+    shell_open_counter: Mutex<u64>,
     /// Append-only log of every recorded call.
     calls: Mutex<Vec<FakeSshCall>>,
 }
@@ -206,6 +307,42 @@ impl FakeSshClient {
             &self.inner.execute_async_queue,
             ExecuteAsyncOutcome::Err(error),
         );
+    }
+
+    /// Queue a successful `open_shell` outcome that binds the supplied
+    /// [`ShellId`]. The fake mints the returned [`ShellEntity`] from the
+    /// session id and terminal description handed to the trait method,
+    /// so callers script behaviour purely through the queue.
+    pub fn queue_open_shell_ok(&self, shell_id: ShellId) {
+        Self::push(
+            &self.inner.open_shell_queue,
+            OpenShellOutcome::Ok { shell_id },
+        );
+    }
+
+    /// Queue a failed `open_shell` outcome with the supplied domain error.
+    pub fn queue_open_shell_error(&self, error: DomainError) {
+        Self::push(&self.inner.open_shell_queue, OpenShellOutcome::Err(error));
+    }
+
+    /// Queue a successful `write_shell` outcome.
+    pub fn queue_write_shell_ok(&self) {
+        Self::push(&self.inner.write_shell_queue, WriteShellOutcome::Ok);
+    }
+
+    /// Queue a failed `write_shell` outcome with the supplied domain error.
+    pub fn queue_write_shell_error(&self, error: DomainError) {
+        Self::push(&self.inner.write_shell_queue, WriteShellOutcome::Err(error));
+    }
+
+    /// Queue a successful `close_shell` outcome.
+    pub fn queue_close_shell_ok(&self) {
+        Self::push(&self.inner.close_shell_queue, CloseShellOutcome::Ok);
+    }
+
+    /// Queue a failed `close_shell` outcome with the supplied domain error.
+    pub fn queue_close_shell_error(&self, error: DomainError) {
+        Self::push(&self.inner.close_shell_queue, CloseShellOutcome::Err(error));
     }
 
     /// Snapshot of every recorded call in invocation order.
@@ -288,6 +425,68 @@ impl FakeSshClient {
                 }
             },
         )
+    }
+
+    fn pop_open_shell_outcome(&self, session_id: &SessionId) -> OpenShellOutcome {
+        self.inner.open_shell_queue.lock().map_or_else(
+            |_| OpenShellOutcome::Ok {
+                shell_id: self.mint_default_shell_id(session_id),
+            },
+            |mut guard| {
+                if guard.is_empty() {
+                    OpenShellOutcome::Ok {
+                        shell_id: self.mint_default_shell_id(session_id),
+                    }
+                } else {
+                    guard.remove(0)
+                }
+            },
+        )
+    }
+
+    fn pop_write_shell_outcome(&self) -> WriteShellOutcome {
+        self.inner.write_shell_queue.lock().map_or_else(
+            |_| WriteShellOutcome::Ok,
+            |mut guard| {
+                if guard.is_empty() {
+                    WriteShellOutcome::Ok
+                } else {
+                    guard.remove(0)
+                }
+            },
+        )
+    }
+
+    fn pop_close_shell_outcome(&self) -> CloseShellOutcome {
+        self.inner.close_shell_queue.lock().map_or_else(
+            |_| CloseShellOutcome::Ok,
+            |mut guard| {
+                if guard.is_empty() {
+                    CloseShellOutcome::Ok
+                } else {
+                    guard.remove(0)
+                }
+            },
+        )
+    }
+
+    /// Mint a default shell id for an `open_shell` call that is not
+    /// pre-scripted. Mirrors the production shape `<session>-shell-<n>`
+    /// used by [`crate::adapters::ssh::russh_adapter::RusshAdapter`] so
+    /// tests reading back the id observe the same convention.
+    fn mint_default_shell_id(&self, session_id: &SessionId) -> ShellId {
+        let next = self.inner.shell_open_counter.lock().map_or_else(
+            |poison| {
+                let mut guard = poison.into_inner();
+                *guard = guard.saturating_add(1);
+                *guard
+            },
+            |mut guard| {
+                *guard = guard.saturating_add(1);
+                *guard
+            },
+        );
+        ShellId::new(format!("{}-shell-{next}", session_id.as_str()))
     }
 }
 
@@ -381,9 +580,47 @@ impl SshClientPort for FakeSshClient {
     async fn open_shell(
         &self,
         session_id: &SessionId,
-        _terminal: ShellTerminal,
+        terminal: ShellTerminal,
     ) -> Result<ShellEntity, DomainError> {
-        Err(DomainError::SessionNotFound(session_id.clone()))
+        self.record(FakeSshCall::OpenShell {
+            session_id: session_id.clone(),
+            term: terminal.term_type.clone(),
+            cols: terminal.cols,
+            rows: terminal.rows,
+        });
+        match self.pop_open_shell_outcome(session_id) {
+            OpenShellOutcome::Ok { shell_id } => Ok(ShellEntity::new(
+                shell_id,
+                session_id.clone(),
+                terminal,
+                Utc::now(),
+                FAKE_SHELL_DEFAULT_INACTIVITY_TTL,
+                FAKE_SHELL_DEFAULT_BUFFER_BYTES,
+            )),
+            OpenShellOutcome::Err(err) => Err(err),
+        }
+    }
+
+    async fn write_shell(&self, shell_id: &ShellId, bytes: Bytes) -> Result<usize, DomainError> {
+        let len = bytes.len();
+        self.record(FakeSshCall::WriteShell {
+            shell_id: shell_id.clone(),
+            bytes,
+        });
+        match self.pop_write_shell_outcome() {
+            WriteShellOutcome::Ok => Ok(len),
+            WriteShellOutcome::Err(err) => Err(err),
+        }
+    }
+
+    async fn close_shell(&self, shell_id: &ShellId) -> Result<(), DomainError> {
+        self.record(FakeSshCall::CloseShell {
+            shell_id: shell_id.clone(),
+        });
+        match self.pop_close_shell_outcome() {
+            CloseShellOutcome::Ok => Ok(()),
+            CloseShellOutcome::Err(err) => Err(err),
+        }
     }
 
     async fn health_check(&self, session_id: &SessionId) -> Result<(), DomainError> {
@@ -402,8 +639,10 @@ mod tests {
     use super::{FakeSshCall, FakeSshClient};
     use crate::domain::error::DomainError;
     use crate::domain::identity::{Address, Credentials};
-    use crate::domain::ids::SessionId;
+    use crate::domain::ids::{SessionId, ShellId};
+    use crate::domain::shell::{ShellStatus, ShellTerminal};
     use crate::ports::ssh_client::SshClientPort;
+    use bytes::Bytes;
     use std::time::Duration;
 
     fn sample_creds() -> Credentials {
@@ -469,5 +708,130 @@ mod tests {
         assert!(matches!(log[0], FakeSshCall::Connect { .. }));
         assert!(matches!(log[1], FakeSshCall::HealthCheck { .. }));
         assert!(matches!(log[2], FakeSshCall::Disconnect { .. }));
+    }
+
+    fn sample_terminal() -> ShellTerminal {
+        ShellTerminal::new("xterm-256color".to_string(), 80, 24)
+    }
+
+    #[tokio::test]
+    async fn default_open_shell_mints_session_scoped_id_and_records_terminal() {
+        let client = FakeSshClient::new();
+        let sid = SessionId::new("sess-shell".to_string());
+        let entity = client
+            .open_shell(&sid, sample_terminal())
+            .await
+            .expect("open_shell ok");
+        assert_eq!(entity.session_id, sid);
+        assert_eq!(entity.terminal.term_type, "xterm-256color");
+        assert_eq!(entity.terminal.cols, 80);
+        assert_eq!(entity.terminal.rows, 24);
+        assert_eq!(entity.status, ShellStatus::Open);
+        assert!(entity.id.as_str().starts_with("sess-shell-shell-"));
+        let log = client.calls();
+        assert_eq!(log.len(), 1);
+        let recorded = match &log[0] {
+            FakeSshCall::OpenShell {
+                session_id,
+                term,
+                cols,
+                rows,
+            } => (session_id.clone(), term.clone(), *cols, *rows),
+            other => panic!("expected OpenShell, got {other:?}"),
+        };
+        assert_eq!(recorded.0, sid);
+        assert_eq!(recorded.1, "xterm-256color");
+        assert_eq!(recorded.2, 80);
+        assert_eq!(recorded.3, 24);
+    }
+
+    #[tokio::test]
+    async fn queued_open_shell_ok_binds_supplied_shell_id() {
+        let client = FakeSshClient::new();
+        let sid = SessionId::new("s-1".to_string());
+        client.queue_open_shell_ok(ShellId::new("custom-shell".to_string()));
+        let entity = client
+            .open_shell(&sid, sample_terminal())
+            .await
+            .expect("open_shell ok");
+        assert_eq!(entity.id.as_str(), "custom-shell");
+    }
+
+    #[tokio::test]
+    async fn queued_open_shell_error_propagates() {
+        let client = FakeSshClient::new();
+        let sid = SessionId::new("s-1".to_string());
+        client.queue_open_shell_error(DomainError::MaxShellsExceeded { limit: 4 });
+        let err = client
+            .open_shell(&sid, sample_terminal())
+            .await
+            .expect_err("queued error must propagate");
+        match err {
+            DomainError::MaxShellsExceeded { limit } => assert_eq!(limit, 4),
+            other => panic!("expected MaxShellsExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_write_shell_returns_byte_count_and_records_payload() {
+        let client = FakeSshClient::new();
+        let shell_id = ShellId::new("sh-1".to_string());
+        let payload = Bytes::from_static(b"ls -la\n");
+        let written = client
+            .write_shell(&shell_id, payload.clone())
+            .await
+            .expect("write_shell ok");
+        assert_eq!(written, payload.len());
+        let log = client.calls();
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            FakeSshCall::WriteShell {
+                shell_id: recorded_id,
+                bytes,
+            } => {
+                assert_eq!(recorded_id, &shell_id);
+                assert_eq!(bytes.as_ref(), b"ls -la\n");
+            }
+            other => panic!("expected WriteShell, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_write_shell_error_propagates() {
+        let client = FakeSshClient::new();
+        let shell_id = ShellId::new("sh-1".to_string());
+        client.queue_write_shell_error(DomainError::ShellNotFound(shell_id.clone()));
+        let err = client
+            .write_shell(&shell_id, Bytes::from_static(b"x"))
+            .await
+            .expect_err("queued error must propagate");
+        assert_eq!(err, DomainError::ShellNotFound(shell_id));
+    }
+
+    #[tokio::test]
+    async fn default_close_shell_succeeds_and_records_call() {
+        let client = FakeSshClient::new();
+        let shell_id = ShellId::new("sh-1".to_string());
+        client.close_shell(&shell_id).await.expect("close_shell ok");
+        let log = client.calls();
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            FakeSshCall::CloseShell {
+                shell_id: recorded_id,
+            } => assert_eq!(recorded_id, &shell_id),
+            other => panic!("expected CloseShell, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_close_shell_error_propagates() {
+        let client = FakeSshClient::new();
+        let shell_id = ShellId::new("sh-1".to_string());
+        client.queue_close_shell_error(DomainError::ShellNotFound(shell_id.clone()));
+        let err = client
+            .close_shell(&shell_id)
+            .await
+            .expect_err("queued error must propagate");
+        assert_eq!(err, DomainError::ShellNotFound(shell_id));
     }
 }

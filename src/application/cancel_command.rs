@@ -375,6 +375,25 @@ mod tests {
             ))
         }
 
+        async fn write_shell(
+            &self,
+            _shell_id: &crate::domain::ids::ShellId,
+            _bytes: bytes::Bytes,
+        ) -> Result<usize, DomainError> {
+            Err(DomainError::Internal(
+                "CancellingSsh::write_shell unused".to_string(),
+            ))
+        }
+
+        async fn close_shell(
+            &self,
+            _shell_id: &crate::domain::ids::ShellId,
+        ) -> Result<(), DomainError> {
+            Err(DomainError::Internal(
+                "CancellingSsh::close_shell unused".to_string(),
+            ))
+        }
+
         async fn health_check(&self, _session_id: &SessionId) -> Result<(), DomainError> {
             Err(DomainError::Internal(
                 "CancellingSsh::health_check unused".to_string(),
