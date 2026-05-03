@@ -46,7 +46,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -63,6 +63,9 @@ use crate::adapters::sftp::internal::sftp::{
 use crate::adapters::sftp::internal::transfer::TransferStatus as McpStatus;
 use crate::adapters::sftp::internal::types::ProgressEvent;
 use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::adapters::ssh::internal::status_sink::{
+    NoopTransferStatusSink, SharedTransferStatusSink,
+};
 use crate::domain::error::DomainError;
 use crate::domain::ids::{SessionId, TransferId};
 use crate::domain::transfer::{TransferDirection, TransferEntity, TransferStatus as DomainStatus};
@@ -200,7 +203,7 @@ impl InflightTransfers {
 /// // H6 SSH adapter populates `registry` on connect.
 /// let sftp = RusshSftpAdapter::new(registry, 256, 10);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RusshSftpAdapter {
     handle_registry: SshHandleRegistry,
     inflight: InflightTransfers,
@@ -211,6 +214,25 @@ pub struct RusshSftpAdapter {
     /// `MAX_TRANSFERS_PER_SESSION`. Validated against the inflight map
     /// before a new upload/download is spawned.
     max_per_session: usize,
+    /// Bridge that pumps live `TransferShared` status transitions into
+    /// the domain `TransferRepository`. Defaults to a no-op when the
+    /// adapter is built without a composition root (tests, fixtures).
+    /// The composition root replaces it via
+    /// [`Self::with_status_sink`] so `ssh_get_transfer_progress`
+    /// observes terminal state.
+    status_sink: SharedTransferStatusSink,
+}
+
+impl fmt::Debug for RusshSftpAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RusshSftpAdapter")
+            .field("handle_registry", &self.handle_registry)
+            .field("inflight_count", &self.inflight.by_id.len())
+            .field("broadcast_cap", &self.broadcast_cap)
+            .field("max_per_session", &self.max_per_session)
+            .field("status_sink", &"<dyn TransferStatusSink>")
+            .finish()
+    }
 }
 
 impl RusshSftpAdapter {
@@ -227,7 +249,20 @@ impl RusshSftpAdapter {
             inflight: InflightTransfers::new(),
             broadcast_cap,
             max_per_session,
+            status_sink: Arc::new(NoopTransferStatusSink),
         }
+    }
+
+    /// Wire a bridge that pumps live `TransferShared` status transitions
+    /// into the domain `TransferRepository`. The composition root supplies
+    /// the production sink built on top of the shared
+    /// [`crate::adapters::repo::dashmap::transfer::DashMapTransferRepo`];
+    /// tests / fixtures keep the no-op default so behaviour is identical
+    /// to the v4.1 baseline.
+    #[must_use]
+    pub fn with_status_sink(mut self, sink: SharedTransferStatusSink) -> Self {
+        self.status_sink = sink;
+        self
     }
 
     /// Borrow the underlying handle registry. Exposed so the H6 SSH
@@ -262,28 +297,35 @@ impl RusshSftpAdapter {
 
     /// Build the [`TransferShared`] bundle handed to the streaming
     /// helpers. Encapsulates the broadcast/watch primitives so both
-    /// `upload` and `download` share identical wiring.
-    fn build_shared(
-        &self,
-        transfer_id: &TransferId,
-        total_bytes: u64,
-    ) -> (TransferShared, CancellationToken) {
+    /// `upload` and `download` share identical wiring. Returns the
+    /// freshly minted `status_rx` and `bytes_transferred` handles
+    /// alongside the bundle so the spawn helpers can wire a watcher
+    /// task without re-cloning out of the bundle (the streaming task
+    /// owns the bundle by value once spawned).
+    fn build_shared(&self, transfer_id: &TransferId, total_bytes: u64) -> SharedBundle {
         let cancel = CancellationToken::new();
-        let (status_tx, _status_rx) = watch::channel(McpStatus::Running);
+        let (status_tx, status_rx) = watch::channel(McpStatus::Running);
         let (progress_tx, _rx) = broadcast::channel::<ProgressEvent>(self.broadcast_cap);
         let bytes = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(total_bytes));
+        let error = Arc::new(OnceCell::new());
         let shared = TransferShared {
             transfer_id: transfer_id.as_str().to_string(),
-            bytes_transferred: bytes,
+            bytes_transferred: Arc::clone(&bytes),
             total_bytes: total,
             progress_tx,
             data_notify: Arc::new(Notify::new()),
             cancel_token: cancel.clone(),
             status_tx,
-            error: Arc::new(OnceCell::new()),
+            error: Arc::clone(&error),
         };
-        (shared, cancel)
+        SharedBundle {
+            shared,
+            cancel,
+            status_rx,
+            bytes_transferred: bytes,
+            error,
+        }
     }
 
     /// Common preflight for both `upload` and `download`: enforce the
@@ -313,9 +355,23 @@ impl RusshSftpAdapter {
         remote_path: String,
         total_bytes: u64,
     ) {
-        let (shared, cancel) = self.build_shared(&transfer_id, total_bytes);
+        let bundle = self.build_shared(&transfer_id, total_bytes);
+        let SharedBundle {
+            shared,
+            cancel,
+            status_rx,
+            bytes_transferred,
+            error,
+        } = bundle;
         self.inflight
             .register(transfer_id.clone(), session_id, cancel);
+        Self::spawn_status_watcher(
+            Arc::clone(&self.status_sink),
+            transfer_id.clone(),
+            status_rx,
+            bytes_transferred,
+            error,
+        );
         let inflight = self.inflight.clone();
         let task_id = transfer_id;
         tokio::spawn(async move {
@@ -339,9 +395,23 @@ impl RusshSftpAdapter {
         remote_path: String,
         total_bytes: u64,
     ) {
-        let (shared, cancel) = self.build_shared(&transfer_id, total_bytes);
+        let bundle = self.build_shared(&transfer_id, total_bytes);
+        let SharedBundle {
+            shared,
+            cancel,
+            status_rx,
+            bytes_transferred,
+            error,
+        } = bundle;
         self.inflight
             .register(transfer_id.clone(), session_id, cancel);
+        Self::spawn_status_watcher(
+            Arc::clone(&self.status_sink),
+            transfer_id.clone(),
+            status_rx,
+            bytes_transferred,
+            error,
+        );
         let inflight = self.inflight.clone();
         let task_id = transfer_id;
         tokio::spawn(async move {
@@ -354,6 +424,84 @@ impl RusshSftpAdapter {
             }
         });
     }
+
+    /// Spawn the per-transfer status watcher. Subscribes to
+    /// `status_rx` and pumps the first terminal value into the
+    /// configured [`SharedTransferStatusSink`]. The byte counter is
+    /// snapshot from the live atomic so the persisted entity carries the
+    /// final progress without a second read of the streaming task. The
+    /// sink is allowed to be a no-op so the spawn is harmless when no
+    /// repo bridge is wired.
+    fn spawn_status_watcher(
+        sink: SharedTransferStatusSink,
+        transfer_id: TransferId,
+        mut status_rx: watch::Receiver<McpStatus>,
+        bytes_transferred: Arc<AtomicU64>,
+        error: Arc<OnceCell<String>>,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let current = *status_rx.borrow_and_update();
+                if current != McpStatus::Running {
+                    Self::dispatch_terminal(
+                        &sink,
+                        &transfer_id,
+                        current,
+                        &bytes_transferred,
+                        &error,
+                    )
+                    .await;
+                    break;
+                }
+                if status_rx.changed().await.is_err() {
+                    warn!(
+                        transfer_id = %transfer_id,
+                        "transfer status watcher: channel closed before terminal frame"
+                    );
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Translate an `McpStatus` terminal value into the matching sink
+    /// call. Match is exhaustive — `Running` is unreachable because the
+    /// caller filters it out.
+    async fn dispatch_terminal(
+        sink: &SharedTransferStatusSink,
+        transfer_id: &TransferId,
+        status: McpStatus,
+        bytes_transferred: &AtomicU64,
+        error: &OnceCell<String>,
+    ) {
+        let bytes = bytes_transferred.load(Ordering::SeqCst);
+        match status {
+            McpStatus::Completed => sink.mark_completed(transfer_id, bytes).await,
+            McpStatus::Failed => {
+                let reason = error.get().cloned();
+                sink.mark_failed(transfer_id, reason).await;
+            }
+            McpStatus::Cancelled => sink.mark_cancelled(transfer_id).await,
+            McpStatus::Running => {
+                warn!(
+                    transfer_id = %transfer_id,
+                    "transfer status watcher: unexpected Running terminal value (no-op)"
+                );
+            }
+        }
+    }
+}
+
+/// Bundle returned by [`RusshSftpAdapter::build_shared`]. Carries every
+/// handle the spawn helpers need so they can wire both the streaming
+/// task and the status watcher without re-deriving anything from the
+/// already-moved [`TransferShared`].
+struct SharedBundle {
+    shared: TransferShared,
+    cancel: CancellationToken,
+    status_rx: watch::Receiver<McpStatus>,
+    bytes_transferred: Arc<AtomicU64>,
+    error: Arc<OnceCell<String>>,
 }
 
 /// Translate a v3 SFTP error string into a [`DomainError::Sftp`]. Kept

@@ -5,6 +5,32 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] — 2026-05-03
+
+### Highlights
+
+- Patch release closing four runtime regressions surfaced by the Python stdio integration suite after the v4.1 deep-decouple. Public MCP API stays byte-compatible with v4.1.0 / v4.0.0 / v3.0.0 — same 18 tools, same 5 resource schemes, same markdown shape, same env vars, same defaults.
+
+### Fixed
+
+- **Command status pump** — `ssh_get_command_output { wait=true }` no longer hangs on `RUNNING` after the SSH driver completes. The russh adapter now spawns a dedicated status watcher per async command that bridges the live `RunningCommand.status_rx` watcher channel into the domain `CommandRepository` via a new internal `CommandStatusSink` trait. The composition root pins a `RepoCommandStatusSink` over the shared `DashMapCommandRepo`; tests/fixtures keep the no-op default so no behavioural change reaches the use-case test surface.
+- **Cancel snapshot** — `ssh_cancel_command` no longer surfaces `COMMAND_NOT_FOUND` when the cancellation succeeds. The cancel use case now snapshots stdout/stderr **before** issuing `SshClientPort::cancel`, falling back to an empty snapshot if both pre- and post-cancel reads fail. The SSH adapter still tears its internal command record down inside `cancel`, but the use case no longer races that tear-down.
+- **Shell output flush** — `ssh_shell_read` / `ssh_shell_wait_for` long polls no longer time out with empty `data` after a write produced visible output. The shell reader task now flushes incoming PTY frames to `RunningShell.history` (and the broadcast channel) on every chunk (`SHELL_FLUSH_THRESHOLD = 1`) instead of waiting for a 4 KiB batch — interactive shells need per-frame visibility.
+- **Shell close pump** — `RusshAdapter::close_shell` now pumps an explicit `Closed` notification into the domain `ShellRepository` via a new internal `ShellStatusSink` trait. Mirrors the command sink path so subscribers / long-poll consumers observe the terminal state without waiting for an entity-removal sweep.
+- **Transfer status pump** — SFTP upload/download drivers now surface `Completed` / `Failed` / `Cancelled` and intermediate `record_progress` updates into the domain `TransferRepository` via a new internal `TransferStatusSink` trait. Wired in `composition::prod` over the shared `DashMapTransferRepo`. `ssh_get_transfer_progress { wait=true }` polls now observe the terminal state cleanly.
+- **Python integration parser** — `scripts/helpers/parse_block.py` now publishes wire-key aliases (`exit` → `exit_code`, `sessions` → `sessions_disconnected`, `commands` → `commands_cancelled`) so existing test assertions match the v3 short-form keys without any wire-format change. Test-only fix; the markdown response shape stays byte-identical.
+
+### Internal
+
+- New module `src/adapters/ssh/internal/status_sink.rs` — purpose-built `Send + Sync` trait surface (manual AFIT via boxed futures) so the production russh adapter can hold a single `Arc<dyn CommandStatusSink>` / `Arc<dyn ShellStatusSink>` field without dragging the repository generics into its type list.
+- New module `src/composition/status_sinks.rs` — production `RepoCommandStatusSink` / `RepoShellStatusSink` / `RepoTransferStatusSink` implementations backed by `DashMap*Repo` and wired by `composition::prod::build_use_cases`.
+- `RusshAdapter` and `RusshSftpAdapter` gain optional `with_*_status_sink` setters (default no-op) so the v4.1 public-surface tests continue to compile and pass without any wiring change.
+
+### Tests
+
+- Lib tests: **1014 → 1031** (+ 10 status-sink unit tests, + 7 production sink integration tests).
+- Python integration suites: stdio **8/13 → 13/13**; HTTP **14/14 → 14/14**.
+
 ## [4.1.0] — 2026-05-03
 
 ### Highlights
