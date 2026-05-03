@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior, interval};
 use tracing::debug;
 
-use super::config::{
+use crate::adapters::config::internal::{
     resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
 

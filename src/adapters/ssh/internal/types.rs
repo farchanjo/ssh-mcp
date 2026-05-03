@@ -1,5 +1,6 @@
-//! Internal data types used by the SSH adapter (v3 leftover, relocated in
-//! H17.6 P1 from `crate::mcp::types` to `crate::adapters::ssh::internal::types`).
+//! Internal data types used by the SSH adapter (legacy leftover,
+//! relocated in H17.6 P1 from the former v3 types module to
+//! `crate::adapters::ssh::internal::types`).
 //!
 //! Response types that used to be returned directly by MCP tools were
 //! removed in v2.0. The types that remain here are pure internal data

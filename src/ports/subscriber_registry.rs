@@ -16,7 +16,7 @@ use crate::domain::ids::PeerId;
 use super::notifier::PeerHandle;
 
 /// Resource scheme handled by the registry. Mirrors the v3
-/// [`crate::mcp::subscription::ResourceKind`] but lives in the port layer
+/// [`crate::adapters::subscription::legacy::ResourceKind`] but lives in the port layer
 /// to avoid leaking adapter types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKind {

@@ -5,7 +5,7 @@
 //!   in-flight transfer state. Hides every russh / russh-sftp type from
 //!   the use case layer.
 //! - `internal` — adapter-private streaming + transfer-state runtime
-//!   relocated from the v3 `crate::mcp::*` namespace in H17.6 P1.
+//!   relocated from the legacy v3 namespace in H17.6 P1.
 //!
 //! ## SSH handle bridging
 //!

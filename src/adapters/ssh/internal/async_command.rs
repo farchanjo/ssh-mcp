@@ -29,7 +29,7 @@ use tokio::sync::{OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{AsyncCommandInfo, AsyncCommandStatus};
-use crate::mcp::config::resolve_command_broadcast_cap;
+use crate::adapters::config::internal::resolve_command_broadcast_cap;
 
 /// Output buffer for collecting command output
 #[derive(Debug, Default, Clone)]
@@ -102,7 +102,7 @@ fn drain_head_if_over(buf: &mut Vec<u8>, max_size: usize) {
 /// snapshot from `RunningCommand::output_history` and continue subscribing.
 ///
 /// Each chunk carries a `seq` allocated by
-/// [`crate::mcp::subscription::SubscriptionRegistry::next_seq`] so a
+/// [`crate::adapters::subscription::legacy::SubscriptionRegistry::next_seq`] so a
 /// subscriber that recovers from `Lagged` can detect gaps.
 #[derive(Debug, Clone)]
 pub enum OutputChunk {
@@ -168,7 +168,7 @@ impl RunningCommand {
     /// Construct a `RunningCommand` with fresh lock-free primitives.
     ///
     /// The broadcast channel capacity is resolved from `SSH_COMMAND_BROADCAST_CAP`
-    /// via [`crate::mcp::config::resolve_command_broadcast_cap`], with a default of
+    /// via [`crate::adapters::config::internal::resolve_command_broadcast_cap`], with a default of
     /// 1024 frames, a floor of 16, and a hard cap of 65536.
     #[must_use]
     pub fn new(info: AsyncCommandInfo) -> Self {

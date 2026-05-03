@@ -34,7 +34,7 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{ShellInfo, ShellStatus};
-use crate::mcp::config::resolve_shell_broadcast_cap;
+use crate::adapters::config::internal::resolve_shell_broadcast_cap;
 
 /// Write handle for sending input to a shell channel.
 ///
@@ -137,7 +137,7 @@ impl RunningShell {
     /// Build a `RunningShell` with fresh lock-free primitives.
     ///
     /// The broadcast channel capacity is resolved via
-    /// [`crate::mcp::config::resolve_shell_broadcast_cap`] (default 1024,
+    /// [`crate::adapters::config::internal::resolve_shell_broadcast_cap`] (default 1024,
     /// floor 16, hard cap 65536). The mpsc input queue is sized to the
     /// same value so a single noisy producer cannot swamp the writer.
     #[must_use]

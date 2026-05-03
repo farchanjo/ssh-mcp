@@ -12,7 +12,7 @@
 //!   `russh::client::Handle` per `SessionId` and translates every domain
 //!   primitive on the way in and every transport result on the way out.
 //! - `internal` — adapter-private SSH/PTY runtime carriers relocated from
-//!   the v3 `crate::mcp::*` namespace in H17.6 P1.
+//!   the legacy v3 namespace in H17.6 P1.
 //!
 //! Future siblings (e.g. an in-process fake for tests, or an alternate
 //! implementation for a non-russh backend) land as additional submodules

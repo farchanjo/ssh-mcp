@@ -94,7 +94,7 @@ pub struct RusshAdapterConfig {
     /// is `None`.
     pub default_command_timeout: Duration,
     /// Maximum SSH connect retry attempts (see `MAX_RETRY_DELAY` in
-    /// [`crate::mcp::config`] for the wall-clock cap).
+    /// [`crate::adapters::config::internal`] for the wall-clock cap).
     pub max_retries: u32,
     /// Initial retry delay; doubled with jitter on each attempt.
     pub retry_delay: Duration,
@@ -846,7 +846,7 @@ const DEFAULT_SHELL_BUFFER_SIZE: u64 = 10_u64.saturating_mul(1024).saturating_mu
 const SHELL_INPUT_CHANNEL_CAP: usize = 64;
 
 /// Local staging capacity for the shell reader before the first
-/// flush. Mirrors `mcp::tools::legacy_helpers::shell_reader`.
+/// flush. Mirrors the legacy `legacy_helpers::shell_reader`.
 const SHELL_READER_LOCAL_CAP: usize = 4096;
 
 /// Local-buffer high-water mark that triggers an early flush into
@@ -856,7 +856,7 @@ const SHELL_FLUSH_THRESHOLD: usize = 4096;
 /// Spawn the dedicated writer task that owns the russh write half
 /// exclusively. Drains [`WriteRequest`] frames from `input_rx` until
 /// either a [`WriteRequest::Close`] arrives, the senders are dropped,
-/// or `cancel_token` fires. Mirrors `mcp::tools::legacy_helpers::shell_writer`.
+/// or `cancel_token` fires. Mirrors the legacy `legacy_helpers::shell_writer`.
 fn spawn_shell_writer_task(
     write_half: russh::ChannelWriteHalf<Msg>,
     mut input_rx: mpsc::Receiver<WriteRequest>,
@@ -921,7 +921,7 @@ impl ShellReaderHandles {
 
 /// Spawn the dedicated reader task that drains the russh read half and
 /// publishes incoming PTY bytes into [`RunningShell::history`] via
-/// [`ArcSwap::rcu`]. Mirrors `mcp::tools::legacy_helpers::shell_reader`
+/// [`ArcSwap::rcu`]. Mirrors the legacy `legacy_helpers::shell_reader`
 /// without the registry-side debouncing — the
 /// [`crate::ports::subscription::SubscriberRegistry`] adapter (H9) will
 /// observe the per-shell broadcast channel directly.

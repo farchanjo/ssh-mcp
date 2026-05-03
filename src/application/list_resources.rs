@@ -1,6 +1,6 @@
 //! Use case: enumerate every active ssh-mcp resource.
 //!
-//! Translates the v3 [`crate::mcp::resources::list_resources_impl`] into a
+//! Translates the legacy v3 `list_resources_impl` into a
 //! hexagonal use case orchestrating the five repositories.
 //!
 //! # Orchestration shape
