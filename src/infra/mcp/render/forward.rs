@@ -6,12 +6,16 @@
 use crate::application::forward_port::ForwardPortOutcome;
 use crate::infra::mcp::helpers::output::sanitize_value;
 
-/// Render a [`ForwardPortOutcome`] as the v3 `SSH_FORWARD: OK` block.
+/// Render a [`ForwardPortOutcome`] as the `SSH_FORWARD: OK` block.
+///
+/// v4.5: emits `FORWARD_ID` and `SESSION_ID` so callers can construct
+/// the matching `forward://<FORWARD_ID>/events` resource subscribe URI
+/// without round-tripping `resources/list`.
 #[must_use]
 pub fn forward_render(outcome: ForwardPortOutcome) -> String {
     let ForwardPortOutcome {
-        forward_id: _,
-        session_id: _,
+        forward_id,
+        session_id,
         local_port,
         remote_address,
         remote_port,
@@ -19,8 +23,12 @@ pub fn forward_render(outcome: ForwardPortOutcome) -> String {
     } = outcome;
     let local = format!("0.0.0.0:{local_port}");
     let remote = format!("{remote_address}:{remote_port}");
-    let mut out = String::with_capacity(96);
-    out.push_str("SSH_FORWARD: OK\nLOCAL: ");
+    let mut out = String::with_capacity(160);
+    out.push_str("SSH_FORWARD: OK\nFORWARD_ID: ");
+    out.push_str(&sanitize_value(forward_id.as_str()));
+    out.push_str("\nSESSION_ID: ");
+    out.push_str(&sanitize_value(session_id.as_str()));
+    out.push_str("\nLOCAL: ");
     out.push_str(&sanitize_value(&local));
     out.push_str("\nREMOTE: ");
     out.push_str(&sanitize_value(&remote));
@@ -46,7 +54,7 @@ mod tests {
         });
         assert_eq!(
             m,
-            "SSH_FORWARD: OK\nLOCAL: 0.0.0.0:8080\nREMOTE: localhost:3306\nACTIVE: true"
+            "SSH_FORWARD: OK\nFORWARD_ID: fwd-1\nSESSION_ID: sess-1\nLOCAL: 0.0.0.0:8080\nREMOTE: localhost:3306\nACTIVE: true"
         );
     }
 }

@@ -52,23 +52,42 @@ pub struct SshShellSendKeyArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
 
-    /// Named keystroke to send. Examples: `ctrl_c`, `arrow_up`, `f5`,
-    /// `enter`, `tab`. See `ShellKey` for the full enum.
+    /// Named keystroke to send.
+    ///
+    /// Per-key modifier policy (modifiers beyond the listed set return
+    /// error code `MODIFIER_NOT_ALLOWED`):
+    ///
+    /// - Arrow keys (`arrow_up`, `arrow_down`, `arrow_left`, `arrow_right`)
+    ///   accept any of `shift` / `alt` / `ctrl`.
+    /// - Navigation (`home`, `end`, `page_up`, `page_down`, `insert`,
+    ///   `delete`) accept any of `shift` / `alt` / `ctrl`.
+    /// - Function keys `f1`-`f12` accept any of `shift` / `alt` / `ctrl`.
+    /// - `tab` accepts only `shift` (back-tab); rejects `alt` / `ctrl`.
+    /// - All other keys (`ctrl_c`, `ctrl_d`, `ctrl_z`, `ctrl_l`,
+    ///   `ctrl_r`, `ctrl_w`, `ctrl_u`, `enter`, `escape`, `backspace`,
+    ///   `space`) reject every modifier — the keystroke is already a
+    ///   complete control byte.
+    ///
+    /// Examples: `ctrl_c`, `arrow_up`, `f5`, `enter`, `tab`.
     pub key: ShellKey,
 
     /// Apply Shift modifier. Default: false. Valid on: arrows,
-    /// navigation keys, F1-F12, and `tab`.
+    /// navigation keys, F1-F12, and `tab` (back-tab). See the `key` field
+    /// for the full per-key policy.
     pub shift: Option<bool>,
 
     /// Apply Alt modifier. Default: false. Valid on: arrows, navigation
-    /// keys, F1-F12.
+    /// keys, and F1-F12. See the `key` field for the full per-key policy.
     pub alt: Option<bool>,
 
     /// Apply Ctrl modifier. Default: false. Valid on: arrows, navigation
-    /// keys, F1-F12.
+    /// keys, and F1-F12. Cannot be combined with `ctrl_*` keys (already a
+    /// complete control byte). See the `key` field for the full per-key
+    /// policy.
     pub ctrl: Option<bool>,
 
-    /// Repeat the keystroke N times. Default: 1. Range: 1..=64.
+    /// Repeat the keystroke N times. Default: 1. Range: 1..=64. Values
+    /// outside this range return error code `INVALID_REPEAT`.
     pub repeat: Option<u8>,
 }
 
@@ -113,6 +132,10 @@ pub struct SshShellWaitForArgs {
     /// `MATCHED_PATTERN`. Each pattern up to 1024 bytes. Prefer
     /// `resources/subscribe shell://<shell_id>/output` (realtime push)
     /// over polling — use this for single-shot prompt gating.
+    ///
+    /// Errors: empty list returns code `EMPTY_PATTERNS`. List with more
+    /// than 16 entries returns `TOO_MANY_PATTERNS`. Any single pattern
+    /// over 1024 bytes returns `PATTERN_TOO_LONG`.
     pub patterns: Vec<String>,
 
     /// Maximum seconds to wait. Default: 30. Cap: 300.

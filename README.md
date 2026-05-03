@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-4.1.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1074%20passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-4.5.0-blue.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
 
@@ -23,12 +23,25 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 
 [[_TOC_]]
 
-## What's New in v4.1.0
+## What's New in v4.5.0
+
+- **LLM UX overhaul** — the wire contract documented for years is now actually emitted on every read.
+- **Stable `PeerId`** — derived from `Mcp-Session-Id` (HTTP) or a `Stdio` singleton key. Subscribe and unsubscribe addressed to the same connection share a single id, so per-peer cursors no longer reset between requests.
+- **`_meta` envelope on `resources/read`** — every response embeds `kind`, `cursor`, `buffer_size`, `last_seq`, and `status` (cursor + `buffer_size` only on the byte-stream resources). MIME types are explicit: `text/plain` for `shell://`, block-style `text/plain` for `command://`, `application/json` for `transfer:// session:// forward://`.
+- **Granular wire error codes** — 11 error tags now reach the wire (`EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG`, `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT`, `FEATURE_DISABLED`, `WRITE_FAILED`, `CHANNEL_FAILED`, `COMMAND_FAILED`, `LOCAL_FILE_ERROR`, `SFTP_OPEN_FAILED`); 3 reserved tags (`FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR`) are recognised by the dispatcher with no live raise site yet. Untagged messages still fall through to the flat codes (`INVALID_ARGUMENT`, `TRANSPORT_ERROR`, `SFTP_ERROR`).
+- **Server identity** — the `Implementation` advertised on `initialize` carries `title = "SSH Remote Shell"`, a multi-line `description`, and `website_url = "https://github.com/farchanjo/ssh-mcp"`. Icons are intentionally omitted until a stable hosted SVG asset URL ships.
+- **18 tool annotations + few-shot `instructions`** — every tool emits a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}` so MCP hosts can rank, filter, and warn before destructive use. The `instructions` field carries three canonical workflows (run command, interactive shell, upload) for smaller LLMs.
+- **`ssh_forward` emits `FORWARD_ID` + `SESSION_ID`** — callers can construct the matching `forward://<FORWARD_ID>/events` subscribe URI without a round-trip through `resources/list`.
+- **Public MCP API unchanged** — same 18 tools, same 5 resource schemes, same markdown response shape, same env vars. v3 / v4.0 / v4.1 hosts work against v4.5 servers without any change.
+
+### Carried forward from v4.4.0
+
+- **Connection lifecycle steering** — `EXPIRES_AT` (RFC3339), `PERSISTENT: true|false`, and an anti-leak `HINT:` line when an `agent_id` owns more than 5 sessions. `agent_id` is now first-class on `ssh_connect` and ranks reuse matches when set.
+
+### Carried forward from v4.1.0
 
 - **Deep decouple complete** — H17.6 removed the entire `src/mcp/` foundational tree (~6 500 LOC). Every former `crate::mcp::*` reference now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` (or `adapters::subscription::legacy` for the transitional global registry). Each adapter is self-contained.
 - **`async-trait` direct dep dropped** — the surviving v3 strategy chain was rewritten to native AFIT inside `src/adapters/ssh/internal/auth/` with an enum dispatcher replacing dyn. Any `async-trait` copies left in the dependency tree are transitive (rmcp, etc.) and outside our control.
-- **Public MCP API unchanged** — same 18 tools, same 5 resource schemes, same markdown response shape, same env vars. v3 / v4.0 hosts work against v4.1 servers without any change.
-- **1016 tests** (1014 lib + 2 integration) — every public-surface guarantee preserved.
 
 ### Carried forward from v4.0.0
 
