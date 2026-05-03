@@ -328,6 +328,12 @@ where
     // ---------- Connection domain ------------------------------------
 
     #[tool(
+        title = "Connect to SSH server",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward.\n- `AGENT_ID`: optional grouping; passed to ssh_list_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_execute `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED."
     )]
     async fn ssh_connect(
@@ -338,6 +344,12 @@ where
     }
 
     #[tool(
+        title = "Disconnect SSH session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
         description = "Disconnect an SSH session.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- Cancels every async command, closes every PTY, and aborts every in-flight SFTP transfer for the session.\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR."
     )]
     async fn ssh_disconnect(
@@ -358,6 +370,12 @@ where
     }
 
     #[tool(
+        title = "List SSH sessions",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "List active SSH sessions on the server.\n\nWhen to use:\n- Inspecting sessions known to this server (optionally narrowed to one agent).\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR."
     )]
     async fn ssh_list_sessions(
@@ -379,6 +397,12 @@ where
     }
 
     #[tool(
+        title = "Disconnect all agent sessions",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
         description = "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR."
     )]
     async fn ssh_disconnect_agent(
@@ -403,6 +427,12 @@ where
     // ---------- Execute domain ---------------------------------------
 
     #[tool(
+        title = "Run remote command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
         description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and polling its output via ssh_get_command_output.\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: passed to ssh_get_command_output, ssh_cancel_command.\n\nWorkflow:\n1. Call ssh_execute with the SESSION_ID and command line.\n2. Use ssh_get_command_output to fetch progress / completion.\n3. Optional ssh_cancel_command to interrupt.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR."
     )]
     async fn ssh_execute(
@@ -422,6 +452,12 @@ where
     }
 
     #[tool(
+        title = "Get command output",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND."
     )]
     async fn ssh_get_command_output(
@@ -441,6 +477,12 @@ where
     }
 
     #[tool(
+        title = "List async commands",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "List asynchronous commands tracked on the server.\n\nWhen to use:\n- Inspecting every command (optionally filtered by session and/or status).\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR."
     )]
     async fn ssh_list_commands(
@@ -461,6 +503,12 @@ where
     }
 
     #[tool(
+        title = "Cancel running command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
         description = "Cancel an asynchronous command.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_execute.\n- Returns the partial stdout/stderr captured so far when the command was running.\n\nStatus values: CANCELLED, NOOP.\n\nErrors: COMMAND_NOT_FOUND."
     )]
     async fn ssh_cancel_command(
@@ -480,6 +528,12 @@ where
     // ---------- Shell domain -----------------------------------------
 
     #[tool(
+        title = "Open PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
         description = "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- Prefer subscribing to `shell://<shell_id>/output` over polling ssh_shell_read.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_send_key, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR."
     )]
     async fn ssh_shell_open(
@@ -501,6 +555,12 @@ where
     }
 
     #[tool(
+        title = "Write to PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
         description = "Write raw bytes to a PTY shell.\n\nWhen to use:\n- Submitting a typed command (append `\\n`).\n- Sending raw control sequences (e.g. `\\x03` for Ctrl+C, `\\x1b[A` for arrow up).\n- Prefer ssh_shell_send_key for named keystrokes.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR."
     )]
     async fn ssh_shell_write(
@@ -518,6 +578,12 @@ where
     }
 
     #[tool(
+        title = "Send keystroke to PTY",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
         description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nWhen to use:\n- Sending arrows, function keys, control codes, navigation keys without crafting the bytes manually.\n- Optional Shift / Alt / Ctrl modifiers; optional `repeat` (1..=64).\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT (bad repeat / modifier combination), TRANSPORT_ERROR."
     )]
     async fn ssh_shell_send_key(
@@ -537,6 +603,12 @@ where
     }
 
     #[tool(
+        title = "Read PTY buffer",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Read the buffered output of a PTY shell.\n\nWhen to use:\n- FALLBACK polling when subscribing to `shell://<shell_id>/output` is not feasible.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND."
     )]
     async fn ssh_shell_read(
@@ -558,6 +630,12 @@ where
     }
 
     #[tool(
+        title = "Wait for shell pattern",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT."
     )]
     async fn ssh_shell_wait_for(
@@ -578,6 +656,12 @@ where
     }
 
     #[tool(
+        title = "Close PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
         description = "Close a PTY shell and free its resources.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR."
     )]
     async fn ssh_shell_close(
@@ -600,6 +684,12 @@ where
     // ---------- SFTP domain ------------------------------------------
 
     #[tool(
+        title = "Upload file via SFTP",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
         description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_get_transfer_progress.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR."
     )]
     async fn ssh_upload(
@@ -618,6 +708,12 @@ where
     }
 
     #[tool(
+        title = "Download file via SFTP",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
         description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR."
     )]
     async fn ssh_download(
@@ -636,6 +732,12 @@ where
     }
 
     #[tool(
+        title = "Get transfer progress",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND."
     )]
     async fn ssh_get_transfer_progress(
@@ -656,6 +758,12 @@ where
     // ---------- Forward domain --------------------------------------
 
     #[tool(
+        title = "Forward TCP port",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
         description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE."
     )]
     async fn ssh_forward(
@@ -714,6 +822,12 @@ where
     // ---------- Connection domain ------------------------------------
 
     #[tool(
+        title = "Connect to SSH server",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
         description = "Connect to an SSH server and store the session.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`."
     )]
     async fn ssh_connect(
@@ -723,7 +837,15 @@ where
         run_connect(self.use_cases.connect.as_ref(), args).await
     }
 
-    #[tool(description = "Disconnect an SSH session.")]
+    #[tool(
+        title = "Disconnect SSH session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Disconnect an SSH session."
+    )]
     async fn ssh_disconnect(
         &self,
         Parameters(args): Parameters<SshDisconnectArgs>,
@@ -741,7 +863,15 @@ where
         }
     }
 
-    #[tool(description = "List active SSH sessions.")]
+    #[tool(
+        title = "List SSH sessions",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "List active SSH sessions."
+    )]
     async fn ssh_list_sessions(
         &self,
         Parameters(args): Parameters<SshListSessionsArgs>,
@@ -760,7 +890,15 @@ where
         }
     }
 
-    #[tool(description = "Disconnect every session bound to a given agent.")]
+    #[tool(
+        title = "Disconnect all agent sessions",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Disconnect every session bound to a given agent."
+    )]
     async fn ssh_disconnect_agent(
         &self,
         Parameters(args): Parameters<SshDisconnectAgentArgs>,
@@ -782,7 +920,15 @@ where
 
     // ---------- Execute domain ---------------------------------------
 
-    #[tool(description = "Spawn an asynchronous command on an SSH session.")]
+    #[tool(
+        title = "Run remote command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Spawn an asynchronous command on an SSH session."
+    )]
     async fn ssh_execute(
         &self,
         Parameters(args): Parameters<SshExecuteArgs>,
@@ -799,7 +945,15 @@ where
         }
     }
 
-    #[tool(description = "Fetch the current output of an asynchronous command.")]
+    #[tool(
+        title = "Get command output",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Fetch the current output of an asynchronous command."
+    )]
     async fn ssh_get_command_output(
         &self,
         Parameters(args): Parameters<SshGetCommandOutputArgs>,
@@ -816,7 +970,15 @@ where
         }
     }
 
-    #[tool(description = "List asynchronous commands tracked on the server.")]
+    #[tool(
+        title = "List async commands",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "List asynchronous commands tracked on the server."
+    )]
     async fn ssh_list_commands(
         &self,
         Parameters(args): Parameters<SshListCommandsArgs>,
@@ -834,7 +996,15 @@ where
         }
     }
 
-    #[tool(description = "Cancel an asynchronous command.")]
+    #[tool(
+        title = "Cancel running command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Cancel an asynchronous command."
+    )]
     async fn ssh_cancel_command(
         &self,
         Parameters(args): Parameters<SshCancelCommandArgs>,
@@ -851,7 +1021,15 @@ where
 
     // ---------- Shell domain -----------------------------------------
 
-    #[tool(description = "Open an interactive PTY shell.")]
+    #[tool(
+        title = "Open PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
+        description = "Open an interactive PTY shell."
+    )]
     async fn ssh_shell_open(
         &self,
         Parameters(args): Parameters<SshShellOpenArgs>,
@@ -870,7 +1048,15 @@ where
         }
     }
 
-    #[tool(description = "Write raw bytes to a PTY shell.")]
+    #[tool(
+        title = "Write to PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Write raw bytes to a PTY shell."
+    )]
     async fn ssh_shell_write(
         &self,
         Parameters(args): Parameters<SshShellWriteArgs>,
@@ -885,7 +1071,15 @@ where
         }
     }
 
-    #[tool(description = "Send a named keystroke (with optional modifiers) to a PTY shell.")]
+    #[tool(
+        title = "Send keystroke to PTY",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Send a named keystroke (with optional modifiers) to a PTY shell."
+    )]
     async fn ssh_shell_send_key(
         &self,
         Parameters(args): Parameters<SshShellSendKeyArgs>,
@@ -902,7 +1096,15 @@ where
         }
     }
 
-    #[tool(description = "Read the buffered output of a PTY shell.")]
+    #[tool(
+        title = "Read PTY buffer",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Read the buffered output of a PTY shell."
+    )]
     async fn ssh_shell_read(
         &self,
         Parameters(args): Parameters<SshShellReadArgs>,
@@ -921,7 +1123,15 @@ where
         }
     }
 
-    #[tool(description = "Block until a substring pattern appears in the shell output.")]
+    #[tool(
+        title = "Wait for shell pattern",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Block until a substring pattern appears in the shell output."
+    )]
     async fn ssh_shell_wait_for(
         &self,
         Parameters(args): Parameters<SshShellWaitForArgs>,
@@ -939,7 +1149,15 @@ where
         }
     }
 
-    #[tool(description = "Close a PTY shell.")]
+    #[tool(
+        title = "Close PTY shell",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Close a PTY shell."
+    )]
     async fn ssh_shell_close(
         &self,
         Parameters(args): Parameters<SshShellCloseArgs>,
@@ -959,7 +1177,15 @@ where
 
     // ---------- SFTP domain ------------------------------------------
 
-    #[tool(description = "Upload a local file to the remote host via SFTP.")]
+    #[tool(
+        title = "Upload file via SFTP",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Upload a local file to the remote host via SFTP."
+    )]
     async fn ssh_upload(
         &self,
         Parameters(args): Parameters<SshUploadArgs>,
@@ -975,7 +1201,15 @@ where
         }
     }
 
-    #[tool(description = "Download a remote file via SFTP.")]
+    #[tool(
+        title = "Download file via SFTP",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
+        description = "Download a remote file via SFTP."
+    )]
     async fn ssh_download(
         &self,
         Parameters(args): Parameters<SshDownloadArgs>,
@@ -991,7 +1225,15 @@ where
         }
     }
 
-    #[tool(description = "Snapshot the progress of an SFTP transfer.")]
+    #[tool(
+        title = "Get transfer progress",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Snapshot the progress of an SFTP transfer."
+    )]
     async fn ssh_get_transfer_progress(
         &self,
         Parameters(args): Parameters<SshGetTransferProgressArgs>,
@@ -1100,6 +1342,92 @@ fn parse_human_bytes(input: Option<&str>) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Server identity + LLM bootstrap
+// ---------------------------------------------------------------------------
+
+/// Build the rmcp [`Implementation`] descriptor advertised on the
+/// `initialize` handshake. Carries display title, free-form description,
+/// and a public landing page so modern MCP hosts (Claude mobile / remote
+/// clients) can render a humanised server card. Icons are intentionally
+/// omitted for now — flipping them on requires a stable hosted asset URL
+/// plus a tiny SVG.
+//
+// Field selection matches the rmcp 1.6 builder surface at
+// `~/.cargo/registry/.../rmcp-1.6.0/src/model.rs:1009-1056`. The struct
+// is `#[non_exhaustive]`, so we have to go through `Implementation::new`
+// + the `with_*` setters.
+fn build_implementation() -> Implementation {
+    Implementation::new("ssh-mcp", env!("CARGO_PKG_VERSION"))
+        .with_title("SSH Remote Shell")
+        .with_description(
+            "Run remote commands, drive PTY shells, transfer files via SFTP, \
+             and forward TCP ports over SSH. Subscribe to shell, command, transfer, \
+             session, and forward streams for push notifications.",
+        )
+        .with_website_url("https://github.com/farchanjo/ssh-mcp")
+    // TODO(v4.5+): wire `.with_icons(vec![Icon::new("...").with_mime_type("image/svg+xml")])`
+    // once a stable asset URL ships under `assets/icon.svg`.
+}
+
+/// Shared [`ServerCapabilities`] fingerprint advertised on the
+/// `initialize` handshake — tools + resources + subscribe channels.
+/// Both feature flavours of the server return the exact same capability
+/// set; only the tool catalogue and instructions differ.
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_tools()
+        .enable_tool_list_changed()
+        .enable_resources()
+        .enable_resources_subscribe()
+        .enable_resources_list_changed()
+        .build()
+}
+
+/// Few-shot bootstrap text for the `port_forward` build (18 tools / 5
+/// streams). Three canonical workflows steer 27B-class models away from
+/// the most common failure modes (forgetting `wait=true`, leaking
+/// sessions, polling instead of subscribing).
+#[cfg(feature = "port_forward")]
+const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 18 tools, 5 push streams \
+(shell://, command://, transfer://, session://, forward://). All tools return \
+block markdown: first line TOOL: STATUS, then KEY: value pairs. Output blocks \
+delimited by --- name [nonce] ---. IDs end in _ID.\n\
+\n\
+Happy paths:\n\
+1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute. \
+Then ssh_get_command_output wait=true.\n\
+2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe \
+shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key. \
+Read deltas via resources/read?cursor=auto on each notification. \
+ssh_shell_close, ssh_disconnect.\n\
+3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+\n\
+Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close. \
+Watch for HINT lines and EXPIRES_AT.";
+
+/// Few-shot bootstrap text for the build without `port_forward`
+/// (17 tools / 4 streams). Identical workflows minus the `forward://`
+/// stream; the catalogue claim is dropped so callers do not look for
+/// `ssh_forward`.
+#[cfg(not(feature = "port_forward"))]
+const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 17 tools, 4 push streams \
+(shell://, command://, transfer://, session://). All tools return block \
+markdown: first line TOOL: STATUS, then KEY: value pairs. Output blocks \
+delimited by --- name [nonce] ---. IDs end in _ID.\n\
+\n\
+Happy paths:\n\
+1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute. \
+Then ssh_get_command_output wait=true.\n\
+2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe \
+shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key. \
+Read deltas via resources/read?cursor=auto on each notification. \
+ssh_shell_close, ssh_disconnect.\n\
+3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+\n\
+Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close. \
+Watch for HINT lines and EXPIRES_AT.";
+
+// ---------------------------------------------------------------------------
 // `#[tool_handler]` impl
 // ---------------------------------------------------------------------------
 
@@ -1124,25 +1452,10 @@ where
     Idg: IdGeneratorPort + Send + Sync + 'static,
 {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::V_2025_06_18;
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_tool_list_changed()
-            .enable_resources()
-            .enable_resources_subscribe()
-            .enable_resources_list_changed()
-            .build();
-        let mut implementation = Implementation::default();
-        implementation.name = "ssh-mcp".to_string();
-        implementation.version = env!("CARGO_PKG_VERSION").to_string();
-        info.server_info = implementation;
-        info.instructions = Some(
-            "SSH MCP server (v4 hexagonal). 18 SSH tools and 5 resource subscribe schemes \
-             (shell://, command://, transfer://, session://, forward://)."
-                .to_string(),
-        );
-        info
+        ServerInfo::new(server_capabilities())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_server_info(build_implementation())
+            .with_instructions(INSTRUCTIONS_WITH_FORWARD)
     }
 
     async fn list_resources(
@@ -1216,25 +1529,10 @@ where
     Idg: IdGeneratorPort + Send + Sync + 'static,
 {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::V_2025_06_18;
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_tool_list_changed()
-            .enable_resources()
-            .enable_resources_subscribe()
-            .enable_resources_list_changed()
-            .build();
-        let mut implementation = Implementation::default();
-        implementation.name = "ssh-mcp".to_string();
-        implementation.version = env!("CARGO_PKG_VERSION").to_string();
-        info.server_info = implementation;
-        info.instructions = Some(
-            "SSH MCP server (v4 hexagonal). 17 SSH tools and 4 resource subscribe schemes \
-             (shell://, command://, transfer://, session://)."
-                .to_string(),
-        );
-        info
+        ServerInfo::new(server_capabilities())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_server_info(build_implementation())
+            .with_instructions(INSTRUCTIONS_WITHOUT_FORWARD)
     }
 
     async fn list_resources(
