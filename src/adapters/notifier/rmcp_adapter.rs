@@ -49,10 +49,10 @@ impl NotifierPort for RmcpNotifier {
         // Snapshot the rmcp peer out of the shared table BEFORE awaiting so
         // we never hold a DashMap shard guard across `.await`. `Peer` is
         // cheap to clone (mpsc::Sender + Arc).
-        let Some(rmcp_peer) = self.peers.get(&peer_id).map(|entry| entry.value().clone()) else {
-            // The matching `RmcpPeerHandle` has already been dropped — the
-            // transport is gone. Resource notifications are at-most-once,
-            // so a miss is not an error.
+        let Some(rmcp_peer) = self.peers.lookup_peer(&peer_id) else {
+            // The matching peer has been GC-collected (transport closed).
+            // Resource notifications are at-most-once, so a miss is not
+            // an error.
             return Ok(());
         };
         let params = ResourceUpdatedNotificationParam {

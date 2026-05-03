@@ -1,6 +1,6 @@
-# Resources Reference (v4.0.0)
+# Resources Reference (v4.5.0)
 
-ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is unchanged from v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); the implementation moved into the v4 hexagonal layout.
+ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 puts the v3-promised `_meta` envelope on every read, formalises the per-resource MIME types, and derives a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests.
 
 Cross references:
 
@@ -15,6 +15,7 @@ Cross references:
 - `protocol_version = 2025-06-18`.
 - `capabilities.tools = { list_changed: true }`.
 - `capabilities.resources = { subscribe: true, list_changed: true }`.
+- v4.5 `Implementation` identity: `title = "SSH Remote Shell"`, multi-line `description`, `website_url = "https://github.com/farchanjo/ssh-mcp"`. Icons left as TODO. See [API.md - Capability handshake](./API.md#capability-handshake-1).
 
 The `list_changed` advertisement is reserved for tool-driven lifecycle events. The current implementation does not emit `notifications/resources/list_changed`; clients should `resources/list` once and rely on `notifications/resources/updated` plus their own bookkeeping for new shells / commands / transfers. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the deferred plan.
 
@@ -104,19 +105,38 @@ After every read, the server bumps the per-peer cursor to `start + bytes_returne
 
 The total bytes returned per call are capped at `SSH_MCP_OUTPUT_MAX_BYTES_CAP` (default 1 MiB). Anything beyond is left in the buffer for the next read.
 
-## `_meta` fields on `resources/read`
+## `_meta` fields on `resources/read` (v4.5)
 
-Every `resources/read` response embeds a `_meta` object on `ResourceContents`:
+Every `resources/read` response embeds a `_meta` object on `ResourceContents`. Stream resources (`shell` / `command`) carry the cursor pair; snapshots (`transfer` / `session` / `forward`) omit them.
 
-| Key                             | Type    | Notes                                                                                                                                            |
-| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cursor`                        | u64     | Next cursor to pass on the following read.                                                                                                       |
-| `buffer_size`                   | u64     | Bytes currently held in the resource history (`0` for stateless point-in-time resources like transfer / session / forward).                      |
-| `last_seq`                      | u64     | Last sequence number allocated for the resource. Compare to your previous `last_seq` to detect gaps after a `Lagged` recovery.                   |
-| `shell_status` / `command_status` / `transfer_status` / `session_status` / `forward_status` | string | Kind-specific status snapshot.                                                                                                                   |
-| `keepalive`                     | bool    | Present and `true` only when no fresh bytes / events were available — i.e. the response is the keepalive ping.                                   |
-| `truncated_since_last_read`     | u64     | Bytes the server dropped from the head between this read and the previous one (only when positive). Indicates head truncation by the producer.   |
-| `lagged_since_last_read`        | u64     | Reserved for future broadcast-`Lagged` recovery; currently omitted.                                                                              |
+| Key            | Type   | Carried on        | Notes                                                                                                                          |
+| -------------- | ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `kind`         | string | all               | `"shell" | "command" | "transfer" | "session" | "forward"`. Lets the host route the body without re-parsing the URI.        |
+| `cursor`       | u64    | shell, command    | Next cursor to pass on the following `?cursor=` read. Server bumps it to `start + bytes_returned` after every read.           |
+| `buffer_size`  | u64    | shell, command    | Bytes currently held in the resource history.                                                                                  |
+| `last_seq`     | u64    | all               | Last sequence number allocated for the resource. Compare to your previous `last_seq` to detect gaps after a `Lagged` recovery. |
+| `status`       | string | all               | Kind-specific snapshot (`open` / `closed` / `running` / `completed` / `failed` / `healthy` / `unhealthy`).                     |
+
+The envelope is constructed in `src/infra/mcp/resource_handlers.rs::build_stream_meta` (shell / command) and `build_snapshot_meta` (transfer / session / forward). The envelope shape is verified by `read_resource_shell_returns_bytes_and_meta` and friends.
+
+### Body MIME types per scheme
+
+| Scheme | MIME | Body shape |
+|--------|------|------------|
+| `shell://` | `text/plain` | UTF-8 lossy slice of the PTY ring buffer for the requested cursor window. |
+| `command://` | `text/plain` | Block-style v3 stdout/stderr (one nonce per response, two `--- name [nonce] ---` blocks separated by a newline). |
+| `transfer://` | `application/json` | Snapshot JSON (transfer id, direction, paths, bytes_transferred, total_bytes, status, last_seq). |
+| `session://` | `application/json` | Snapshot JSON (session id, healthy, last_health_check, last_seq). |
+| `forward://` | `application/json` | Snapshot JSON (forward id, listener, target, accepted/closed counters, last_seq). |
+
+## Stable peer identity (v4.5)
+
+The peer identity used by `?cursor=auto` is derived from the transport, not minted per request:
+
+- HTTP transport: the `Mcp-Session-Id` header (case-insensitive) seeds a `PeerKey::Http(<sid>)` lookup. Every request that lands on the same Streamable HTTP session shares the same `PeerId`.
+- Stdio transport: process-wide singleton (`PeerKey::Stdio`).
+
+Implementation: `src/adapters/notifier/rmcp_peer.rs::peer_key_from_context` reads `Mcp-Session-Id` out of the rmcp `RequestContext` extensions, falling back to `Stdio` when the extension is absent. `PeerTable::get_or_mint` keys on `PeerKey` so subscribe + unsubscribe + cursor reads addressed to the same connection always see the same id. Two concurrent peers (two HTTP clients with different `Mcp-Session-Id` values, or one HTTP client + one stdio client) advance independently.
 
 ## Subscribe lifecycle
 
@@ -194,7 +214,7 @@ If your peer receives a `notifications/resources/updated` and the `last_seq` in 
 
 ### B. Keepalive
 
-Per resource, the debouncer task fires a `notifications/resources/updated` every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s) even when the producer is idle. The corresponding `resources/read` will set `_meta.keepalive = true`. Use this signal to keep your subscription alive across NAT / proxy timeouts.
+Per resource, the debouncer task fires a `notifications/resources/updated` every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s) even when the producer is idle. The corresponding `resources/read?cursor=auto` returns an empty body with the same `_meta.cursor` and `_meta.last_seq` as the previous read — a no-progress tick. Use the steady stream of notifications to keep the subscription alive across NAT / proxy timeouts.
 
 ### D. Cumulative chunks
 
@@ -212,7 +232,7 @@ peer B subscribes shell://abc/output
 peer B read ?cursor=auto -> 0..2048  (cursor stored = 2048; A's cursor untouched)
 
 peer A read ?cursor=auto -> 1024..2048
-peer B read ?cursor=auto -> (no new bytes; keepalive=true)
+peer B read ?cursor=auto -> (no new bytes; _meta unchanged)
 ```
 
 Implementation: `MemoryRegistry::peer_progress(peer_id, uri) -> Arc<PeerProgress>` (`src/adapters/subscription/memory_registry.rs`) returns the same `Arc` for the same `(peer_id, uri)` tuple and a fresh one for any other combination. This is verified in `tests::peer_progress_returns_independent_arc_for_different_peers` and friends.
@@ -224,7 +244,7 @@ When a producer drops bytes from the head of its ring buffer (because `max_buffe
 1. A peer that had already consumed past the drop window keeps reading new bytes seamlessly.
 2. A peer that was mid-window now reads from offset 0 of the surviving buffer.
 
-The next `resources/read` returns `_meta.truncated_since_last_read = <bytes_dropped>` so the peer can log a gap warning if needed.
+After truncation, the next `resources/read?cursor=auto` returns the surviving bytes with `_meta.cursor` reset to the new offset; subscribers detect the gap by comparing the previously seen `_meta.last_seq` against the now-decremented buffer state. Future telemetry (`truncated_since_last_read`, `lagged_since_last_read`) is reserved on `_meta` but not yet emitted in v4.5.
 
 ## Tunables
 
@@ -251,13 +271,15 @@ All knobs live under `SSH_NOTIFY_*` and `SSH_*_BROADCAST_CAP`. Defaults are sane
 
 -- nothing happens for 30s --
 
-<- notifications/resources/updated { "uri": "shell://5e2d/output" }   # keepalive
+<- notifications/resources/updated { "uri": "shell://5e2d/output" }   # keepalive tick
 
 -> resources/read { "uri": "shell://5e2d/output?cursor=auto" }
 <- contents:
-   { "text": "",
-     "_meta": { "cursor": 0, "buffer_size": 0, "last_seq": 0,
-                "shell_status": "open", "keepalive": true } }
+   { "uri": "shell://5e2d/output",
+     "mimeType": "text/plain",
+     "text": "",
+     "_meta": { "kind": "shell", "cursor": 0, "buffer_size": 0,
+                "last_seq": 0, "status": "open" } }
 
 -- user sends ssh_shell_write "ls\n" --
 -- shell reader emits 32 bytes of output, pokes registry --
@@ -266,7 +288,9 @@ All knobs live under `SSH_NOTIFY_*` and `SSH_*_BROADCAST_CAP`. Defaults are sane
 
 -> resources/read { "uri": "shell://5e2d/output?cursor=auto" }
 <- contents:
-   { "text": "$ ls\nfoo bar baz\n",
-     "_meta": { "cursor": 32, "buffer_size": 32, "last_seq": 1,
-                "shell_status": "open" } }
+   { "uri": "shell://5e2d/output",
+     "mimeType": "text/plain",
+     "text": "$ ls\nfoo bar baz\n",
+     "_meta": { "kind": "shell", "cursor": 32, "buffer_size": 32,
+                "last_seq": 1, "status": "open" } }
 ```
