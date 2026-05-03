@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1074%20passing-brightgreen.svg)]()
 [![Version](https://img.shields.io/badge/version-4.5.0-blue.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
