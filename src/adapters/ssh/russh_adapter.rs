@@ -686,7 +686,7 @@ impl SshClientPort for RusshAdapter {
 
         let response = execute_ssh_command(&handle, command.as_str(), timeout)
             .await
-            .map_err(DomainError::Transport)?;
+            .map_err(|e| DomainError::Transport(format!("COMMAND_FAILED: {e}")))?;
         Ok(CommandOutcome {
             exit_code: Some(response.exit_code),
             stdout: Bytes::from(response.stdout.into_bytes()),
@@ -732,7 +732,9 @@ impl SshClientPort for RusshAdapter {
             .send(WriteRequest::Data(bytes))
             .await
             .map_err(|e| {
-                DomainError::Transport(format!("shell write failed for {shell_id}: {e}"))
+                DomainError::Transport(format!(
+                    "WRITE_FAILED: shell write failed for {shell_id}: {e}"
+                ))
             })?;
         Ok(len)
     }
@@ -970,7 +972,7 @@ impl RusshAdapter {
             terminal.rows,
         )
         .await
-        .map_err(DomainError::Transport)?;
+        .map_err(|e| DomainError::Transport(format!("CHANNEL_FAILED: {e}")))?;
         let shell_id = self.mint_shell_id(session_id);
         let entity = ShellEntity::new(
             shell_id.clone(),

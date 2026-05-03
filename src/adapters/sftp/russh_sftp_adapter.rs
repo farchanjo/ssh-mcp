@@ -531,8 +531,35 @@ struct SharedBundle {
 
 /// Translate a v3 SFTP error string into a [`DomainError::Sftp`]. Kept
 /// outside the impl block so the cargo lint baseline can spot duplicates.
+///
+/// v4.5 prefixes the classified message with one of the granular SFTP
+/// tags (`LOCAL_FILE_ERROR`, `SFTP_OPEN_FAILED`) so the rmcp tool
+/// router promotes the failure to the specific wire code instead of the
+/// collapsed `SFTP_ERROR`. Operations that do not match any tag fall
+/// back to the legacy untagged shape.
 fn map_sftp_error(operation: &str, raw: &str) -> DomainError {
-    DomainError::Sftp(classify_transfer_error(operation, raw))
+    let body = classify_transfer_error(operation, raw);
+    DomainError::Sftp(match sftp_error_tag(operation) {
+        Some(tag) => format!("{tag}: {body}"),
+        None => body,
+    })
+}
+
+/// Pick the v4.5 SFTP wire tag matching the given `operation` label
+/// produced by `classify_transfer_error`. Returns `None` for operations
+/// that should keep the legacy flat code so untagged callers still get
+/// the v4.4 byte-compatible message shape.
+fn sftp_error_tag(operation: &str) -> Option<&'static str> {
+    if operation.contains("local file") {
+        return Some("LOCAL_FILE_ERROR");
+    }
+    if operation.contains("SFTP channel")
+        || operation.contains("SFTP subsystem")
+        || operation.contains("SFTP session")
+    {
+        return Some("SFTP_OPEN_FAILED");
+    }
+    None
 }
 
 /// Build the started-at timestamp the [`TransferEntity::new`] constructor
