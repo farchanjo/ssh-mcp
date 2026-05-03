@@ -16,6 +16,7 @@ pub mod clock;
 pub mod config;
 pub mod id_generator;
 pub mod notifier;
+pub mod output_stream;
 pub mod repo;
 pub mod sftp;
 pub mod ssh;

@@ -45,8 +45,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -54,7 +56,7 @@ use dashmap::mapref::entry::Entry;
 use russh::Disconnect;
 use russh::client::{self, Msg};
 use russh::{Channel, ChannelMsg};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -72,8 +74,8 @@ use crate::mcp::client::{
     execute_ssh_command_async_pty, open_pty_shell,
 };
 use crate::mcp::session::SshClientHandler;
-use crate::mcp::shell::{ChannelWriter, WriteRequest};
-use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus};
+use crate::mcp::shell::{ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms};
+use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
 
 /// Type alias for the v3 SSH handle the adapter wraps.
@@ -147,17 +149,21 @@ impl fmt::Debug for SessionRecord {
 }
 
 /// Adapter-internal record bound to one async command id.
-struct CommandRecord {
+pub(crate) struct CommandRecord {
     /// Owning session — used to scope cancellation by tooling that
     /// might want to walk every command for a given session.
     #[allow(
         dead_code,
         reason = "session linkage will drive bulk-cancellation when the use cases land in H10-H15"
     )]
-    session_id: SessionId,
+    pub(crate) session_id: SessionId,
     /// v3 lock-free command state. Holding the `Arc` here keeps the
     /// background reader task alive for the duration of the command.
-    running: Arc<RunningCommand>,
+    /// Exposed `pub(crate)` so the sibling
+    /// [`crate::adapters::output_stream::russh_output::RusshOutputAdapter`]
+    /// can snapshot `output_history` without going through the trait
+    /// boundary.
+    pub(crate) running: Arc<RunningCommand>,
 }
 
 impl fmt::Debug for CommandRecord {
@@ -170,23 +176,29 @@ impl fmt::Debug for CommandRecord {
 }
 
 /// Adapter-internal record bound to one open PTY shell id.
-struct ShellRecord {
+pub(crate) struct ShellRecord {
     /// Owning session — used to scope bulk-close logic when a
     /// `disconnect` tears the parent session down.
     #[allow(
         dead_code,
         reason = "session linkage will drive bulk-close when the H13 shell-IO use cases land"
     )]
-    session_id: SessionId,
+    pub(crate) session_id: SessionId,
     /// Sink for input frames consumed by the dedicated writer task.
     /// `write_shell` clones this and forwards `WriteRequest::Data`;
     /// `close_shell` forwards `WriteRequest::Close`.
-    input_tx: mpsc::Sender<WriteRequest>,
+    pub(crate) input_tx: mpsc::Sender<WriteRequest>,
     /// Cancellation handle for the writer task. Firing it terminates
     /// the loop so `close_shell` can guarantee teardown even if the
     /// `WriteRequest::Close` frame never reaches the writer (e.g. the
     /// mpsc queue was already torn down by an inactivity sweep).
-    cancel_token: CancellationToken,
+    pub(crate) cancel_token: CancellationToken,
+    /// Lock-free per-shell state. The reader task publishes incoming
+    /// PTY bytes into [`RunningShell::history`] (`ArcSwap`) so the
+    /// sibling
+    /// [`crate::adapters::output_stream::russh_output::RusshOutputAdapter`]
+    /// can snapshot stdout without holding any guard.
+    pub(crate) running: Arc<RunningShell>,
 }
 
 impl fmt::Debug for ShellRecord {
@@ -195,6 +207,7 @@ impl fmt::Debug for ShellRecord {
             .field("session_id", &self.session_id)
             .field("input_tx", &"<mpsc::Sender<WriteRequest>>")
             .field("cancel_token", &self.cancel_token.is_cancelled())
+            .field("running", &"<RunningShell>")
             .finish()
     }
 }
@@ -265,6 +278,28 @@ impl RusshAdapter {
     #[must_use]
     pub fn shell_count(&self) -> usize {
         self.shells.len()
+    }
+
+    /// Borrow the per-command record table.
+    ///
+    /// Exposed `pub(crate)` so the sibling
+    /// [`crate::adapters::output_stream::russh_output::RusshOutputAdapter`]
+    /// can share the same `Arc<DashMap>` and snapshot
+    /// `RunningCommand.output_history` without duplicating state. Returning
+    /// the [`Arc`] (rather than a raw reference) keeps every consumer
+    /// lock-free: the caller clones the [`Arc`] once and never holds a
+    /// shard guard across `.await`. The visibility matches
+    /// [`CommandRecord`] itself, which is also crate-private.
+    #[must_use]
+    pub(crate) const fn command_table(&self) -> &Arc<DashMap<CommandId, CommandRecord>> {
+        &self.commands
+    }
+
+    /// Borrow the per-shell record table. See [`Self::command_table`] for
+    /// the rationale.
+    #[must_use]
+    pub(crate) const fn shell_table(&self) -> &Arc<DashMap<ShellId, ShellRecord>> {
+        &self.shells
     }
 
     /// Internal: clone the russh handle for a given session id without
@@ -693,32 +728,39 @@ impl RusshAdapter {
         let entity = ShellEntity::new(
             shell_id.clone(),
             session_id.clone(),
-            terminal,
+            terminal.clone(),
             Utc::now(),
             self.config.inactivity_timeout,
             DEFAULT_SHELL_BUFFER_SIZE,
         );
-        self.bind_shell(&shell_id, session_id, channel)?;
+        self.bind_shell(&shell_id, session_id, &terminal, channel)?;
         Ok(entity)
     }
 
     /// Bind a freshly opened russh channel to a shell id by splitting it
     /// into read/write halves, spawning the dedicated writer task, and
-    /// parking the read half on the cancel token until the H13 reader
-    /// driver lands. Surfaces an `Internal` error on the (extremely
-    /// unlikely) id race.
+    /// driving a real reader that publishes incoming PTY bytes into
+    /// [`RunningShell::history`] (`ArcSwap`). Surfaces an `Internal`
+    /// error on the (extremely unlikely) id race.
     fn bind_shell(
         &self,
         shell_id: &ShellId,
         session_id: &SessionId,
+        terminal: &ShellTerminal,
         channel: Channel<Msg>,
     ) -> Result<(), DomainError> {
         let (read_half, write_half) = channel.split();
         let (input_tx, input_rx) = mpsc::channel::<WriteRequest>(SHELL_INPUT_CHANNEL_CAP);
         let cancel_token = CancellationToken::new();
+        let running = Arc::new(RunningShell::new(
+            build_shell_info(shell_id, session_id, terminal),
+            cancel_token.clone(),
+            input_tx.clone(),
+            DEFAULT_SHELL_BUFFER_SIZE,
+        ));
 
         spawn_shell_writer_task(write_half, input_rx, cancel_token.clone());
-        spawn_shell_reader_drain(read_half, cancel_token.clone());
+        spawn_shell_reader_task(read_half, &running);
 
         match self.shells.entry(shell_id.clone()) {
             Entry::Vacant(slot) => {
@@ -726,6 +768,7 @@ impl RusshAdapter {
                     session_id: session_id.clone(),
                     input_tx,
                     cancel_token,
+                    running,
                 });
                 Ok(())
             }
@@ -762,6 +805,14 @@ const DEFAULT_SHELL_BUFFER_SIZE: u64 = 10_u64.saturating_mul(1024).saturating_mu
 /// `SHELL_INPUT_CHANNEL_CAP` so the writer task drains at the same rate
 /// as the legacy code path.
 const SHELL_INPUT_CHANNEL_CAP: usize = 64;
+
+/// Local staging capacity for the shell reader before the first
+/// flush. Mirrors `mcp::tools::legacy_helpers::shell_reader`.
+const SHELL_READER_LOCAL_CAP: usize = 4096;
+
+/// Local-buffer high-water mark that triggers an early flush into
+/// [`RunningShell::history`]. Mirrors v3's `SHELL_FLUSH_THRESHOLD`.
+const SHELL_FLUSH_THRESHOLD: usize = 4096;
 
 /// Spawn the dedicated writer task that owns the russh write half
 /// exclusively. Drains [`WriteRequest`] frames from `input_rx` until
@@ -800,29 +851,146 @@ fn spawn_shell_writer_task(
     });
 }
 
-/// Spawn a minimal reader-drain task so the read half does not block
-/// the russh channel state machine before the H13 reader driver lands.
-/// This task only consumes frames until the channel signals close or
-/// the cancel token fires; the actual byte forwarding belongs to the
-/// `ShellReaderPort` adapter introduced by H13.
-fn spawn_shell_reader_drain(
-    mut read_half: russh::ChannelReadHalf,
+/// Bundle of `Arc`s that the shell reader task needs to publish bytes
+/// into [`RunningShell::history`]. Pulled out of the loop body so the
+/// public spawn signature stays narrow and the loop function avoids
+/// the `too-many-arguments` threshold.
+struct ShellReaderHandles {
+    history: Arc<ArcSwap<RingBuffer>>,
+    output_tx: broadcast::Sender<Bytes>,
+    data_notify: Arc<Notify>,
     cancel_token: CancellationToken,
-) {
+    max_buffer_size: Arc<AtomicU64>,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl ShellReaderHandles {
+    /// Build the bundle from a borrowed [`Arc<RunningShell>`] without
+    /// consuming it — the caller still needs the `Arc` to register the
+    /// shell record.
+    fn from_running(running: &Arc<RunningShell>) -> Self {
+        Self {
+            history: Arc::clone(&running.history),
+            output_tx: running.output_tx.clone(),
+            data_notify: Arc::clone(&running.data_notify),
+            cancel_token: running.cancel_token.clone(),
+            max_buffer_size: Arc::clone(&running.max_buffer_size),
+            last_activity_ms: Arc::clone(&running.last_activity_ms),
+        }
+    }
+}
+
+/// Spawn the dedicated reader task that drains the russh read half and
+/// publishes incoming PTY bytes into [`RunningShell::history`] via
+/// [`ArcSwap::rcu`]. Mirrors `mcp::tools::legacy_helpers::shell_reader`
+/// without the registry-side debouncing — the
+/// [`crate::ports::subscription::SubscriberRegistry`] adapter (H9) will
+/// observe the per-shell broadcast channel directly.
+fn spawn_shell_reader_task(read_half: russh::ChannelReadHalf, running: &Arc<RunningShell>) {
+    let handles = ShellReaderHandles::from_running(running);
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel_token.cancelled() => break,
-                msg = read_half.wait() => {
-                    match msg {
-                        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
-                        Some(_) => {}
-                    }
+        run_shell_reader(read_half, handles).await;
+    });
+}
+
+/// Reader-loop body. Pulled out of [`spawn_shell_reader_task`] so the
+/// spawned future stays under the project's `too-many-lines`
+/// threshold.
+async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellReaderHandles) {
+    let mut local: Vec<u8> = Vec::with_capacity(SHELL_READER_LOCAL_CAP);
+    loop {
+        tokio::select! {
+            biased;
+            () = handles.cancel_token.cancelled() => break,
+            msg = read_half.wait() => {
+                if !handle_reader_msg(msg, &mut local, &handles) {
+                    break;
                 }
             }
         }
+    }
+    if !local.is_empty() {
+        flush_shell_buffer(
+            &handles.history,
+            &handles.output_tx,
+            &handles.data_notify,
+            &mut local,
+            &handles.max_buffer_size,
+        );
+    }
+}
+
+/// Handle a single russh frame. Returns `true` to continue the reader
+/// loop and `false` when the channel signalled EOF / Close (or
+/// `None`).
+fn handle_reader_msg(
+    msg: Option<ChannelMsg>,
+    local: &mut Vec<u8>,
+    handles: &ShellReaderHandles,
+) -> bool {
+    match msg {
+        Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
+            local.extend_from_slice(&data);
+            handles.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+            if local.len() >= SHELL_FLUSH_THRESHOLD {
+                flush_shell_buffer(
+                    &handles.history,
+                    &handles.output_tx,
+                    &handles.data_notify,
+                    local,
+                    &handles.max_buffer_size,
+                );
+            }
+            true
+        }
+        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => false,
+        Some(_) => true,
+    }
+}
+
+/// Flush a local staging buffer into [`RunningShell::history`] via
+/// [`ArcSwap::rcu`] and broadcast the chunk. The same logic is applied
+/// to head-truncate the rolling buffer to `max_buffer_size`.
+fn flush_shell_buffer(
+    history: &ArcSwap<RingBuffer>,
+    output_tx: &broadcast::Sender<Bytes>,
+    data_notify: &Notify,
+    local: &mut Vec<u8>,
+    max_buffer_size: &AtomicU64,
+) {
+    let chunk = Bytes::copy_from_slice(local);
+    local.clear();
+    let max_size = usize::try_from(max_buffer_size.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+    history.rcu(|current| {
+        let mut combined = Vec::with_capacity(current.data.len() + chunk.len());
+        combined.extend_from_slice(&current.data);
+        combined.extend_from_slice(&chunk);
+        if max_size > 0 && combined.len() > max_size {
+            let excess = combined.len() - max_size;
+            combined.drain(..excess);
+        }
+        RingBuffer {
+            data: Bytes::from(combined),
+        }
     });
+    let _ = output_tx.send(chunk);
+    data_notify.notify_waiters();
+}
+
+/// Build a [`ShellInfo`] payload for the lock-free shell record.
+fn build_shell_info(
+    shell_id: &ShellId,
+    session_id: &SessionId,
+    terminal: &ShellTerminal,
+) -> ShellInfo {
+    ShellInfo {
+        shell_id: shell_id.as_str().to_string(),
+        session_id: session_id.as_str().to_string(),
+        term_type: terminal.term_type.clone(),
+        cols: terminal.cols,
+        rows: terminal.rows,
+        opened_at: Utc::now().to_rfc3339(),
+    }
 }
 
 /// Translate a [`Credentials`] variant into the `(password, key_path)`
