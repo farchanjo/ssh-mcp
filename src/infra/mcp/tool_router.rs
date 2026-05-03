@@ -1717,4 +1717,49 @@ mod tests {
         let (code, _reason, _detail) = classify_error(&err);
         assert_eq!(code, "FEATURE_DISABLED");
     }
+
+    /// `FORWARD_FAILED` is the v4.5 wire tag for non-`AddrInUse`
+    /// pre-flight bind failures emitted by
+    /// [`crate::application::forward_port::ForwardPortUseCase`]. The use
+    /// case raises it via `DomainError::Transport`, so the dispatcher
+    /// must promote it from the `TRANSPORT_ERROR` fallback to the
+    /// dedicated wire code.
+    #[test]
+    fn classify_error_promotes_forward_failed_tag() {
+        let err = DomainError::Transport(
+            "FORWARD_FAILED: bind 0.0.0.0:80 failed: permission denied".to_string(),
+        );
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "FORWARD_FAILED");
+        assert_eq!(reason, "bind 0.0.0.0:80 failed: permission denied");
+    }
+
+    /// `LOCAL_NOT_FILE` is the v4.5 wire tag for upload pre-flight
+    /// failures where the local path resolves to a directory or other
+    /// non-regular file. Emitted by
+    /// [`crate::application::upload_file::UploadFileUseCase`] via
+    /// `DomainError::Sftp`.
+    #[test]
+    fn classify_error_promotes_local_not_file_tag() {
+        let err = DomainError::Sftp(
+            "LOCAL_NOT_FILE: local path '/tmp' is not a regular file".to_string(),
+        );
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "LOCAL_NOT_FILE");
+        assert_eq!(reason, "local path '/tmp' is not a regular file");
+    }
+
+    /// `REMOTE_METADATA_ERROR` is the v4.5 wire tag for download
+    /// pre-flight failures where the remote stat call fails. Emitted by
+    /// [`crate::application::download_file::DownloadFileUseCase`] via
+    /// `DomainError::Sftp`.
+    #[test]
+    fn classify_error_promotes_remote_metadata_error_tag() {
+        let err = DomainError::Sftp(
+            "REMOTE_METADATA_ERROR: cannot stat remote path: permission denied".to_string(),
+        );
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "REMOTE_METADATA_ERROR");
+        assert_eq!(reason, "cannot stat remote path: permission denied");
+    }
 }
