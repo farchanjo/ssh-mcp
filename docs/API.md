@@ -1,12 +1,14 @@
-# SSH MCP API Reference (v4.6.0)
+# SSH MCP API Reference (v4.7.0)
 
-Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes exposed by the v4.6.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). The markdown / `_meta` wire contract is byte-compatible with v3.0.0 / v4.0.x at the structural level. **v4.6 ships one narrow renaming**: the agent_id field key changed from `AGENT:` to `AGENT_ID:` (see the v4.6 wire change callout below). v4.6 also layers `NEXT:` advisory lines on every response with a clear successor, four new subscribe-first `HINT:` sites, JSON Schema `default` keywords on optional args, one-line cost hints on every tool description, and a wired `Implementation.icons` URL. v4.5 added the `EXPIRES_AT` / `PERSISTENT` / `HINT` lines on connection responses, the `_meta` envelope on every `resources/read`, granular wire error codes, server identity, tool annotations, and `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.7.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0; the v4.7 `structured_content` payload sits next to it. v4.7 adds three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
 
-> **v4.6 wire change — `AGENT:` -> `AGENT_ID:`.** Renamed for consistency with every other ID field. Affects 7 render sites: `ssh_connect` (OK / REUSED / SUGGESTED-single), `ssh_list_sessions` (per-row decoration), `ssh_execute`, `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. Hosts that grep `^AGENT:` literally must update; key-value parsers walking the lines generically are unaffected.
+> **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). 6 tools advertise `output_schema` (`ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress`); other 15 emit free-form structured payload. Errors as `{ tool, status: "error", code, reason, detail }`. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
-> **Tool metadata note (v4.5, icon wired in v4.6).** Every tool carries a `Tool.title` and `ToolAnnotations` (`read_only_hint`, `destructive_hint`, `idempotent_hint`). Full matrix in [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46). v4.6 wires `Implementation.icons` to a hosted SVG URL.
+> **v4.7 new tools — `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`.** Tool count moves from 18 to 21 (or 17 to 20 without `port_forward`). Per-tool sections below.
 
-> **Subscribe-first note.** Prefer `resources/subscribe <scheme>://<id>/<sub-path>` over long-poll `wait=true` for stream resources. v4.6 reinforces this with `HINT:` lines on every async-spawn response and `NEXT:` advisories that pre-fill the next call. See [LLM_GUIDE.md](./LLM_GUIDE.md) for token-efficient patterns.
+> **v4.6 wire change** — `AGENT:` -> `AGENT_ID:` (7 render sites). Hosts that grep `^AGENT:` literally must update; generic key-value parsers unaffected.
+
+> **Subscribe-first** — prefer `resources/subscribe <scheme>://<id>/<sub-path>` over long-poll `wait=true`. v4.6 `HINT:` + `NEXT:` lines reinforce this on every async-spawn response. See [LLM_GUIDE.md](./LLM_GUIDE.md).
 
 [[_TOC_]]
 
@@ -54,11 +56,11 @@ Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes
 
 ---
 
-## Tools (18)
+## Tools (21 with `port_forward`, 20 without)
 
-The catalogue below covers every tool: schema, defaults, response sample, status values, and error codes.
+The catalogue below covers every tool. v4.7 adds `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. Groups: Connection (5), Commands (6), Shell (6), SFTP (3), Network (1, feature-gated).
 
-## Connection (4)
+## Connection (5)
 
 ### ssh_connect
 
@@ -226,7 +228,41 @@ The `AGENT_ID:` key replaces the v4.5 `AGENT:` (v4.6 rename for consistency). Te
 
 ---
 
-## Execute (4)
+### ssh_disconnect_many (v4.7)
+
+Best-effort batch disconnect of 1..=64 sessions in a single call. Per-id failures are reported in the response but do not abort the remaining disconnects.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_ids` | `string[]` | — | 1..=64 `SESSION_ID`s previously returned by `ssh_connect`. Empty list rejected with `INVALID_ARGUMENT`. |
+
+When to use:
+- Cleaning up a fan-out of sessions when bulk-by-agent is not appropriate.
+- Tearing down an explicit subset of an agent's sessions without affecting the rest.
+
+**Status values**: `OK`, `ERROR`.
+
+**Response**:
+```
+SSH_DISCONNECT_MANY: OK
+DISCONNECTED: 2
+FAILED: 1
+- a3f2b1d7-...: ok
+- 9b1c2d3e-...: ok
+- f0e1d2c3-...: error [SESSION_NOT_FOUND] no session with id f0e1d2c3-...
+```
+
+Each item carries the session id followed by `ok` (success) or `error [<CODE>] <reason>` (per-id failure). Counters at the top mirror the `disconnected` / `failed` fields in the structured channel.
+
+**structured_content shape**: `{ tool: "ssh_disconnect_many", status: "ok", results: [{ session_id, status: "ok"|"error", code?, reason? }, ...], disconnected, failed }`. Top-level `status` is always `"ok"` — per-id failures live inside `results`. Full schema in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Idempotency: pass `_meta.idempotency_key` to dedup retried bulk-disconnect calls.
+
+**Errors**: `INVALID_ARGUMENT` (empty list / `>64` ids), `IDEMPOTENCY_KEY_TOO_LONG`.
+
+**Wire codes**: `INVALID_ARGUMENT`, `IDEMPOTENCY_KEY_TOO_LONG`.
+
+---
+
+## Execute (6)
 
 ### ssh_execute
 
@@ -355,6 +391,88 @@ last line before cancel
 
 ---
 
+### ssh_run (v4.7)
+
+One-shot orchestration of `ssh_connect` + `ssh_execute(wait=true)` + (optional) `ssh_disconnect`. Avoids the three-round-trip `connect -> execute -> wait` choreography for short atomic commands like `uptime`, `hostname`, `cat /etc/release`. The session is minted (or reused via `reuse=auto`) under the hood.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `address` | `string` | — | `host[:port]` (e.g. `192.168.1.1:22`, `example.com`). Port defaults to `22`. |
+| `username` | `string` | — | SSH login user. |
+| `command` | `string` | — | Shell command to run on the remote host. |
+| `password` | `string?` | — | Optional password for password authentication. |
+| `key_path` | `string?` | — | Optional path to a private key file. Auth chain: key -> password -> agent (`SSH_AUTH_SOCK`). |
+| `agent_id` | `string?` | — | Optional `AGENT_ID` for grouping the underlying session. |
+| `pty` | `bool?` | `false` | Allocate a pseudo-terminal for the command. |
+| `timeout_secs` | `u64?` | `30` | Maximum seconds to wait for the command. Cap `300` (`SshRunTimeoutCap`). |
+| `max_output_bytes` | `usize?` | `16384` | Max bytes returned in stdout/stderr. Cap `1 048 576`. |
+| `disconnect_after` | `bool?` | `true` | Disconnect the session after the command finishes (one-shot mode). Set `false` to keep the session open for follow-up `ssh_execute` calls. |
+
+Behaviour:
+1. `ssh_run` mints (or reuses) a session via `reuse=auto`, ranking matches by `agent_id` when set.
+2. Spawns the command and blocks until completion or `timeout_secs` fires.
+3. With `disconnect_after=true` (default) tears the session down after the command terminates.
+
+**Status values**: `COMPLETED`, `TIMEOUT`, `FAILED`, `CANCELLED`, `ERROR`.
+
+**Response — COMPLETED**:
+```
+SSH_RUN: COMPLETED
+SESSION_ID: a3f2b1d7-...
+COMMAND_ID: 7d4c8e2a-...
+EXIT: 0
+DISCONNECTED: true
+--- stdout [c8d9e0f1] ---
+14:22:01 up 12 days,  3:14,  1 user,  load average: 0.21, 0.14, 0.10
+--- stderr [c8d9e0f1] (empty) ---
+```
+
+`DISCONNECTED:` is `true` when `disconnect_after=true` (default) and the post-execute disconnect succeeded; `false` when the caller opted to keep the session alive. The resolved `SESSION_ID:` is preserved in either case so the caller can reuse it. Terminal — no `NEXT:` line on `COMPLETED`.
+
+**structured_content shape**: `{ tool: "ssh_run", status, session_id, command_id, disconnected, exit_code?, stdout, stderr, stdout_truncated, stderr_truncated, timed_out, error? }`. Full schema in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Idempotency: pass `_meta.idempotency_key` to dedup retried `ssh_run` calls (connect + execute + disconnect form one logical operation).
+
+**Errors**: `CONNECTION_FAILED`, `AUTH_FAILED`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR`, `IDEMPOTENCY_KEY_TOO_LONG`.
+
+**Wire codes**: `CONNECTION_FAILED`, `AUTH_FAILED`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR`, `IDEMPOTENCY_KEY_TOO_LONG`.
+
+---
+
+### ssh_execute_batch (v4.7)
+
+Sequential execution of 1..=16 commands against a single session, with optional stop-on-failure semantics. Trades the per-command round-trip for a single tool call when a small linear pipeline (`mkdir`, `tar -xzf`, `chown -R`) needs to run in order.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_id` | `string` | — | `SESSION_ID`. |
+| `commands` | `string[]` | — | 1..=16 commands, executed in order. |
+| `stop_on_failure` | `bool?` | `true` | Halt the loop on the first non-zero exit code; remaining slots surface as `skipped`. |
+| `timeout_secs_per_command` | `u64?` | `30` | Per-command wait timeout. Cap `300`. |
+| `max_output_bytes_per_command` | `usize?` | `16384` | Per-command max bytes returned in stdout/stderr. Cap `1 048 576`. |
+| `pty` | `bool?` | `false` | Allocate a PTY for each command. |
+
+**Status values**: `OK`, `HALTED`, `ERROR`. `OK` when every command ran (regardless of exit code); `HALTED` when `stop_on_failure=true` short-circuited the loop after the first non-zero exit.
+
+**Response — HALTED**:
+```
+SSH_EXECUTE_BATCH: HALTED
+SESSION_ID: a3f2b1d7-...
+TOTAL: 3
+EXECUTED: 2
+- [0] mkdir /tmp/foo: COMPLETED exit=0
+- [1] tar -xzf bundle.tgz -C /tmp/foo: FAILED exit=2
+- [2] chown -R svc /tmp/foo: SKIPPED
+```
+
+Each `results[]` entry carries its own `command_id`, `exit_code`, stdout/stderr blocks, and (optional) `error` string.
+
+**structured_content shape**: `{ tool: "ssh_execute_batch", status, session_id, total, executed, results: [{ index, command, status: "completed|failed|timeout|cancelled|skipped", command_id?, exit_code?, stdout, stderr, stdout_truncated, stderr_truncated, timed_out, error? }, ...] }`. Full schema in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Idempotency: pass `_meta.idempotency_key` to dedup retried batches.
+
+**Errors**: `SESSION_NOT_FOUND`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR`, `INVALID_ARGUMENT` (empty / `>16` commands), `IDEMPOTENCY_KEY_TOO_LONG`.
+
+**Wire codes**: `SESSION_NOT_FOUND`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR` (untagged), `CHANNEL_FAILED` (tagged transport), `INVALID_ARGUMENT`, `IDEMPOTENCY_KEY_TOO_LONG`.
+
+---
+
 ## Shell (6)
 
 ### ssh_shell_open
@@ -381,11 +499,14 @@ SHELL_ID: 4b9c8e2a-...
 SESSION_ID: a3f2b1d7-...
 TERM: xterm 80x24
 AGENT_ID: claude-code-instance-abc123
+INITIAL_BUFFER: Last login: Sat May  3 14:22:01 2026 from 10.0.0.4\r\n$ 
 HINT: subscribe to shell://4b9c8e2a-.../output for realtime output (preferred over polling)
 NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_shell_send_key
 ```
 
 `TERM` carries the terminal type and the geometry on a single line (`<term> <cols>x<rows>`). `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when no agent owns the session. The v4.6 `HINT:` steers toward push notifications; `NEXT:` names the three successor calls.
+
+**v4.7 `INITIAL_BUFFER:` line.** When the PTY emits stdout within `SSH_SHELL_OPEN_INITIAL_PEEK_MS` (default 100 ms; tick `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS` default 5 ms) of the open call, the response embeds a single `INITIAL_BUFFER:` line with the head-truncated bytes (cap `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES`, default 4 KiB). CR/LF escaped to `\r`/`\n`. Structured twin emits `initial_buffer`. Omitted when no stdout arrived within the budget. Smaller LLMs sometimes skip the first `resources/read` round-trip when the prompt is already visible. Reference: `src/infra/mcp/render/shell.rs::shell_open_render_with_initial`. See [LLM_GUIDE.md section O](./LLM_GUIDE.md#o-initial_buffer-on-ssh_shell_open-v47).
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_SHELLS_EXCEEDED`, `CHANNEL_FAILED`, `TRANSPORT_ERROR`.
 
@@ -790,19 +911,34 @@ The build without `port_forward` advertises `17 tools, 4 push streams (shell://,
 
 `Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description when the asset is unreachable. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
 
-Each of the 18 tools (or 17 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix.
+Each of the 21 tools (or 20 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (5 entries) and `resources/templates/list` (4 / 5 entries depending on `port_forward`).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer → debouncer → notification pipeline and [FLOWS.md](./FLOWS.md) for end-to-end sequence diagrams.
 
 ---
 
+## structured_content channel and output_schema (v4.7)
+
+Every tool response carries BOTH the block-style Markdown (`content[].text`) AND a typed JSON object (`structured_content`). Text channel byte-identical with v4.6. 6 tools advertise `output_schema` for validation: `ssh_connect` -> `SshConnectResult`, `ssh_execute` -> `SshExecuteResult`, `ssh_get_command_output` -> `SshGetCommandOutputResult`, `ssh_shell_open` -> `SshShellOpenResult`, `ssh_shell_read` -> `SshShellReadResult`, `ssh_get_transfer_progress` -> `SshGetTransferProgressResult` (refs in `src/infra/mcp/results.rs`). Other 15 tools emit free-form structured payload (keys in per-tool sections). Full canonical example shapes per tool — including `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — live in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Error shape on every tool: `{ tool, status: "error", code, reason, detail }` (when the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion). Reference: `src/infra/mcp/helpers/structured.rs` (dual-channel render) + `src/infra/mcp/suggestions.rs` (Levenshtein picker).
+
+---
+
+## Resource templates / Progress / Prompts / Idempotency (v4.7)
+
+- **Resource templates** — `resources/templates/list` advertises 4 RFC 6570 URI shapes without `port_forward`, 5 with. Full payload + MIME table in [RESOURCES.md - Resource Templates (v4.7)](./RESOURCES.md#resource-templates-v47).
+- **Progress notifications** — when a request includes `_meta.progressToken`, the server fires periodic `notifications/progress` updates during `ssh_get_command_output(wait=true)` (5 s cadence), `ssh_get_transfer_progress(wait=true)` (5 s), and `ssh_shell_wait_for` (1 s). Payload `{progress_token, progress, total, message}`. Best-effort — transport errors swallowed. See [LLM_GUIDE.md section L](./LLM_GUIDE.md#l-progress-notifications-v47). Reference: `src/infra/mcp/progress.rs::ProgressEmitter`.
+- **Prompts catalog** — `prompts/list` advertises 5 canonical workflows; `prompts/get` returns a parameterised tool-sequence recipe. See [LLM_GUIDE.md section M](./LLM_GUIDE.md#m-prompts-catalog-v47). Reference: `src/infra/mcp/prompts.rs`.
+- **Idempotency** — mutating tools (15 total) accept `_meta.idempotency_key` (1..=256 bytes). Cached response replays within the TTL window (default 300 s, env `SSH_IDEMPOTENCY_TTL_SECS`; cap 1024 entries, env `SSH_IDEMPOTENCY_MAX_ENTRIES`). Read-only tools ignore the key. Oversized keys raise `IDEMPOTENCY_KEY_TOO_LONG`. See [LLM_GUIDE.md section J](./LLM_GUIDE.md#j-idempotency-v47) + [ERRORS.md](./ERRORS.md#v47-idempotency-error). Reference: `src/infra/mcp/idempotency.rs`.
+
+---
+
 ## NEXT: advisory coverage matrix (v4.6)
 
-Every response with a clear successor tool ends with `NEXT: <pipe-separated tool calls>`. Each per-tool section above documents which statuses emit `NEXT:` and the literal hint string they emit. The full per-status coverage matrix is consolidated in [LLM_GUIDE.md section E](./LLM_GUIDE.md#e-next-advisory-line-v46). Reference implementations: `src/infra/mcp/render/{connection,execute,shell,sftp,forward}.rs::next_hint_for_*`. Convention: terminal statuses (`COMPLETED`, `CLOSED`, `CANCELLED`, `NOOP`, etc.) omit `NEXT:` because the next move depends entirely on the user prompt rather than the tool result.
+Every response with a clear successor tool ends with `NEXT: <pipe-separated tool calls>`. Per-tool sections above document the literal hints; the full coverage matrix lives in [LLM_GUIDE.md section E](./LLM_GUIDE.md#e-next-advisory-line-v46). Terminal statuses (`COMPLETED`, `CLOSED`, `CANCELLED`, `NOOP`, etc.) deliberately omit `NEXT:`. Reference: `src/infra/mcp/render/{connection,execute,shell,sftp,forward}.rs::next_hint_for_*`.
 
 ## Cost hints and JSON Schema defaults (v4.6)
 
-Every tool description now ends with a single-line `Cost:` hint stating O() complexity, expected latency, and whether the call is blocking or async. Optional `Option<T>` fields whose doc comment cites a default now emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]` so smaller LLMs that read the schema mechanically can see the default value without parsing English. The full cost matrix and the per-Args-struct default coverage live in [LLM_GUIDE.md sections H + I](./LLM_GUIDE.md#h-json-schema-defaults-v46). Reference implementations: `src/infra/mcp/tool_router.rs` (cost-hint strings) and `src/infra/mcp/args/{connection,execute,shell,sftp}.rs` (`#[schemars(default = ...)]` attributes).
+Every tool description ends with a single-line `Cost:` hint (O() + latency + blocking/async). Optional `Option<T>` fields whose doc comment cites a default emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]`. Full coverage in [LLM_GUIDE.md sections H + I](./LLM_GUIDE.md#h-json-schema-defaults-v46). Reference: `src/infra/mcp/tool_router.rs` + `src/infra/mcp/args/{connection,execute,shell,sftp}.rs`.
 
 ## Cross-reference — keyboard input
 

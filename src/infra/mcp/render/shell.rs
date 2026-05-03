@@ -5,14 +5,20 @@
 //! `render_shell_send_key_ok`, `ShellReadBuilder`, `ShellWaitForBuilder`,
 //! `render_shell_close_ok` — but takes the v4 use case Outcomes as input.
 
+use serde_json::{Value, json};
+
 use crate::application::close_shell::CloseShellOutcome;
 use crate::application::open_shell::OpenShellOutcome;
 use crate::application::read_shell::{ReadShellOutcome, ReadShellStatus};
 use crate::application::send_key::SendKeyOutcome;
 use crate::application::wait_for_pattern::{WaitForPatternOutcome, WaitForPatternStatus};
 use crate::application::write_shell::WriteShellOutcome;
+use crate::domain::ids::{AgentId, SessionId};
+use crate::domain::shell::ShellEntity;
 use crate::infra::mcp::helpers::nonce::generate_nonce;
-use crate::infra::mcp::helpers::output::{render_output_block, sanitize_value};
+use crate::infra::mcp::helpers::output::{
+    render_output_block, sanitize_value, truncate_utf8_safe_tail,
+};
 
 /// Default byte cap applied to data blocks when the request did not
 /// supply one. Mirrors the v3 `output_default_bytes` config knob (16
@@ -22,15 +28,56 @@ const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024;
 /// Render an [`OpenShellOutcome`] as the v3 `SSH_SHELL_OPEN` block.
 #[must_use]
 pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
+    shell_open_render_with_initial(outcome, None)
+}
+
+/// v4.7-step7 variant of [`shell_open_render`].
+///
+/// Injects an `INITIAL_BUFFER:` line right after the standard fields
+/// when the inbound `peek_initial_shell_buffer` poll captured non-empty
+/// stdout within the budget. `initial_buffer` carries the head-truncated
+/// byte slice (already capped by
+/// [`crate::infra::mcp::tool_router::SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES`]).
+/// Pass `None` to retain the byte-identical legacy shape.
+#[must_use]
+pub fn shell_open_render_with_initial(
+    outcome: OpenShellOutcome,
+    initial_buffer: Option<&[u8]>,
+) -> String {
     let OpenShellOutcome {
         shell,
         session_id,
         agent_id,
     } = outcome;
     let shell_id = shell.id.as_str().to_string();
-    let mut out = String::with_capacity(320);
+    let mut out = String::with_capacity(384);
+    append_shell_open_header(&mut out, &shell, &shell_id, &session_id, agent_id.as_ref());
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
+        append_initial_buffer_line(&mut out, bytes);
+    }
+    append_subscribe_hint(
+        &mut out,
+        &format!(
+            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
+        ),
+    );
+    append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
+    out
+}
+
+/// Stamp the canonical `SSH_SHELL_OPEN` field block into `out`.
+///
+/// Pulled out so [`shell_open_render_with_initial`] stays under the
+/// 30-line ceiling.
+fn append_shell_open_header(
+    out: &mut String,
+    shell: &ShellEntity,
+    shell_id: &str,
+    session_id: &SessionId,
+    agent_id: Option<&AgentId>,
+) {
     out.push_str("SSH_SHELL_OPEN: OK\nSHELL_ID: ");
-    out.push_str(&shell_id);
+    out.push_str(shell_id);
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id.as_str());
     out.push_str("\nTERM: ");
@@ -43,14 +90,17 @@ pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
         out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
-    append_subscribe_hint(
-        &mut out,
-        &format!(
-            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
-        ),
-    );
-    append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
-    out
+}
+
+/// Append `INITIAL_BUFFER: <escaped-bytes>` to the response.
+///
+/// The bytes arrive already head-capped; `sanitize_value` escapes
+/// control chars the same way the rest of the markdown shape does so
+/// multi-line banners stay on a single line.
+fn append_initial_buffer_line(out: &mut String, bytes: &[u8]) {
+    let lossy = String::from_utf8_lossy(bytes);
+    out.push_str("\nINITIAL_BUFFER: ");
+    out.push_str(&sanitize_value(&lossy));
 }
 
 /// Successor tools after `ssh_shell_open` — subscribe-first push, or
@@ -218,6 +268,166 @@ pub fn shell_close_render(outcome: &CloseShellOutcome) -> String {
     out.push_str("SSH_SHELL_CLOSE: OK\nSHELL_ID: ");
     out.push_str(outcome.shell_id.as_str());
     out
+}
+
+// ---------------------------------------------------------------------------
+// v4.7 — structured_content payloads (JSON parallel to the Markdown body)
+// ---------------------------------------------------------------------------
+
+/// Build the open-shell structured payload mirroring [`shell_open_render`].
+#[must_use]
+pub fn shell_open_structured(outcome: &OpenShellOutcome) -> Value {
+    shell_open_structured_with_initial(outcome, None)
+}
+
+/// v4.7-step7 variant of [`shell_open_structured`].
+///
+/// Emits `initial_buffer` (UTF-8 lossy decoded) on the structured
+/// payload when the inbound peek captured stdout. The field is omitted
+/// when the peek returned empty (and never overrides the legacy `next`
+/// advisory).
+#[must_use]
+pub fn shell_open_structured_with_initial(
+    outcome: &OpenShellOutcome,
+    initial_buffer: Option<&[u8]>,
+) -> Value {
+    let mut json = json!({
+        "tool":   "ssh_shell_open",
+        "status": "ok",
+        "session_id": outcome.session_id.as_str(),
+        "shell_id":   outcome.shell.id.as_str(),
+        "term":   outcome.shell.terminal.term_type,
+        "cols":   outcome.shell.terminal.cols,
+        "rows":   outcome.shell.terminal.rows,
+        "agent_id": outcome.agent_id.as_ref().map(AgentId::as_str),
+        "next": [
+            "resources/subscribe shell://<shell_id>/output",
+            "ssh_shell_write",
+            "ssh_shell_send_key",
+        ],
+    });
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "initial_buffer".to_string(),
+                Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            );
+        }
+    }
+    json
+}
+
+/// Build the write-shell structured payload mirroring [`shell_write_render`].
+#[must_use]
+pub fn shell_write_structured(outcome: &WriteShellOutcome) -> Value {
+    json!({
+        "tool":   "ssh_shell_write",
+        "status": "ok",
+        "shell_id":   outcome.shell_id.as_str(),
+        "bytes_sent": outcome.bytes_written,
+        "next": [
+            "resources/read shell://<shell_id>/output?cursor=auto",
+            "ssh_shell_wait_for",
+            "ssh_shell_read",
+        ],
+    })
+}
+
+/// Build the send-key structured payload mirroring [`shell_send_key_render`].
+#[must_use]
+pub fn shell_send_key_structured(outcome: &SendKeyOutcome) -> Value {
+    let modifiers: Vec<String> = outcome
+        .modifier_label
+        .as_ref()
+        .map(|label| label.split('+').map(str::to_string).collect())
+        .unwrap_or_default();
+    json!({
+        "tool":   "ssh_shell_send_key",
+        "status": "ok",
+        "shell_id":   outcome.shell_id.as_str(),
+        "key":        outcome.key_label,
+        "modifiers":  modifiers,
+        "repeat":     outcome.repeat,
+        "bytes_sent": outcome.bytes_sent,
+        "next": [
+            "resources/read shell://<shell_id>/output?cursor=auto",
+            "ssh_shell_wait_for",
+            "ssh_shell_read",
+        ],
+    })
+}
+
+const fn read_status_lower(s: ReadShellStatus) -> &'static str {
+    match s {
+        ReadShellStatus::Open => "open",
+        ReadShellStatus::Closed => "closed",
+        ReadShellStatus::Timeout => "timeout",
+    }
+}
+
+/// Build the read-shell structured payload mirroring [`shell_read_render`].
+/// `cleared` echoes the request flag passed in by the tool router so the
+/// LLM can branch on whether the buffer was drained.
+#[must_use]
+pub fn shell_read_structured(outcome: &ReadShellOutcome, cleared: bool) -> Value {
+    let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
+    json!({
+        "tool":     "ssh_shell_read",
+        "status":   read_status_lower(outcome.status),
+        "shell_id": outcome.shell_id.as_str(),
+        "stdout":   data,
+        "bytes_returned": info.shown_bytes,
+        "buffer_size_at_snapshot": info.total_bytes,
+        "cleared":   cleared,
+        "truncated": info.was_truncated(),
+    })
+}
+
+const fn wait_for_status_lower(s: WaitForPatternStatus) -> &'static str {
+    match s {
+        WaitForPatternStatus::Matched => "matched",
+        WaitForPatternStatus::Timeout => "timeout",
+        WaitForPatternStatus::Closed => "closed",
+    }
+}
+
+/// Build the wait-for-pattern structured payload mirroring
+/// [`shell_wait_for_render`].
+#[must_use]
+pub fn shell_wait_for_structured(outcome: &WaitForPatternOutcome) -> Value {
+    let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
+    let next = match outcome.status {
+        WaitForPatternStatus::Matched => Some(json!([
+            "ssh_shell_write",
+            "ssh_shell_send_key",
+            "ssh_shell_close",
+        ])),
+        WaitForPatternStatus::Timeout => Some(json!([
+            "ssh_shell_wait_for",
+            "ssh_shell_read",
+            "ssh_shell_close",
+        ])),
+        WaitForPatternStatus::Closed => None,
+    };
+    json!({
+        "tool":     "ssh_shell_wait_for",
+        "status":   wait_for_status_lower(outcome.status),
+        "shell_id": outcome.shell_id.as_str(),
+        "matched_pattern": outcome.matched_pattern,
+        "stdout":   data,
+        "bytes_returned": info.shown_bytes,
+        "next":     next,
+    })
+}
+
+/// Build the close-shell structured payload mirroring [`shell_close_render`].
+#[must_use]
+pub fn shell_close_structured(outcome: &CloseShellOutcome) -> Value {
+    json!({
+        "tool":   "ssh_shell_close",
+        "status": "ok",
+        "shell_id": outcome.shell_id.as_str(),
+    })
 }
 
 #[cfg(test)]

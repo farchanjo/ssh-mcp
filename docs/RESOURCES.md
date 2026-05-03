@@ -1,6 +1,6 @@
-# Resources Reference (v4.6.0)
+# Resources Reference (v4.7.0)
 
-ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 put the v3-promised `_meta` envelope on every read, formalised the per-resource MIME types, and derived a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests. v4.6 leaves the subscribe contract unchanged from v4.5; the only resource-related change is that every async-spawn tool response now carries a `HINT: subscribe to <uri> for realtime ...` line steering the LLM toward push.
+ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure features, and (v4.7) the `resources/templates/list` advertisement. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 put the v3-promised `_meta` envelope on every read, formalised the per-resource MIME types, and derived a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests. v4.6 layered the LLM steering surface onto the tool responses (`HINT:` and `NEXT:` lines). v4.7 adds the parameterised template advertisement so smaller LLMs can scan the URI shape catalogue without enumerating every live instance — see [Resource Templates (v4.7)](#resource-templates-v47) below.
 
 Cross references:
 
@@ -53,6 +53,86 @@ Errors during parsing surface as `INVALID_PARAMS` from `resources/read` and `res
 - `MissingId` — empty resource id.
 - `BadSubPath` — sub-path does not match the scheme (e.g. `shell://abc/progress`).
 - `BadCursor` — `?cursor=` value is neither `auto`, `0`, nor a valid `u64`.
+
+## Resource Templates (v4.7)
+
+`resources/templates/list` returns a static catalogue of RFC 6570-style URI templates so MCP clients (and smaller LLMs) can learn the parameterised URI shape without first walking live instances via `resources/list`. The list is byte-stable across builds; only the `port_forward` Cargo feature toggles the `forward://` entry on or off.
+
+### Catalogue
+
+| URI template                                  | Title                              | MIME                 | Cursor (RFC 6570 form-style) | Feature gate    |
+| --------------------------------------------- | ---------------------------------- | -------------------- | ---------------------------- | --------------- |
+| `shell://{shell_id}/output{?cursor}`          | Shell PTY output stream            | `text/plain`         | yes (`{?cursor}`)            | always          |
+| `command://{command_id}/output{?cursor}`      | Async command output stream        | `text/plain`         | yes (`{?cursor}`)            | always          |
+| `transfer://{transfer_id}/progress`           | SFTP transfer progress snapshot    | `application/json`   | no                           | always          |
+| `session://{session_id}/health`               | SSH session health snapshot        | `application/json`   | no                           | always          |
+| `forward://{forward_id}/events{?cursor}`      | Port-forward event log             | `application/json`   | yes (`{?cursor}`)            | `port_forward`  |
+
+Builds without `port_forward` advertise four templates (`shell`, `command`, `transfer`, `session`); builds with the feature advertise five. Order is stable across builds — clients can index into the list without name-matching.
+
+### Field shape
+
+Each entry carries the four MCP-spec fields:
+
+- `uriTemplate` — RFC 6570 string, simple variable expansion for the path segment (`{shell_id}`) and form-style query expansion for the cursor (`{?cursor}`).
+- `name` — short identifier (e.g. `"Shell PTY output stream"`).
+- `title` — humanised label, identical to `name` in v4.7 but reserved as a separate field per the MCP spec.
+- `description` — multi-sentence prose covering payload semantics and cursor behaviour.
+- `mimeType` — the body MIME type the matching `resources/read` returns.
+
+Reference implementation: `src/infra/mcp/resource_templates.rs::build_list` (gated on the `port_forward` feature).
+
+### Sample `resources/templates/list` response
+
+```json
+{
+  "resourceTemplates": [
+    {
+      "uriTemplate": "shell://{shell_id}/output{?cursor}",
+      "name": "Shell PTY output stream",
+      "title": "Shell PTY output stream",
+      "description": "Live PTY output buffer for an open shell. Pass `cursor=auto` (or an absolute byte offset) to receive only the new bytes since the last read; omit to start from the head of the buffer.",
+      "mimeType": "text/plain"
+    },
+    {
+      "uriTemplate": "command://{command_id}/output{?cursor}",
+      "name": "Async command output stream",
+      "title": "Async command output stream",
+      "description": "Stdout/stderr block payload for an async command. Pass `cursor=auto` (or an absolute byte offset) to receive only the new bytes since the last read; omit to start from the head of the buffer.",
+      "mimeType": "text/plain"
+    },
+    {
+      "uriTemplate": "transfer://{transfer_id}/progress",
+      "name": "SFTP transfer progress snapshot",
+      "title": "SFTP transfer progress snapshot",
+      "description": "Point-in-time JSON progress snapshot for an SFTP transfer (`status`, `bytes_transferred`, `total_bytes`). Each subscription update fires a fresh snapshot; no cursor pagination.",
+      "mimeType": "application/json"
+    },
+    {
+      "uriTemplate": "session://{session_id}/health",
+      "name": "SSH session health snapshot",
+      "title": "SSH session health snapshot",
+      "description": "Point-in-time JSON health snapshot for an SSH session (`healthy`, `host`, `expires_at`). Each subscription update fires a fresh snapshot; no cursor pagination.",
+      "mimeType": "application/json"
+    },
+    {
+      "uriTemplate": "forward://{forward_id}/events{?cursor}",
+      "name": "Port-forward event log",
+      "title": "Port-forward event log",
+      "description": "Append-only JSON event log for a TCP port forwarder (`accepted`, `connected`, `closed`, `error`). Pass `cursor=auto` (or an absolute event index) to receive only events since the last read; omit to start from the head of the log.",
+      "mimeType": "application/json"
+    }
+  ]
+}
+```
+
+### When to use
+
+- **Pre-flight discovery.** A smaller LLM that wants to construct a subscribe URI ahead of any live resource can scan `resources/templates/list` once at session start and cache the URI shape per scheme.
+- **Documentation in-band.** The `description` field carries the cursor semantics so an LLM that has not seen [RESOURCES.md](#resourcesread-flow) can still reason about whether to pass `?cursor=auto`.
+- **Feature detection.** Hosts that want to know whether the server was built with `--features port_forward` can check for the `forward://` template (presence is a stronger signal than calling `tools/list` and looking for `ssh_forward`, since some hosts hide tools behind permission checks).
+
+`resources/templates/list` does not replace `resources/list` — the latter still returns the live instance catalogue, the former only the parameterised shape. Use both: templates for the URI grammar, list for the live IDs.
 
 ## resources/list response
 

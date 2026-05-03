@@ -4,6 +4,8 @@
 //! `TransferStartedBuilder`, `TransferProgressBuilder` — but takes the v4
 //! use case Outcomes as input.
 
+use serde_json::{Value, json};
+
 use crate::application::download_file::DownloadOutcome;
 use crate::application::get_transfer_progress::GetTransferProgressResult;
 use crate::application::upload_file::UploadOutcome;
@@ -237,6 +239,87 @@ fn compute_percent(transferred: u64, total: u64) -> u8 {
     } else {
         0
     }
+}
+
+// ---------------------------------------------------------------------------
+// v4.7 — structured_content payloads (JSON parallel to the Markdown body)
+// ---------------------------------------------------------------------------
+
+/// Build the upload structured payload mirroring [`upload_render`].
+#[must_use]
+pub fn upload_structured(outcome: &UploadOutcome) -> Value {
+    json!({
+        "tool":   "ssh_upload",
+        "status": "started",
+        "transfer_id": outcome.transfer_id.as_str(),
+        "session_id":  outcome.session_id.as_str(),
+        "agent_id":    outcome.agent_id.as_ref().map(AgentId::as_str),
+        "from":        outcome.local_path,
+        "to":          outcome.remote_path,
+        "size_bytes":  outcome.total_bytes,
+        "next": [
+            "ssh_get_transfer_progress(wait=true)",
+        ],
+    })
+}
+
+/// Build the download structured payload mirroring [`download_render`].
+#[must_use]
+pub fn download_structured(outcome: &DownloadOutcome) -> Value {
+    json!({
+        "tool":   "ssh_download",
+        "status": "started",
+        "transfer_id": outcome.transfer_id.as_str(),
+        "session_id":  outcome.session_id.as_str(),
+        "agent_id":    outcome.agent_id.as_ref().map(AgentId::as_str),
+        "from":        outcome.remote_path,
+        "to":          outcome.local_path,
+        "size_bytes":  outcome.total_bytes,
+        "next": [
+            "ssh_get_transfer_progress(wait=true)",
+        ],
+    })
+}
+
+const fn transfer_status_lower(s: TransferStatus) -> &'static str {
+    match s {
+        TransferStatus::Running => "running",
+        TransferStatus::Completed => "completed",
+        TransferStatus::Cancelled => "cancelled",
+        TransferStatus::Failed => "failed",
+    }
+}
+
+const fn transfer_direction_lower(d: TransferDirection) -> &'static str {
+    match d {
+        TransferDirection::Upload => "upload",
+        TransferDirection::Download => "download",
+    }
+}
+
+/// Build the transfer-progress structured payload mirroring
+/// [`transfer_progress_render`].
+#[must_use]
+pub fn transfer_progress_structured(result: &GetTransferProgressResult) -> Value {
+    let percent = compute_percent(result.bytes_transferred, result.total_bytes);
+    let next = matches!(result.status, TransferStatus::Running).then(|| {
+        let id = result.transfer_id.as_str();
+        json!([
+            format!("resources/subscribe transfer://{id}/progress"),
+            format!("ssh_get_transfer_progress(transfer_id={id}, wait=true)"),
+        ])
+    });
+    json!({
+        "tool":      "ssh_get_transfer_progress",
+        "status":    transfer_status_lower(result.status),
+        "transfer_id": result.transfer_id.as_str(),
+        "direction": transfer_direction_lower(result.direction),
+        "progress_percent":   percent,
+        "bytes_transferred":  result.bytes_transferred,
+        "total_bytes":        result.total_bytes,
+        "error":              result.error,
+        "next":               next,
+    })
 }
 
 #[cfg(test)]
