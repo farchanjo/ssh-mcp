@@ -1,6 +1,6 @@
-# SSH MCP Flow Diagrams (v4.1.0)
+# SSH MCP Flow Diagrams (v4.5.0)
 
-Sequence diagrams for the most common workflows on top of the v4.1.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4.1 hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs` (with the transitional global registry at `src/adapters/subscription/legacy.rs`), and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/internal/*` after the H17.6 deep decouple — see [ARCHITECTURE.md](./ARCHITECTURE.md#v41-deep-decouple-completed).
+Sequence diagrams for the most common workflows on top of the v4.5.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4.x hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs` (with the transitional global registry at `src/adapters/subscription/legacy.rs`), and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/internal/*` after the H17.6 deep decouple — see [ARCHITECTURE.md](./ARCHITECTURE.md#v41-deep-decouple-completed). v4.5 turns the long-promised `_meta` envelope into the live wire payload of every `resources/read` and derives a stable `PeerId` from `Mcp-Session-Id` (HTTP) / stdio singleton.
 
 [[_TOC_]]
 
@@ -66,6 +66,7 @@ sequenceDiagram
     Server-->>Client: SSH_SHELL_OPEN: OK\nSHELL_ID: 4b9c8e2a-...\nTERM: xterm 80x24
 
     Client->>Server: resources/subscribe shell://4b9c8e2a-.../output
+    Server->>Server: peer_id = PeerTable.get_or_mint(Mcp-Session-Id or Stdio)
     Server->>Reg: subscribe(Shell, "4b9c8e2a-...", uri, peer_id, peer)
     Reg->>Reg: spawn debouncer (first subscriber)
     Server-->>Client: ()
@@ -80,7 +81,7 @@ sequenceDiagram
     Reg-->>Client: notifications/resources/updated shell://4b9c8e2a-.../output
 
     Client->>Server: resources/read shell://4b9c8e2a-.../output?cursor=auto
-    Server-->>Client: text="$ ls -la\n..." + _meta{cursor=128, last_seq=3, shell_status=open}
+    Server-->>Client: text="$ ls -la\n..." + _meta{kind=shell, cursor=128, buffer_size=128, last_seq=3, status=open}
 
     Note over Reader,Reg: Subsequent pokes within 50 ms<br/>collapse into one notification.
 
@@ -199,14 +200,14 @@ sequenceDiagram
         Cmd->>Reg: poke(Command, "7d4c8e2a-...")
         Reg-->>Client: notifications/resources/updated (debounced)
         Client->>Server: resources/read command://7d4c8e2a-.../output?cursor=auto
-        Server-->>Client: text + _meta{cursor, last_seq, command_status=running}
+        Server-->>Client: text + _meta{kind=command, cursor, buffer_size, last_seq, status=running}
     end
 
     Cmd->>Cmd: OnceCell::set(exit_code=0) and status_rx becomes Completed
     Cmd->>Reg: poke(Command, "7d4c8e2a-...")
     Reg-->>Client: notifications/resources/updated (final)
     Client->>Server: resources/read ...?cursor=auto
-    Server-->>Client: text + _meta{command_status=completed, last_seq=N}
+    Server-->>Client: text + _meta{kind=command, status=completed, last_seq=N}
 
     Client->>Server: resources/unsubscribe command://7d4c8e2a-.../output
 ```
@@ -239,14 +240,14 @@ sequenceDiagram
         Tr->>Reg: poke(Transfer, "8f7e6d5c-...")
         Reg-->>Client: notifications/resources/updated (debounced)
         Client->>Server: resources/read transfer://8f7e6d5c-.../progress
-        Server-->>Client: JSON {bytes_transferred, total_bytes, status="running", last_seq}
+        Server-->>Client: JSON body + _meta{kind=transfer, last_seq, status=running}
     end
 
     Tr->>Tr: progress_tx.send(ProgressEvent::Completed{seq, bytes})
     Tr->>Reg: poke(Transfer, ...)
     Reg-->>Client: notifications/resources/updated
     Client->>Server: resources/read ...
-    Server-->>Client: JSON {status="completed", bytes=total, last_seq=N}
+    Server-->>Client: JSON body + _meta{kind=transfer, last_seq=N, status=completed}
 
     Client->>Server: resources/unsubscribe transfer://8f7e6d5c-.../progress
 ```
@@ -279,7 +280,7 @@ sequenceDiagram
         Server->>Reg: poke(Session, "s1")
         Reg-->>Client: notifications/resources/updated session://s1/health
         Client->>Server: resources/read session://s1/health
-        Server-->>Client: JSON {healthy:true, last_health_check, last_seq}
+        Server-->>Client: JSON body + _meta{kind=session, last_seq, status=healthy}
     and s2 dies
         Server->>SS: probe s2 -> error -> SessionRepository.remove(s2)
         SS->>SS: health_tx.send(HealthEvent::Disconnected{seq})
@@ -343,13 +344,13 @@ sequenceDiagram
     Note over Client: Client missed a notification window.
 
     Client->>Server: resources/read command://.../output?cursor=auto
-    Server-->>Client: text + _meta{cursor=N, last_seq=K}
+    Server-->>Client: text + _meta{kind=command, cursor=N, buffer_size, last_seq=K, status=running}
 
     Client->>Client: previous _meta.last_seq was K-50<br/>now sees jump K-50 -> K (gap detected)
 
     Note over Client: Recovery: request a full snapshot.
     Client->>Server: resources/read command://.../output?cursor=0
-    Server-->>Client: full buffer + _meta{cursor=current_size, last_seq=K}
+    Server-->>Client: full buffer + _meta{kind=command, cursor=current_size, buffer_size, last_seq=K, status=running}
 
     Note over Client: Optional: subscribe again if peer was dropped<br/>by SSH_MCP_PEER_GC_INTERVAL_S.
 ```

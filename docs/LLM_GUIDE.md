@@ -1,6 +1,6 @@
-# LLM Guide (v4.0.0)
+# LLM Guide (v4.5.0)
 
-This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is identical to v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)).
+This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 and v4.0.x; v4.5 layers a richer steering surface on top (subscribe-first `_meta` envelope, granular wire error codes, `EXPIRES_AT` / `HINT` lines, server identity, tool annotations, few-shot `instructions`).
 
 Cross references:
 
@@ -11,21 +11,21 @@ Cross references:
 
 ## Decision table
 
-The single most important table in this document. Pick the ★-marked path whenever the host advertises `resources.subscribe = true` (every spec-compliant MCP host since protocol 2025-06-18 does).
+The single most important table in this document. Pick the star-marked path whenever the host advertises `resources.subscribe = true` (every spec-compliant MCP host since protocol 2025-06-18 does).
 
 | What you want                                      | Tool / Pattern                                                |
 | -------------------------------------------------- | ------------------------------------------------------------- |
 | Run a one-shot remote command                      | `ssh_execute` -> `ssh_get_command_output`                     |
-| Open an interactive shell                          | `ssh_shell_open` + `resources/subscribe shell://<id>/output` ★ |
+| Open an interactive shell                          | `ssh_shell_open` + `resources/subscribe shell://<id>/output` * |
 | Send `Ctrl+C`, arrows, function keys               | `ssh_shell_send_key`                                          |
 | Send raw text input                                | `ssh_shell_write`                                             |
-| Watch shell output realtime                        | `resources/subscribe` + `resources/read` ★                    |
+| Watch shell output realtime                        | `resources/subscribe` + `resources/read?cursor=auto` *        |
 | Wait for a specific prompt (gate)                  | `ssh_shell_wait_for`                                          |
 | Read shell buffer once (snapshot)                  | `resources/read shell://<id>/output`                          |
-| Watch async command output realtime                | `resources/subscribe command://<id>/output` ★                 |
-| Watch SFTP transfer progress realtime              | `resources/subscribe transfer://<id>/progress` ★              |
-| Watch session health changes                       | `resources/subscribe session://<id>/health` ★                 |
-| Watch port-forward events                          | `resources/subscribe forward://<id>/events` ★                 |
+| Watch async command output realtime                | `resources/subscribe command://<id>/output` *                 |
+| Watch SFTP transfer progress realtime              | `resources/subscribe transfer://<id>/progress` *              |
+| Watch session health changes                       | `resources/subscribe session://<id>/health` *                 |
+| Watch port-forward events                          | `resources/subscribe forward://<id>/events` *                 |
 | Upload / download a file                           | `ssh_upload` / `ssh_download`                                 |
 | Cancel a long-running command                      | `ssh_cancel_command`                                          |
 | Forward a TCP port                                 | `ssh_forward` (feature-gated)                                 |
@@ -34,11 +34,74 @@ The single most important table in this document. Pick the ★-marked path whene
 | Discover existing SESSION_IDs                      | `ssh_list_sessions`                                           |
 | Check what is still running before disconnect      | `ssh_list_commands`                                           |
 
-★ = preferred path (lowest latency, lowest token cost).
+* = preferred path (lowest latency, lowest token cost).
+
+## Subscribe-first contract (live as of v4.5)
+
+Every `resources/read` response now embeds the v4.5 `_meta` envelope on the `ResourceContents`. Subscribe-first is no longer aspirational — the cursor and sequence telemetry the LLM relies on for delta replay is in the wire payload of every read.
+
+### Envelope shape
+
+```json
+{
+  "uri": "shell://4b9c8e2a-.../output",
+  "mimeType": "text/plain",
+  "text": "$ ls -la\n...",
+  "_meta": {
+    "kind": "shell",
+    "cursor": 4096,
+    "buffer_size": 4096,
+    "last_seq": 17,
+    "status": "open"
+  }
+}
+```
+
+Fields:
+
+- `kind` — one of `"shell" | "command" | "transfer" | "session" | "forward"`. Lets the host route the response without re-parsing the URI.
+- `cursor` — `u64`. Next cursor value to pass on the following `?cursor=` read. **Only present on `shell` and `command`** (the byte-stream resources).
+- `buffer_size` — `u64`. Bytes currently held in the resource history buffer. **Only present on `shell` and `command`**.
+- `last_seq` — `u64`. Last sequence number allocated for `(kind, id)` by the producer. Compare to your previous `last_seq` to detect gaps.
+- `status` — string. Kind-specific (`open` / `closed` / `running` / `completed` / `failed` / `healthy` / `unhealthy`).
+
+`transfer://`, `session://`, and `forward://` are point-in-time snapshots and omit `cursor` / `buffer_size`.
+
+### MIME types
+
+| Scheme | MIME | Body shape |
+|--------|------|------------|
+| `shell://` | `text/plain` | UTF-8 lossy slice of the PTY buffer. |
+| `command://` | `text/plain` | Block-style v3 stdout/stderr (one nonce per response, two `--- name [nonce] ---` blocks). |
+| `transfer://` | `application/json` | Snapshot JSON (transfer id, direction, paths, bytes_transferred, total_bytes, status, last_seq). |
+| `session://` | `application/json` | Snapshot JSON (session id, healthy, last_health_check, last_seq). |
+| `forward://` | `application/json` | Snapshot JSON (forward id, listener, target, accepted/closed counters, last_seq). |
+
+### Cursor-aware loop
+
+```
+1. resources/subscribe { uri }
+2. wait for notifications/resources/updated { uri }
+3. resources/read { uri: "<uri>?cursor=auto" }
+4. server returns only fresh bytes/events since this peer's last read
+   _meta.cursor advances atomically to <previous>+bytes_returned
+5. goto 2
+```
+
+The server tracks `(peer, uri) -> cursor` internally — the LLM does not have to remember byte offsets. Re-issuing `?cursor=auto` after a notification returns just the delta.
+
+### Stable peer identity
+
+The peer identity used by `?cursor=auto` is derived from the transport, not minted per request:
+
+- HTTP transport: `Mcp-Session-Id` header (case-insensitive). Every request that lands on the same Streamable HTTP session shares the same `PeerId`.
+- Stdio transport: process-wide singleton (`Stdio` key).
+
+That means subscribe and unsubscribe addressed to the same connection always see the same per-peer cursor. Two concurrent peers (two HTTP clients with different `Mcp-Session-Id` values, or one HTTP client + one stdio client) advance independently.
 
 ## Golden path (subscribe-first PTY)
 
-This is the canonical multi-step interactive flow. Every step that the LLM emits is annotated.
+This is the canonical multi-step interactive flow.
 
 ```mermaid
 sequenceDiagram
@@ -48,10 +111,10 @@ sequenceDiagram
     participant Server as ssh-mcp
     participant Remote as Remote SSH
 
-    LLM->>Host: ssh_connect (host, user, key)
+    LLM->>Host: ssh_connect (host, user, key, agent_id, reuse=auto)
     Host->>Server: tools/call ssh_connect
     Server->>Remote: SSH handshake
-    Server-->>Host: SESSION_ID
+    Server-->>Host: SESSION_ID + EXPIRES_AT
     Host-->>LLM: SESSION_ID
 
     LLM->>Host: ssh_shell_open (session_id)
@@ -59,7 +122,7 @@ sequenceDiagram
     Server-->>Host: SHELL_ID
     Host-->>LLM: SHELL_ID
 
-    LLM->>Host: resources/subscribe shell://<SHELL_ID>/output
+    LLM->>Host: resources/subscribe shell://SHELL_ID/output
     Host->>Server: subscribe
     Server-->>Host: ack
 
@@ -68,35 +131,34 @@ sequenceDiagram
 
     Server-->>Host: notifications/resources/updated
     Host->>Server: resources/read ?cursor=auto
-    Server-->>Host: delta bytes + _meta {cursor, last_seq, ...}
+    Server-->>Host: text + _meta {kind, cursor, buffer_size, last_seq, status}
     Host-->>LLM: new bytes
 
     LLM->>Host: ssh_shell_send_key ctrl_c
-    Host->>Server: tools/call ssh_shell_send_key
-
     LLM->>Host: ssh_shell_close (shell_id)
     LLM->>Host: ssh_disconnect (session_id)
 ```
 
 Step-by-step prose:
 
-1. **Connect** with `ssh_connect`. Capture `SESSION_ID` (and optional `AGENT_ID`).
+1. **Connect** with `ssh_connect`. Pass `agent_id` (groups sessions for bulk cleanup) and `reuse=auto` (pick the most recent healthy match in one round-trip). Capture `SESSION_ID`. Watch the response for an `EXPIRES_AT` line — it is the RFC3339 deadline at which the inactivity sweeper will reap the session unless you ping it.
 2. **Open the PTY** with `ssh_shell_open`. Capture `SHELL_ID`.
-3. **Subscribe immediately** to `shell://<SHELL_ID>/output` — before sending any input. This means the very first byte the remote emits triggers a `notifications/resources/updated`, instead of you polling.
+3. **Subscribe immediately** to `shell://<SHELL_ID>/output` — before sending any input. The very first byte the remote emits triggers `notifications/resources/updated` instead of you polling.
 4. **Drive input** with `ssh_shell_write` (text) or `ssh_shell_send_key` (named keys). Both are non-blocking.
-5. **Read the delta** with `resources/read?cursor=auto` whenever you receive `notifications/resources/updated`. The server tracks per-peer cursor so each read is just the new bytes.
+5. **Read the delta** with `resources/read?cursor=auto` whenever you receive `notifications/resources/updated`. The server tracks per-peer cursor, so each read is just the new bytes.
 6. **Gate on prompts** with `ssh_shell_wait_for` only when you need a single-shot gate (for example before sending the next command). For continuous observation prefer the subscribe loop.
 7. **Close cleanly** with `ssh_shell_close`, then `ssh_disconnect` (or `ssh_disconnect_agent`).
 
 ## Anti-patterns to avoid
 
-- **Polling `ssh_shell_read` in a loop when subscribe is available.** Every poll consumes tokens for the round trip plus the response payload. The subscribe path emits a single `notifications/resources/updated` per debounce window (50 ms by default — see [RESOURCES.md](./RESOURCES.md)), and `resources/read?cursor=auto` returns only the delta.
+- **Polling `ssh_shell_read` in a loop when subscribe is available.** Every poll consumes tokens for the round trip plus the response payload. The subscribe path emits a single `notifications/resources/updated` per debounce window (50 ms by default), and `resources/read?cursor=auto` returns only the delta.
 - **Calling `ssh_shell_wait_for` as a polling substitute.** It is a single-shot prompt gate (1..=16 patterns). Calling it repeatedly with the same patterns wastes a long-poll budget; subscribe instead.
-- **Sending hex escape sequences via `ssh_shell_write`** when `ssh_shell_send_key` already covers the keystroke. The named API validates modifier rules at the schema layer and avoids LLM transcription mistakes (`\x1b[A` vs `\x1bOA`).
-- **Reusing a `SESSION_ID` without verification when in doubt.** If you cannot remember whether the session still lives, call `ssh_list_sessions` (it runs an `echo 1` health probe and prunes dead sessions) before issuing tool calls that would otherwise return `SESSION_NOT_FOUND`.
+- **Sending hex escape sequences via `ssh_shell_write`** when `ssh_shell_send_key` already covers the keystroke. The named API validates modifier rules at the schema layer (returns `MODIFIER_NOT_ALLOWED` instead of corrupting the PTY) and avoids LLM transcription mistakes (`\x1b[A` vs `\x1bOA`).
+- **Reusing a `SESSION_ID` without verification when in doubt.** If you cannot remember whether the session still lives, call `ssh_list_sessions` (it runs an `echo 1` health probe and prunes dead sessions) before issuing tool calls that would otherwise return `SESSION_NOT_FOUND`. Even better: pass `agent_id` on every `ssh_connect` and let `reuse=auto` pick the live one for you.
 - **Calling `ssh_disconnect` on a session with running async commands without first checking `ssh_list_commands`.** The disconnect cancels every running command — useful when you mean it, surprising when you do not.
-- **Ignoring `_meta.last_seq` after a long pause.** If `last_seq` jumped by more than 1 since your previous read, you may have lagged. Re-read with `?cursor=0` to get a full snapshot, then resume `?cursor=auto`.
+- **Ignoring `_meta.last_seq` after a long pause.** If `last_seq` jumped by more than 1 since your previous read, you may have lagged on the broadcast channel. Re-read with `?cursor=0` to get a full snapshot, then resume `?cursor=auto`.
 - **Spamming `resources/read` between notifications.** The notification is the signal — read once per notification.
+- **Ignoring `HINT:` lines.** The server appends `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent` when an agent leaks sessions. Treat it as actionable, not chatter.
 
 ## Token efficiency tips
 
@@ -137,7 +199,7 @@ flowchart LR
     TID --> TPoll[ssh_get_transfer_progress]
 
     SID --> Fwd[ssh_forward]
-    Fwd --> FID(LOCAL host:port)
+    Fwd --> FID(FORWARD_ID)
     FID -.subscribe.-> FRes((forward://FID/events))
 
     SID -.subscribe.-> SRes((session://SID/health))
@@ -155,6 +217,182 @@ Some hosts do not consume MCP notifications. Fallback paths:
 - **Transfer completion** -> `ssh_get_transfer_progress` with `wait=true`.
 
 Even on the fallback path, prefer the long-poll `wait=true` variants over a tight loop of `wait=false` polls — the long-poll wakes immediately on real activity and idles cheaply otherwise.
+
+## A. Connection lifecycle and recycling (v4.4)
+
+ssh-mcp surfaces three signals that small LLMs can use to keep a session pool tidy without leaking handles.
+
+### `agent_id`
+
+Pass `agent_id` on every `ssh_connect` to group sessions under a logical owner. Two consequences:
+
+- `ssh_list_sessions { agent_id }` filters to that owner only.
+- `ssh_disconnect_agent { agent_id }` bulk-disconnects every session owned by that agent — cancelling commands, closing shells, aborting transfers.
+- When `agent_id` is set on `ssh_connect`, `reuse=auto` and `reuse=suggest` rank sessions owned by the same agent first.
+
+### `EXPIRES_AT` / `PERSISTENT`
+
+`ssh_connect` and `ssh_list_sessions` emit one of two mutually exclusive lines per session:
+
+- `EXPIRES_AT: <RFC3339 UTC>` — deadline at which the inactivity sweeper will reap the session. The clock starts at `connected_at` and resets on activity.
+- `PERSISTENT: true` — the caller passed `persistent=true` on connect; the inactivity sweeper is disabled and `EXPIRES_AT` is omitted.
+
+To extend a session before `EXPIRES_AT` fires, run any cheap call (a colon ping `ssh_execute ":"`, `ssh_list_sessions`, etc.). Each touch resets the timer.
+
+### `HINT:` lines
+
+When more than 5 sessions are owned by the same `agent_id` (anti-leak threshold), `ssh_list_sessions` and `ssh_connect SUGGESTED` append:
+
+```
+HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup
+```
+
+Small LLMs should treat `HINT:` as actionable. The most common cause is a workflow that keeps spawning new sessions instead of reusing a healthy one — fix it by passing `reuse=auto`.
+
+### `ReusePolicy` defaults
+
+- `reuse=suggest` (default) — list matching sessions and stop. Right when a human will pick.
+- `reuse=auto` — return the most recent healthy match (or open a new session). Right for "I just want to run a command".
+- `reuse=force_new` — skip the lookup entirely. Right when you want a guaranteed fresh transport.
+
+## B. Granular error codes (v4.5)
+
+The wire codes are now ALL granular when the failure has a known cause. The dispatcher recognises 14 tag prefixes that `DomainError` carriers can attach to their reason string.
+
+### Emitted today (11)
+
+- `EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG` — from `ssh_shell_wait_for`.
+- `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT` — from `ssh_shell_send_key`.
+- `FEATURE_DISABLED` — when the `port_forward` Cargo feature is off and the LLM tries `ssh_forward` or subscribes to a `forward://` URI.
+- `WRITE_FAILED` — shell writer task closed (PTY transport gone).
+- `CHANNEL_FAILED` — russh failed to open a channel (often `MaxSessions` exhaustion).
+- `COMMAND_FAILED` — async command's transport failed before completion.
+- `LOCAL_FILE_ERROR` — `fs::metadata` failed on a local upload path.
+- `SFTP_OPEN_FAILED` — SFTP subsystem could not be opened on the remote.
+
+### Reserved (3)
+
+The dispatcher recognises the tag and will promote it to a granular wire code, but no live raise site exists today. Treat them like the emitted codes when they show up:
+
+- `FORWARD_FAILED` — port-forward listener bind or stream-open failed.
+- `LOCAL_NOT_FILE` — the local upload path resolved but is not a regular file.
+- `REMOTE_METADATA_ERROR` — `sftp.metadata(remote_path)` failed.
+
+### Untagged fallbacks
+
+Any failure without a recognised tag prefix falls through to the legacy flat code:
+
+- `INVALID_ARGUMENT` (from `DomainError::InvalidArgument`)
+- `TRANSPORT_ERROR` (from `DomainError::Transport`)
+- `SFTP_ERROR` (from `DomainError::Sftp`)
+
+See [ERRORS.md](./ERRORS.md) for the full table including emission-site references and recovery guidance.
+
+## C. Server identity for the host (v4.5)
+
+The server now advertises a richer `Implementation` descriptor on `initialize` so MCP hosts (Claude mobile, remote clients, registries) can render a humanised server card:
+
+- `Implementation.title = "SSH Remote Shell"`
+- `Implementation.description = "Run remote commands, drive PTY shells, transfer files via SFTP, and forward TCP ports over SSH. Subscribe to shell, command, transfer, session, and forward streams for push notifications."`
+- `Implementation.website_url = "https://github.com/farchanjo/ssh-mcp"`
+- `Implementation.icons` — currently omitted (TODO until a stable hosted SVG asset URL ships under `assets/icon.svg`).
+
+Each tool also carries `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. Hosts use these to rank suggestions, filter destructive tools out of safe-by-default modes, and warn before running anything tagged `destructive`.
+
+### Title and annotation matrix
+
+| Tool | Title | read_only | destructive | idempotent |
+|------|-------|-----------|-------------|------------|
+| `ssh_connect` | Connect to SSH server | false | false | true |
+| `ssh_disconnect` | Disconnect SSH session | false | true | true |
+| `ssh_list_sessions` | List SSH sessions | true | false | true |
+| `ssh_disconnect_agent` | Disconnect all agent sessions | false | true | true |
+| `ssh_execute` | Run remote command | false | true | false |
+| `ssh_get_command_output` | Get command output | true | false | true |
+| `ssh_list_commands` | List async commands | true | false | true |
+| `ssh_cancel_command` | Cancel running command | false | true | true |
+| `ssh_shell_open` | Open PTY shell | false | false | false |
+| `ssh_shell_write` | Write to PTY shell | false | true | false |
+| `ssh_shell_send_key` | Send keystroke to PTY | false | true | false |
+| `ssh_shell_read` | Read PTY buffer | false | false | true |
+| `ssh_shell_wait_for` | Wait for shell pattern | true | false | true |
+| `ssh_shell_close` | Close PTY shell | false | true | true |
+| `ssh_upload` | Upload file via SFTP | false | true | false |
+| `ssh_download` | Download file via SFTP | false | false | false |
+| `ssh_get_transfer_progress` | Get transfer progress | true | false | true |
+| `ssh_forward` (feature-gated) | Forward TCP port | false | false | false |
+
+### Few-shot `instructions`
+
+The server's `instructions` field now ships three canonical workflows verbatim. Models trained to read MCP capability handshakes pick them up automatically:
+
+```
+SSH MCP. 18 tools, 5 push streams (shell://, command://, transfer://,
+session://, forward://). All tools return block markdown: first line
+TOOL: STATUS, then KEY: value pairs. Output blocks delimited by
+--- name [nonce] ---. IDs end in _ID.
+
+Happy paths:
+1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute.
+   Then ssh_get_command_output wait=true.
+2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe
+   shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key.
+   Read deltas via resources/read?cursor=auto on each notification.
+   ssh_shell_close, ssh_disconnect.
+3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.
+
+Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close.
+Watch for HINT lines and EXPIRES_AT.
+```
+
+The build without `port_forward` advertises 17 tools and 4 streams (everything else is identical).
+
+## D. Smaller-LLM cookbook
+
+Three canonical workflows that map 1:1 to the few-shot `instructions` constant. Use these as templates when prompting a 27B-class model.
+
+### Workflow 1 — Run a single remote command
+
+```
+1. ssh_connect { address, username, agent_id="my-agent", reuse="auto" }
+   -> capture SESSION_ID + EXPIRES_AT
+2. ssh_execute { session_id, command="uname -a" }
+   -> capture COMMAND_ID
+3. ssh_get_command_output { command_id, wait=true, wait_timeout_secs=30 }
+   -> COMPLETED + EXIT + stdout block
+4. (Optional) ssh_disconnect_agent { agent_id="my-agent" } when the task is over.
+```
+
+### Workflow 2 — Drive an interactive shell with subscribe
+
+```
+1. ssh_connect { address, username, agent_id="my-agent", reuse="auto" }
+2. ssh_shell_open { session_id }
+   -> capture SHELL_ID
+3. resources/subscribe { uri: "shell://<SHELL_ID>/output" }
+4. ssh_shell_write { shell_id, input: "ls -la\n" }
+5. on notifications/resources/updated:
+   resources/read { uri: "shell://<SHELL_ID>/output?cursor=auto" }
+   -> consume text + _meta { cursor, last_seq, status="open" }
+6. ssh_shell_send_key { shell_id, key: "ctrl_c" } when interrupting.
+7. ssh_shell_close { shell_id }
+8. ssh_disconnect { session_id }  (or ssh_disconnect_agent)
+```
+
+### Workflow 3 — Upload a file with progress
+
+```
+1. ssh_connect { address, username, agent_id="my-agent", reuse="auto" }
+2. ssh_upload { session_id, local_path, remote_path }
+   -> capture TRANSFER_ID + SIZE
+3. (Recommended) resources/subscribe { uri: "transfer://<TRANSFER_ID>/progress" }
+   On notification, resources/read returns JSON with bytes_transferred / total_bytes / status.
+   OR
+   ssh_get_transfer_progress { transfer_id, wait=true } long-poll fallback.
+4. (Optional verify) ssh_execute { command: "sha256sum <remote_path>" }
+   -> ssh_get_command_output wait=true
+5. ssh_disconnect_agent { agent_id="my-agent" } when done.
+```
 
 ## Sample prompts for the LLM
 
