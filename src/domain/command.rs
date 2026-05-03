@@ -38,6 +38,22 @@ impl fmt::Display for CommandStatus {
     }
 }
 
+impl CommandStatus {
+    /// Returns `true` when the command has reached a terminal state
+    /// (`Completed`, `Cancelled`, or `Failed`).
+    ///
+    /// Used by use cases that need to tolerate adapter-side teardown of
+    /// the SSH-internal record after the lifecycle has settled — for
+    /// example, [`crate::application::get_command_output::GetCommandOutputUseCase`]
+    /// treats a [`crate::domain::error::DomainError::CommandNotFound`]
+    /// from `snapshot_command` as benign when the entity itself is in a
+    /// terminal state.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
 /// Description of a command to execute on an established session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRequest {
@@ -155,6 +171,14 @@ mod tests {
         assert_eq!(CommandStatus::Completed.to_string(), "completed");
         assert_eq!(CommandStatus::Cancelled.to_string(), "cancelled");
         assert_eq!(CommandStatus::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn command_status_is_terminal_only_for_settled_states() {
+        assert!(!CommandStatus::Running.is_terminal());
+        assert!(CommandStatus::Completed.is_terminal());
+        assert!(CommandStatus::Cancelled.is_terminal());
+        assert!(CommandStatus::Failed.is_terminal());
     }
 
     #[test]

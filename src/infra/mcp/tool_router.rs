@@ -307,7 +307,26 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CallToolResult, McpError>>,
 {
-    let key = match extract_idempotency_key(ctx) {
+    with_idempotency_keyed(cache, extract_idempotency_key(ctx), tool, f).await
+}
+
+/// Inner driver shared with the unit-test path. Splitting this out lets
+/// the regression test for v4.7.1 Bug #3 (the "replay is a pure
+/// passthrough" invariant) drive the same code path the inbound
+/// handlers use without constructing a full
+/// [`RequestContext<RoleServer>`] (the rmcp `Peer::new` constructor is
+/// `pub(crate)`).
+async fn with_idempotency_keyed<F, Fut>(
+    cache: &IdempotencyCache,
+    outcome: KeyOutcome,
+    tool: &str,
+    f: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<CallToolResult, McpError>>,
+{
+    let key = match outcome {
         KeyOutcome::Absent => return f().await,
         KeyOutcome::TooLong => {
             return Ok(render_tool_error(
@@ -3772,5 +3791,162 @@ mod tests {
         }
         assert_eq!(peek.bytes.len(), 8);
         assert!(peek.truncated);
+    }
+
+    // -------------------------------------------------------------------
+    // v4.7.1 Bug #3 — idempotency replay must NOT invoke the use case.
+    //
+    // The `with_idempotency` wrapper is a wire-level dedup: on a cache
+    // hit it must return the cached body verbatim and skip the
+    // user-supplied closure entirely. The original execution is the
+    // canonical writer of every side effect (subscriber notifications,
+    // repo state, output stream pumps); a replay-induced re-run would
+    // break the "exactly-once" contract LLMs rely on for retried calls.
+    // The chaos battery's `cs12_idempotency_with_subscribe` reports the
+    // post-replay notification count for context but cannot distinguish
+    // a wrapper-induced republish from an unrelated debouncer
+    // force-flush — these unit tests lock the wrapper purity contract
+    // directly.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn idempotency_replay_does_not_invoke_callback() {
+        use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
+        use rmcp::ErrorData as McpError;
+        use rmcp::model::CallToolResult;
+        use rmcp::model::Content;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = "k-v471-bug3";
+
+        let make_body = |calls: Arc<AtomicUsize>| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let mut result = CallToolResult::success(vec![Content::text("BODY")]);
+            result.structured_content = Some(json!({"tool": "ssh_test", "status": "ok"}));
+            Ok::<_, McpError>(result)
+        };
+
+        // First call: cache miss, callback MUST run exactly once and
+        // the response is cached.
+        let calls1 = Arc::clone(&calls);
+        let first = rt
+            .block_on(super::with_idempotency_keyed(
+                &cache,
+                KeyOutcome::Present(key.to_string()),
+                "ssh_test",
+                || make_body(Arc::clone(&calls1)),
+            ))
+            .expect("first call");
+        assert_eq!(first.is_error, Some(false));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first call must run f");
+
+        // Second call with same key: cache hit, callback MUST NOT run.
+        // This is the load-bearing assertion — locks the "replay is a
+        // pure passthrough" contract documented above.
+        let calls2 = Arc::clone(&calls);
+        let second = rt
+            .block_on(super::with_idempotency_keyed(
+                &cache,
+                KeyOutcome::Present(key.to_string()),
+                "ssh_test",
+                || make_body(Arc::clone(&calls2)),
+            ))
+            .expect("second call");
+        assert_eq!(second.is_error, Some(false));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "replay must NOT invoke the callback — counter must still be 1"
+        );
+        // Body must be replayed verbatim from the cached response.
+        let body = second
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert_eq!(body, "BODY", "replay must return cached body verbatim");
+    }
+
+    #[test]
+    fn idempotency_absent_key_runs_callback_every_time() {
+        use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
+        use rmcp::ErrorData as McpError;
+        use rmcp::model::CallToolResult;
+        use rmcp::model::Content;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let calls_inner = Arc::clone(&calls);
+            let _ = rt
+                .block_on(super::with_idempotency_keyed(
+                    &cache,
+                    KeyOutcome::Absent,
+                    "ssh_test",
+                    || async move {
+                        calls_inner.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, McpError>(CallToolResult::success(vec![Content::text("x")]))
+                    },
+                ))
+                .expect("call");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "absent key must drive the callback on every call"
+        );
+    }
+
+    #[test]
+    fn idempotency_failed_response_is_not_cached() {
+        // When the use case returns is_error=true, the response is NOT
+        // cached so the LLM can retry after fixing the input. Lock that
+        // contract here so an accidental "always cache" regression
+        // surfaces as a unit-test failure.
+        use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
+        use rmcp::ErrorData as McpError;
+        use rmcp::model::CallToolResult;
+        use rmcp::model::Content;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = "k-fail";
+
+        for _ in 0..2 {
+            let calls_inner = Arc::clone(&calls);
+            let _ = rt
+                .block_on(super::with_idempotency_keyed(
+                    &cache,
+                    KeyOutcome::Present(key.to_string()),
+                    "ssh_test",
+                    || async move {
+                        calls_inner.fetch_add(1, Ordering::SeqCst);
+                        let mut r = CallToolResult::success(vec![Content::text("nope")]);
+                        r.is_error = Some(true);
+                        Ok::<_, McpError>(r)
+                    },
+                ))
+                .expect("call");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "error responses must NOT be cached — both calls must run f"
+        );
     }
 }

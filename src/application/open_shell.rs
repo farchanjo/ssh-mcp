@@ -167,8 +167,14 @@ where
 
         let terminal = build_terminal(&req);
         let shell_id = self.ids.new_shell_id();
+        // v4.7.1 BUG #1 fix: thread the caller's `max_buffer_size`
+        // override into the SSH port so the runtime ring-buffer cap
+        // matches the persisted entity. Without this, the runtime
+        // `RunningShell.max_buffer_size: Arc<AtomicU64>` stayed at the
+        // adapter's hardcoded 10 MiB default while the entity reported
+        // the override, causing the cap to be silently ignored.
         let entity = self
-            .open_shell_entity(&req.session_id, terminal, &shell_id)
+            .open_shell_entity(&req.session_id, terminal, &shell_id, req.max_buffer_size)
             .await?;
         let entity = apply_overrides(entity, &req);
         self.shells.insert(entity.clone()).await?;
@@ -198,17 +204,24 @@ where
     /// the use-case stack purely so the touch on
     /// [`IdGeneratorPort::new_shell_id`] stays observable in tests
     /// asserting deterministic id bookkeeping.
+    ///
+    /// `max_buffer_size` flows from [`OpenShellRequest::max_buffer_size`]
+    /// into the SSH adapter so the runtime ring-buffer cap matches the
+    /// persisted entity. v4.7.1 BUG #1 fix.
     async fn open_shell_entity(
         &self,
         session_id: &SessionId,
         terminal: ShellTerminal,
         _shell_id: &ShellId,
+        max_buffer_size: Option<u64>,
     ) -> Result<ShellEntity, DomainError> {
         // Touch the clock so adapters that lean on it for retry
         // accounting (FakeClock advances on every read) stay coherent
         // with the canary canon.
         let _ = self.clock.utc_now();
-        self.ssh.open_shell(session_id, terminal).await
+        self.ssh
+            .open_shell(session_id, terminal, max_buffer_size)
+            .await
     }
 }
 
@@ -345,14 +358,23 @@ mod tests {
         }
     }
 
-    fn open_shell_call(calls: &[FakeSshCall]) -> Option<(SessionId, String, u32, u32)> {
+    fn open_shell_call(
+        calls: &[FakeSshCall],
+    ) -> Option<(SessionId, String, u32, u32, Option<u64>)> {
         calls.iter().find_map(|c| match c {
             FakeSshCall::OpenShell {
                 session_id,
                 term,
                 cols,
                 rows,
-            } => Some((session_id.clone(), term.clone(), *cols, *rows)),
+                max_buffer_size,
+            } => Some((
+                session_id.clone(),
+                term.clone(),
+                *cols,
+                *rows,
+                *max_buffer_size,
+            )),
             FakeSshCall::Connect { .. }
             | FakeSshCall::Disconnect { .. }
             | FakeSshCall::Execute { .. }
