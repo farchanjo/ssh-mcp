@@ -155,9 +155,9 @@ where
         };
 
         let final_entity = self.fetch_or_not_found(&req.command_id).await?;
-        let snapshot = self.streams.snapshot_command(&req.command_id).await?;
-        let stdout = head_truncate(snapshot.stdout, req.max_output_bytes);
-        let stderr = head_truncate(snapshot.stderr, req.max_output_bytes);
+        let (stdout, stderr, last_seq) = self
+            .resolve_output(&req.command_id, &final_entity.status, req.max_output_bytes)
+            .await?;
 
         Ok(GetCommandOutputResult {
             command_id: req.command_id,
@@ -167,8 +167,38 @@ where
             exit_code: final_entity.exit_code,
             error: None,
             timed_out: final_entity.timed_out || timed_out,
-            last_seq: snapshot.last_seq,
+            last_seq,
         })
+    }
+
+    /// Snapshot the output stream for the given command and head-truncate
+    /// each buffer to `max_output_bytes`. v4.7.1 (Bug #2) fix: when the
+    /// adapter tears down its internal record before the snapshot is read
+    /// (the russh adapter does this on cancel) and the entity has reached
+    /// a terminal state, treat
+    /// [`DomainError::CommandNotFound`] as a benign "snapshot evicted"
+    /// and surface an empty stdout/stderr pair with `last_seq = 0` so the
+    /// inbound layer can render the saved status without a hard error.
+    async fn resolve_output(
+        &self,
+        command_id: &CommandId,
+        status: &CommandStatus,
+        max_output_bytes: Option<usize>,
+    ) -> Result<(Bytes, Bytes, u64), DomainError> {
+        let snapshot = match self.streams.snapshot_command(command_id).await {
+            Ok(snap) => Some(snap),
+            Err(DomainError::CommandNotFound(_)) if status.is_terminal() => None,
+            Err(err) => return Err(err),
+        };
+        let (raw_stdout, raw_stderr, last_seq) = snapshot.map_or_else(
+            || (Bytes::new(), Bytes::new(), 0_u64),
+            |snap| (snap.stdout, snap.stderr, snap.last_seq),
+        );
+        Ok((
+            head_truncate(raw_stdout, max_output_bytes),
+            head_truncate(raw_stderr, max_output_bytes),
+            last_seq,
+        ))
     }
 
     /// Re-read the entity by id, mapping `Ok(None)` to
@@ -556,5 +586,69 @@ mod tests {
         let buf = Bytes::from_static(b"abcdef");
         let out = head_truncate(buf, Some(0));
         assert!(out.is_empty());
+    }
+
+    // --- Scenario 11: terminal-state + evicted snapshot (Bug #2 v4.7.1) ---
+    //
+    // The russh adapter tears down its internal `CommandRecord` the
+    // moment `cancel` is invoked — `OutputStreamPort::snapshot_command`
+    // therefore returns `CommandNotFound` even though the repo entity
+    // is still alive in `Cancelled`. The use case must NOT translate
+    // that into a hard `CommandNotFound` error: it must surface the
+    // saved status with empty stdout/stderr so the caller can render
+    // the canonical post-cancel block.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_with_evicted_snapshot_returns_status_with_empty_output() {
+        let (uc, commands, _streams) = build_use_case();
+        // Seed Cancelled entity, but do NOT put a snapshot — fake
+        // returns CommandNotFound, mirroring the russh adapter's
+        // post-cancel record teardown.
+        let entity = seed_command(&commands, "c-cancel-evicted", CommandStatus::Cancelled);
+        let res = unwrap_result(uc.execute(base_request(&entity.id)).await);
+        assert_eq!(res.status, CommandStatus::Cancelled);
+        assert!(res.stdout.is_empty());
+        assert!(res.stderr.is_empty());
+        assert_eq!(res.last_seq, 0);
+        assert_eq!(res.exit_code, None);
+        assert!(!res.timed_out);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_with_evicted_snapshot_returns_status_with_empty_output() {
+        let (uc, commands, _streams) = build_use_case();
+        let entity = seed_command(&commands, "c-done-evicted", CommandStatus::Completed);
+        let res = unwrap_result(uc.execute(base_request(&entity.id)).await);
+        assert_eq!(res.status, CommandStatus::Completed);
+        assert!(res.stdout.is_empty());
+        assert!(res.stderr.is_empty());
+        assert_eq!(res.exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_with_evicted_snapshot_returns_status_with_empty_output() {
+        let (uc, commands, _streams) = build_use_case();
+        let entity = seed_command(&commands, "c-fail-evicted", CommandStatus::Failed);
+        let res = unwrap_result(uc.execute(base_request(&entity.id)).await);
+        assert_eq!(res.status, CommandStatus::Failed);
+        assert!(res.stdout.is_empty());
+        assert!(res.stderr.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_with_evicted_snapshot_still_propagates_command_not_found() {
+        // Sanity check: the lenient fallback only applies to terminal
+        // states. A `Running` entity whose snapshot is missing is a
+        // genuine inconsistency and must surface as CommandNotFound so
+        // the caller can decide whether to retry or surface the error.
+        let (uc, commands, _streams) = build_use_case();
+        let entity = seed_command(&commands, "c-run-evicted", CommandStatus::Running);
+        let mut req = base_request(&entity.id);
+        req.wait = false;
+        let err = uc.execute(req).await.expect_err("must propagate");
+        match err {
+            DomainError::CommandNotFound(id) => assert_eq!(id, entity.id),
+            other => panic!("expected CommandNotFound, got {other:?}"),
+        }
     }
 }
