@@ -5,7 +5,7 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::mcp::keys::ShellKey;
+use crate::domain::keys::ShellKey;
 
 /// Arguments for the `ssh_shell_open` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
