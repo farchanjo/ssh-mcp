@@ -5,6 +5,48 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] — 2026-05-03
+
+### Highlights
+
+- Patch release extending the v4.2 status-pump bridge with **registration sinks**, closing the **TOCTOU race in the per-session transfer cap**, fixing a **shell-id collision** under concurrent `ssh_shell_open` bursts, and shipping a full **chaos suite** (errors, locks, recovery, exhaustion + master runner) on top of the existing stress harness. Public MCP API stays byte-compatible with v4.2.0 / v4.1.0 / v4.0.0 / v3.0.0 — same 18 tools, same 5 resource schemes, same markdown shape, same env vars, same defaults.
+
+### Fixed
+
+- **Shell-id collision under bursts (Bug C)** — concurrent `ssh_shell_open` calls on the same session no longer collide on a deterministic id. The russh adapter now suffixes a UUID v4 onto every minted `ShellId` so 100 concurrent opens produce 100 distinct ids even when the upstream `IdGeneratorPort` returns the same time-derived prefix.
+- **Per-session transfer cap TOCTOU (Bug D)** — `ssh_upload` / `ssh_download` no longer breach `SSH_MAX_TRANSFERS_PER_SESSION` under contention. The repository now exposes an atomic `TransferRepository::insert_if_under_cap(entity, cap)` that performs the count probe and the insert under a single shard guard. The use cases route through this method in `persist_or_rollback`; the production transfer registration sink does the same so adapter-side registers cannot slip past the gate either. Optimistic pre-check stays in place to short-circuit obvious overflows before any SFTP RTT.
+- **Registration sinks (Bug A)** — `resources/subscribe shell://X/output` no longer fails with `SHELL_NOT_FOUND` immediately after `ssh_shell_open` lands. The russh adapter now bridges its in-memory shell binding into the domain `ShellRepository` via a new internal `ShellRegistrationSink` trait spawned fire-and-forget so the use-case-side `ShellRepository::insert` keeps winning the canonical race; the sink uses `get-then-insert` semantics so a duplicate is a no-op. Mirrors apply for `RunningCommand` (`CommandRegistrationSink`), `TransferShared` (`TransferRegistrationSink`, cap-aware) and (feature-gated) `ForwardHandle` (`ForwardRegistrationSink`). Adapter-driven teardown paths (`close_shell` inactivity sweep, future bulk-cleanup) call `unregister` so the repo never carries stale rows past adapter destruction.
+- **Stress scripts go stdio (Bug B)** — `scripts/stress_{concurrent_writes,lagged_sub,locks,subscribe}.py` now default to spawning a single coordinator `ssh-mcp-stdio` child instead of fanning out HTTP clients across ephemeral ports. Set `STRESS_TRANSPORT=http` to flip back to the v4.2 HTTP behaviour. Each script writes a single JSON line summary to stdout (`status: ok | fail | skip`).
+
+### Added
+
+- **Chaos suite** — four new scripts and a master runner under `scripts/`:
+  - `chaos_errors.py` — 27 documented-error scenarios (bad ids, validation failures, oversized inputs, unknown sessions, idempotent agent disconnect, invalid URI subscribe, etc.).
+  - `chaos_locks.py` — 7 lock-contention scenarios (parallel `shell_open`, parallel `shell_write` FIFO, mixed `send_key + write`, subscribers-then-close, burst execute+cancel, concurrent transfers, open+cancel+close race).
+  - `chaos_recovery.py` — 5 recovery scenarios (kill-during-command, sigterm session, buffer truncation, cancel-during-cancel, subscribe-after-close).
+  - `chaos_exhaustion.py` — 3 exhaustion scenarios (push 100 MiB upload, max-sessions burst, 1000 subscribers).
+  - `chaos_runner.py` — aggregator that runs `test_stdio` + 4 stress + 4 chaos suites and prints a single ASCII summary table.
+- `scripts/helpers/chaos.py` — stderr-capturing stdio transport (`_StderrCapturingStdioTransport`), `ChaosSshTarget`, `chaos_session()` context manager, and JSON-line emitters (`write_event`, `write_summary`).
+
+### Changed
+
+- `chaos_locks.py::parallel_shell_open` now accepts `TRANSPORT_ERROR` / `CHANNEL_OPEN_FAILED` / `SSH_ERROR` as valid second-class rejections alongside `MAX_SHELLS_EXCEEDED` (upstream sshd `MaxSessions = 10` is a known environmental cap; the application-side floor of "exactly 10 shells open + 90 documented errors + zero panics" stays strict).
+- `scripts/run_all.sh` builds both default-features and `--no-default-features` binaries, then executes pytest + 4 stress + 4 chaos + the aggregate runner.
+
+### Internal
+
+- New traits in `src/adapters/ssh/internal/status_sink.rs`: `CommandRegistrationSink`, `ShellRegistrationSink`, `TransferRegistrationSink`, plus the `port_forward`-gated `ForwardRegistrationSink`. Each carries `register(entity)` + `unregister(id)` over manual AFIT (boxed futures) so the trait stays object-safe.
+- New atomic API on `TransferRepository`: `insert_if_under_cap(entity, cap)`. The DashMap implementation acquires the session-bucket shard guard first, gates on the bucket length, and then binds the primary row before releasing — closing the read-then-insert TOCTOU window observed in v4.2.
+- New production sinks in `src/composition/status_sinks.rs`: `RepoCommandRegistrationSink` / `RepoShellRegistrationSink` / `RepoTransferRegistrationSink` (cap-aware, holds a `Arc<EnvConfig>`) / `RepoForwardRegistrationSink`. Each uses `get-then-insert` so the canonical use-case insert is never overwritten; `unregister` swallows `Ok(None)` cleanly.
+- `RusshAdapter` and `RusshSftpAdapter` gain optional `with_*_registration_sink` setters (default no-op). The composition root wires production sinks alongside the existing status sinks.
+- Adapter-side `register` calls are spawned (fire-and-forget) so the use case wins the race; `unregister` calls happen inline at lifecycle exit.
+- Helpers `make_stress_client` / `make_stress_client_http` / `stress_transport_mode` added to `scripts/helpers/fixtures.py` so the four stress scripts share one transport-selection seam.
+
+### Tests
+
+- Lib tests: **1031 → 1048** (registration-sink unit tests covering noop variants, duplicate-id handling, unregister silent-when-absent, the feature-gated forward path; new TOCTOU coverage on `DashMapTransferRepo::insert_if_under_cap` including the 50-concurrent-inserts atomic-gate test; new sink-cap-honour test on `RepoTransferRegistrationSink`).
+- Python integration suites: stdio **13/13** (unchanged); the 4 stress scripts succeed in stdio mode against a local sshd; the 4 chaos scripts pass with the new strict + environment-aware assertions.
+
 ## [4.2.0] — 2026-05-03
 
 ### Highlights
