@@ -13,7 +13,8 @@ use crate::application::read_shell::{ReadShellOutcome, ReadShellStatus};
 use crate::application::send_key::SendKeyOutcome;
 use crate::application::wait_for_pattern::{WaitForPatternOutcome, WaitForPatternStatus};
 use crate::application::write_shell::WriteShellOutcome;
-use crate::domain::ids::AgentId;
+use crate::domain::ids::{AgentId, SessionId};
+use crate::domain::shell::ShellEntity;
 use crate::infra::mcp::helpers::nonce::generate_nonce;
 use crate::infra::mcp::helpers::output::{
     render_output_block, sanitize_value, truncate_utf8_safe_tail,
@@ -27,15 +28,56 @@ const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024;
 /// Render an [`OpenShellOutcome`] as the v3 `SSH_SHELL_OPEN` block.
 #[must_use]
 pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
+    shell_open_render_with_initial(outcome, None)
+}
+
+/// v4.7-step7 variant of [`shell_open_render`].
+///
+/// Injects an `INITIAL_BUFFER:` line right after the standard fields
+/// when the inbound `peek_initial_shell_buffer` poll captured non-empty
+/// stdout within the budget. `initial_buffer` carries the head-truncated
+/// byte slice (already capped by
+/// [`crate::infra::mcp::tool_router::SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES`]).
+/// Pass `None` to retain the byte-identical legacy shape.
+#[must_use]
+pub fn shell_open_render_with_initial(
+    outcome: OpenShellOutcome,
+    initial_buffer: Option<&[u8]>,
+) -> String {
     let OpenShellOutcome {
         shell,
         session_id,
         agent_id,
     } = outcome;
     let shell_id = shell.id.as_str().to_string();
-    let mut out = String::with_capacity(320);
+    let mut out = String::with_capacity(384);
+    append_shell_open_header(&mut out, &shell, &shell_id, &session_id, agent_id.as_ref());
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
+        append_initial_buffer_line(&mut out, bytes);
+    }
+    append_subscribe_hint(
+        &mut out,
+        &format!(
+            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
+        ),
+    );
+    append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
+    out
+}
+
+/// Stamp the canonical `SSH_SHELL_OPEN` field block into `out`.
+///
+/// Pulled out so [`shell_open_render_with_initial`] stays under the
+/// 30-line ceiling.
+fn append_shell_open_header(
+    out: &mut String,
+    shell: &ShellEntity,
+    shell_id: &str,
+    session_id: &SessionId,
+    agent_id: Option<&AgentId>,
+) {
     out.push_str("SSH_SHELL_OPEN: OK\nSHELL_ID: ");
-    out.push_str(&shell_id);
+    out.push_str(shell_id);
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id.as_str());
     out.push_str("\nTERM: ");
@@ -48,14 +90,17 @@ pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
         out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
-    append_subscribe_hint(
-        &mut out,
-        &format!(
-            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
-        ),
-    );
-    append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
-    out
+}
+
+/// Append `INITIAL_BUFFER: <escaped-bytes>` to the response.
+///
+/// The bytes arrive already head-capped; `sanitize_value` escapes
+/// control chars the same way the rest of the markdown shape does so
+/// multi-line banners stay on a single line.
+fn append_initial_buffer_line(out: &mut String, bytes: &[u8]) {
+    let lossy = String::from_utf8_lossy(bytes);
+    out.push_str("\nINITIAL_BUFFER: ");
+    out.push_str(&sanitize_value(&lossy));
 }
 
 /// Successor tools after `ssh_shell_open` — subscribe-first push, or
@@ -232,7 +277,21 @@ pub fn shell_close_render(outcome: &CloseShellOutcome) -> String {
 /// Build the open-shell structured payload mirroring [`shell_open_render`].
 #[must_use]
 pub fn shell_open_structured(outcome: &OpenShellOutcome) -> Value {
-    json!({
+    shell_open_structured_with_initial(outcome, None)
+}
+
+/// v4.7-step7 variant of [`shell_open_structured`].
+///
+/// Emits `initial_buffer` (UTF-8 lossy decoded) on the structured
+/// payload when the inbound peek captured stdout. The field is omitted
+/// when the peek returned empty (and never overrides the legacy `next`
+/// advisory).
+#[must_use]
+pub fn shell_open_structured_with_initial(
+    outcome: &OpenShellOutcome,
+    initial_buffer: Option<&[u8]>,
+) -> Value {
+    let mut json = json!({
         "tool":   "ssh_shell_open",
         "status": "ok",
         "session_id": outcome.session_id.as_str(),
@@ -246,7 +305,16 @@ pub fn shell_open_structured(outcome: &OpenShellOutcome) -> Value {
             "ssh_shell_write",
             "ssh_shell_send_key",
         ],
-    })
+    });
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "initial_buffer".to_string(),
+                Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            );
+        }
+    }
+    json
 }
 
 /// Build the write-shell structured payload mirroring [`shell_write_render`].

@@ -71,12 +71,15 @@ use crate::application::upload_file::UploadFileUseCase;
 use crate::application::wait_for_pattern::WaitForPatternUseCase;
 use crate::application::write_shell::WriteShellUseCase;
 use crate::composition::UseCases;
+use crate::composition::id_lister::ProdIdLister;
 use crate::composition::status_sinks::{
     RepoCommandRegistrationSink, RepoCommandStatusSink, RepoShellRegistrationSink,
     RepoShellStatusSink, RepoTransferRegistrationSink, RepoTransferStatusSink,
 };
+use crate::infra::mcp::idempotency::IdempotencyCache;
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
+use crate::infra::mcp::tool_router::IdLister;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
 /// as the legacy v3 `RuntimeError` so binaries do not need to change.
@@ -160,18 +163,32 @@ pub type ProdUseCases = UseCases<
 // Wiring
 // ---------------------------------------------------------------------------
 
-/// Build the production [`UseCases`] container plus the shared peer
-/// table the rmcp `RmcpPeerHandle` writes into.
+/// Bundle returned by [`build_use_cases`] — production wiring plus the
+/// per-process side tables the [`McpSshServer`] constructor needs.
 ///
-/// Both handles are returned together because the [`McpSshServer`]
-/// constructor (`infra::mcp::server`) takes both — the table feeds the
-/// notifier, the use cases drive everything else.
+/// Returned as a tuple-struct via the deconstruction pattern in
+/// [`build_use_cases`] callers; the type alias keeps signatures readable.
+type ProdWiring = (
+    Arc<ProdUseCases>,
+    Arc<PeerTable>,
+    Arc<IdempotencyCache>,
+    Arc<dyn IdLister>,
+);
+
+/// Build the production [`UseCases`] container plus the shared peer
+/// table the rmcp `RmcpPeerHandle` writes into and the dedup cache the
+/// v4.7-step5 mutating-tool layer reads.
+///
+/// All three handles are returned together because the [`McpSshServer`]
+/// constructor (`infra::mcp::server`) takes them as a triple — the
+/// table feeds the notifier, the cache wraps mutating tools, the use
+/// cases drive everything else.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
     reason = "composition root naturally instantiates every adapter + use case (22 use cases x ~5 lines each); H17 may extract sub-builders per domain"
 )]
-pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
+pub fn build_use_cases() -> ProdWiring {
     let sessions = Arc::new(DashMapSessionRepo::new());
     let commands = Arc::new(DashMapCommandRepo::new());
     let shells = Arc::new(DashMapShellRepo::new());
@@ -410,6 +427,24 @@ pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
     let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(Arc::clone(&subscribers)));
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
 
+    let idempotency = Arc::new(IdempotencyCache::from_env());
+
+    #[cfg(feature = "port_forward")]
+    let id_lister: Arc<dyn IdLister> = Arc::new(ProdIdLister::new(
+        Arc::clone(&sessions),
+        Arc::clone(&commands),
+        Arc::clone(&shells),
+        Arc::clone(&transfers),
+        Arc::clone(&forwards),
+    ));
+    #[cfg(not(feature = "port_forward"))]
+    let id_lister: Arc<dyn IdLister> = Arc::new(ProdIdLister::new(
+        Arc::clone(&sessions),
+        Arc::clone(&commands),
+        Arc::clone(&shells),
+        Arc::clone(&transfers),
+    ));
+
     let use_cases = Arc::new(UseCases {
         connect,
         disconnect,
@@ -439,14 +474,14 @@ pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
         notifier,
     });
 
-    (use_cases, peer_table)
+    (use_cases, peer_table, idempotency, id_lister)
 }
 
 /// Build a fresh [`McpSshServer`] backed by the production wiring.
 #[must_use]
 pub fn build_server() -> McpSshServer<ProdUseCases> {
-    let (use_cases, peer_table) = build_use_cases();
-    McpSshServer::<ProdUseCases>::new(use_cases, peer_table)
+    let (use_cases, peer_table, idempotency, id_lister) = build_use_cases();
+    McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency).with_id_lister(id_lister)
 }
 
 // ---------------------------------------------------------------------------

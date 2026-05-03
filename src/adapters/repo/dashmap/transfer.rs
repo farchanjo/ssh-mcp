@@ -528,17 +528,11 @@ mod tests {
     #[tokio::test]
     async fn insert_if_under_cap_rejects_duplicate_id() {
         let repo = DashMapTransferRepo::new();
-        repo.insert_if_under_cap(
-            entity("t-dup", "s-1", TransferDirection::Upload),
-            10,
-        )
-        .await
-        .expect("first");
+        repo.insert_if_under_cap(entity("t-dup", "s-1", TransferDirection::Upload), 10)
+            .await
+            .expect("first");
         let err = repo
-            .insert_if_under_cap(
-                entity("t-dup", "s-1", TransferDirection::Upload),
-                10,
-            )
+            .insert_if_under_cap(entity("t-dup", "s-1", TransferDirection::Upload), 10)
             .await
             .expect_err("second must fail");
         match err {

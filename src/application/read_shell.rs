@@ -165,6 +165,16 @@ where
         }
     }
 
+    /// Borrow the shared output-stream port handle.
+    ///
+    /// The inbound rmcp layer uses this to peek at the freshly opened
+    /// shell's stdout buffer (v4.7-step7 `INITIAL_BUFFER`) without
+    /// rerunning the full read use case.
+    #[must_use]
+    pub const fn streams(&self) -> &Arc<OS> {
+        &self.streams
+    }
+
     /// Drive the orchestration. See module-level docs for the step-by-step
     /// semantics.
     ///

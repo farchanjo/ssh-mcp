@@ -29,14 +29,16 @@
 //! The `ServerHandler` impl + `tool_router` impl live in
 //! [`super::tool_router`] alongside the per-tool stub args.
 
+use core::fmt;
 use std::sync::Arc;
 
+use super::idempotency::IdempotencyCache;
 use super::peer_handle::PeerTable;
+use super::tool_router::{IdLister, noop_id_lister};
 
 /// v4 MCP server handler. Generic over the concrete [`crate::composition::UseCases`]
 /// container. The production binary instantiates one wiring; tests (H18) pick
 /// fakes.
-#[derive(Debug)]
 pub struct McpSshServer<UC>
 where
     UC: Send + Sync + 'static,
@@ -50,20 +52,47 @@ where
     /// [`crate::infra::mcp::peer_handle::RmcpPeerHandle`] mutates this
     /// table, so `subscribe` and `read_resource` share the handle.
     pub(super) peer_table: Arc<PeerTable>,
+    /// v4.7-step5 dedup cache for mutating tool calls. Shared across
+    /// every tool fan-out so two requests with the same
+    /// `_meta.idempotency_key` hit the same entry.
+    pub(super) idempotency: Arc<IdempotencyCache>,
+    /// v4.7-step6 closest-match adapter. Used by the tool router to
+    /// enumerate live `SESSION` / `SHELL` / `COMMAND` / `TRANSFER` /
+    /// `FORWARD` ids when augmenting `NOT_FOUND` error details.
+    /// Defaults to a no-op lister so tests can construct the server
+    /// without repository wiring.
+    pub(super) id_lister: Arc<dyn IdLister>,
 }
 
 impl<UC> McpSshServer<UC>
 where
     UC: Send + Sync + 'static,
 {
-    /// Build the server with an already-shared use case container and the
-    /// per-process peer table.
+    /// Build the server with an already-shared use case container, the
+    /// per-process peer table, and the idempotency cache. Uses a
+    /// no-op id lister; call [`Self::with_id_lister`] to plug in a
+    /// repository-backed lister for closest-match suggestions.
     #[must_use]
-    pub const fn from_parts(use_cases: Arc<UC>, peer_table: Arc<PeerTable>) -> Self {
+    pub fn from_parts(
+        use_cases: Arc<UC>,
+        peer_table: Arc<PeerTable>,
+        idempotency: Arc<IdempotencyCache>,
+    ) -> Self {
         Self {
             use_cases,
             peer_table,
+            idempotency,
+            id_lister: noop_id_lister(),
         }
+    }
+
+    /// Replace the (default no-op) id lister with a repository-backed
+    /// adapter. Used by the production composition root to wire the
+    /// v4.7-step6 closest-match suggestions on `NOT_FOUND`.
+    #[must_use]
+    pub fn with_id_lister(mut self, lister: Arc<dyn IdLister>) -> Self {
+        self.id_lister = lister;
+        self
     }
 
     /// Borrow the underlying use case container. Test/observability helper.
@@ -76,5 +105,31 @@ where
     #[must_use]
     pub const fn peer_table(&self) -> &Arc<PeerTable> {
         &self.peer_table
+    }
+
+    /// Borrow the shared idempotency cache. Test/observability helper.
+    #[must_use]
+    pub const fn idempotency(&self) -> &Arc<IdempotencyCache> {
+        &self.idempotency
+    }
+
+    /// Borrow the id lister adapter.
+    #[must_use]
+    pub const fn id_lister(&self) -> &Arc<dyn IdLister> {
+        &self.id_lister
+    }
+}
+
+impl<UC> fmt::Debug for McpSshServer<UC>
+where
+    UC: Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpSshServer")
+            .field("use_cases", &"<elided>")
+            .field("peer_table", &"<elided>")
+            .field("idempotency", &self.idempotency)
+            .field("id_lister", &"<dyn IdLister>")
+            .finish()
     }
 }
