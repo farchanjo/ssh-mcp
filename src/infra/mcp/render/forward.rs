@@ -21,11 +21,12 @@ pub fn forward_render(outcome: ForwardPortOutcome) -> String {
         remote_port,
         started_at: _,
     } = outcome;
+    let forward = sanitize_value(forward_id.as_str());
     let local = format!("0.0.0.0:{local_port}");
     let remote = format!("{remote_address}:{remote_port}");
-    let mut out = String::with_capacity(160);
+    let mut out = String::with_capacity(288);
     out.push_str("SSH_FORWARD: OK\nFORWARD_ID: ");
-    out.push_str(&sanitize_value(forward_id.as_str()));
+    out.push_str(&forward);
     out.push_str("\nSESSION_ID: ");
     out.push_str(&sanitize_value(session_id.as_str()));
     out.push_str("\nLOCAL: ");
@@ -33,7 +34,30 @@ pub fn forward_render(outcome: ForwardPortOutcome) -> String {
     out.push_str("\nREMOTE: ");
     out.push_str(&sanitize_value(&remote));
     out.push_str("\nACTIVE: true");
+    append_subscribe_hint(
+        &mut out,
+        &format!("subscribe to forward://{forward}/events for realtime event log"),
+    );
+    append_next_line(
+        &mut out,
+        &format!("resources/subscribe forward://{forward}/events"),
+    );
     out
+}
+
+/// Append a single `NEXT: <hint>` advisory line listing concrete tool
+/// calls a smaller LLM can chain without consulting the cookbook.
+fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Append a `HINT:` line steering 27B-class models toward the
+/// subscribe-first resource pattern (push notifications) instead of
+/// hot-polling tool calls.
+fn append_subscribe_hint(out: &mut String, hint: &str) {
+    out.push_str("\nHINT: ");
+    out.push_str(hint);
 }
 
 #[cfg(test)]
@@ -54,7 +78,14 @@ mod tests {
         });
         assert_eq!(
             m,
-            "SSH_FORWARD: OK\nFORWARD_ID: fwd-1\nSESSION_ID: sess-1\nLOCAL: 0.0.0.0:8080\nREMOTE: localhost:3306\nACTIVE: true"
+            "SSH_FORWARD: OK\n\
+             FORWARD_ID: fwd-1\n\
+             SESSION_ID: sess-1\n\
+             LOCAL: 0.0.0.0:8080\n\
+             REMOTE: localhost:3306\n\
+             ACTIVE: true\n\
+             HINT: subscribe to forward://fwd-1/events for realtime event log\n\
+             NEXT: resources/subscribe forward://fwd-1/events"
         );
     }
 }

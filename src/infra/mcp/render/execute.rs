@@ -28,16 +28,48 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
         agent_id,
         started_at: _,
     } = outcome;
-    let mut out = String::with_capacity(160);
+    let mut out = String::with_capacity(288);
     out.push_str("SSH_EXECUTE: STARTED\nCOMMAND_ID: ");
     out.push_str(command_id.as_str());
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id.as_str());
     if let Some(agent) = agent_id {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
+    append_subscribe_hint(
+        &mut out,
+        &format!(
+            "subscribe to command://{cmd}/output for realtime output (preferred over polling)",
+            cmd = command_id.as_str(),
+        ),
+    );
+    append_next_line(&mut out, &next_hint_for_execute(command_id.as_str()));
     out
+}
+
+/// Successor tools after `ssh_execute: STARTED` — fetch output (with
+/// long-poll) or cancel the spawned command.
+fn next_hint_for_execute(command_id: &str) -> String {
+    format!(
+        "ssh_get_command_output(command_id={command_id}, wait=true) | \
+         ssh_cancel_command(command_id={command_id})"
+    )
+}
+
+/// Append a single `NEXT: <hint>` advisory line listing concrete tool
+/// calls a smaller LLM can chain without consulting the cookbook.
+fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Append a `HINT:` line steering 27B-class models toward the
+/// subscribe-first resource pattern (push notifications) instead of
+/// hot-polling tool calls.
+fn append_subscribe_hint(out: &mut String, hint: &str) {
+    out.push_str("\nHINT: ");
+    out.push_str(hint);
 }
 
 /// Render a [`GetCommandOutputResult`] as the v3
@@ -58,20 +90,55 @@ pub fn get_command_output_render(result: GetCommandOutputResult) -> String {
     let (status_label, hint, exit) = classify_state(status, exit_code, timed_out);
     let stdout_block = render_output_block("stdout", &nonce, &stdout, DEFAULT_OUTPUT_BYTES, hint);
     let stderr_block = render_output_block("stderr", &nonce, &stderr, DEFAULT_OUTPUT_BYTES, hint);
-    let mut out = String::with_capacity(128 + stdout_block.len() + stderr_block.len());
+    let mut out = build_get_command_output_head(
+        status_label,
+        command_id.as_str(),
+        exit,
+        &stdout_block,
+        &stderr_block,
+    );
+    if matches!(status, CommandStatus::Running) {
+        append_next_line(
+            &mut out,
+            &next_hint_for_running_command(command_id.as_str()),
+        );
+    }
+    out
+}
+
+/// Compose the static head of `SSH_GET_COMMAND_OUTPUT` (status + ids +
+/// optional exit + stdout/stderr blocks). Pulled out so the entry point
+/// stays under the 30-line cognitive threshold.
+fn build_get_command_output_head(
+    status_label: &str,
+    command_id: &str,
+    exit: Option<i32>,
+    stdout_block: &str,
+    stderr_block: &str,
+) -> String {
+    let mut out = String::with_capacity(192 + stdout_block.len() + stderr_block.len());
     out.push_str("SSH_GET_COMMAND_OUTPUT: ");
     out.push_str(status_label);
     out.push_str("\nCOMMAND_ID: ");
-    out.push_str(command_id.as_str());
+    out.push_str(command_id);
     if let Some(code) = exit {
         out.push_str("\nEXIT: ");
         out.push_str(&code.to_string());
     }
     out.push('\n');
-    out.push_str(&stdout_block);
+    out.push_str(stdout_block);
     out.push('\n');
-    out.push_str(&stderr_block);
+    out.push_str(stderr_block);
     out
+}
+
+/// Successor advisory for an in-flight command — subscribe for push
+/// updates or long-poll the same tool.
+fn next_hint_for_running_command(command_id: &str) -> String {
+    format!(
+        "resources/subscribe command://{command_id}/output | \
+         ssh_get_command_output(command_id={command_id}, wait=true)"
+    )
 }
 
 const fn classify_state(
