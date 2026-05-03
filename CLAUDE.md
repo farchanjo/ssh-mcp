@@ -15,9 +15,9 @@ cargo fmt --all -- --check                         # Check formatting
 cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
 ```
 
-## Architecture (v4.1.0 — Hexagonal / Ports and Adapters, deep-decoupled)
+## Architecture (v4.5.0 — Hexagonal / Ports and Adapters, deep-decoupled)
 
-The public MCP API is unchanged from v3 / v4.0 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
+The public MCP API is unchanged from v3 / v4.0 / v4.1 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4.5 layers a richer LLM UX on top: stable `PeerId` derived from `Mcp-Session-Id` (HTTP) or stdio singleton, live `_meta` envelope on `resources/read`, granular wire error codes (14 dispatched tags), `Implementation` identity (title/description/website_url) with few-shot `instructions`, and `ToolAnnotations` on every tool. v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
 
 ### Binary Targets
 
