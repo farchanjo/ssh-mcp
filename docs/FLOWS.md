@@ -1,1158 +1,388 @@
-# SSH MCP Operation Flows
+# SSH MCP Flow Diagrams (v4.0.0)
 
-This document describes the operational flows of the SSH MCP server: session lifecycle, connection with smart reuse, authentication, command execution + cancellation, interactive shell lifecycle, SFTP transfers, port forwarding, and retry/error handling. Diagrams reflect the **v2.0.1** codebase where every tool returns a markdown `Text<String>`.
+Sequence diagrams for the most common workflows on top of the v4.0.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4 hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs`, and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/*` (which delegate into the foundational `src/mcp/{shell,async_command,sftp,transfer}` modules pending the H17.6 cleanup — see [ARCHITECTURE.md Future work](./ARCHITECTURE.md#future-work)).
 
 [[_TOC_]]
 
-## Session Lifecycle
+## 1. Connect, execute, disconnect (golden path)
 
-The complete lifecycle of an SSH session from creation to termination.
-
-<details>
-<summary>Session lifecycle state diagram</summary>
-
-```mermaid
-stateDiagram-v2
-    [*] --> Disconnected
-
-    Disconnected --> Reusing: ssh_connect with healthy match + auto
-    Disconnected --> Suggested: ssh_connect with matches + suggest
-    Disconnected --> Connecting: ssh_connect (no match / force_new)
-
-    Suggested --> [*]: client picks existing or retries
-    Reusing --> Connected: Health check OK
-
-    Connecting --> Authenticating: TCP handshake OK
-    Connecting --> RetryLogic: Connection failed
-
-    RetryLogic --> Connecting: Retryable error
-    RetryLogic --> Disconnected: Non-retryable / max retries
-
-    Authenticating --> Connected: AuthChain succeeds
-    Authenticating --> Disconnected: All strategies failed
-
-    Connected --> Executing: ssh_execute
-    Connected --> ShellOpen: ssh_shell_open
-    Connected --> Transferring: ssh_upload / ssh_download
-    Connected --> Forwarding: ssh_forward
-    Connected --> Disconnecting: ssh_disconnect / ssh_disconnect_agent
-    Connected --> Disconnected: Inactivity timeout
-
-    Executing --> Connected: Command completes / times out / cancelled
-    ShellOpen --> Connected: Shell closes (explicit / inactivity TTL)
-    Transferring --> Connected: Transfer reaches terminal state
-    Forwarding --> Connected: Listener task still live
-
-    Disconnecting --> Disconnected: Commands cancelled, shells closed, transfers cancelled, handle disconnected
-
-    Disconnected --> [*]
-```
-
-</details>
-
-### Session States
-
-| State | Description |
-|-------|-------------|
-| `Disconnected` | Not present in `SESSION_STORAGE`. |
-| `Suggested` | `ssh_connect` found healthy matches and returned `SSH_CONNECT: SUGGESTED` without opening a connection. |
-| `Reusing` | `ssh_connect` ran a 5 s `echo 1` health check on an existing session and is returning `SSH_CONNECT: REUSED`. |
-| `Connecting` | TCP connection + retry logic in flight. |
-| `Authenticating` | AuthChain running; on success, the session is stored. |
-| `Connected` | Handle wrapped in `Arc`, `channel_permits: Semaphore(1)` allocated. |
-| `Executing` / `ShellOpen` / `Transferring` / `Forwarding` | Background tasks are touching the session — they coexist with other tasks on the same session (channel opens are serialized through the semaphore). |
-| `Disconnecting` | `cancel_session_transfers` → `close_session_shells` → `cancel_session_commands` → `SESSION_STORAGE.remove` → `Disconnect::ByApplication`. |
-
-### Session Properties
-
-| Property | Description |
-|----------|-------------|
-| `name` | Optional human-readable identifier (surfaces in `ssh_list_sessions` and `SUGGESTED` responses). |
-| `agent_id` | Optional grouping key used by `ssh_disconnect_agent`. |
-| `persistent` | When true, `build_client_config` sets `inactivity_timeout: None`; keepalive (30 s interval, max 3) still runs. |
-| `compression_enabled` | Reported on `ssh_list_sessions` decorations as `[compression: off]` when disabled (default: on). |
-| `last_health_check` / `healthy` | Populated by `ssh_list_sessions` (sweeps sessions with a 5 s `echo 1`) and by the smart-reuse logic in `ssh_connect`. |
-| `channel_permits` | `Arc<Semaphore>` with `CHANNEL_CONCURRENCY_PER_SESSION = 1`. Every russh channel open goes through it, serializing bursts so `MaxSessions` on the remote is never exceeded. |
-
-## SSH Connection Flow
-
-`ssh_connect` combines smart-reuse detection, retry logic, and auth-chain composition.
-
-<details>
-<summary>ssh_connect sequence diagram</summary>
+The minimal end-to-end flow: open a connection, run one command, tear down.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_connect
-    participant Store as SESSION_STORAGE
-    participant Reuse as evaluate_identity_matches
-    participant Retry as connect_to_ssh_with_retry
-    participant SSH as russh::client
-    participant Server as SSH Server
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant SSH as russh
+    participant Remote as Remote host
 
-    Client->>Cmd: ssh_connect(params)
+    Client->>Server: ssh_connect(address=example.com, username=alice, password=...)
+    Server->>SSH: connect_to_ssh_with_retry()
+    SSH->>Remote: TCP + SSH handshake
+    Remote-->>SSH: authenticated
+    SSH-->>Server: handle
+    Server->>Server: SessionRepository.insert(SessionEntity)
+    Server-->>Client: SSH_CONNECT: OK\nSESSION_ID: a3f2b1d7-...
 
-    alt session_id provided
-        Cmd->>Store: get(session_id)
-        Cmd->>SSH: execute "echo 1" (health check, 5s)
-        alt Healthy
-            Cmd-->>Client: SSH_CONNECT: REUSED
-        else Dead
-            Store->>Store: remove(session_id)
-        end
+    Client->>Server: ssh_execute(session_id, command="uname -a")
+    Server->>Server: register RunningCommand + spawn task
+    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
+
+    par command runs in background
+        Server->>SSH: open_channel + exec
+        SSH->>Remote: exec "uname -a"
+        Remote-->>SSH: stdout + exit 0
+        SSH-->>Server: OutputChunk + exit
+        Server->>Server: ArcSwap publish + OnceCell::set(exit_code=0)
     end
 
-    alt reuse == "force_new"
-        Note over Cmd: skip identity lookup
-    else
-        Cmd->>Reuse: find_by_identity(host, port, user)
-        loop candidates
-            Reuse->>SSH: execute "echo 1"
-            alt Healthy
-                Reuse->>Store: update_health
-            else Unhealthy
-                Reuse->>Cmd: cancel transfers/shells/commands
-                Reuse->>Store: remove session
-                Note right of Reuse: REPLACED: N
-            end
-        end
-    end
+    Client->>Server: ssh_get_command_output(command_id, wait=true)
+    Server->>Server: status_rx watch (Completed)
+    Server-->>Client: SSH_GET_COMMAND_OUTPUT: COMPLETED\nEXIT: 0\n--- stdout ... ---
 
-    alt reuse == "auto" & any healthy
-        Cmd-->>Client: SSH_CONNECT: REUSED (most recent)
-    else reuse == "suggest" & any healthy
-        Cmd-->>Client: SSH_CONNECT: SUGGESTED (list)
-    else
-        Cmd->>Retry: connect_to_ssh_with_retry(...)
-        Retry->>SSH: client::connect (timeout)
-        SSH->>Server: TCP + SSH handshake
-        Retry->>SSH: AuthChain.authenticate
-        alt Auth OK
-            SSH-->>Retry: Handle, retry_count
-            Retry-->>Cmd: Handle
-            Cmd->>Store: insert(new SESSION_ID, info, Arc::new(handle))
-            Cmd-->>Client: SSH_CONNECT: OK (+ REPLACED: N?)
-        else Auth failed
-            Retry-->>Cmd: Err(auth error, non-retryable)
-            Cmd-->>Client: SSH_CONNECT: ERROR
+    Client->>Server: ssh_disconnect(session_id)
+    Server->>Server: cancel commands, close shells, abort transfers
+    Server->>SSH: handle.disconnect(ByApplication)
+    Server-->>Client: SSH_DISCONNECT: OK
+```
+
+## 2. Subscribe-first PTY interactive (preferred)
+
+The recommended UX for interactive shells: subscribe to push notifications instead of polling.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Reg as SubscriptionRegistry
+    participant Reader as PTY reader task
+    participant Writer as PTY writer task
+
+    Client->>Server: ssh_connect(...)
+    Server-->>Client: SESSION_ID
+
+    Client->>Server: ssh_shell_open(session_id, term=xterm)
+    Server->>Reader: spawn (ArcSwap of RingBuffer + broadcast + Notify)
+    Server->>Writer: spawn (mpsc::Receiver of WriteRequest)
+    Server-->>Client: SSH_SHELL_OPEN: OK\nSHELL_ID: 4b9c8e2a-...\nTERM: xterm 80x24
+
+    Client->>Server: resources/subscribe shell://4b9c8e2a-.../output
+    Server->>Reg: subscribe(Shell, "4b9c8e2a-...", uri, peer_id, peer)
+    Reg->>Reg: spawn debouncer (first subscriber)
+    Server-->>Client: ()
+
+    Client->>Server: ssh_shell_write(shell_id, "ls -la\n")
+    Server->>Writer: WriteRequest::Data(b"ls -la\n")
+    Writer->>Reader: bytes flow back
+    Reader->>Reader: rcu append + head-trim
+    Reader->>Reg: poke(Shell, "4b9c8e2a-...")
+
+    Reg->>Reg: tokio::sleep(50 ms)
+    Reg-->>Client: notifications/resources/updated shell://4b9c8e2a-.../output
+
+    Client->>Server: resources/read shell://4b9c8e2a-.../output?cursor=auto
+    Server-->>Client: text="$ ls -la\n..." + _meta{cursor=128, last_seq=3, shell_status=open}
+
+    Note over Reader,Reg: Subsequent pokes within 50 ms<br/>collapse into one notification.
+
+    Client->>Server: resources/unsubscribe shell://4b9c8e2a-.../output
+    Server->>Reg: unsubscribe(peer_id, uri) -> debouncer aborted
+
+    Client->>Server: ssh_shell_close(shell_id)
+    Server-->>Client: SSH_SHELL_CLOSE: OK
+    Client->>Server: ssh_disconnect(session_id)
+```
+
+## 3. Long-poll fallback (no subscribe support)
+
+Clients that cannot subscribe fall back to `ssh_shell_read.wait`.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Shell as RunningShell
+
+    loop until exit condition
+        Client->>Server: ssh_shell_read(shell_id, wait=true, wait_timeout_secs=30, min_bytes=1)
+        Server->>Shell: load_full() snapshot
+        alt new_bytes >= min_bytes
+            Server-->>Client: SSH_SHELL_READ: OPEN\n--- data ... ---
+        else status changed to Closed
+            Server-->>Client: SSH_SHELL_READ: CLOSED\n--- data ... ---
+        else 30 s elapsed
+            Server-->>Client: SSH_SHELL_READ: TIMEOUT\n--- data ... ---
+            Note over Client: Reissue another wait=true call
         end
     end
 ```
 
-</details>
+## 4. wait_for fallback (gated single-shot)
 
-### Smart Session Reuse
-
-<details>
-<summary>Smart reuse policy flowchart</summary>
-
-```mermaid
-flowchart TD
-    Start([ssh_connect args]) --> HasSessionId{session_id<br/>provided?}
-
-    HasSessionId -->|Yes| HealthOne[Health check target]
-    HealthOne --> HealthyOne{healthy?}
-    HealthyOne -->|Yes| OutputReused[Return REUSED]
-    HealthyOne -->|No| DropOne[Remove target from storage]
-    DropOne --> LookupIdent
-
-    HasSessionId -->|No| LookupIdent[find_by_identity]
-
-    LookupIdent --> EachCandidate{candidates?}
-    EachCandidate -->|none| CreateNew
-    EachCandidate -->|some| HealthCheck[echo 1 on each]
-    HealthCheck --> Classify[healthy vs dead]
-    Classify --> DropDead[Disconnect + unregister dead]
-    DropDead --> Sort[Sort healthy by connected_at desc]
-
-    Sort --> Policy{reuse?}
-    Policy -->|force_new| CreateNew
-    Policy -->|auto, any healthy| OutputReusedAuto[Return REUSED - newest match]
-    Policy -->|suggest, any healthy| OutputSuggested[Return SUGGESTED]
-    Policy -->|auto/suggest, none healthy| CreateNew
-
-    CreateNew[connect + auth + store new session] --> AppendReplaced{replaced > 0?}
-    AppendReplaced -->|Yes| AppendLine[Append REPLACED: N to OK body]
-    AppendReplaced -->|No| ReturnOk
-    AppendLine --> ReturnOk[Return SSH_CONNECT: OK]
-
-    style OutputReused fill:#e8f5e9
-    style OutputReusedAuto fill:#e8f5e9
-    style ReturnOk fill:#e8f5e9
-    style OutputSuggested fill:#fff8e1
-```
-
-</details>
-
-### Configuration Resolution Priority
-
-Each configuration value follows the same resolution pattern.
-
-<details>
-<summary>Configuration resolution flowchart</summary>
-
-```mermaid
-flowchart TD
-    Start([Resolve Config Value]) --> CheckParam{Parameter provided?}
-
-    CheckParam -->|Yes| UseParam[Use parameter value]
-    CheckParam -->|No| CheckEnv{Env var set?}
-
-    CheckEnv -->|Yes| ParseEnv{Parses ok?}
-    CheckEnv -->|No| UseDefault[Use default]
-
-    ParseEnv -->|Yes| UseEnv[Use env value]
-    ParseEnv -->|No| UseDefault
-
-    UseParam --> Return([Return Duration/usize/bool])
-    UseEnv --> Return
-    UseDefault --> Return
-
-    style Start fill:#e3f2fd
-    style Return fill:#e8f5e9
-```
-
-</details>
-
-### Address Parsing
-
-`parse_host_port` (for identity lookups) and `parse_address` (for the russh client) accept plain hosts, `host:port`, and IPv6 bracketed forms.
-
-<details>
-<summary>Address parsing flowchart</summary>
-
-```mermaid
-flowchart LR
-    Input["Address String"] --> IPv6{Starts with '['?}
-
-    IPv6 -->|Yes| SplitBracket["Split on ']'"]
-    SplitBracket --> ExtractPort["Port after ':' (default 22)"]
-    ExtractPort --> Lowercase
-
-    IPv6 -->|No| Colon{Contains colon?}
-    Colon -->|Yes| Split["rsplit_once on colon"]
-    Colon -->|No| Default22["port = 22"]
-
-    Split --> ParsePort["Parse as u16"]
-    ParsePort --> Valid{Valid?}
-    Valid -->|Yes| Lowercase
-    Valid -->|No| Default22
-
-    Default22 --> Lowercase
-    Lowercase["Lowercase host"] --> Return["(host_lc, port)"]
-
-    style Input fill:#e3f2fd
-    style Return fill:#e8f5e9
-```
-
-</details>
-
-## Authentication Flow
-
-`client::build_auth_chain` composes an `AuthChain` that is later called by `client::connect_to_ssh`:
-
-1. `PasswordAuth` (when `password` is provided).
-2. `KeyAuth` for `key_path` (if explicit) **or** one per default OpenSSH key found in `~/.ssh/` (`id_ed25519`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519_sk`, `id_rsa`, `id_dsa`).
-3. `AgentAuth` (always appended).
-
-Every strategy implements `AuthStrategy`; the chain stops at the first success.
-
-<details>
-<summary>Authentication sequence diagram</summary>
+Branch a workflow on the first matching pattern (e.g. `password:`, `Permission denied`, `$ `).
 
 ```mermaid
 sequenceDiagram
-    participant Client as client::connect_to_ssh
-    participant Chain as AuthChain
-    participant Pass as PasswordAuth
-    participant Key as KeyAuth
-    participant Agent as AgentAuth
-    participant Handle as russh::client::Handle
-    participant Server as SSH Server
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Shell as RunningShell
 
-    Client->>Chain: authenticate(handle, username)
+    Client->>Server: ssh_shell_open(...) -> SHELL_ID
 
-    Chain->>Pass: authenticate (if present)
-    Pass->>Handle: authenticate_password
-    Handle->>Server: publickey / password request
-    Server-->>Handle: result
-    alt success
-        Pass-->>Chain: Ok(true)
-        Chain-->>Client: Ok(true)
-    else
-        Pass-->>Chain: Ok(false) / Err
-    end
+    Client->>Server: ssh_shell_write(shell_id, "ssh root@bastion\n")
 
-    Chain->>Key: authenticate (for each key path)
-    Key->>Key: keys::load_secret_key
-    Key->>Handle: best_supported_rsa_hash
-    Handle-->>Key: Some(rsa-sha2-512 / 256) or None
-    Key->>Key: PrivateKeyWithHashAlg::new(key, hash_alg)
-    Key->>Handle: authenticate_publickey
-    alt success
-        Key-->>Chain: Ok(true)
-        Chain-->>Client: Ok(true)
-    else
-        Key-->>Chain: Ok(false)
-    end
+    Client->>Server: ssh_shell_wait_for(shell_id, patterns=["password:", "Permission denied", "$ "], timeout_secs=15)
 
-    Chain->>Agent: authenticate
-    Agent->>Agent: keys::agent::AgentClient::connect_env
-    Agent->>Agent: request_identities
-    loop for each identity
-        Agent->>Handle: best_supported_rsa_hash
-        Agent->>Handle: authenticate_publickey_with(hash_alg)
-        alt success
-            Agent-->>Chain: Ok(true)
-            Chain-->>Client: Ok(true)
-        else
-            Note over Agent: try next identity
+    loop until match / timeout / closed
+        Server->>Shell: load_full() snapshot
+        Server->>Server: scan_for_first_match(buffer, patterns)
+        alt pattern hit
+            Server-->>Client: SSH_SHELL_WAIT_FOR: MATCHED\nMATCHED_PATTERN: password:
+            Note over Client: Branch on MATCHED_PATTERN
+            Client->>Server: ssh_shell_write(shell_id, "secret\n")
+        else timeout
+            Server-->>Client: SSH_SHELL_WAIT_FOR: TIMEOUT\n--- data ... ---
+        else shell closed
+            Server-->>Client: SSH_SHELL_WAIT_FOR: CLOSED\n--- data ... ---
         end
     end
-
-    alt no strategy succeeded
-        Chain-->>Client: Ok(false)  // caller converts to error
-    end
 ```
 
-</details>
+## 5. send_key Ctrl+C interrupt
 
-### RSA Hash Algorithm Negotiation
-
-<details>
-<summary>RSA hash negotiation flowchart</summary>
-
-```mermaid
-flowchart TD
-    Start([best_supported_rsa_hash]) --> Query[Query server capabilities]
-    Query --> CheckSupport{Server supports modern RSA?}
-
-    CheckSupport -->|Yes| CheckSHA512{rsa-sha2-512?}
-    CheckSupport -->|No| Legacy[Return None - use legacy ssh-rsa]
-
-    CheckSHA512 -->|Yes| UseSHA512[Return rsa-sha2-512]
-    CheckSHA512 -->|No| CheckSHA256{rsa-sha2-256?}
-
-    CheckSHA256 -->|Yes| UseSHA256[Return rsa-sha2-256]
-    CheckSHA256 -->|No| Legacy
-
-    UseSHA512 --> End([Hash selected])
-    UseSHA256 --> End
-    Legacy --> End
-
-    style Start fill:#e3f2fd
-    style End fill:#e8f5e9
-    style Legacy fill:#fff8e1
-```
-
-</details>
-
-### Authentication Method Priority
-
-<details>
-<summary>Authentication priority flowchart</summary>
-
-```mermaid
-flowchart TD
-    Start([build_auth_chain]) --> CheckPassword{password<br/>provided?}
-    CheckPassword -->|Yes| AddPassword[chain.with_password]
-    AddPassword --> CheckKey
-    CheckPassword -->|No| CheckKey{key_path<br/>provided?}
-
-    CheckKey -->|Yes| AddKey[chain.with_key(key_path)]
-    CheckKey -->|No| Discover[discover_default_keys]
-    Discover --> LoopKeys{found any?}
-    LoopKeys -->|Yes| EachKey[chain.with_key(path)]
-    EachKey --> LoopKeys
-    LoopKeys -->|No| AddAgent
-
-    AddKey --> AddAgent[chain.with_agent (always)]
-    Discover --> AddAgent
-
-    AddAgent --> Done([Chain ready])
-
-    style Start fill:#e3f2fd
-    style Done fill:#e8f5e9
-```
-
-</details>
-
-## Command Execution Flow
-
-`ssh_execute` registers a `RunningCommand`, queues a background task through the per-session channel semaphore, and returns a `COMMAND_ID` immediately.
-
-<details>
-<summary>ssh_execute sequence diagram</summary>
+Send a semantic keystroke to interrupt a running command without closing the shell.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_execute
-    participant Store as SESSION_STORAGE / COMMAND_STORAGE
-    participant Sem as channel_permits (Semaphore)
-    participant Task as background task
-    participant Handle as russh::Handle
-    participant Channel as russh::Channel
-    participant Server as Remote Server
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Shell as RunningShell
+    participant Remote as Remote PTY
 
-    Client->>Cmd: ssh_execute(session_id, command)
+    Client->>Server: ssh_shell_open(...) returns SHELL_ID
+    Client->>Server: ssh_shell_write(shell_id, INFINITE_LOOP_CMD)
+    Note over Client,Remote: INFINITE_LOOP_CMD is a busy loop such as `while true do date && sleep 1 done`.
 
-    Cmd->>Store: count_running_by_session
-    alt >= MAX_ASYNC_COMMANDS_PER_SESSION (100)
-        Cmd-->>Client: ERROR [MAX_COMMANDS_EXCEEDED]
-    end
+    Note over Remote: shell prints date every second
 
-    Cmd->>Store: get(session_id) -> handle_arc, agent_id, channel_permits
+    Client->>Server: ssh_shell_send_key(shell_id, key=ctrl_c)
+    Server->>Server: ShellKey::CtrlC.encode(empty_mods) returns b"\x03"
+    Server->>Shell: input_tx.send(WriteRequest::Data(b"\x03"))
+    Shell->>Remote: \x03
+    Remote-->>Shell: ^C $
+    Server-->>Client: SSH_SHELL_SEND_KEY OK<br/>SHELL_ID: ...<br/>KEY: ctrl_c<br/>BYTES_SENT: 1
 
-    Note over Cmd: Generate COMMAND_ID (UUIDv4)
-    Note over Cmd: create_running_command(...)
-    Cmd->>Store: COMMAND_STORAGE.register(command_id, running)
-
-    Cmd-->>Client: SSH_EXECUTE: STARTED (COMMAND_ID, SESSION_ID, AGENT?)
-
-    Note over Task: spawn_command_task / spawn_cleanup_task
-
-    Task->>Sem: acquire_owned (queue if busy)
-    Sem-->>Task: OwnedSemaphorePermit
-
-    Task->>Handle: channel_open_session (or PTY open)
-    Handle->>Server: SSH_MSG_CHANNEL_OPEN
-    Server-->>Handle: SSH_MSG_CHANNEL_OPEN_CONFIRMATION
-    Handle-->>Task: Channel
-
-    Task->>Channel: exec (command)
-
-    loop tokio::select! (biased)
-        alt cancel_token.cancelled()
-            Task->>Channel: close
-            Task-->>Store: status_tx.send(Cancelled)
-        else time::sleep(timeout)
-            Task-->>Store: timed_out.store(true)
-            Task->>Channel: close
-            Task-->>Store: status_tx.send(Completed)
-        else ChannelMsg::Data / ExtendedData
-            Task->>Store: output.append_stdout_bounded / append_stderr_bounded
-        else ChannelMsg::ExitStatus
-            Task->>Store: exit_code.lock = Some(code)
-        else ChannelMsg::Eof / Close / None
-            Task->>Store: status_tx.send(Completed)
-            Task->>Channel: close (idempotent)
-        end
-    end
-
-    Note over Task: permit dropped -> next queued execute may proceed
+    Note over Client: Shell remains open and ready for next command.
 ```
 
-</details>
+## 6. Async command with realtime monitoring (subscribe)
 
-### Polling for Output
-
-<details>
-<summary>Polling sequence diagram</summary>
+Subscribe to `command://<id>/output` to observe stdout/stderr live.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_get_command_output
-    participant Store as COMMAND_STORAGE
-    participant Task as background task
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Reg as SubscriptionRegistry
+    participant Cmd as RunningCommand
 
-    Client->>Cmd: ssh_get_command_output(command_id, wait?, wait_timeout_secs?, max_output_bytes?)
+    Client->>Server: ssh_execute(session_id, command="cargo build --release")
+    Server->>Cmd: spawn (ArcSwap of OutputBuffer + broadcast + OnceCell)
+    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
-    Cmd->>Store: get_direct(command_id)
-    alt Not found
-        Cmd-->>Client: ERROR [COMMAND_NOT_FOUND]
+    Client->>Server: resources/subscribe command://7d4c8e2a-.../output
+    Server->>Reg: subscribe(Command, "7d4c8e2a-...", uri, peer_id, peer)
+    Reg->>Reg: spawn debouncer
+    Server-->>Client: ()
+
+    loop output chunks
+        Cmd->>Cmd: ArcSwap publish + broadcast
+        Cmd->>Reg: poke(Command, "7d4c8e2a-...")
+        Reg-->>Client: notifications/resources/updated (debounced)
+        Client->>Server: resources/read command://7d4c8e2a-.../output?cursor=auto
+        Server-->>Client: text + _meta{cursor, last_seq, command_status=running}
     end
 
-    alt wait == true
-        Cmd->>Cmd: tokio::time::timeout(wait_timeout, wait_for_command_completion)
-    end
+    Cmd->>Cmd: OnceCell::set(exit_code=0) and status_rx becomes Completed
+    Cmd->>Reg: poke(Command, "7d4c8e2a-...")
+    Reg-->>Client: notifications/resources/updated (final)
+    Client->>Server: resources/read ...?cursor=auto
+    Server-->>Client: text + _meta{command_status=completed, last_seq=N}
 
-    Cmd->>Store: output_read.store(true)
-    Cmd->>Store: read status_rx, output, exit_code, error, timed_out
-
-    alt Failed
-        Cmd-->>Client: ERROR [COMMAND_FAILED]
-    else Running (wait timed out)
-        Cmd-->>Client: SSH_GET_COMMAND_OUTPUT: RUNNING + stdout/stderr blocks (partial)
-    else Completed
-        Cmd-->>Client: SSH_GET_COMMAND_OUTPUT: COMPLETED + EXIT + stdout/stderr blocks
-    else timed_out set
-        Cmd-->>Client: SSH_GET_COMMAND_OUTPUT: TIMEOUT + partial blocks
-    else Cancelled
-        Cmd-->>Client: SSH_GET_COMMAND_OUTPUT: COMPLETED (exit 0) (status is treated as a clean exit)
-    end
-
-    Note over Task: cleanup task observes output_read=true<br/>+ 1 s grace -> remove from storage
+    Client->>Server: resources/unsubscribe command://7d4c8e2a-.../output
 ```
 
-</details>
+## 7. SFTP upload with progress subscribe
 
-### Async Command State Machine
-
-<details>
-<summary>Async command state machine</summary>
-
-```mermaid
-stateDiagram-v2
-    [*] --> NotStarted
-
-    NotStarted --> Queued: ssh_execute registers RunningCommand
-    Queued --> Acquiring: Await channel_permits
-    Acquiring --> Collecting: channel_open_session + exec
-    Acquiring --> Failed: Channel open error
-
-    Collecting --> Collecting: ChannelMsg::Data / ExtendedData
-    Collecting --> Completed: Eof / Close / exit_code received
-    Collecting --> Completed: Timeout -> partial + timed_out=true
-    Collecting --> Cancelled: cancel_token triggered
-    Collecting --> Failed: exec error / permit closed
-
-    Completed --> ReadyRead
-    Cancelled --> ReadyRead
-    Failed --> ReadyRead
-    ReadyRead --> Cleanup: output_read + 1s grace
-    ReadyRead --> Cleanup: TTL (SSH_COMMAND_CLEANUP_TTL)
-
-    Cleanup --> [*]
-```
-
-</details>
-
-### Session Cap Enforcement
-
-<details>
-<summary>Async command limits flowchart</summary>
-
-```mermaid
-flowchart TD
-    Start([ssh_execute]) --> CountRunning[COMMAND_STORAGE.count_running_by_session]
-    CountRunning --> CheckLimit{>= 100?}
-
-    CheckLimit -->|Yes| Reject[Return ERROR [MAX_COMMANDS_EXCEEDED]]
-    CheckLimit -->|No| GetSession[SESSION_STORAGE.get]
-
-    GetSession --> Found{Found?}
-    Found -->|No| SessionError[Return ERROR [SESSION_NOT_FOUND]]
-    Found -->|Yes| CreateState[create_running_command + register_and_spawn]
-
-    CreateState --> Spawn[tokio::spawn background task]
-    Spawn --> Return[Return SSH_EXECUTE: STARTED]
-
-    style Return fill:#e8f5e9
-    style Reject fill:#ffebee
-    style SessionError fill:#ffebee
-```
-
-</details>
-
-## Command Cancellation Flow
-
-`ssh_cancel_command` triggers the cancellation token, waits up to 5 s for the background task to transition out of `Running`, then pauses 100 ms more before returning. The post-drain pause guarantees the server's `CHANNEL_CLOSE` accounting is settled, so a quick `execute + cancel + execute` burst never races `MaxSessions`.
-
-<details>
-<summary>Cancellation sequence diagram</summary>
+Subscribe to `transfer://<id>/progress` for tick-driven progress updates.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_cancel_command
-    participant Store as COMMAND_STORAGE
-    participant Task as background task
-    participant Channel as russh::Channel
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Reg as SubscriptionRegistry
+    participant Tr as RunningTransfer
+    participant SFTP as russh-sftp
 
-    Client->>Cmd: ssh_cancel_command(command_id)
+    Client->>Server: ssh_upload(session_id, local_path, remote_path)
+    Server->>Tr: spawn (AtomicU64 + broadcast::Sender of ProgressEvent + OnceCell)
+    Server-->>Client: SSH_UPLOAD: STARTED\nTRANSFER_ID: 8f7e6d5c-...
 
-    Cmd->>Store: get_direct(command_id)
-    alt Not found
-        Cmd-->>Client: ERROR [COMMAND_NOT_FOUND]
-    else Not running
-        Cmd-->>Client: SSH_CANCEL_COMMAND: NOOP | REASON: not running
-    end
-
-    Cmd->>Task: cancel_token.cancel()
-
-    Task->>Channel: close (awaited before status_tx.send)
-    Task-->>Store: status_tx.send(Cancelled)
-
-    Cmd->>Cmd: timeout(5s, wait_for_command_completion)
-    Cmd->>Cmd: sleep(100ms) -- post-drain pause
-
-    Cmd->>Store: output.lock
-    Cmd-->>Client: SSH_CANCEL_COMMAND: CANCELLED + stdout/stderr blocks (partial)
-```
-
-</details>
-
-### Cancellation Signal Flow
-
-<details>
-<summary>Cancellation signal flow</summary>
-
-```mermaid
-flowchart TD
-    subgraph ClientSide["Client Side"]
-        Call[ssh_cancel_command]
-        Lookup[COMMAND_STORAGE.get_direct]
-        SignalCancel[cancel_token.cancel]
-        WaitStatus[timeout(5s) + sleep(100ms)]
-        Response[SSH_CANCEL_COMMAND: CANCELLED]
-    end
-
-    subgraph BackgroundTask["Background Task (select! biased)"]
-        WaitSelect[select! awaits]
-        CancelBranch[cancel_token.cancelled()]
-        TimeoutBranch[time::sleep(timeout)]
-        OutputBranch[ChannelMsg / collect_async_output]
-    end
-
-    subgraph Cleanup["Cleanup Side"]
-        Close[Channel.close]
-        Status[status_tx.send(Cancelled)]
-    end
-
-    Call --> Lookup
-    Lookup --> SignalCancel
-    SignalCancel -.->|signal| CancelBranch
-    SignalCancel --> WaitStatus
-
-    WaitSelect --> CancelBranch
-    CancelBranch --> Close
-    Close --> Status
-
-    WaitStatus -->|status changed| Response
-
-    style ClientSide fill:#e3f2fd
-    style BackgroundTask fill:#fff8e1
-    style Cleanup fill:#e8f5e9
-```
-
-</details>
-
-### Partial Output Recovery
-
-When a command is cancelled, whatever was collected before the signal is preserved:
-
-<details>
-<summary>Partial output recovery</summary>
-
-```mermaid
-flowchart LR
-    subgraph Before["Before Cancellation"]
-        Stdout1[stdout: partial bytes]
-        Stderr1[stderr: partial bytes]
-        Status1[status: Running]
-    end
-
-    subgraph Cancel["Cancellation"]
-        Signal[cancel_token.cancel]
-        Wait[Wait up to 5s + 100ms drain]
-    end
-
-    subgraph After["After Cancellation"]
-        Stdout2[stdout: preserved + head-drained]
-        Stderr2[stderr: preserved + head-drained]
-        Status2[status: Cancelled]
-        Annotated[(partial) output block]
-    end
-
-    Before --> Cancel
-    Cancel --> After
-
-    Stdout1 -.-> Stdout2
-    Stderr1 -.-> Stderr2
-
-    style Before fill:#fff8e1
-    style Cancel fill:#ffebee
-    style After fill:#e8f5e9
-```
-
-</details>
-
-### Cancel Response Fields
-
-| Field | Description |
-|-------|-------------|
-| `SSH_CANCEL_COMMAND: CANCELLED` | Command was running and cancel succeeded. |
-| `SSH_CANCEL_COMMAND: NOOP` | Command was not in `Running` state — idempotent response. |
-| `COMMAND_ID` | The cancelled command's UUID. |
-| `--- stdout [nonce] (partial) ---` | Captured output before cancellation. |
-| `--- stderr [nonce] (partial, empty) ---` | Empty output block when stderr was never written. |
-
-## Interactive Shell Lifecycle
-
-`ssh_shell_open` allocates a PTY channel, splits it into read/write halves, and spawns a dedicated reader task plus an inactivity-TTL watcher.
-
-<details>
-<summary>Shell open/read/close sequence</summary>
-
-```mermaid
-sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_shell_*
-    participant Store as SHELL_STORAGE
-    participant Session as SESSION_STORAGE
-    participant Reader as shell_reader task
-    participant TTL as spawn_shell_inactivity_task
-    participant Handle as russh::Handle
-    participant Channel as Channel<Msg>
-
-    Client->>Cmd: ssh_shell_open(session_id, term, cols, rows, inactivity_ttl?, max_buffer_size?)
-    Cmd->>Store: count_by_session
-    alt >= MAX_SHELLS_PER_SESSION (10)
-        Cmd-->>Client: ERROR [MAX_SHELLS_EXCEEDED]
-    end
-    Cmd->>Session: get(session_id)
-    Cmd->>Handle: open_pty_shell(term, cols, rows)
-    Handle->>Channel: channel_open_session + request_pty + request_shell
-    Cmd->>Cmd: split into (read_half, write_half)
-    Cmd->>Store: register RunningShell (+ channel_writer = Arc<Mutex<ChannelWriter>>)
-    Cmd->>Reader: spawn_shell_reader (owns read_half)
-    Cmd->>TTL: spawn_shell_inactivity_task
-    Cmd-->>Client: SSH_SHELL_OPEN: OK + SHELL_ID
-
-    Client->>Cmd: ssh_shell_write(shell_id, input)
-    Cmd->>Store: get_direct(shell_id) -> channel_writer, last_activity
-    Cmd->>Channel: channel_writer.write(input)
-    Cmd->>Store: last_activity = now
-    Cmd-->>Client: SSH_SHELL_WRITE: OK | BYTES_SENT: N
-
-    Reader->>Channel: wait()
-    Reader->>Store: append_shell_output (head-drain on overflow)
-    Reader->>Store: last_activity = now (per message)
-
-    Client->>Cmd: ssh_shell_read(shell_id, clear?, max_output_bytes?)
-    Cmd->>Store: get_direct(shell_id)
-    Cmd->>Cmd: ShellReadBuilder builds response
-    alt clear == true
-        Cmd->>Store: drain head bytes actually shown
-        Cmd->>Store: shrink_to_fit if capacity >> len
-    end
-    Cmd->>Store: last_activity = now
-    Cmd-->>Client: SSH_SHELL_READ: OPEN | data block
-
-    Note over TTL: every 5s checks elapsed vs inactivity_ttl
-    TTL-->>Store: if expired -> cancel + unregister
-
-    Client->>Cmd: ssh_shell_close(shell_id)
-    Cmd->>Store: unregister(shell_id)
-    Cmd->>Channel: cancel_token.cancel() + channel_writer.close()
-    Cmd-->>Client: SSH_SHELL_CLOSE: OK
-```
-
-</details>
-
-### Shell States
-
-| State | Trigger |
-|-------|---------|
-| `Open` | Successful `ssh_shell_open`. Reader task running, TTL task watching activity. |
-| `Closed` | Reader received `Eof`/`Close`/`None`, or the inactivity task cancelled the token, or `ssh_shell_close` removed the entry. `status_tx` broadcasts `Closed`. |
-
-Head-based pagination on `ssh_shell_read(clear=true)` removes only the bytes rendered in the response, keeping the rest available for the next call.
-
-## SFTP Transfer Flow
-
-Transfers are spawned as background tasks similar to async commands but do not consume the per-session channel semaphore (SFTP runs on its own subsystem channel).
-
-<details>
-<summary>SFTP upload sequence</summary>
-
-```mermaid
-sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_upload
-    participant Store as TRANSFER_STORAGE
-    participant Task as sftp_upload_streaming
-    participant Session as SESSION_STORAGE
-    participant SFTP as SftpSession
-    participant Server as SSH Server
-
-    Client->>Cmd: ssh_upload(session_id, local_path, remote_path)
-
-    Cmd->>Store: count_by_session
-    alt >= MAX_TRANSFERS_PER_SESSION (10)
-        Cmd-->>Client: ERROR [MAX_TRANSFERS_EXCEEDED]
-    end
-
-    Cmd->>Session: get(session_id)
-    Cmd->>Cmd: resolve_local_path (expand ~ / relative -> home)
-    Cmd->>Cmd: tokio::fs::metadata -> size
-    alt missing / not file
-        Cmd-->>Client: ERROR [LOCAL_FILE_ERROR] / [LOCAL_NOT_FILE]
-    end
-
-    Note over Cmd: Generate TRANSFER_ID (UUIDv4)
-    Cmd->>Store: register RunningTransfer + spawn cleanup task (TTL 300s)
-    Cmd->>Task: tokio::spawn(sftp_upload_streaming)
-
-    Cmd-->>Client: SSH_UPLOAD: STARTED + SIZE + BYTES
-
-    Task->>Session: handle_arc
-    Task->>SFTP: open_sftp_session (channel_open_session + subsystem "sftp")
-    SFTP->>Server: SFTP INIT
-    Task->>SFTP: open remote file (create+write)
+    Client->>Server: resources/subscribe transfer://8f7e6d5c-.../progress
+    Server->>Reg: subscribe(Transfer, "8f7e6d5c-...", uri, peer_id, peer)
+    Reg->>Reg: spawn debouncer (force-flush every 1 s)
+    Server-->>Client: ()
 
     loop 32 KiB chunks
-        alt cancel_token.cancelled()
-            Task->>Store: status = Cancelled
-            Note over Task: break loop
-        else chunk
-            Task->>SFTP: write chunk
-            Task->>Store: bytes_transferred.fetch_add(len)
-        end
+        SFTP->>Tr: write chunk
+        Tr->>Tr: bytes_transferred.fetch_add(32 KiB)
+        Tr->>Tr: progress_tx.send(ProgressEvent::Tick{seq, bytes, total})
+        Tr->>Reg: poke(Transfer, "8f7e6d5c-...")
+        Reg-->>Client: notifications/resources/updated (debounced)
+        Client->>Server: resources/read transfer://8f7e6d5c-.../progress
+        Server-->>Client: JSON {bytes_transferred, total_bytes, status="running", last_seq}
     end
 
-    Task->>Store: status = Completed (or Failed with error)
+    Tr->>Tr: progress_tx.send(ProgressEvent::Completed{seq, bytes})
+    Tr->>Reg: poke(Transfer, ...)
+    Reg-->>Client: notifications/resources/updated
+    Client->>Server: resources/read ...
+    Server-->>Client: JSON {status="completed", bytes=total, last_seq=N}
 
-    Note over Store: cleanup task removes after SSH_TRANSFER_CLEANUP_TTL (default 300s)
+    Client->>Server: resources/unsubscribe transfer://8f7e6d5c-.../progress
 ```
 
-</details>
+## 8. Multi-session health monitoring
 
-Downloads mirror the flow through `sftp_download_streaming`: the tool pre-fetches metadata via `SftpSession::metadata` to know the total size before starting, then streams in 32 KiB chunks.
-
-### Transfer State Machine
-
-<details>
-<summary>Transfer state machine</summary>
-
-```mermaid
-stateDiagram-v2
-    [*] --> Registered
-    Registered --> Running: Background task starts
-    Running --> Running: chunk written + bytes_transferred++
-    Running --> Completed: Last chunk written successfully
-    Running --> Failed: SFTP error (classified)
-    Running --> Cancelled: cancel_token triggered by ssh_disconnect or disconnect_agent
-
-    Completed --> Cleanup: status_tx.send triggers cleanup task
-    Failed --> Cleanup
-    Cancelled --> Cleanup
-
-    Cleanup --> [*]: SSH_TRANSFER_CLEANUP_TTL elapsed
-```
-
-</details>
-
-### Error Classification
-
-`classify_transfer_error(operation, raw)` maps raw SFTP errors to structured codes consumed by the tool responses:
-
-| Code | Trigger substring | Emitted via |
-|------|-------------------|-------------|
-| `READ_ONLY_FS` | `"read-only file system"` | `REASON: [READ_ONLY_FS] target filesystem is read-only ...` |
-| `DISK_FULL` | `"no space left on device"` | ... |
-| `PERMISSION_DENIED` | `"permission denied"` | ... |
-| `CONNECTION_LOST` | `broken pipe` / `connection reset/refused` / `network is unreachable` / `no route to host` | ... |
-| `TIMEOUT` | `timed out` / `timeout` | ... |
-| `REMOTE_DIR_NOT_FOUND` | (`no such file` or `not a directory`) AND operation contains `create` | Missing remote parent directory on upload. |
-| `FILE_NOT_FOUND` | `no such file` / `not found` | ... |
-| `SFTP_PROTOCOL` | `channel` / `subsystem` / `sftp` / `session` | ... |
-| `IO_ERROR` | fallback | ... |
-
-## Port Forwarding Flow
-
-`ssh_forward` binds a local TCP listener on `127.0.0.1:<local_port>` and spawns an accept loop. Every incoming connection is handled by a per-connection task that opens a `direct-tcpip` channel and copies bytes both ways via `tokio::io::copy`.
-
-<details>
-<summary>Port forwarding sequence diagram</summary>
+Subscribe to `session://<id>/health` for each session and react to disconnect events.
 
 ```mermaid
 sequenceDiagram
-    participant Client as MCP Client
-    participant Cmd as commands::ssh_forward
-    participant Session as SESSION_STORAGE
-    participant Setup as setup_port_forwarding
-    participant Listener as TcpListener
-    participant Handler as handle_port_forward_connection
-    participant Handle as russh::Handle
-    participant Channel as direct-tcpip Channel
-    participant Remote as Remote Server
+    participant Client as MCP client
+    participant Server as McpSshServer
+    participant Reg as SubscriptionRegistry
+    participant SS as SessionRepository
 
-    Client->>Cmd: ssh_forward(session_id, local_port, remote_address, remote_port)
-    Cmd->>Session: get(session_id) -> Arc<Handle>
-    Cmd->>Setup: setup_port_forwarding(handle_arc, local_port, ...)
+    Client->>Server: ssh_connect(host=db1, ...)
+    Server-->>Client: SESSION_ID: s1
+    Client->>Server: ssh_connect(host=db2, ...)
+    Server-->>Client: SESSION_ID: s2
 
-    Setup->>Listener: TcpListener::bind("127.0.0.1:<port>")
-    alt bind failed
-        Setup-->>Cmd: Err("Failed to bind ...")
-        Cmd-->>Client: ERROR [FORWARD_FAILED]
+    Client->>Server: resources/subscribe session://s1/health
+    Server->>Reg: subscribe(Session, "s1", uri, peer_id, peer)
+    Client->>Server: resources/subscribe session://s2/health
+
+    Note over Server,Reg: ssh_list_sessions probes echo 1 every call. Each probe fires HealthEvent::Healthy.
+
+    par s1 stays healthy
+        Client->>Server: ssh_list_sessions
+        Server->>SS: probe s1 -> ok -> health_tx.send(Healthy)
+        Server->>Reg: poke(Session, "s1")
+        Reg-->>Client: notifications/resources/updated session://s1/health
+        Client->>Server: resources/read session://s1/health
+        Server-->>Client: JSON {healthy:true, last_health_check, last_seq}
+    and s2 dies
+        Server->>SS: probe s2 -> error -> SessionRepository.remove(s2)
+        SS->>SS: health_tx.send(HealthEvent::Disconnected{seq})
+        SS->>Reg: poke(Session, "s2")
+        Reg-->>Client: notifications/resources/updated session://s2/health
+        Client->>Server: resources/read session://s2/health
+        Server-->>Client: error: McpError::resource_not_found
+        Note over Client: React: ssh_connect again or surface alert.
     end
-
-    Setup->>Setup: tokio::spawn(run_accept_loop)
-    Setup-->>Cmd: local SocketAddr
-    Cmd-->>Client: SSH_FORWARD: OK | LOCAL | REMOTE | ACTIVE: true
-
-    loop accept loop
-        Listener->>Listener: accept()
-        alt connection
-            Listener->>Handler: spawn handle_port_forward_connection
-        else error
-            Note over Listener: break loop
-        end
-    end
-
-    Handler->>Handle: channel_open_direct_tcpip
-    Handle->>Remote: SSH direct-tcpip
-    Remote-->>Handle: confirmation
-    Handler->>Channel: into_stream
-    Handler->>Handler: io::split both streams
-    par
-        Handler->>Handler: tokio::io::copy(local -> channel)
-    and
-        Handler->>Handler: tokio::io::copy(channel -> local)
-    end
-    Handler->>Handler: tokio::select! completes when either side EOFs
 ```
 
-</details>
+## 9. Cancellation propagation
 
-### Port Forwarding Data Flow
-
-<details>
-<summary>Port forwarding data flow</summary>
-
-```mermaid
-flowchart TD
-    subgraph Setup["Setup"]
-        GetSession[Get session handle]
-        Bind[TcpListener::bind 127.0.0.1:port]
-        Spawn[tokio::spawn(run_accept_loop)]
-    end
-
-    GetSession --> Bind
-    Bind --> BindResult{Bind ok?}
-    BindResult -->|No| ErrReturn([Return FORWARD_FAILED])
-    BindResult -->|Yes| Spawn
-    Spawn --> OkReturn([Return OK | LOCAL | REMOTE | ACTIVE: true])
-
-    subgraph AcceptLoop["Accept Loop (background)"]
-        Accept[listener.accept]
-        Decide{Connection?}
-        Dispatch[spawn handle_port_forward_connection]
-    end
-
-    Accept --> Decide
-    Decide -->|Ok| Dispatch
-    Decide -->|Error| Break[log + break]
-
-    subgraph PerConn["Per-connection Handler"]
-        OpenDirect[channel_open_direct_tcpip]
-        IntoStream[channel.into_stream]
-        Split[io::split]
-        L2R[tokio::io::copy local to remote]
-        R2L[tokio::io::copy remote to local]
-        SelectCopy[tokio::select! either side]
-    end
-
-    OpenDirect --> IntoStream --> Split
-    Split --> L2R
-    Split --> R2L
-    L2R --> SelectCopy
-    R2L --> SelectCopy
-
-    style Setup fill:#e3f2fd
-    style AcceptLoop fill:#fff8e1
-    style PerConn fill:#f3e5f5
-```
-
-</details>
-
-## Error Handling and Retry Logic
-
-### Error Classification
-
-`error::is_retryable_error` matches case-insensitive substrings.
-
-<details>
-<summary>Error classification flowchart</summary>
-
-```mermaid
-flowchart TD
-    Error["Error Message"] --> ToLower["Lowercase"]
-    ToLower --> CheckAuth{auth keyword?}
-
-    CheckAuth -->|Yes| NonRetryable([Not retryable])
-    CheckAuth -->|No| CheckConn{connection keyword?}
-
-    CheckConn -->|Yes| Retryable([Retryable])
-    CheckConn -->|No| CheckSSH{contains "ssh"?}
-
-    CheckSSH -->|No| DefaultRetry([Retryable - conservative default])
-    CheckSSH -->|Yes| CheckTimeout{contains "timeout" or "connect"?}
-
-    CheckTimeout -->|Yes| Retryable
-    CheckTimeout -->|No| NonRetryable
-
-    subgraph AuthKeywords["Auth keywords (AUTH_ERRORS)"]
-        direction TB
-        A1["authentication failed"]
-        A2["password authentication failed"]
-        A3["key authentication failed"]
-        A4["agent authentication failed"]
-        A5["permission denied"]
-        A6["publickey"]
-        A7["auth fail"]
-        A8["no authentication"]
-        A9["all authentication methods failed"]
-    end
-
-    subgraph ConnKeywords["Connection keywords (RETRYABLE_ERRORS)"]
-        direction TB
-        C1["connection refused"]
-        C2["connection reset"]
-        C3["connection timed out"]
-        C4["timeout"]
-        C5["network is unreachable"]
-        C6["no route to host"]
-        C7["host is down"]
-        C8["temporary failure"]
-        C9["resource temporarily unavailable"]
-        C10["handshake failed"]
-        C11["failed to connect"]
-        C12["broken pipe"]
-        C13["would block"]
-    end
-
-    style NonRetryable fill:#ffebee
-    style Retryable fill:#e8f5e9
-    style DefaultRetry fill:#e8f5e9
-```
-
-</details>
-
-### Exponential Backoff with Jitter
-
-`client::build_backoff` constructs a `backon::ExponentialBuilder` with `min_delay = retry_delay`, `max_delay = MAX_RETRY_DELAY` (10 s), `max_times = max_retries`, and `.with_jitter()`.
-
-<details>
-<summary>Exponential backoff sequence diagram</summary>
+`notifications/cancelled` is routed natively by rmcp 1.6 — no custom transport handling required.
 
 ```mermaid
 sequenceDiagram
-    participant Client as connect_to_ssh_with_retry
-    participant Retryable as backon::Retryable
-    participant SSH as connect_to_ssh
-    participant Classifier as is_retryable_error
+    participant Client as MCP client
+    participant Rmcp as rmcp transport
+    participant Server as McpSshServer
+    participant Cmd as RunningCommand
 
-    Client->>Client: ExponentialBuilder (min/max/max_times + jitter)
-    Client->>Retryable: wrap retryable closure
+    Client->>Server: ssh_execute(session_id, command="sleep 600")
+    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
-    loop until success or max retries
-        Retryable->>SSH: attempt connection
-        alt Success
-            SSH-->>Retryable: Handle
-            Retryable-->>Client: Ok(Handle)
-        else Error
-            SSH-->>Retryable: Err(message)
-            Retryable->>Classifier: when(err)
-            alt Retryable
-                Note over Retryable: wait with jitter (capped at 10s)
-            else Not retryable
-                Retryable-->>Client: Err immediately
-            end
-        end
+    Note over Client: Decide to cancel.
+
+    par via notifications/cancelled
+        Client->>Rmcp: notifications/cancelled {requestId}
+        Rmcp->>Server: native cancellation routing
+        Server->>Server: tool task aborted and status_rx becomes Cancelled
+    and via ssh_cancel_command tool
+        Client->>Server: ssh_cancel_command(command_id="7d4c8e2a-...")
+        Server->>Cmd: cancel_token.cancel()
+        Cmd->>Cmd: status_rx becomes Cancelled
+        Server-->>Client: SSH_CANCEL_COMMAND CANCELLED<br/>--- stdout (partial) ---
     end
 
-    Note over Client: Return handle + retry_count
+    Note over Cmd: status persists as Cancelled until the SSH_COMMAND_CLEANUP_TTL post-read GC removes it.
 ```
 
-</details>
+## 10. Subscriber lagged + auto-recovery
 
-### Retry Timeline Example
-
-<details>
-<summary>Retry timeline diagram</summary>
-
-```mermaid
-flowchart LR
-    subgraph Backoff["Backoff Config"]
-        Min[min_delay: 1000ms]
-        Max[max_delay: 10s]
-        MaxRetries[max_times: 3]
-        Jitter[jitter enabled]
-    end
-
-    subgraph Timeline["Timeline Example"]
-        T0[Attempt 1] --> D1[~1s]
-        D1 --> T1[Attempt 2]
-        T1 --> D2[~2s]
-        D2 --> T2[Attempt 3]
-        T2 --> D3[~4s]
-        D3 --> T3[Attempt 4]
-        T3 --> End[Max retries exceeded]
-    end
-
-    Min --> Timeline
-    Jitter --> D1
-    Jitter --> D2
-    Jitter --> D3
-
-    style Backoff fill:#e3f2fd
-    style Timeline fill:#fff8e1
-```
-
-</details>
-
-### Retry Notification Flow
-
-<details>
-<summary>Retry notification sequence</summary>
+`broadcast::RecvError::Lagged` recovery uses `_meta.last_seq` to detect gaps and `?cursor=0` to resync.
 
 ```mermaid
 sequenceDiagram
-    participant Client as ssh_connect
-    participant Retryable as backon::Retryable
-    participant SSH as connect_to_ssh
-    participant Server as SSH Server
+    participant Client as Slow MCP client
+    participant Server as McpSshServer
+    participant Reg as SubscriptionRegistry
+    participant Cmd as RunningCommand
 
-    Client->>Retryable: retry(connect_fn)
-    Retryable->>SSH: Attempt 1
-    SSH->>Server: connect
-    Server-->>SSH: Connection refused
-    SSH-->>Retryable: Err
+    Note over Cmd,Reg: Producer fires many chunks.<br/>Subscriber falls behind.
 
-    Retryable->>Retryable: when(is_retryable_error) -> true
-    Retryable->>Retryable: notify (tracing::warn)
-    Note over Retryable: Wait ~1s + jitter
+    loop high-volume output
+        Cmd->>Cmd: ArcSwap publish + broadcast.send (cap=1024)
+        Cmd->>Reg: poke(Command, ...)
+        Reg-->>Client: notifications/resources/updated
+    end
 
-    Retryable->>SSH: Attempt 2
-    SSH->>Server: connect
-    Server-->>SSH: Timeout
-    SSH-->>Retryable: Err
+    Note over Client: Client missed a notification window.
 
-    Retryable->>Retryable: when -> true
-    Retryable->>Retryable: notify
-    Note over Retryable: Wait ~2s + jitter
+    Client->>Server: resources/read command://.../output?cursor=auto
+    Server-->>Client: text + _meta{cursor=N, last_seq=K}
 
-    Retryable->>SSH: Attempt 3
-    SSH->>Server: connect
-    Server-->>SSH: Connected
-    SSH->>Server: Authenticate
-    Server-->>SSH: Success
-    SSH-->>Retryable: Ok(handle)
+    Client->>Client: previous _meta.last_seq was K-50<br/>now sees jump K-50 -> K (gap detected)
 
-    Retryable-->>Client: Ok(handle, retry_count=2)
+    Note over Client: Recovery: request a full snapshot.
+    Client->>Server: resources/read command://.../output?cursor=0
+    Server-->>Client: full buffer + _meta{cursor=current_size, last_seq=K}
+
+    Note over Client: Optional: subscribe again if peer was dropped<br/>by SSH_MCP_PEER_GC_INTERVAL_S.
 ```
 
-</details>
+## 11. Peer disconnect GC
 
-## Module Responsibilities
+`spawn_peer_gc` periodically removes peers whose rmcp transport has closed (rmcp 1.6 does not raise a callback).
 
-| Module | Responsibility |
-|--------|----------------|
-| `commands.rs` | MCP tool entry points, helpers for smart reuse / cleanup / response rendering (16 tools). |
-| `client.rs` | SSH connection, retry wrapper, sync command execution (`execute_ssh_command`), async execution (`execute_ssh_command_async`, PTY variant), PTY shell open, auth chain composition, default key discovery. |
-| `session.rs` | `SshClientHandler` for russh callbacks. |
-| `shell.rs` | Interactive PTY shell types. |
-| `sftp.rs` | SFTP session management, streaming upload/download, error classification, path resolution. |
-| `transfer.rs` | Transfer tracking types (`RunningTransfer`, `TransferStatus`, `TransferDirection`, `CHUNK_SIZE`, `MAX_TRANSFERS_PER_SESSION`). |
-| `config.rs` | Configuration resolution + byte-size parser. |
-| `error.rs` | `is_retryable_error` classification. |
-| `forward.rs` | Port forwarding (TcpListener + `direct-tcpip` + bidirectional io::copy). |
-| `storage/*` | Lock-free `DashMap` storage with secondary indices for sessions (agent / identity), commands, shells, and transfers. |
-| `auth/*` | Password / key / agent strategies and the composite `AuthChain`. |
-| `message/helpers` | Shared primitives: nonce, UTF-8 truncation, sanitize, `format_error`, `render_output_block`. |
-| `message/builder` | Per-tool markdown builders (connect OK/REUSED/SUGGESTED, execute STARTED, get-output RUNNING/COMPLETED/TIMEOUT, cancel CANCELLED/NOOP, shell OPEN/CLOSED, transfer STARTED/RUNNING/COMPLETED/FAILED, list sessions/commands, forward OK, disconnect OK). |
+```mermaid
+sequenceDiagram
+    participant Bin as "ssh-mcp / ssh-mcp-stdio"
+    participant GC as "spawn_peer_gc task"
+    participant Reg as SubscriptionRegistry
+    participant Peer as "rmcp::Peer (closed)"
+
+    Bin->>GC: spawn_peer_gc(interval_s, cancel_token)
+
+    loop every SSH_MCP_PEER_GC_INTERVAL_S (default 30 s)
+        GC->>Reg: gc_closed_peers()
+        Reg->>Reg: snapshot subscribers and for each unique peer_id probe peer.is_transport_closed
+        Reg->>Peer: is_transport_closed() returns true
+        Reg->>Reg: drop_peer(peer_id) then for each URI unsubscribe(peer_id, uri)
+        Note over Reg: Last unsubscribe per URI aborts the debouncer task.
+    end
+
+    Bin->>GC: cancel_token.cancel() (Ctrl-C / stdin close)
+    GC->>GC: tokio::select! cancellation branch then exit
+```
+
+---
+
+## Cross-references
+
+- Tool reference: [API.md](./API.md)
+- Architectural background: [ARCHITECTURE.md](./ARCHITECTURE.md)
+- Tunables: [CONFIGURATION.md](./CONFIGURATION.md)

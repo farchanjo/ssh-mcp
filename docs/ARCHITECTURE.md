@@ -1,905 +1,421 @@
-# SSH MCP Architecture
+# SSH MCP Architecture (v4.0.0 — hexagonal)
 
-This document describes the system architecture of the SSH Model Context Protocol (MCP) Server, providing a comprehensive overview of components, their relationships, and the underlying threading model. Unless stated otherwise, everything here reflects the **v2.0.1** codebase, where every tool returns a markdown `Text<String>` response built by `message::builder`.
+This document describes the architecture of the SSH Model Context Protocol (MCP) server. It reflects the **v4.0.0** codebase, which adopts a strict hexagonal (Ports and Adapters) layout on top of the v3 lock-free runtime: same 18 MCP tools, same 5 resource subscribe schemes, same wire format — but the internals are split into `domain/` (pure), `ports/` (trait skeletons), `application/` (use cases), `adapters/` (concrete implementations), `infra/` (inbound MCP transport), and `composition/` (root wiring).
 
 [[_TOC_]]
 
 ## Overview
 
-SSH MCP is a Rust crate that exposes SSH operations as MCP tools, enabling LLM-based systems to interact with remote servers via SSH. Two transport binaries are provided:
+ssh-mcp is a Rust crate (edition `2024`, MSRV `1.85`) that turns SSH operations into MCP tools. v4.0.0 ships:
 
-1. **HTTP Transport** (`ssh-mcp`) — Poem-based HTTP server, default port 8000, streamable HTTP endpoint.
-2. **Stdio Transport** (`ssh-mcp-stdio`) — Line-delimited JSON-RPC on stdin/stdout, logs go to stderr. Ships a small event loop (`src/bin/ssh_mcp_stdio.rs`) that intercepts `notifications/cancelled` (both `camelCase` and `snake_case`) and drops responses for cancelled IDs.
+- **Hexagonal architecture** — every concrete dependency (rmcp, russh, russh-sftp, dashmap, tokio) is wrapped behind a port trait. Use cases compose ports through static-dispatch generics, never `dyn`. Adapters live in `src/adapters/` and are swapped wholesale at composition time.
+- **Inbound MCP layer** under `src/infra/mcp/` — an `rmcp::ServerHandler` (`McpSshServer<UC>`) generic over the `UseCases<…>` container, with the `#[tool_router]` block aggregating the 18 `#[tool]` entry points and the `resources/*` overrides.
+- **Two binaries** — `ssh-mcp` (HTTP via `axum 0.8` + `rmcp::transport::streamable_http_server::StreamableHttpService`) and `ssh-mcp-stdio` (stdio via `rmcp::transport::io::stdio()`). Both delegate to `composition::prod::run_{http,stdio}` so the wiring lives in one place.
+- **Lock-free runtime** preserved verbatim from v3 — `Arc<ArcSwap<T>>`, `tokio::sync::broadcast`, `tokio::sync::mpsc`, `OnceCell`, `AtomicU64`, `Notify`, `DashMap`. The carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`) and the per-resource debouncer / subscription registry are ported into `src/adapters/` (see [LOCKS.md](./LOCKS.md)).
+- **Strict lint baseline** — Clippy `forbid` / `deny` plus `await_holding_lock`, `mutex_atomic`, `mutex_integer`, `clone_on_ref_ptr`, `as_conversions`, `pub_use`, `absolute_paths`, `allow_attributes_without_reason`. Every `#[allow(...)]` carries `reason = "..."`.
 
-<details>
-<summary>System overview diagram</summary>
+Public MCP API is **stable**: same 18 tools, same 5 resource schemes, same response markdown shape, same env-var names. Only the internal module layout moved. See [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) for the contributor-facing change log.
 
-```mermaid
-flowchart TB
-    subgraph Clients["MCP Clients"]
-        LLM["LLM / AI Agent"]
-        CLI["CLI Client"]
-    end
+## Hexagonal layers
 
-    subgraph Transport["Transport Layer"]
-        HTTP["HTTP Server<br/>(Poem, streamable_http)"]
-        STDIO["Stdio Transport<br/>(JSON-RPC, stderr logs)"]
-    end
-
-    subgraph Core["SSH MCP Core"]
-        MCP["McpSSHCommands<br/>16 MCP Tools"]
-        Storage["Storage Layer<br/>(SESSION/COMMAND/SHELL/TRANSFER_STORAGE)"]
-        Messages["Message Layer<br/>(builder + helpers)"]
-    end
-
-    subgraph SSH["SSH Layer"]
-        Russh["russh 0.55<br/>(Async SSH Client)"]
-        RusshSftp["russh-sftp 2<br/>(SFTP Streaming)"]
-        Agent["SSH Agent"]
-    end
-
-    subgraph Remote["Remote Systems"]
-        Server1["SSH Server 1"]
-        Server2["SSH Server 2"]
-        ServerN["SSH Server N"]
-    end
-
-    LLM --> HTTP
-    CLI --> STDIO
-    HTTP --> MCP
-    STDIO --> MCP
-    MCP --> Storage
-    MCP --> Messages
-    MCP --> Russh
-    MCP --> RusshSftp
-    Russh --> Agent
-    Russh --> Server1
-    Russh --> Server2
-    Russh --> ServerN
-    RusshSftp --> Server1
-
-    style Core fill:#e1f5fe
-    style Transport fill:#fff3e0
-    style SSH fill:#f3e5f5
-```
-
-</details>
-
-## Module Structure
-
-The codebase consists of **28 source files** (roughly **12.9K lines** including tests) organized into a SOLID-friendly, trait-driven architecture.
-
-### Core Modules (`src/mcp/`)
-
-| File | Lines | Visibility | Description |
-|------|-------|------------|-------------|
-| `mod.rs` | 40 | — | Module root / feature gating. |
-| `types.rs` | 230 | `pub` | Internal data carriers (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, status enums). Structured response types from v1 were removed — handlers now build markdown directly via `message::builder`. |
-| `config.rs` | 1101 | `pub(crate)` | Parameter / env / default resolution plus human-readable byte-size parser. |
-| `error.rs` | 359 | `pub(crate)` | Retryable vs non-retryable classifier. |
-| `session.rs` | 41 | `pub` | `SshClientHandler` (russh host-key handler — currently accepts all keys, ready for extension). |
-| `client.rs` | 1220 | `pub(crate)` | Address parsing, `build_client_config`, retry loop with `backon`, command execution (sync + async + async-PTY), PTY shell open, default key discovery. |
-| `async_command.rs` | 325 | `pub(crate)` | `RunningCommand` + bounded `OutputBuffer` (head-drained stdout/stderr). |
-| `shell.rs` | 152 | `pub(crate)` | `RunningShell`, `ChannelWriter`, shell capacity constants (`MAX_SHELLS_PER_SESSION = 10`). |
-| `schema.rs` | 76 | `pub` | `uint` schema helper for `schemars` (avoids `format: "uint"` which some LLMs can't parse). |
-| `forward.rs` | 168 | `pub(crate)` | Port forwarding via `channel_open_direct_tcpip` + bidirectional `tokio::io::copy` (feature-gated `port_forward`). |
-| `commands.rs` | 2272 | `pub` | `McpSSHCommands` with the 16 `#[Tools]`-annotated handlers and their orchestration helpers (reuse detection, cleanup tasks, response builders). |
-| `sftp.rs` | 740 | `pub(crate)` | `open_sftp_session`, path resolution (`~` + relative → home), streaming upload/download, `classify_transfer_error` (FILE_NOT_FOUND, PERMISSION_DENIED, ...). |
-| `transfer.rs` | 342 | `pub(crate)` | `RunningTransfer`, `TransferDirection`, `TransferStatus`, `MAX_TRANSFERS_PER_SESSION = 10`, `CHUNK_SIZE = 32 KiB`. |
-
-### Storage Layer (`src/mcp/storage/`) — SOLID: SRP, DIP
-
-Traits live in `traits.rs`; each implementation uses `DashMap` for lock-free concurrent reads and writes, plus secondary indices for O(1) lookups.
-
-| File | Lines | Description |
-|------|-------|-------------|
-| `mod.rs` | 12 | Module exports. |
-| `traits.rs` | 186 | `SessionStorage`, `CommandStorage`, `ShellStorage`, `TransferStorage` traits plus `SessionRef` / `CommandRef` read-only views. |
-| `session.rs` | 691 | `DashMapSessionStorage`, `parse_host_port`, `find_by_identity`, agent & identity indices, per-session channel semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`). |
-| `command.rs` | 1088 | `DashMapCommandStorage` with session index and running-only counter. |
-| `shell.rs` | 173 | `DashMapShellStorage` with session index. |
-| `transfer.rs` | 173 | `DashMapTransferStorage` with session index. |
-
-Global singleton instances (`SESSION_STORAGE`, `COMMAND_STORAGE`, `SHELL_STORAGE`, `TRANSFER_STORAGE`) expose the traits to the rest of the crate via `LazyLock`.
-
-### Authentication Layer (`src/mcp/auth/`) — SOLID: OCP, SRP
-
-Strategy pattern via `AuthStrategy`, with `AuthChain` composing multiple strategies in order.
-
-| File | Lines | Description |
-|------|-------|-------------|
-| `mod.rs` | 30 | Module exports and a usage example. |
-| `traits.rs` | 40 | `AuthStrategy` trait (`authenticate`, `name`). |
-| `password.rs` | 129 | Password auth. |
-| `key.rs` | 212 | Key-file auth. Queries `best_supported_rsa_hash()` and wraps the key with `PrivateKeyWithHashAlg` so RSA keys negotiate `rsa-sha2-256` / `rsa-sha2-512` when available. |
-| `agent.rs` | 145 | SSH-agent auth. Connects via `SSH_AUTH_SOCK`, iterates all identities, negotiates RSA hash per identity. |
-| `chain.rs` | 330 | `AuthChain` — fluent builder: `.with_password`, `.with_key`, `.with_agent`. |
-
-The default chain assembled in `client::build_auth_chain` is:
-
-1. `PasswordAuth` (if a password was provided).
-2. `KeyAuth` for each provided / discovered key file — `key_path` when explicit, otherwise each default OpenSSH file found in `~/.ssh/` (`id_ed25519`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519_sk`, `id_rsa`, `id_dsa`).
-3. `AgentAuth` is always appended.
-
-### Message Layer (`src/mcp/message/`) — SOLID: SRP
-
-| File | Lines | Description |
-|------|-------|-------------|
-| `mod.rs` | 8 | Re-exports. |
-| `helpers.rs` | 1001 | Shared primitives: `generate_nonce()`, `truncate_utf8_safe_tail`/`head`, `sanitize_value`, `format_bytes_human`, `format_error`, `render_output_block`. |
-| `builder.rs` | 1635 | Per-tool markdown builders — see below. |
-
-**`message::helpers`** (shared across every tool response):
-
-- `generate_nonce()` — 8-character lowercase hex, sourced from the high 32 bits of a fresh UUIDv4 (~4 billion unique values). Used as an anti-injection token in `--- stdout [nonce] ---` delimiters.
-- `truncate_utf8_safe_tail` / `truncate_utf8_safe_head` — respect UTF-8 char boundaries when cutting bytes.
-- `sanitize_value` — `Cow` wrapper; only allocates if the input contains `\n`, `\r`, or `\t` (escaped to two-char literals).
-- `format_bytes_human` — base-1024 size renderer with one decimal place (`B`, `KB`, `MB`, `GB`).
-- `format_error(tool, code, reason, detail?)` — canonical `TOOL: ERROR` / `REASON: [CODE] ...` / `DETAIL: ...` block; detail is head-truncated at 2 KiB.
-- `render_output_block(name, nonce, &[u8], max_bytes, status_hint?)` — renders an output block without materializing the whole buffer as `String`; only the truncated tail is allocated.
-
-**`message::builder`** — dedicated builder for each tool response. All builders are `#[must_use]` and return `String`:
-
-- `ConnectOkBuilder` (OK / REUSED / replaced), `ConnectSuggestedBuilder` (single- and multi-match) + `SessionMatch`.
-- `ExecuteStartedBuilder`.
-- `GetCommandOutputBuilder` with `GetCommandOutputState::{Running, Completed(i32), Timeout}`.
-- `CancelCommandCancelledBuilder` + `render_cancel_command_noop`.
-- `ShellOpenBuilder`, `ShellReadBuilder` with `ShellReadState::{Open, Closed}`.
-- `TransferStartedBuilder` (+ `TransferStartDirection::{Upload, Download}`), `TransferProgressBuilder` with `TransferProgressState::{Running, Completed, Failed(&str)}`.
-- `ListSessionsBuilder`, `ListCommandsBuilder` — apply pagination markers (`COUNT: N (showing N of M)`).
-- Inline renderers for small responses: `render_disconnect_ok`, `render_disconnect_agent`, `render_shell_write_ok`, `render_shell_close_ok`, `render_forward_ok`.
-
-### Response Format (v2.0)
-
-- **First line** → `TOOL_NAME: STATUS` where status is one of `OK`, `REUSED`, `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`.
-- **Block layout** when the body has 4+ fields or an output block (one `KEY: value` per line).
-- **Inline layout** for ≤3 simple fields (`TOOL: STATUS | KEY: v | KEY: v`).
-- **Identifiers** use the `_ID` suffix (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`).
-- **Output blocks** — `--- stdout [a3f2b1d7] ---`, `--- stdout [a3f2b1d7] (empty) ---`, `--- stdout [a3f2b1d7] (partial, truncated: showing 16.0KB of 2.3MB) ---`. Shells use `data` instead of `stdout`/`stderr`.
-- **Errors** — `TOOL: ERROR\nREASON: [CODE] ...\nDETAIL: ...`. See [`docs/API.md`](API.md#error-format) for the code catalogue.
-
-## Module Dependency Graph
-
-<details>
-<summary>Module dependency graph</summary>
+Six top-level directories under `src/`. Each layer's import rules are enforced by the strict lint baseline plus per-module documentation rather than by macro magic.
 
 ```mermaid
 flowchart TB
-    subgraph Binaries["Binary Targets"]
-        main["main.rs<br/>HTTP Server"]
-        stdio["bin/ssh_mcp_stdio.rs<br/>Stdio Transport"]
+    subgraph Outside["Outside world"]
+        LLM["LLM / MCP client"]
+        SSH["sshd / SFTP / agent"]
     end
 
-    subgraph Library["Library (src/lib.rs)"]
-        lib["lib.rs"]
+    subgraph Infra["src/infra/mcp/  -- inbound MCP transport"]
+        Server["McpSshServer&lt;UC&gt;<br/>(rmcp ServerHandler)"]
+        ToolRouter["tool_router.rs<br/>(18 #[tool] fns)"]
+        ResHandlers["resource_handlers.rs<br/>(list/read/subscribe/unsubscribe)"]
+        Render["render/* + helpers/*<br/>(markdown builders)"]
     end
 
-    subgraph Public["Public Modules"]
-        commands["commands.rs<br/>McpSSHCommands"]
-        types["types.rs<br/>SessionInfo / AsyncCommandInfo / ShellInfo"]
-        session["session.rs<br/>SshClientHandler"]
-        schema["schema.rs<br/>JSON schema helper"]
-        storage["storage (traits + DashMap impls)"]
-        message["message::{builder, helpers}"]
-        auth["auth::{traits, password, key, agent, chain}"]
+    subgraph Application["src/application/  -- use cases"]
+        UC["22 *UseCase&lt;Ports...&gt;<br/>execute(req) -&gt; Result&lt;Outcome, DomainError&gt;"]
     end
 
-    subgraph Internal["Internal Modules"]
-        client["client.rs"]
-        config["config.rs"]
-        error["error.rs"]
-        forward["forward.rs"]
-        async_cmd["async_command.rs"]
-        shell["shell.rs"]
-        sftp["sftp.rs"]
-        transfer["transfer.rs"]
+    subgraph Ports["src/ports/  -- trait skeletons"]
+        SshP["SshClientPort"]
+        SftpP["SftpClientPort"]
+        Repos["{Session,Command,Shell,Transfer,Forward}Repository"]
+        Notif["NotifierPort + PeerHandle"]
+        Out["OutputStreamPort"]
+        Sub["SubscriberRegistryPort + SubscriberRegistryAsync"]
+        Misc["ClockPort, ConfigPort, IdGeneratorPort, AuthStrategyPort"]
     end
 
-    subgraph External["External Crates"]
-        russh["russh 0.55"]
-        russh_sftp["russh-sftp 2"]
-        backon["backon"]
-        tokio["tokio + tokio-util"]
-        poem_mcp["poem-mcpserver"]
-        tracing["tracing"]
+    subgraph Domain["src/domain/  -- pure"]
+        Entities["session, command, shell, transfer, forward, identity, ids, auth, keys, policy, ringbuffer"]
+        Errors["DomainError + AuthError"]
+        Events["OutputChunk, ProgressEvent, HealthEvent, ForwardEvent"]
     end
 
-    main --> poem_mcp
-    main --> commands
-    stdio --> commands
-    stdio --> poem_mcp
-    lib --> commands
+    subgraph Adapters["src/adapters/  -- concrete adapters"]
+        Russh["ssh/russh_adapter.rs<br/>(russh + RunningCommand + RunningShell)"]
+        Sftp["sftp/russh_sftp_adapter.rs<br/>(russh-sftp + RunningTransfer)"]
+        Dash["repo/dashmap/*<br/>(DashMap-backed repositories)"]
+        SubReg["subscription/memory_registry.rs<br/>(debouncer + per-peer cursor)"]
+        Notifier["notifier/rmcp_adapter.rs<br/>(rmcp Peer fan-out)"]
+        Auth["auth/{password,key,agent,chain}.rs"]
+        Output["output_stream/russh_output.rs<br/>(snapshot path for resources/read)"]
+        Clock["clock/system.rs"]
+        Cfg["config/env.rs"]
+        Ids["id_generator/uuid.rs"]
+    end
 
-    commands --> client
-    commands --> sftp
-    commands --> forward
-    commands --> async_cmd
-    commands --> shell
-    commands --> storage
-    commands --> message
-    commands --> transfer
-    commands --> config
+    subgraph Composition["src/composition/  -- root wiring"]
+        Prod["prod.rs<br/>(ConcreteX type aliases + build_use_cases)"]
+        Mod["mod.rs<br/>(generic UseCases container)"]
+    end
 
-    client --> auth
-    client --> config
-    client --> error
-    client --> session
-    client --> async_cmd
-    client --> russh
-    client --> backon
+    LLM --> Server
+    Server --> ToolRouter
+    Server --> ResHandlers
+    ToolRouter --> Render
+    ToolRouter --> UC
+    ResHandlers --> UC
+    UC --> Ports
+    Adapters --> Ports
+    Adapters --> SSH
+    UC -.depends on.-> Domain
+    Ports -.use.-> Domain
+    Adapters -.use.-> Domain
+    Prod --> UC
+    Prod --> Adapters
 
-    sftp --> session
-    sftp --> transfer
-    sftp --> russh_sftp
-
-    storage --> session
-    storage --> async_cmd
-    storage --> shell
-    storage --> transfer
-    storage --> types
-
-    message --> types
-
-    auth --> session
-    auth --> russh
-
-    forward --> russh
-    forward --> tokio
-    async_cmd --> tokio
-    shell --> tokio
-
-    style Binaries fill:#fce4ec
-    style Library fill:#e8f5e9
-    style Public fill:#e8f5e9
-    style Internal fill:#fff3e0
-    style External fill:#e3f2fd
+    style Domain fill:#fff3e0
+    style Ports fill:#e3f2fd
+    style Application fill:#f3e5f5
+    style Adapters fill:#e8f5e9
+    style Infra fill:#fce4ec
+    style Composition fill:#fffde7
 ```
 
-</details>
+### Layer contracts
 
-## Component Architecture
+| Layer | What lives here | Allowed deps | Forbidden deps |
+|-------|-----------------|--------------|----------------|
+| `domain` | Entities, value objects, errors, live event variants, semantic keystroke encoder | `std`, `serde`, `serde_json`, `chrono`, `thiserror`, `schemars`, `bytes` | `tokio`, `russh`, `rmcp`, `axum`, `dashmap` |
+| `ports` | Trait skeletons (sync + async via `#[trait_variant::make(Port: Send)]`) | `domain`, `bytes`, `chrono`, `std`, `trait_variant` | `tokio`, `russh`, `rmcp`, `axum`, `dashmap` |
+| `application` | Use cases (`*UseCase<Ports...>`) — one struct + DTO per business operation | `domain`, `ports`, `tokio` (for `select!` / `spawn`) | `russh`, `rmcp`, `axum`, `dashmap` |
+| `adapters` | Concrete implementations of every port | All runtime crates (`tokio`, `russh`, `russh_sftp`, `dashmap`, `arc_swap`) | `rmcp` (only `notifier/rmcp_*`), `axum` |
+| `infra` | Inbound MCP transport (`#[tool_router]`, `ServerHandler`, render, args, helpers) | `rmcp`, `application`, `domain`, `adapters::notifier::rmcp_peer` | `russh`, `russh_sftp`, `dashmap` |
+| `composition` | Root wiring — pins concrete adapters via `type ConcreteX = …`, builds the `UseCases` container | All adapters + `infra::mcp` + `application` | — (it is the leaf) |
 
-The following diagram shows the concrete types behind the 16 tools. Note that v1's many public response structs were removed; every tool now returns `Text<String>` built by `message::builder`.
+### Static dispatch + AFIT (no async-trait, no dyn)
 
-<details>
-<summary>Component class diagram</summary>
-
-```mermaid
-classDiagram
-    class McpSSHCommands {
-        +ssh_connect() Text
-        +ssh_disconnect() Text
-        +ssh_list_sessions() Text
-        +ssh_disconnect_agent() Text
-        +ssh_execute() Text
-        +ssh_get_command_output() Text
-        +ssh_list_commands() Text
-        +ssh_cancel_command() Text
-        +ssh_forward() Text
-        +ssh_shell_open() Text
-        +ssh_shell_write() Text
-        +ssh_shell_read() Text
-        +ssh_shell_close() Text
-        +ssh_upload() Text
-        +ssh_download() Text
-        +ssh_get_transfer_progress() Text
-    }
-
-    class StoredSession {
-        +info: SessionInfo
-        +handle: Arc~Handle~
-        +channel_permits: Arc~Semaphore~
-    }
-
-    class SessionInfo {
-        +session_id: String
-        +name: Option~String~
-        +agent_id: Option~String~
-        +host: String
-        +username: String
-        +connected_at: String
-        +default_timeout_secs: u64
-        +retry_attempts: u32
-        +compression_enabled: bool
-        +last_health_check: Option~String~
-        +healthy: Option~bool~
-    }
-
-    class RunningCommand {
-        +info: AsyncCommandInfo
-        +cancel_token: CancellationToken
-        +status_rx: watch~Receiver~
-        +status_tx: watch~Sender~
-        +output: Arc~Mutex~OutputBuffer~~
-        +exit_code: Arc~Mutex~Option~i32~~~
-        +error: Arc~Mutex~Option~String~~~
-        +timed_out: Arc~AtomicBool~
-        +output_read: Arc~AtomicBool~
-    }
-
-    class OutputBuffer {
-        +stdout: Vec~u8~
-        +stderr: Vec~u8~
-        +append_stdout_bounded(cap)
-        +append_stderr_bounded(cap)
-    }
-
-    class RunningShell {
-        +info: ShellInfo
-        +cancel_token: CancellationToken
-        +output: Arc~Mutex~Vec~~
-        +channel_writer: Arc~Mutex~ChannelWriter~~
-        +status_tx: watch~Sender~
-        +status_rx: watch~Receiver~
-        +last_activity: Arc~Mutex~Instant~~
-        +max_buffer_size: Arc~AtomicU64~
-    }
-
-    class RunningTransfer {
-        +info: TransferInfo
-        +cancel_token: CancellationToken
-        +bytes_transferred: Arc~AtomicU64~
-        +total_bytes: Arc~AtomicU64~
-        +status_rx: watch~Receiver~
-        +status_tx: watch~Sender~
-        +error: Arc~Mutex~Option~String~~~
-    }
-
-    class SESSION_STORAGE {
-        <<global>>
-        LazyLock~DashMapSessionStorage~
-    }
-    class COMMAND_STORAGE {
-        <<global>>
-        LazyLock~DashMapCommandStorage~
-    }
-    class SHELL_STORAGE {
-        <<global>>
-        LazyLock~DashMapShellStorage~
-    }
-    class TRANSFER_STORAGE {
-        <<global>>
-        LazyLock~DashMapTransferStorage~
-    }
-
-    McpSSHCommands ..> StoredSession
-    McpSSHCommands ..> RunningCommand
-    McpSSHCommands ..> RunningShell
-    McpSSHCommands ..> RunningTransfer
-    StoredSession *-- SessionInfo
-    RunningCommand *-- OutputBuffer
-    SESSION_STORAGE --> StoredSession
-    COMMAND_STORAGE --> RunningCommand
-    SHELL_STORAGE --> RunningShell
-    TRANSFER_STORAGE --> RunningTransfer
-```
-
-</details>
-
-### Component Descriptions
-
-| Component | Module | Description |
-|-----------|--------|-------------|
-| `McpSSHCommands` | `commands.rs` | MCP tool surface. Each handler returns `Result<Text<String>, String>` or `Text<String>` directly. |
-| `SshClientHandler` | `session.rs` | russh host-key handler (accepts all keys — extend for `known_hosts` verification in production). |
-| `SessionStorage` trait + `DashMapSessionStorage` | `storage/session.rs` | Primary map + agent index + identity-triple index (`host_lc`, `port`, `user`) for smart reuse. Each stored session owns a 1-permit channel semaphore. |
-| `CommandStorage` trait + `DashMapCommandStorage` | `storage/command.rs` | Primary map + per-session index; `count_running_by_session` feeds the 100-commands-per-session cap. |
-| `ShellStorage` trait + `DashMapShellStorage` | `storage/shell.rs` | Primary map + per-session index. |
-| `TransferStorage` trait + `DashMapTransferStorage` | `storage/transfer.rs` | Primary map + per-session index. |
-| `AuthStrategy` trait + `AuthChain` | `auth/*` | Strategy / chain pattern. `with_password`, `with_key`, `with_agent` fluent builder. |
-| `RunningCommand` / `OutputBuffer` | `async_command.rs` | Async command state; `OutputBuffer` drains head-first when over `SSH_COMMAND_MAX_BUFFER_SIZE` (default 10 MiB). |
-| `RunningShell` / `ChannelWriter` | `shell.rs` | Interactive PTY state. Output buffer bounded by `max_buffer_size`; shell reader task drops oldest bytes on overflow. |
-| `RunningTransfer` | `transfer.rs` | SFTP transfer state. `bytes_transferred` / `total_bytes` are atomic so progress polls are lock-free. |
-| Message builders | `message/builder.rs` | Per-tool markdown assemblers. Each carries the tool name, status, and relevant `_ID` fields. |
-| Helpers | `message/helpers.rs` | `format_error`, `render_output_block`, `generate_nonce`, sanitization, UTF-8 safe truncation. |
-
-## Authentication Flow
-
-`client.rs` composes an `AuthChain` and calls it inside the retry loop. Retries run only for connection-layer failures; authentication failures surface immediately.
-
-<details>
-<summary>Authentication flow diagram</summary>
-
-```mermaid
-flowchart TB
-    subgraph Entry["client::connect_to_ssh"]
-        Start["build_client_config + parse_address"]
-        Connect["russh::client::connect (timeout)"]
-        BuildChain["build_auth_chain(password, key_path)"]
-        Authenticate["AuthChain.authenticate(&mut handle, username)"]
-    end
-
-    subgraph Methods["Strategies (tried in order)"]
-        Password["PasswordAuth"]
-        KeyExplicit["KeyAuth (key_path)"]
-        KeyDefault["KeyAuth (default ~/.ssh/ keys)"]
-        Agent["AgentAuth"]
-    end
-
-    subgraph KeyFlow["KeyAuth"]
-        LoadKey["keys::load_secret_key"]
-        QueryRSA["best_supported_rsa_hash"]
-        Wrap["PrivateKeyWithHashAlg"]
-        DoAuth["authenticate_publickey"]
-    end
-
-    subgraph AgentFlow["AgentAuth"]
-        ConnectAgent["keys::agent::AgentClient::connect_env"]
-        ListIds["request_identities"]
-        LoopIds["For each identity"]
-        QueryAgentRSA["best_supported_rsa_hash"]
-        AgentAuthCall["authenticate_publickey_with(hash_alg)"]
-    end
-
-    Start --> Connect
-    Connect --> BuildChain
-    BuildChain --> Authenticate
-
-    Authenticate --> Password
-    Authenticate --> KeyExplicit
-    Authenticate --> KeyDefault
-    Authenticate --> Agent
-
-    KeyExplicit --> KeyFlow
-    KeyDefault --> KeyFlow
-    KeyFlow --> LoadKey --> QueryRSA --> Wrap --> DoAuth
-
-    Agent --> AgentFlow
-    AgentFlow --> ConnectAgent --> ListIds --> LoopIds --> QueryAgentRSA --> AgentAuthCall
-
-    style Entry fill:#e3f2fd
-    style Methods fill:#fff3e0
-    style KeyFlow fill:#e8f5e9
-    style AgentFlow fill:#f3e5f5
-```
-
-</details>
-
-### RSA Hash Algorithm Negotiation
-
-Both `KeyAuth` and `AgentAuth` call `handle.best_supported_rsa_hash()`. The algorithm is wrapped into the key via `keys::PrivateKeyWithHashAlg::new(key, hash_alg)` so the SSH layer signs with the server's preferred modern hash:
-
-| Priority | Algorithm |
-|----------|-----------|
-| 1 | `rsa-sha2-512` |
-| 2 | `rsa-sha2-256` |
-| 3 | Legacy `ssh-rsa` (SHA-1) — used only when the server does not advertise a modern option. |
-
-## Session Storage Architecture
-
-`DashMapSessionStorage` holds three data structures:
-
-- **Primary map** — `session_id → StoredSession`.
-- **Agent index** — `agent_id → HashSet<session_id>` for `ssh_disconnect_agent` and agent-filtered listings.
-- **Identity index** — `(host_lc, port, username) → HashSet<session_id>` for smart reuse (`ssh_connect reuse="suggest"|"auto"|"force_new"`).
-
-Each `StoredSession` carries an `Arc<Semaphore>` with a single permit (`CHANNEL_CONCURRENCY_PER_SESSION = 1`): background command tasks acquire it before `channel_open_session()` and drop it when the channel has fully closed. This keeps rapid `execute + cancel` bursts from racing OpenSSH's `MaxSessions` budget (typically 10).
-
-<details>
-<summary>Session storage diagram</summary>
-
-```mermaid
-flowchart LR
-    subgraph Abstraction["SessionStorage Trait"]
-        Trait["insert, get, remove, list, session_ids,<br/>update_health, register_agent, unregister_agent,<br/>get_agent_sessions, remove_agent_sessions"]
-    end
-
-    subgraph Implementation["DashMapSessionStorage"]
-        Primary["DashMap<br/>session_id → StoredSession"]
-        SecAgent["sessions_by_agent<br/>agent_id → HashSet<session_id>"]
-        SecIdent["sessions_by_identity<br/>(host_lc, port, user) → HashSet<session_id>"]
-    end
-
-    subgraph Sessions["Active Sessions"]
-        S1["StoredSession 1"]
-        S2["StoredSession 2"]
-        S3["StoredSession 3"]
-    end
-
-    Trait --> Implementation
-    Primary --> S1
-    Primary --> S2
-    Primary --> S3
-    SecAgent -.-> Primary
-    SecIdent -.-> Primary
-
-    style Abstraction fill:#e3f2fd
-    style Implementation fill:#e8f5e9
-    style Sessions fill:#fff3e0
-```
-
-</details>
-
-### Storage Design Decisions
-
-1. **Trait-based abstraction (DIP).** Storage traits allow mocking in unit tests and future swap-in of alternative backends.
-2. **DashMap.** Lock-free concurrent access — readers and writers never block each other.
-3. **Multiple secondary indices.** Keep `O(1)` path for identity-triple lookups, agent cleanup, and session scans.
-4. **`Arc<Handle>`.** Each russh handle is wrapped in `Arc` so multiple async tasks can share it (the semaphore serializes channel opens, not handle reads).
-5. **UUIDv4 identifiers.** All `session_id` / `command_id` / `shell_id` / `transfer_id` values are UUIDv4 strings.
-
-### Lock-Free Access Pattern
+Async ports use the `trait-variant` macro pattern:
 
 ```rust
-use crate::mcp::storage::{SESSION_STORAGE, COMMAND_STORAGE};
-
-// Insert (v2 signature)
-SESSION_STORAGE.insert(session_id, info, Arc::new(handle));
-
-// Fetch metadata + handle
-if let Some(session_ref) = SESSION_STORAGE.get(&session_id) {
-    // session_ref.info     — SessionInfo clone
-    // session_ref.handle   — Arc<russh::client::Handle<SshClientHandler>>
-    // session_ref.channel_permits — Arc<Semaphore>
+// src/ports/ssh_client.rs
+#[trait_variant::make(SshClientPort: Send)]
+pub trait LocalSshClientPort: Send + Sync {
+    async fn connect(&self, ...) -> Result<SessionEntity, DomainError>;
+    async fn execute(&self, request: CommandRequest) -> Result<CommandOutcome, DomainError>;
+    // ...
 }
-
-// Smart reuse lookup
-let candidates = SESSION_STORAGE.find_by_identity("host.example.com", 22, "user");
-
-// Agent-based operations
-SESSION_STORAGE.register_agent(&agent_id, &session_id);
-let agent_sessions = SESSION_STORAGE.get_agent_sessions(&agent_id);
 ```
 
-## Async Command Architecture
+The macro generates two trait surfaces:
 
-Async commands are the backbone of long-running work. Each `ssh_execute` call creates a `RunningCommand`, registers it in `COMMAND_STORAGE`, and spawns a background task that awaits the per-session channel semaphore before opening a russh channel.
+- `LocalSshClientPort` — pure AFIT (`async fn` in trait), kept private and used by tests.
+- `SshClientPort` — `Send`-bounded re-export consumed by use cases as a generic parameter.
 
-<details>
-<summary>Async command architecture diagram</summary>
+Use cases stay generic over the port, never over `dyn Trait`:
+
+```rust
+pub struct ConnectSessionUseCase<S, SR, C, Idg, Cfg>
+where
+    S: SshClientPort + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    // ...
+{
+    ssh: Arc<S>,
+    sessions: Arc<SR>,
+    // ...
+}
+```
+
+The composition root pins one concrete adapter per port:
+
+```rust
+// src/composition/prod.rs
+type ConcreteSsh = RusshAdapter;
+type ConcreteSessionRepo = DashMapSessionRepo;
+// ...
+
+pub type ProdUseCases = UseCases<ConcreteSsh, ConcreteSftp, /* ... */>;
+```
+
+This has three benefits: zero virtual-call overhead in the hot path, every use case can be unit-tested with in-memory fakes (loaded as a different `UseCases<FakeSsh, …>`), and rustc surfaces wiring errors at the composition root rather than at runtime.
+
+The legacy v3 auth chain (`src/mcp/auth/*.rs`) still uses `#[async_trait]` because the H8 refit landed under `src/adapters/auth/` while the v3 module remains runtime-active. The `async-trait` direct dependency is slated for deletion in the v4.1 cleanup window (see [Future work](#future-work)).
+
+## Module map
+
+The crate root is `src/`. Library code lives under `src/{domain,ports,application,adapters,infra,composition}/`. The two binaries are thin shells that delegate to `composition::prod`.
+
+### Binary entry points
+
+| File | Role |
+|------|------|
+| `src/main.rs` | HTTP transport binary (`ssh-mcp`). Calls `composition::prod::run_http()`. Default bind `0.0.0.0:8000`, path `/`. |
+| `src/bin/ssh_mcp_stdio.rs` | Stdio transport binary (`ssh-mcp-stdio`). Calls `composition::prod::run_stdio()`. Logs to stderr via `RUST_LOG`. |
+
+Both entry points spawn the peer-GC task (`mcp::subscription::spawn_peer_gc`) on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30s). rmcp 1.6 does not expose a peer-disconnect callback, so the periodic scan is the only way to reclaim subscription state for closed transports.
+
+### `src/domain/` — pure layer
+
+| File | Role |
+|------|------|
+| `mod.rs` | Re-export tree. **MUST NOT** import `tokio`, `russh`, `rmcp`, `axum`, or `dashmap`. |
+| `auth.rs` | `AuthError` variant for credential rejection. |
+| `command.rs` | `CommandEntity`, `CommandRequest`, `CommandStatus`. |
+| `error.rs` | `DomainError` (top-level) — variants: `SessionNotFound`, `CommandNotFound`, `ShellNotFound`, `TransferNotFound`, `ForwardNotFound`, `MaxCommandsExceeded`, `MaxShellsExceeded`, `MaxTransfersExceeded`, `InvalidArgument`, `ConnectFailed`, `Auth`, `Timeout`, `Sftp`, `PortInUse`, `Transport`, `Storage`, `Internal`. |
+| `events.rs` | Live event enums shipped by the runtime ports — `OutputChunk`, `ProgressEvent`, `HealthEvent`, `ForwardEvent`. Every variant carries `seq: u64` allocated by the subscription registry. |
+| `forward.rs` | `ForwardEntity`. |
+| `identity.rs` | `Address`, `Credentials`. |
+| `ids.rs` | Newtype ids — `SessionId`, `CommandId`, `ShellId`, `TransferId`, `ForwardId`, `AgentId`, `PeerId`. |
+| `keys.rs` | `ShellKey`, `KeyModifiers`, semantic keystroke encoder (xterm-compatible byte sequences). Backs the `ssh_shell_send_key` use case. |
+| `policy.rs` | `CommandStatusFilter`, `MaxItemsPolicy`, etc. |
+| `ringbuffer.rs` | `RingBuffer` value type used by the shell adapter. |
+| `session.rs` | `SessionEntity`. |
+| `shell.rs` | `ShellEntity`, `ShellTerminal`. |
+| `transfer.rs` | `TransferEntity`, `TransferStatus`, `TransferDirection`. |
+
+### `src/ports/` — trait skeletons
+
+| File | Role |
+|------|------|
+| `ssh_client.rs` | `SshClientPort` — connect, disconnect, execute (sync + async), open/write/close shell, health check. |
+| `sftp_client.rs` | `SftpClientPort` — upload, download, cancel. |
+| `session_repo.rs` | `SessionRepository` — insert, get, remove, list, update_health, register_agent, list_by_agent, remove_by_agent. |
+| `command_repo.rs` | `CommandRepository` — insert, update, get, remove, count_by_session, count_running_by_session, list_filtered. |
+| `shell_repo.rs` | `ShellRepository` — same shape, scoped to shells. |
+| `transfer_repo.rs` | `TransferRepository` — same shape, scoped to transfers. |
+| `forward_repo.rs` | `ForwardRepository` (feature-gated `port_forward`). |
+| `notifier.rs` | `NotifierPort` (async fan-out) + `PeerHandle` (sync, dyn-safe handle to a connected MCP peer). |
+| `output_stream.rs` | `OutputStreamPort` — `snapshot_command`, `snapshot_shell`. Returns `OutputSnapshot { byte_cursor, last_seq, stdout, stderr }`. |
+| `subscriber_registry.rs` | `SubscriberRegistryPort` (sync slice — `next_seq`, `current_seq`, `poke`, cursor read/advance, GC) + `SubscriberRegistryAsync` (subscribe/unsubscribe/drop_peer). |
+| `auth_strategy.rs` | `AuthStrategyPort` — single async `try_authenticate` step in the chain. |
+| `clock.rs` | `ClockPort` — `utc_now`, `instant_now`. Sync, dyn-safe. |
+| `config.rs` | `ConfigPort` — every tunable as a typed accessor (~26 methods). |
+| `id_generator.rs` | `IdGeneratorPort` — `next_session`, `next_command`, `next_shell`, `next_transfer`, `next_forward`, `next_peer`. |
+
+Async ports are declared `#[trait_variant::make(Port: Send)]`; sync ports stay plain `dyn`-safe traits.
+
+### `src/application/` — use cases
+
+22 files, one per business operation. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point.
+
+| Domain | Use cases |
+|--------|-----------|
+| Connection | `connect_session`, `disconnect_session`, `list_sessions`, `disconnect_agent` |
+| Commands | `execute_command`, `get_command_output`, `list_commands`, `cancel_command` |
+| Shell | `open_shell`, `write_shell`, `send_key`, `read_shell`, `wait_for_pattern`, `close_shell` |
+| SFTP | `upload_file`, `download_file`, `get_transfer_progress` |
+| Network | `forward_port` (feature-gated `port_forward`) |
+| Resources | `list_resources`, `read_resource`, `subscribe_resource`, `unsubscribe_resource` |
+| Background | `peer_gc` (periodic invocation of `SubscriberRegistryPort::gc_closed_peers`) |
+
+Inbound DTOs and outcome enums live alongside each use case so an inbound adapter (rmcp tool wrapper, future REST gateway, …) can drive the use case without touching the domain layer directly.
+
+### `src/adapters/` — concrete adapters
+
+Every adapter implements one or more ports.
+
+| Adapter | Port(s) | File |
+|---------|---------|------|
+| `RusshAdapter` | `SshClientPort` | `ssh/russh_adapter.rs` |
+| `RusshSftpAdapter` | `SftpClientPort` | `sftp/russh_sftp_adapter.rs` |
+| `DashMap*Repo` | `*Repository` (5 of them) | `repo/dashmap/{session,command,shell,transfer,forward}.rs` |
+| `RmcpNotifier` + `RmcpPeerHandle` + `PeerTable` | `NotifierPort` + `PeerHandle` | `notifier/{rmcp_adapter,rmcp_peer}.rs` |
+| `MemoryRegistry<N>` | `SubscriberRegistryPort` + `SubscriberRegistryAsync` | `subscription/memory_registry.rs` |
+| `RusshOutputAdapter` | `OutputStreamPort` | `output_stream/russh_output.rs` |
+| `AuthChainAdapter` (+ `PasswordAuth`, `KeyAuth`, `AgentAuth`) | `AuthStrategyPort` | `auth/{password,key,agent,chain}.rs` |
+| `SystemClock` (+ `FakeClock` under `#[cfg(any(test, feature = "test-fixtures"))]`) | `ClockPort` | `clock/{system,fake}.rs` |
+| `EnvConfig` (+ `MemoryConfig`) | `ConfigPort` | `config/{env,memory}.rs` |
+| `UuidIds` (+ `DeterministicIds`) | `IdGeneratorPort` | `id_generator/{uuid,deterministic}.rs` |
+
+`FakeSshAdapter` and `FakeSftpAdapter` (under `#[cfg(any(test, feature = "test-fixtures"))]`) provide in-memory implementations of `SshClientPort` and `SftpClientPort` for use case tests.
+
+### `src/infra/mcp/` — inbound MCP transport
+
+| File | Role |
+|------|------|
+| `server.rs` | `McpSshServer<UC>` — generic over the `UseCases<…>` container. Owns `Arc<UC>` plus `Arc<PeerTable>`. |
+| `tool_router.rs` | `#[tool_router]` impl populating the 18 `#[tool]` entry points (one per MCP tool) and the `#[tool_handler] impl ServerHandler` block. Compiled twice via `#[cfg]` (with / without `port_forward`) so the generic signature stays clean. |
+| `resource_handlers.rs` | Adapters between rmcp `resources/{list,read,subscribe,unsubscribe}` payloads and the matching `*_resource` use cases. Maps `DomainError` onto `McpError` (validation -> `invalid_params`, not-found -> `resource_not_found`, everything else -> `internal_error`). |
+| `peer_handle.rs` | Type aliases (`PeerTable`, `RmcpPeerHandle`) re-surfacing the adapter that lives under `src/adapters/notifier/rmcp_peer.rs`. The wrapper mints a fresh `PeerId`, registers in the per-process `PeerTable` on construction, and removes itself on `Drop`. |
+| `args/` | One module per tool domain (`connection`, `execute`, `shell`, `sftp`, `forward`) with `#[derive(Deserialize, JsonSchema)]` argument structs. |
+| `render/` | One module per tool domain rendering the use case outcome into the v3 markdown body. Uses `helpers::nonce::generate_nonce` (8-hex) and `helpers::output::render_output_block`. |
+| `helpers/` | Shared primitives — `error::format_error`, `nonce::generate_nonce`, `output::render_output_block`, plus UTF-8 safe truncation. |
+
+### `src/composition/` — root wiring
+
+| File | Role |
+|------|------|
+| `mod.rs` | The generic `UseCases<S, F, SR, CR, ShR, TR, [FR,] N, AS, OS, SubR, C, Cfg, Idg>` container. Compiled twice via `#[cfg]` so the `FR` (`ForwardRepository`) parameter only exists with `port_forward`. |
+| `prod.rs` | Production wiring — pins concrete adapters via `type ConcreteX = …`, exposes `build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>)`, `build_server() -> McpSshServer<ProdUseCases>`, and the two transport entry points `run_http()` / `run_stdio()`. |
+| `fixtures.rs` | (Reserved for the H18+ test harness.) |
+
+### Foundational `src/mcp/` — runtime-active v3 leftovers (v4.1 cleanup)
+
+After the H17.5a hard-delete the legacy `src/mcp/{tools,storage,server,message,resources,schema,keys,forward}` modules are gone. The following modules remain runtime-active because the v4 adapters delegate into them; the v4.1 cleanup window will absorb them into the hexagonal layout and retire the `mcp::` namespace entirely.
+
+| File | Why it stays for v4.0.0 |
+|------|-------------------------|
+| `src/mcp/async_command.rs` | `RunningCommand` lock-free state consumed by the russh adapter. |
+| `src/mcp/auth/` | Strategy chain still uses `#[async_trait]`; the `src/adapters/auth/` chain (H8) is the v4 surface, the v3 module is unreachable but pinned by `Cargo.toml`'s transitional `async-trait` dep. |
+| `src/mcp/client.rs` | Low-level russh connect / exec / PTY helpers (`connect_to_ssh_with_retry`, `execute_ssh_command`, `open_pty_shell`) reused by the adapter. |
+| `src/mcp/config.rs` | Env-var resolvers; `adapters::config::env::EnvConfig` delegates here. |
+| `src/mcp/error.rs` | Retry-classification helper consumed by `mcp::client`. |
+| `src/mcp/session.rs` | `SshClientHandler` russh callback type. |
+| `src/mcp/sftp.rs` | Streaming SFTP transfer state used by the SFTP adapter. |
+| `src/mcp/shell.rs` | `RunningShell` + `RingBuffer` consumed by the russh adapter. |
+| `src/mcp/subscription.rs` | `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc` task spawned by `composition::prod`. The `MemoryRegistry` adapter (H9) is the v4 surface for use cases, but the v3 global is still poked from the foundational producers. |
+| `src/mcp/transfer.rs` | `RunningTransfer` lock-free state. |
+| `src/mcp/types.rs` | Shared payload structs (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, …). |
+
+## Lock-free design (now in `adapters/`)
+
+v4 preserves every lock-free invariant from v3 — no `Mutex` on the long-lived state carriers. The carriers themselves now sit in the adapters layer alongside the production rust-channel plumbing. See [LOCKS.md](./LOCKS.md) for the complete acquisition order, channel-capacity table, and decision tree.
+
+| Carrier | Owner module (v4) | Pattern |
+|---------|------------------|---------|
+| Per-command output history | `mcp::async_command::RunningCommand` (consumed by `adapters::ssh::russh_adapter`, snapshot via `adapters::output_stream::russh_output`) | `Arc<ArcSwap<OutputBuffer>>` + `broadcast::Sender<OutputChunk>` + `OnceCell<i32>` exit + `OnceCell<String>` error |
+| Per-shell PTY history | `mcp::shell::RunningShell` (consumed by `adapters::ssh::russh_adapter`) | `Arc<ArcSwap<RingBuffer>>` + `broadcast::Sender<Bytes>` + `mpsc::Sender<WriteRequest>` writer-task ownership + `AtomicU64` activity + `Notify` |
+| Per-transfer progress | `mcp::transfer::RunningTransfer` (consumed by `adapters::sftp::russh_sftp_adapter`) | `AtomicU64` byte counters + `broadcast::Sender<ProgressEvent>` + `OnceCell<String>` error + `Notify` |
+| Subscription registry | `adapters::subscription::memory_registry::MemoryRegistry<N>` | `DashMap` shards (subscribers / progress / waker / debouncer task / sequence counter) + per-`(peer, uri)` `Arc<PeerProgress>` (`AtomicU64` cursor + `AtomicU64` last seen) + per-resource `Arc<Notify>` waker |
+| Repositories | `adapters::repo::dashmap::*` | `Arc<DashMap<Id, Entity>>` primary + secondary `DashMap<AgentId, HashSet<SessionId>>` index. No `await` while a shard guard is alive. |
+
+Snapshot reads always clone the `Arc` out of the relevant `DashMap` (or load the `ArcSwap` payload) **before** touching `.await`. The `clippy::await_holding_lock` + `clippy::significant_drop_in_scrutinee` lints prevent regressions.
+
+### Sequence diagram — shell read fan-out under concurrent writes
 
 ```mermaid
-flowchart TB
-    subgraph Trait["CommandStorage Trait"]
-        T["register, unregister, get_direct, get_ref,<br/>list_by_session, count_by_session,<br/>count_running_by_session, list_all, list_filtered"]
+sequenceDiagram
+    participant Producer as "PTY reader task<br/>(adapters::ssh)"
+    participant History as "ArcSwap of RingBuffer<br/>(mcp::shell)"
+    participant Broadcast as "broadcast::Sender of Bytes"
+    participant Notify as "Notify (data_notify)"
+    participant Reg as "MemoryRegistry<br/>(adapters::subscription)"
+    participant Reader as ReadShellUseCase
+    participant Sub as SubscribeResourceUseCase
+
+    Producer->>History: rcu(append + head-trim)
+    Producer->>Broadcast: send(Bytes)
+    Producer->>Notify: notify_waiters()
+    Producer->>Reg: poke(Shell, id)
+
+    par Snapshot path
+        Reader->>History: load_full()
+        History-->>Reader: Arc of RingBuffer
+        Reader->>Reader: render markdown (infra::mcp::render)
+    and Subscribe path
+        Reg->>Reg: debounce 50 ms
+        Reg-->>Sub: notifications/resources/updated
+        Sub->>Reg: resources/read?cursor=auto
+        Reg->>History: load_full()
+        History-->>Reg: Arc of RingBuffer
+        Reg-->>Sub: text + _meta{cursor, last_seq, ...}
     end
-
-    subgraph Storage["DashMapCommandStorage"]
-        Map["DashMap<br/>command_id → RunningCommand"]
-        Idx["commands_by_session<br/>session_id → HashSet<command_id>"]
-    end
-
-    Trait --> Storage
-
-    subgraph RunningCmd["RunningCommand Shared State"]
-        Info["AsyncCommandInfo"]
-        CancelToken["CancellationToken"]
-        StatusChan["watch::channel<AsyncCommandStatus>"]
-        Output["Arc<Mutex<OutputBuffer>>"]
-        ExitCode["Arc<Mutex<Option<i32>>>"]
-        Error["Arc<Mutex<Option<String>>>"]
-        TimedOut["Arc<AtomicBool>"]
-        OutputRead["Arc<AtomicBool>"]
-    end
-
-    subgraph Execution["Background Task"]
-        Permit["Acquire channel semaphore<br/>(serialized per session)"]
-        Exec["execute_ssh_command_async[_pty]"]
-        Cleanup["spawn_cleanup_task<br/>(TTL + post-read grace)"]
-    end
-
-    Map --> RunningCmd
-    Permit --> Exec
-    Exec -.-> Output
-    Exec -.-> StatusChan
-    Exec -.-> ExitCode
-    Exec -.-> Error
-    Exec -.-> TimedOut
-    CancelToken -.-> Exec
-    OutputRead -.-> Cleanup
-
-    style Storage fill:#e8f5e9
-    style RunningCmd fill:#fff3e0
-    style Execution fill:#e3f2fd
 ```
 
-</details>
+## Subscribe pipeline
 
-### Async Command Flow
-
-1. **`ssh_execute`** — `count_running_by_session` enforces `MAX_ASYNC_COMMANDS_PER_SESSION = 100`; `create_running_command` allocates the shared state; `register_and_spawn` calls `spawn_command_task` which awaits the semaphore before running `execute_ssh_command_async` (or the PTY variant).
-2. **`ssh_get_command_output`** — clones the `status_rx` / `output` handles, optionally waits for completion with a 300 s cap, marks `output_read` atomically, and renders via `GetCommandOutputBuilder`.
-3. **`ssh_cancel_command`** — runs `cancel_token.cancel()`, waits up to 5 s for `status_rx` to leave `Running` (so the server-side channel is confirmed closed), then pauses 100 ms more before returning — back-to-back cancel+execute bursts never race the `CHANNEL_CLOSE` ack.
-4. **`ssh_list_commands`** — filters by session/status and sorts by `started_at`; pagination applies `max_items` (default 500, cap 10 000).
-5. **Cleanup task** — spawned alongside the command. Waits for the command to leave `Running`; if `output_read` was set, cleanup happens after a 1 s grace; otherwise waits up to `SSH_COMMAND_CLEANUP_TTL` (default 60 s) before removing the entry from storage.
-
-### Concurrency Controls
-
-| Control | Value | Purpose |
-|---------|-------|---------|
-| `MAX_ASYNC_COMMANDS_PER_SESSION` | 100 | Running-command cap per session. |
-| `CHANNEL_CONCURRENCY_PER_SESSION` | 1 | Serializes russh channel opens on the same session (semaphore). |
-| `SSH_COMMAND_MAX_BUFFER_SIZE` | 10 MiB | Head-drained stdout/stderr bound per command. |
-| `Arc<AtomicBool>` for `timed_out` / `output_read` | — | Lock-free flags. |
-| `watch::channel` | — | Lock-free status broadcasting. |
-| `CommandStorage` trait | — | Dependency-injection seam for tests. |
-
-### Session Cleanup
-
-`ssh_disconnect` (and the agent variant) run in this order per session:
-
-1. `cancel_session_transfers` — iterate `TRANSFER_STORAGE.list_by_session`, cancel each token, unregister entries.
-2. `close_session_shells` — iterate `SHELL_STORAGE.list_by_session`, cancel reader tasks, close `ChannelWriter`, unregister.
-3. `cancel_session_commands` — iterate `COMMAND_STORAGE.list_by_session`, cancel tokens, unregister entries. Returns the count rendered in `ssh_disconnect_agent`'s `COMMANDS:` field.
-4. `SESSION_STORAGE.remove` and `Disconnect::ByApplication` on the handle.
-
-## Threading and Async Model
-
-The system uses Tokio's multi-threaded async runtime. Everything is native async — there is no `spawn_blocking`.
-
-<details>
-<summary>Threading and async model diagram</summary>
+The subscribe layer turns producer events into rate-limited `notifications/resources/updated` calls. Subscribers then pull byte deltas via `resources/read?cursor=auto`. Logic lives in `adapters::subscription::memory_registry::MemoryRegistry<N>` (where `N` is the `NotifierPort` adapter monomorphised at composition time).
 
 ```mermaid
-flowchart TB
-    subgraph Runtime["Tokio Runtime (Multi-threaded)"]
-        subgraph MainLoop["Main Event Loop"]
-            HTTP["HTTP Request Handler"]
-            STDIO["Stdio Message Handler + cancel interception"]
-        end
+sequenceDiagram
+    participant Prod as "Producer<br/>(PTY/cmd reader, SFTP, health probe)"
+    participant Reg as MemoryRegistry
+    participant Deb as "Debouncer task<br/>(per resource)"
+    participant Notif as RmcpNotifier
+    participant Peer as "rmcp::Peer of RoleServer"
+    participant Client as MCP client
 
-        subgraph Tasks["Async Tasks"]
-            Connect["ssh_connect + retry"]
-            Execute["ssh_execute (spawns bg task)"]
-            CancelCleanup["spawn_cleanup_task"]
-            ShellReader["shell_reader loop"]
-            ShellTTL["spawn_shell_inactivity_task"]
-            XferCleanup["spawn_transfer_cleanup_task"]
-            Forward["Port forward listener"]
-            Disconnect["ssh_disconnect"]
-        end
+    Note over Client,Reg: Subscribe handshake
+    Client->>Peer: resources/subscribe shell://abc/output
+    Peer->>Reg: SubscribeResourceUseCase.execute(...)
+    Reg->>Reg: register subscriber + spawn debouncer (first peer)
 
-        subgraph Channels["russh Channels"]
-            ChanExec["Command channel (session)"]
-            ChanPty["PTY shell channel"]
-            ChanFwd["Direct-TCPIP channel"]
-            ChanSftp["SFTP subsystem channel"]
-        end
-
-        subgraph Semaphore["Per-session channel semaphore<br/>(1 permit)"]
-            S["Serializes channel_open_session calls"]
-        end
+    Note over Prod,Deb: Producer path
+    Prod->>Reg: next_seq(kind, id) -> u64
+    Prod->>Reg: poke(kind, id)        (Notify::notify_one)
+    loop within 50 ms window
+        Prod->>Reg: poke(kind, id)
     end
 
-    HTTP --> Tasks
-    STDIO --> Tasks
-    Execute --> Semaphore
-    Execute --> ChanExec
-    ShellReader --> ChanPty
-    Forward --> ChanFwd
-    Execute --> CancelCleanup
-    Connect --> ChanExec
+    Deb->>Deb: tokio::sleep(50 ms)
+    Deb->>Reg: snapshot_subscribers(uri)
+    Deb->>Notif: notify_resource_updated(peer, uri)
+    Notif-->>Peer: notifications/resources/updated
+    Peer-->>Client: notifications/resources/updated
 
-    style Runtime fill:#e8eaf6
-    style Tasks fill:#fff8e1
-    style Semaphore fill:#e3f2fd
+    Note over Client: Pull delta
+    Client->>Peer: resources/read shell://abc/output?cursor=auto
+    Peer->>Reg: ReadResourceUseCase.execute(...)
+    Reg-->>Peer: text + _meta {cursor, buffer_size, last_seq, ...}
+    Peer-->>Client: ReadResourceResult
+
+    Note over Deb: Force flush + keepalive
+    Deb->>Deb: every force_flush_ms (default 1 s)
+    Deb->>Notif: notify_resource_updated(peer, uri)
+    Deb->>Deb: every keepalive_s (default 30 s)
+    Deb->>Notif: notify_resource_updated(peer, uri)
 ```
 
-</details>
+### Backpressure features (A + B + D)
 
-### Native Async Patterns
+| Feature | Scope | Mechanism | Tunable |
+|---------|-------|-----------|---------|
+| **A. Sequence numbers** | Every event variant (`OutputChunk`, `ProgressEvent`, `HealthEvent`, `ForwardEvent`) | `seq: u64` allocated by `MemoryRegistry::next_seq`; mirrored in `_meta.last_seq` so subscribers detect gaps after a `Lagged` recovery. | — (allocator is shard-atomic) |
+| **B. Keepalive** | Per resource | Per-debouncer ticker emits one notification every `SSH_NOTIFY_KEEPALIVE_S` even when no fresh chunks arrived. Keeps SSE / stdio frames warm. | `SSH_NOTIFY_KEEPALIVE_S` (default `30` s, range `5..=300`) |
+| **D. Cumulative chunks** | Per resource | The debouncer collapses every `poke` inside `SSH_NOTIFY_DEBOUNCE_MS` into exactly one outbound notification; the actual byte coalescing happens server-side when the client calls `resources/read?cursor=auto`. | `SSH_NOTIFY_DEBOUNCE_MS` (default `50` ms), `SSH_NOTIFY_FORCE_FLUSH_MS` (default `1000` ms) |
 
-| Operation | Pattern |
-|-----------|---------|
-| SSH connect | `tokio::time::timeout(client::connect(...))` |
-| Retry | `backon::ExponentialBuilder` with `.with_jitter()`, capped at `MAX_RETRY_DELAY` (10 s). |
-| Synchronous exec (health checks) | `collect_sync_output` over `ChannelMsg::Data` / `ExtendedData` / `ExitStatus` / `Eof` / `Close`. |
-| Background exec | `tokio::spawn(execute_ssh_command_async)` with `tokio::select!` (`biased`, cancel token first, then timeout, then output poll). |
-| Shell reader | Dedicated task owning `ChannelReadHalf`; `ChannelWriter` stays on the write half to avoid locking. |
-| Cancellation | `tokio_util::sync::CancellationToken`. |
-| Status propagation | `tokio::sync::watch::channel` (`RunningCommand`, `RunningShell`, `RunningTransfer`). |
-| Port forwarding | `tokio::io::copy` both directions in `tokio::select!`. |
-| Serialization of SSH channels | `tokio::sync::Semaphore` per session (`CHANNEL_CONCURRENCY_PER_SESSION`). |
-| Bounded buffers | `OutputBuffer::append_*_bounded` + shell reader's `append_shell_output` drain oldest bytes when the cap is exceeded. |
+**Per-peer cursor.** Each `(peer_id, uri)` pair owns a shared `Arc<PeerProgress>` (`byte_cursor: AtomicU64`, `last_seq_seen: AtomicU64`). Reads with `?cursor=auto` slice the buffer from `byte_cursor` and bump it after rendering. Reads with `?cursor=<N>` allow explicit recovery (typically `?cursor=0` for a full snapshot).
 
-## Retry Logic with Backoff
+**Truncation compensation.** When the producer drops bytes from the head (buffer cap exceeded), `MemoryRegistry::compensate_truncation(uri, dropped)` decrements every peer cursor on the same URI by `dropped` (saturating). The next `resources/read` then surfaces the loss via `_meta.truncated_since_last_read`.
 
-<details>
-<summary>Retry logic state diagram</summary>
+**Peer GC.** rmcp 1.6 does not surface a peer-disconnect callback. Both binaries spawn `mcp::subscription::spawn_peer_gc(interval, cancel)` that periodically scans the registry and drops every peer whose `PeerHandle::is_closed()` returns `true`. The `application::peer_gc::PeerGcUseCase` is the v4 façade; the production wiring still spawns the foundational task during the v4.0.0 transition window.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Attempt1
+## Capabilities
 
-    Attempt1 --> Success: Connected & authenticated
-    Attempt1 --> CheckRetry1: Failed
+`McpSshServer` declares the following capabilities through the rmcp `ServerHandler::get_info()` contract:
 
-    CheckRetry1 --> Delay1: is_retryable_error -> true
-    CheckRetry1 --> [*]: Auth / permission -> stop
+| Capability | Status |
+|------------|--------|
+| `tools/list` | 18 tools registered via `#[tool_router]` (see [API.md](./API.md)) |
+| `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
+| `resources/list` | 5 schemes (`shell`, `command`, `transfer`, `session`, `forward`) — see [RESOURCES.md](./RESOURCES.md) |
+| `resources/read` | All 5 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` |
+| `resources/subscribe` + `resources/unsubscribe` | Per `(peer, uri)` cursor maintained by `MemoryRegistry` |
+| `notifications/resources/updated` | Emitted by the per-resource debouncer task |
+| `notifications/resources/list_changed` | Capability advertised; emission still deferred (tracked under [Future work](#future-work)) |
+| Cancellation | Native via rmcp 1.6 — the v3 custom stdio cancel-id parser is gone since v3.0.0 |
 
-    Delay1 --> Attempt2: backoff + jitter
+## Future work
 
-    Attempt2 --> Success: Connected & authenticated
-    Attempt2 --> CheckRetry2: Failed
+- **`notifications/resources/list_changed`** — wire emission through every use case that creates / destroys a tracked resource (capability is already advertised; `Notify` plumbing pending).
+- **`lagged_since_last_read` telemetry** — detect broadcast `RecvError::Lagged` in the registry, populate `_meta.lagged_since_last_read`, and let clients trigger an explicit `?cursor=0` snapshot recovery.
+- **Per-subscriber dedicated `mpsc` channel** — replace the shared `broadcast::Sender` fan-out so a slow subscriber cannot pressure the producer.
+- **H17.6 — foundational decoupling** — absorb the surviving `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` modules into the hexagonal layout and delete the `mcp::` namespace. The v4.0.0 release ships with these modules runtime-active because the russh / SFTP adapters still delegate into them; v4.1 will own the cleanup. See [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) for the deferral rationale.
+- **`async-trait` removal** — the v3 `mcp::auth` module is the last consumer of `#[async_trait]`. Its v4 replacement (`adapters::auth::chain::AuthChainAdapter`) already uses `trait-variant` AFIT; the `Cargo.toml` direct dependency goes away with H17.6.
 
-    CheckRetry2 --> Delay2: Retryable
-    CheckRetry2 --> [*]: Not retryable
+## Cross references
 
-    Delay2 --> AttemptN: backoff + jitter
-
-    AttemptN --> Success
-    AttemptN --> [*]: Max retries exceeded
-
-    Success --> [*]
-```
-
-</details>
-
-`error::is_retryable_error` classifies errors by case-insensitive substring match:
-
-- **Non-retryable** — any of the `AUTH_ERRORS` keywords (auth failed, permission denied, publickey, ...).
-- **Retryable** — any of the `RETRYABLE_ERRORS` keywords (connection refused, reset, timed out, timeout, network unreachable, no route to host, host is down, temporary failure, resource temporarily unavailable, handshake failed, failed to connect, broken pipe, would block).
-- **Unknown, contains "ssh"** — retryable only if the message also mentions "timeout" or "connect".
-- **Unknown, no "ssh"** — treated as retryable (conservative default).
-
-Authentication keywords are checked first so ambiguous messages like "Connection timeout during authentication failed" are classified as non-retryable.
-
-## Binary Targets
-
-### HTTP Server (`ssh-mcp`)
-
-<details>
-<summary>HTTP server diagram</summary>
-
-```mermaid
-flowchart LR
-    subgraph Binary["ssh-mcp Binary (src/main.rs)"]
-        Main["main + tokio::main"]
-        Route["Poem Route"]
-        Streamable["streamable_http::endpoint"]
-    end
-
-    subgraph Server["HTTP Server"]
-        TCP["TcpListener<br/>MCP_HOST:MCP_PORT"]
-        Tracing["Tracing Middleware"]
-    end
-
-    Main --> Route
-    Route --> Streamable
-    Streamable --> Server
-    TCP --> Tracing
-
-    style Binary fill:#e3f2fd
-    style Server fill:#f3e5f5
-```
-
-</details>
-
-**Features:**
-
-- Binds to `MCP_HOST:MCP_PORT` (defaults `0.0.0.0:8000`).
-- Uses Poem's `streamable_http` endpoint — supports plain JSON and SSE event streams.
-- Includes Poem's `Tracing` middleware.
-- Loads `.env` via `dotenvy`.
-- Initializes `tracing_subscriber` with `info` as default.
-
-### Stdio Transport (`ssh-mcp-stdio`)
-
-<details>
-<summary>Stdio transport diagram</summary>
-
-```mermaid
-flowchart LR
-    subgraph Binary["ssh-mcp-stdio Binary (bin/ssh_mcp_stdio.rs)"]
-        Loop["stdio_with_cancellation loop"]
-        Interceptor["intercept_cancel<br/>(camelCase + snake_case)"]
-        Server["McpServer with tools"]
-        Fallback["build_fallback_response"]
-    end
-
-    subgraph IO["Standard I/O"]
-        STDIN["stdin (JSON-RPC lines)"]
-        STDOUT["stdout (responses)"]
-        STDERR["stderr (tracing)"]
-    end
-
-    STDIN --> Loop
-    Loop --> Interceptor
-    Interceptor --> Server
-    Loop --> Fallback
-    Server --> STDOUT
-    Fallback --> STDOUT
-    Loop --> STDERR
-
-    style Binary fill:#e8f5e9
-    style IO fill:#fff3e0
-```
-
-</details>
-
-**Features:**
-
-- Intercepts `notifications/cancelled` for both `request_id` (snake_case) and `requestId` (camelCase) — needed because poem-mcpserver 0.3.1 only knows the snake_case form.
-- Emits fallback responses (`resources/templates/list` → empty, `resources/read` → "Resource not found", `prompts/get` → "Prompt not found", unknown method → `-32601 Method not found`).
-- Serialises every response through a `Mutex<()>` on stdout so cancellation can drop stale responses atomically.
-- Spawns a dedicated task per incoming batch so a long `ssh_get_command_output(wait=true)` never blocks subsequent cancel notifications.
-- Logs exclusively to stderr.
-
-## Key Dependencies
-
-<details>
-<summary>Dependency graph</summary>
-
-```mermaid
-flowchart TB
-    subgraph Core["Core"]
-        Russh["russh 0.55"]
-        RusshSftp["russh-sftp 2"]
-        Tokio["tokio 1.x (full)"]
-        TokioUtil["tokio-util 0.7"]
-        Poem["poem 3.1"]
-    end
-
-    subgraph MCP["MCP Integration"]
-        PoemMCP["poem-mcpserver 0.3.1"]
-    end
-
-    subgraph Utilities["Utilities"]
-        Backon["backon 1.x"]
-        Serde["serde 1.0"]
-        UUID["uuid 1.16"]
-        DashMap["dashmap 6"]
-        Dotenvy["dotenvy 0.15"]
-        Futures["futures 0.3"]
-    end
-
-    PoemMCP --> Poem
-    PoemMCP --> Tokio
-    Russh --> Tokio
-    RusshSftp --> Russh
-    TokioUtil --> Tokio
-
-    style Core fill:#e1f5fe
-    style MCP fill:#f3e5f5
-    style Utilities fill:#e8f5e9
-```
-
-</details>
-
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| `russh` | 0.55 | Async SSH client. |
-| `russh-sftp` | 2 | SFTP streaming on top of russh. |
-| `async-trait` | 0.1 | Async traits for `AuthStrategy`. |
-| `tokio` | 1.x (full) | Async runtime. |
-| `tokio-util` | 0.7 | `CancellationToken`. |
-| `poem` | 3.1 | HTTP framework used by the `ssh-mcp` binary. |
-| `poem-mcpserver` | 0.3.1 | MCP protocol implementation (`streamable_http`, `#[Tools]`). |
-| `backon` | 1.x | Exponential backoff + jitter for retries. |
-| `serde` + `serde_json` | 1.0 | JSON serialization for transport. |
-| `schemars` | 1.0 | JSON schemas for tool parameters (used by `poem-mcpserver`). |
-| `uuid` | 1.16 | UUIDv4 identifiers + nonces. |
-| `dashmap` | 6 | Lock-free concurrent hashmap. |
-| `dotenvy` | 0.15 | `.env` loader. |
-| `tracing` + `tracing-subscriber` | 0.1 / 0.3 | Structured logging. |
-| `chrono` | 0.4 | RFC3339 timestamps. |
-| `futures` | 0.3 | `join_all` for the `ssh_list_sessions` health sweep. |
-
-## Feature Flags
-
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `port_forward` | Yes | Enables SSH port forwarding (`ssh_forward` tool, `src/mcp/forward.rs`). |
-
-Build without port forwarding:
-
-```bash
-cargo build --release --no-default-features
-```
-
-When the feature is disabled, `ssh_forward` returns `SSH_FORWARD: ERROR` with `REASON: [FEATURE_DISABLED] port forwarding feature is not enabled`.
-
-## Strict Lint Profile
-
-`src/lib.rs` opts into `clippy::all + pedantic + nursery + cargo` and then `deny`s a long list of correctness-critical lints (`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_stdout`, `print_stderr`, `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, ...). `clippy.toml` sets `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`. Every `#[allow(...)]` carries a `reason = "..."` documented alongside the suppression.
-
-## Test Surface
-
-501 unit tests across the crate (see [`README.md`](../README.md#unit-test-coverage) for per-module breakdown) plus two Python integration scripts:
-
-| Script | Focus |
-|--------|-------|
-| `scripts/test_http.py` | HTTP transport suite. Exercises every tool, smart-reuse policies, chaos/concurrency scenarios, SFTP round-trip. Ships `parse_mcp_response` to convert markdown back to dict. |
-| `scripts/test_stdio.py` | Same suite against the stdio transport — also verifies the cancel notification shim in `bin/ssh_mcp_stdio.rs`. |
-
-Both scripts can be pointed at any reachable SSH server via the `SSH_HOST`, `SSH_USER`, `SSH_KEY_PATH`, `LOCAL_FILE` environment variables and default to `reuse="force_new"` so repeated runs never collide.
+- [LOCKS.md](./LOCKS.md) — lock-free patterns, acquisition order, channel sizing, loom invariants.
+- [API.md](./API.md) — MCP tool reference (schemas, response shape).
+- [RESOURCES.md](./RESOURCES.md) — `resources/*` contract, cursor semantics, `_meta` envelope.
+- [ERRORS.md](./ERRORS.md) — error catalog.
+- [CONFIGURATION.md](./CONFIGURATION.md) — env-var table.
+- [FLOWS.md](./FLOWS.md) — end-to-end sequence diagrams.
+- [LLM_GUIDE.md](./LLM_GUIDE.md) — guidance for LLM hosts.
+- [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) — internal migration narrative for contributors.
+- [adr/0001-migrate-to-rmcp.md](./adr/0001-migrate-to-rmcp.md) — v3 transport choice.
+- [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) — v4 architecture choice.

@@ -1,51 +1,14 @@
+//! HTTP transport entry point for ssh-mcp.
+//!
+//! Thin shell that defers to [`ssh_mcp::composition::prod::run_http`]. The
+//! v4 composition root in turn delegates to the legacy v3 runtime in H2
+//! (this etapa) and progressively replaces it with adapter-backed wiring as
+//! etapas H3-H17 land.
+
 #![deny(warnings)]
 #![deny(clippy::unwrap_used)]
 
-use dotenvy::dotenv;
-use poem::{EndpointExt, Route, Server, listener::TcpListener, middleware::Tracing};
-use poem_mcpserver::{McpServer, streamable_http};
-use ssh_mcp::mcp::commands::McpSSHCommands;
-use tracing::info;
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv().ok();
-
-    // Initialize logging with proper tracing default
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("info".parse().expect("valid directive")),
-        )
-        .init();
-
-    // Setup MCP server
-    let mcp_host = std::env::var("MCP_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let mcp_port: u16 = std::env::var("MCP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8000);
-    let mcp_addr = format!("{}:{}", mcp_host, mcp_port);
-    info!("Starting MCP server on {}", mcp_addr);
-
-    // Setup the poem-mcpserver endpoint with SSH commands
-    let app = Route::new()
-        .at(
-            "/",
-            streamable_http::endpoint(|_| McpServer::new().tools(McpSSHCommands {})),
-        )
-        .with(Tracing);
-
-    info!("MCP Server with SSH client support is ready");
-    info!("Use the ssh_connect command to establish SSH connections");
-    #[cfg(feature = "port_forward")]
-    info!("Use the ssh_forward command to set up port forwarding");
-
-    // Run the MCP server
-    Server::new(TcpListener::bind(mcp_addr))
-        .name("SSH MCP Server")
-        .run(app)
-        .await?;
-
-    Ok(())
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ssh_mcp::composition::prod::run_http().await
 }

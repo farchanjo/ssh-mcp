@@ -27,10 +27,8 @@ pub struct SessionInfo {
     pub username: String,
     pub connected_at: String,
     /// Default timeout in seconds used for this session's connection
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub default_timeout_secs: u64,
     /// Number of retry attempts needed to establish the connection
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub retry_attempts: u32,
     /// Whether compression is enabled for this session
     pub compression_enabled: bool,
@@ -124,13 +122,72 @@ pub struct ShellInfo {
     /// Terminal type (e.g., "xterm", "vt100")
     pub term_type: String,
     /// Terminal width in columns
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub cols: u32,
     /// Terminal height in rows
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub rows: u32,
     /// When the shell was opened (RFC3339 format)
     pub opened_at: String,
+}
+
+/// Live transition event broadcast by `RunningTransfer`. Subscribers consume
+/// these via `progress_tx` to drive the future `transfer://<id>/progress`
+/// MCP resource (E13).
+///
+/// Each variant carries a `seq` allocated by
+/// [`crate::mcp::subscription::SubscriptionRegistry::next_seq`] so subscribers
+/// recovering from `Lagged` can detect gaps.
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressEvent {
+    /// Transfer made progress — `bytes_transferred` was just updated.
+    Tick {
+        seq: u64,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    /// Transfer terminated successfully.
+    Completed { seq: u64, bytes_transferred: u64 },
+    /// Transfer failed (the failure reason is on `RunningTransfer.error`).
+    Failed { seq: u64 },
+    /// Transfer was cancelled by caller.
+    Cancelled { seq: u64 },
+}
+
+/// Live health event broadcast by a `SessionRef`. Subscribers consume these
+/// via `health_tx` to drive the future `session://<id>/health` MCP resource.
+#[derive(Debug, Clone, Copy)]
+pub enum HealthEvent {
+    /// Health check passed at this timestamp (epoch milliseconds).
+    Healthy { seq: u64, at_ms: u64 },
+    /// Health check failed at this timestamp (epoch milliseconds).
+    Unhealthy { seq: u64, at_ms: u64 },
+    /// Session was disconnected.
+    Disconnected { seq: u64 },
+}
+
+/// Live event broadcast by an active port-forwarder.
+///
+/// Subscribers consume these via `events_tx` to drive the future
+/// `forward://<id>/events` MCP resource (E13). Per-connection eventing
+/// is feature-gated and may be stubbed until the wiring lands in E13.
+#[cfg(feature = "port_forward")]
+#[derive(Debug, Clone)]
+pub enum ForwardEvent {
+    /// Local connection accepted from the given remote address.
+    Accept {
+        seq: u64,
+        client_addr: String,
+        at_ms: u64,
+    },
+    /// Forwarded connection closed; aggregated byte counts are reported.
+    Close {
+        seq: u64,
+        client_addr: String,
+        bytes_in: u64,
+        bytes_out: u64,
+        at_ms: u64,
+    },
+    /// Forwarder task shut down — no further events will be emitted.
+    Stopped { seq: u64 },
 }
 
 #[cfg(test)]

@@ -43,4 +43,10 @@
 #![deny(clippy::absolute_paths)]
 #![deny(clippy::allow_attributes_without_reason)]
 
+pub mod adapters;
+pub mod application;
+pub mod composition;
+pub mod domain;
+pub mod infra;
 pub mod mcp;
+pub mod ports;

@@ -5,25 +5,33 @@
 //!
 //! # Architecture
 //!
-//! - `RunningCommand`: Contains all state for an async command including
-//!   output buffers, cancellation token, and status.
+//! - `RunningCommand`: Lock-free state for an async command. The reader
+//!   background task owns its `OutputBuffer` exclusively and publishes
+//!   snapshots through `output_history` (`ArcSwap`) plus incremental
+//!   chunks via the `output_tx` broadcast channel. Terminal values
+//!   (`exit_code`, `error`) use `tokio::sync::OnceCell` for write-once
+//!   semantics, eliminating every `Mutex` from the struct.
 //! - Storage is handled by `storage::CommandStorage` trait implementations.
 //!
 //! # Limits
 //!
-//! - Maximum 100 concurrent async commands per session
-//! - Completed commands are automatically cleaned up when session disconnects
+//! - Maximum 100 concurrent async commands per session.
+//! - Default broadcast channel capacity: 1024 frames (configurable via
+//!   `SSH_COMMAND_BROADCAST_CAP`).
+//! - Completed commands are automatically cleaned up when session disconnects.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use tokio::sync::{Mutex, watch};
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use tokio::sync::{OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{AsyncCommandInfo, AsyncCommandStatus};
 
 /// Output buffer for collecting command output
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OutputBuffer {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -86,27 +94,101 @@ fn drain_head_if_over(buf: &mut Vec<u8>, max_size: usize) {
     }
 }
 
-/// State for a running async command
+/// Incremental output frame broadcast to subscribers as the command runs.
+///
+/// Subscribers consume chunks in order; when they fall behind, the broadcast
+/// channel surfaces `RecvError::Lagged`. Recovery is to load a fresh
+/// snapshot from `RunningCommand::output_history` and continue subscribing.
+///
+/// Each chunk carries a `seq` allocated by
+/// [`crate::mcp::subscription::SubscriptionRegistry::next_seq`] so a
+/// subscriber that recovers from `Lagged` can detect gaps.
+#[derive(Debug, Clone)]
+pub enum OutputChunk {
+    /// Stdout bytes appended since the previous frame.
+    Stdout {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Bytes appended since the previous frame.
+        data: Bytes,
+    },
+    /// Stderr bytes appended since the previous frame.
+    Stderr {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Bytes appended since the previous frame.
+        data: Bytes,
+    },
+    /// Terminal frame. `exit_code` is `None` when the command was cancelled,
+    /// failed before producing an exit status, or timed out.
+    Closed {
+        /// Monotonic per-resource sequence number (starts at 1).
+        seq: u64,
+        /// Exit code (`None` when missing — see variant docs).
+        exit_code: Option<i32>,
+    },
+}
+
+/// State for a running async command.
+///
+/// All fields are lock-free: snapshots use `ArcSwap`, terminal values use
+/// `OnceCell`, and incremental updates flow through a broadcast channel.
+/// The reader task owns its local `OutputBuffer` exclusively and re-publishes
+/// it after each chunk.
 pub struct RunningCommand {
-    /// Command metadata
+    /// Command metadata.
     pub info: AsyncCommandInfo,
-    /// Token to cancel the command
+    /// Token to cancel the command.
     pub cancel_token: CancellationToken,
-    /// Receiver for status updates
+    /// Receiver for status updates.
     pub status_rx: watch::Receiver<AsyncCommandStatus>,
-    /// Sender for status updates (kept alive to prevent channel closure)
+    /// Sender for status updates (kept alive to prevent channel closure).
     #[allow(dead_code, reason = "kept alive to prevent watch channel closure")]
     pub status_tx: watch::Sender<AsyncCommandStatus>,
-    /// Output buffer (stdout/stderr)
-    pub output: Arc<Mutex<OutputBuffer>>,
-    /// Exit code when completed
-    pub exit_code: Arc<Mutex<Option<i32>>>,
-    /// Error message if failed
-    pub error: Arc<Mutex<Option<String>>>,
-    /// Whether the command timed out
+    /// Snapshot of the current `OutputBuffer`. The reader task publishes
+    /// updates via `output_history.store(Arc::new(new_buf))`; readers obtain
+    /// a consistent view via `output_history.load_full()`.
+    pub output_history: Arc<ArcSwap<OutputBuffer>>,
+    /// Live broadcast channel for incremental chunks. New subscribers join
+    /// via `output_tx.subscribe()`.
+    pub output_tx: broadcast::Sender<OutputChunk>,
+    /// Write-once: set to `Some(code)` when the command terminates with an
+    /// exit status.
+    pub exit_code: Arc<OnceCell<i32>>,
+    /// Write-once: set to a description on failure.
+    pub error: Arc<OnceCell<String>>,
+    /// Whether the command timed out.
     pub timed_out: Arc<AtomicBool>,
-    /// Whether the output has been read by `ssh_get_command_output`
+    /// Whether the output has been read by `ssh_get_command_output`.
     pub output_read: Arc<AtomicBool>,
+}
+
+impl RunningCommand {
+    /// Construct a `RunningCommand` with fresh lock-free primitives.
+    ///
+    /// The broadcast channel capacity is resolved from `SSH_COMMAND_BROADCAST_CAP`
+    /// via [`super::config::resolve_command_broadcast_cap`], with a default of
+    /// 1024 frames, a floor of 16, and a hard cap of 65536.
+    #[must_use]
+    pub fn new(info: AsyncCommandInfo) -> Self {
+        let (status_tx, status_rx) = watch::channel(AsyncCommandStatus::Running);
+        let cap = super::config::resolve_command_broadcast_cap();
+        let (output_tx, _output_rx) = broadcast::channel(cap);
+        Self {
+            info,
+            cancel_token: CancellationToken::new(),
+            status_rx,
+            status_tx,
+            output_history: Arc::new(ArcSwap::from_pointee(OutputBuffer::with_capacity(
+                4096, 1024,
+            ))),
+            output_tx,
+            exit_code: Arc::new(OnceCell::new()),
+            error: Arc::new(OnceCell::new()),
+            timed_out: Arc::new(AtomicBool::new(false)),
+            output_read: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Maximum number of concurrent async commands (multiplexed channels) per session
@@ -288,28 +370,82 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_output_buffer_concurrent_access() {
-            let output = Arc::new(Mutex::new(OutputBuffer::default()));
+        async fn test_arc_swap_output_history_is_lock_free() {
+            let history = Arc::new(ArcSwap::from_pointee(OutputBuffer::default()));
 
-            let output1 = output.clone();
-            let output2 = output.clone();
-
-            let handle1 = tokio::spawn(async move {
-                let mut buf = output1.lock().await;
-                buf.stdout.extend_from_slice(b"from task 1");
+            let history_writer = Arc::clone(&history);
+            let writer = tokio::spawn(async move {
+                let mut buf = OutputBuffer::default();
+                buf.append_stdout_bounded(b"first chunk", 0);
+                history_writer.store(Arc::new(buf.clone()));
+                buf.append_stderr_bounded(b"err chunk", 0);
+                history_writer.store(Arc::new(buf));
             });
 
-            let handle2 = tokio::spawn(async move {
-                let mut buf = output2.lock().await;
-                buf.stderr.extend_from_slice(b"from task 2");
-            });
+            writer.await.unwrap();
 
-            handle1.await.unwrap();
-            handle2.await.unwrap();
+            let snapshot = history.load_full();
+            assert_eq!(snapshot.stdout, b"first chunk");
+            assert_eq!(snapshot.stderr, b"err chunk");
+        }
 
-            let buf = output.lock().await;
-            assert_eq!(buf.stdout, b"from task 1");
-            assert_eq!(buf.stderr, b"from task 2");
+        #[tokio::test]
+        async fn test_running_command_new_has_lock_free_state() {
+            let info = AsyncCommandInfo {
+                command_id: "cmd-1".to_string(),
+                session_id: "sess-1".to_string(),
+                command: "echo".to_string(),
+                status: AsyncCommandStatus::Running,
+                started_at: "2024-01-15T10:30:00Z".to_string(),
+            };
+            let cmd = RunningCommand::new(info);
+
+            // OnceCell starts empty.
+            assert!(cmd.exit_code.get().is_none());
+            assert!(cmd.error.get().is_none());
+
+            // Setting the exit code once succeeds; setting it again is a no-op.
+            cmd.exit_code.set(0).unwrap();
+            assert_eq!(cmd.exit_code.get(), Some(&0));
+            assert!(cmd.exit_code.set(1).is_err());
+
+            // Output history snapshot is reachable without locks.
+            let snap = cmd.output_history.load_full();
+            assert!(snap.stdout.is_empty());
+            assert!(snap.stderr.is_empty());
+
+            // Broadcast channel accepts subscribers.
+            let mut sub = cmd.output_tx.subscribe();
+            cmd.output_tx
+                .send(OutputChunk::Stdout {
+                    seq: 1,
+                    data: Bytes::from_static(b"hello"),
+                })
+                .unwrap();
+            match sub.recv().await {
+                Ok(OutputChunk::Stdout { seq, data }) => {
+                    assert_eq!(seq, 1);
+                    assert_eq!(data.as_ref(), b"hello");
+                }
+                Ok(OutputChunk::Stderr { .. } | OutputChunk::Closed { .. }) | Err(_) => {
+                    panic!("expected stdout chunk");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_output_chunk_closed_carries_exit_code() {
+            let chunk = OutputChunk::Closed {
+                seq: 1,
+                exit_code: Some(0),
+            };
+            match chunk {
+                OutputChunk::Closed { seq, exit_code } => {
+                    assert_eq!(seq, 1);
+                    assert_eq!(exit_code, Some(0));
+                }
+                OutputChunk::Stdout { .. } | OutputChunk::Stderr { .. } => panic!("wrong variant"),
+            }
         }
 
         #[tokio::test]

@@ -209,4 +209,53 @@ mod tests {
         let auth = KeyAuth::new(&long_path);
         assert!(auth.key_path.to_str().unwrap_or("").len() > 700);
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn name_is_static_str_key() {
+            let auth = KeyAuth::new("/x");
+            let n: &'static str = auth.name();
+            assert_eq!(n, "key");
+        }
+
+        #[test]
+        fn auth_strategy_trait_object_works() {
+            let auth: Box<dyn AuthStrategy> = Box::new(KeyAuth::new("/x"));
+            assert_eq!(auth.name(), "key");
+        }
+
+        #[test]
+        fn relative_path_preserved() {
+            // Relative paths should round-trip without the tilde-expansion
+            // pass mutating them.
+            let auth = KeyAuth::new("relative/path/to/key");
+            assert_eq!(auth.key_path, PathBuf::from("relative/path/to/key"));
+        }
+
+        #[test]
+        fn tilde_only_expanded_when_at_start() {
+            // A tilde NOT at the start should remain as-is (no expansion).
+            let auth = KeyAuth::new("/home/user/~/id_rsa");
+            assert!(auth.key_path.to_string_lossy().contains('~'));
+        }
+
+        #[test]
+        fn nested_tilde_path_expanded_at_start() {
+            let auth = KeyAuth::new("~/.ssh/keys/server-prod");
+            assert!(!auth.key_path.starts_with("~"));
+            assert!(
+                auth.key_path
+                    .to_string_lossy()
+                    .ends_with(".ssh/keys/server-prod")
+            );
+        }
+
+        #[test]
+        fn key_path_can_round_trip_to_string() {
+            let auth = KeyAuth::new("/etc/ssh/host_key");
+            assert_eq!(auth.key_path.to_string_lossy(), "/etc/ssh/host_key");
+        }
+    }
 }

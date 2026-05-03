@@ -356,4 +356,110 @@ mod tests {
             ));
         }
     }
+
+    mod e15_extra_branches {
+        use super::*;
+
+        #[test]
+        fn whitespace_only_input_is_retryable() {
+            // No "ssh", no auth, no retryable token: defaults to retryable.
+            assert!(is_retryable_error("   "));
+        }
+
+        #[test]
+        fn host_is_down_mixed_case_retryable() {
+            assert!(is_retryable_error("HoSt Is DoWn"));
+        }
+
+        #[test]
+        fn no_route_to_host_uppercase_retryable() {
+            assert!(is_retryable_error("NO ROUTE TO HOST"));
+        }
+
+        #[test]
+        fn handshake_failed_retryable_even_with_ssh() {
+            // "ssh handshake failed" hits the retryable list before the SSH branch.
+            assert!(is_retryable_error("ssh handshake failed"));
+        }
+
+        #[test]
+        fn auth_substring_inside_longer_word_still_matches() {
+            // "publickey" is a substring; we want a defensive match.
+            assert!(!is_retryable_error("denied: publickey,gssapi-keyex"));
+        }
+
+        #[test]
+        fn connection_keyword_alone_with_ssh_is_retryable() {
+            // "ssh" + "connect" -> retryable via the SSH-fallback rule.
+            assert!(is_retryable_error("ssh: failed to connect"));
+        }
+
+        #[test]
+        fn ssh_with_timeout_substring_retryable() {
+            // "timeout" appears anywhere inside an SSH-tagged message.
+            assert!(is_retryable_error("ssh: read timeout exceeded"));
+        }
+
+        #[test]
+        fn would_block_substring_retryable() {
+            assert!(is_retryable_error("operation_would_block_internal"));
+        }
+
+        #[test]
+        fn temporary_failure_substring_retryable() {
+            assert!(is_retryable_error("temporary failure in name resolution"));
+        }
+
+        #[test]
+        fn resource_temporarily_unavailable_with_punctuation() {
+            assert!(is_retryable_error(
+                "Error: Resource temporarily unavailable!"
+            ));
+        }
+
+        #[test]
+        fn ssh_only_no_keywords_not_retryable() {
+            // Just an SSH-tagged message with no timeout/connect keyword.
+            assert!(!is_retryable_error("ssh: protocol error"));
+        }
+
+        #[test]
+        fn auth_failed_with_extra_text_still_not_retryable() {
+            assert!(!is_retryable_error(
+                "intermittent: authentication failed for user bob"
+            ));
+        }
+
+        #[test]
+        fn connection_refused_with_address_retryable() {
+            assert!(is_retryable_error("connection refused at 192.168.1.1:22"));
+        }
+
+        #[test]
+        fn empty_string_does_not_panic() {
+            // Robustness check: even empty input must succeed without panic.
+            let _ = is_retryable_error("");
+        }
+
+        #[test]
+        fn special_chars_in_message_handled() {
+            assert!(is_retryable_error("connection refused -- node 'foo'"));
+        }
+
+        #[test]
+        fn very_long_input_classified_correctly() {
+            let mut msg = "x".repeat(8192);
+            msg.push_str(" Connection refused");
+            assert!(is_retryable_error(&msg));
+        }
+
+        #[test]
+        fn classification_is_pure_function() {
+            // Same input, called many times, returns the same result.
+            for _ in 0..100_usize {
+                assert!(is_retryable_error("Connection refused"));
+                assert!(!is_retryable_error("Permission denied"));
+            }
+        }
+    }
 }

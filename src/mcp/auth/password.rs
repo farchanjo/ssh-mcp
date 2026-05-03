@@ -126,4 +126,36 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PasswordAuth>();
     }
+
+    mod e15_extra {
+        use super::*;
+
+        #[test]
+        fn name_is_static_str_password() {
+            // The trait returns a 'static str — verify the literal value.
+            let auth = PasswordAuth::new("secret");
+            let n: &'static str = auth.name();
+            assert_eq!(n, "password");
+        }
+
+        #[test]
+        fn auth_strategy_trait_object_works() {
+            let auth: Box<dyn AuthStrategy> = Box::new(PasswordAuth::new("x"));
+            assert_eq!(auth.name(), "password");
+        }
+
+        #[test]
+        fn distinct_passwords_create_distinct_instances() {
+            let a = PasswordAuth::new("aaa");
+            let b = PasswordAuth::new("bbb");
+            assert_eq!(a.password, "aaa");
+            assert_eq!(b.password, "bbb");
+        }
+
+        #[test]
+        fn password_with_emoji_preserved_byte_for_byte() {
+            let auth = PasswordAuth::new("p4ss🔑w0rd");
+            assert_eq!(auth.password, "p4ss🔑w0rd");
+        }
+    }
 }
