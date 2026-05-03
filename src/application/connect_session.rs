@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::domain::error::DomainError;
-use crate::domain::ids::{AgentId, SessionId};
 use crate::domain::identity::{Address, Credentials};
+use crate::domain::ids::{AgentId, SessionId};
 use crate::domain::policy::ReusePolicy;
 use crate::domain::session::SessionEntity;
 use crate::ports::clock::ClockPort;
@@ -191,10 +191,7 @@ where
     /// Identity probing dispatcher. Skipped entirely for
     /// [`ReusePolicy::ForceNew`] so `Connected { replaced: 0, .. }` matches
     /// the v3 semantics.
-    async fn probe_for_policy(
-        &self,
-        req: &ConnectRequest,
-    ) -> Result<IdentityMatches, DomainError> {
+    async fn probe_for_policy(&self, req: &ConnectRequest) -> Result<IdentityMatches, DomainError> {
         match req.reuse {
             ReusePolicy::ForceNew => Ok(IdentityMatches::default()),
             ReusePolicy::Auto | ReusePolicy::Suggest => {
@@ -395,8 +392,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    type UseCaseUnderTest =
-        ConnectSessionUseCase<FakeSshClient, DashMapSessionRepo, FakeClock, SequentialIds, MapConfig>;
+    type UseCaseUnderTest = ConnectSessionUseCase<
+        FakeSshClient,
+        DashMapSessionRepo,
+        FakeClock,
+        SequentialIds,
+        MapConfig,
+    >;
 
     fn build_use_case() -> (
         UseCaseUnderTest,
@@ -556,6 +558,7 @@ mod tests {
                 FakeSshCall::Connect { .. } => "connect",
                 FakeSshCall::Disconnect { .. } => "disconnect",
                 FakeSshCall::Execute { .. } => "execute",
+                FakeSshCall::ExecuteAsync { .. } => "execute_async",
                 FakeSshCall::HealthCheck { .. } => "health",
             })
             .collect();

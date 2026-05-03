@@ -14,11 +14,16 @@
 //! - **Disconnect outcomes**: pushed via [`FakeSshClient::queue_disconnect_ok`] /
 //!   [`FakeSshClient::queue_disconnect_error`] in FIFO order. Each
 //!   `disconnect` call pops the head; an empty queue defaults to success.
+//! - **`execute_async` outcomes**: pushed via
+//!   [`FakeSshClient::queue_execute_async_ok`] /
+//!   [`FakeSshClient::queue_execute_async_error`] in FIFO order. Each
+//!   `execute_async` call pops the head; an empty queue defaults to a
+//!   success that mints a [`CommandHandle`] from the supplied request.
 //!
-//! Other port methods (`execute`, `execute_async`, `cancel`, `open_shell`)
-//! are not exercised by the H10 use case but the trait surface is satisfied
-//! with `DomainError::Internal("not scripted")` so accidental usage in tests
-//! surfaces immediately rather than silently passing.
+//! Other port methods (`execute`, `cancel`, `open_shell`) are not exercised
+//! by the H10/H12a use cases but the trait surface is satisfied with benign
+//! defaults so accidental usage in tests surfaces immediately rather than
+//! silently passing.
 //!
 //! The whole module is gated behind `#[cfg(any(test, feature = "test-fixtures"))]`
 //! so it never reaches a release binary.
@@ -30,7 +35,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use chrono::Utc;
 
-use crate::domain::command::CommandRequest;
+use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{CommandId, SessionId};
@@ -62,6 +67,22 @@ pub enum FakeSshCall {
         session_id: SessionId,
         /// Verbatim command line.
         command: String,
+    },
+    /// `execute_async(command_id, request)` was invoked. The H12a use case
+    /// hands the freshly minted command id straight to the port, so the call
+    /// log captures the id together with the routing-relevant request fields
+    /// (session, command, optional timeout, pty flag).
+    ExecuteAsync {
+        /// Use-case-minted command id.
+        command_id: CommandId,
+        /// Session that owns the spawned channel.
+        session_id: SessionId,
+        /// Verbatim command line.
+        command: String,
+        /// Optional override for the per-session default timeout.
+        timeout: Option<Duration>,
+        /// Whether the channel must allocate a PTY.
+        pty: bool,
     },
     /// `health_check(session_id)` was invoked.
     HealthCheck {
@@ -97,6 +118,17 @@ enum DisconnectOutcome {
     Err(DomainError),
 }
 
+/// Scripted outcome for an `execute_async` call.
+#[derive(Debug, Clone)]
+enum ExecuteAsyncOutcome {
+    /// `execute_async` succeeds. The fake mints the [`CommandHandle`] from
+    /// the supplied request so tests do not have to plumb a [`CommandEntity`]
+    /// builder through the queue.
+    Ok,
+    /// `execute_async` fails with the supplied domain error.
+    Err(DomainError),
+}
+
 /// Test [`SshClientPort`] adapter. Cloneable; clones share the same
 /// scripted state and the same call log via [`Arc`].
 #[derive(Debug, Clone, Default)]
@@ -112,6 +144,10 @@ struct FakeSshClientInner {
     health_queue: Mutex<Vec<HealthOutcome>>,
     /// Scripted `disconnect` outcomes, popped FIFO.
     disconnect_queue: Mutex<Vec<DisconnectOutcome>>,
+    /// Scripted `execute_async` outcomes, popped FIFO. An empty queue
+    /// defaults to success so tests that only care about call recording do
+    /// not need to seed the queue first.
+    execute_async_queue: Mutex<Vec<ExecuteAsyncOutcome>>,
     /// Append-only log of every recorded call.
     calls: Mutex<Vec<FakeSshCall>>,
 }
@@ -155,6 +191,21 @@ impl FakeSshClient {
     /// Queue a failed `disconnect` outcome with the supplied domain error.
     pub fn queue_disconnect_error(&self, error: DomainError) {
         Self::push(&self.inner.disconnect_queue, DisconnectOutcome::Err(error));
+    }
+
+    /// Queue a successful `execute_async` outcome. The fake derives the
+    /// returned [`CommandHandle`] from the request handed to the trait
+    /// method, so callers script behaviour purely through queue order.
+    pub fn queue_execute_async_ok(&self) {
+        Self::push(&self.inner.execute_async_queue, ExecuteAsyncOutcome::Ok);
+    }
+
+    /// Queue a failed `execute_async` outcome with the supplied domain error.
+    pub fn queue_execute_async_error(&self, error: DomainError) {
+        Self::push(
+            &self.inner.execute_async_queue,
+            ExecuteAsyncOutcome::Err(error),
+        );
     }
 
     /// Snapshot of every recorded call in invocation order.
@@ -225,6 +276,19 @@ impl FakeSshClient {
             },
         )
     }
+
+    fn pop_execute_async_outcome(&self) -> ExecuteAsyncOutcome {
+        self.inner.execute_async_queue.lock().map_or_else(
+            |_| ExecuteAsyncOutcome::Ok,
+            |mut guard| {
+                if guard.is_empty() {
+                    ExecuteAsyncOutcome::Ok
+                } else {
+                    guard.remove(0)
+                }
+            },
+        )
+    }
 }
 
 impl SshClientPort for FakeSshClient {
@@ -287,12 +351,27 @@ impl SshClientPort for FakeSshClient {
 
     async fn execute_async(
         &self,
-        _command_id: CommandId,
-        _request: CommandRequest,
+        command_id: CommandId,
+        request: CommandRequest,
     ) -> Result<CommandHandle, DomainError> {
-        Err(DomainError::Internal(
-            "FakeSshClient::execute_async not scripted".to_string(),
-        ))
+        self.record(FakeSshCall::ExecuteAsync {
+            command_id: command_id.clone(),
+            session_id: request.session_id.clone(),
+            command: request.command.clone(),
+            timeout: request.timeout,
+            pty: request.pty,
+        });
+        match self.pop_execute_async_outcome() {
+            ExecuteAsyncOutcome::Ok => Ok(CommandHandle {
+                entity: CommandEntity::new(
+                    command_id,
+                    request.session_id,
+                    request.command,
+                    Utc::now(),
+                ),
+            }),
+            ExecuteAsyncOutcome::Err(err) => Err(err),
+        }
     }
 
     async fn cancel(&self, command_id: &CommandId) -> Result<(), DomainError> {
