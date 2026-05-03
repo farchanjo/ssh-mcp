@@ -43,4 +43,6 @@
 #![deny(clippy::absolute_paths)]
 #![deny(clippy::allow_attributes_without_reason)]
 
+pub mod domain;
 pub mod mcp;
+pub mod ports;
