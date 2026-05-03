@@ -116,6 +116,19 @@ where
         Self { transfers }
     }
 
+    /// Borrow the shared transfer-repository handle.
+    ///
+    /// The inbound rmcp layer uses this to interleave per-tick lookups
+    /// with the use case future when emitting bounded
+    /// `notifications/progress` notifications during a `wait=true`
+    /// poll. The use case body itself does not need an accessor (it
+    /// already owns the same `Arc`); the helper is purely
+    /// inbound-facing.
+    #[must_use]
+    pub const fn transfers(&self) -> &Arc<TR> {
+        &self.transfers
+    }
+
     /// Drive the orchestration. See module-level docs for the step-by-step
     /// semantics.
     ///
