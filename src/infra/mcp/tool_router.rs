@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rmcp::ErrorData as McpError;
+use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Icon, Implementation, ListResourcesResult, PaginatedRequestParams,
+    CallToolResult, Icon, Implementation, ListResourcesResult, PaginatedRequestParams,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -51,8 +52,13 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
-use crate::infra::mcp::helpers::error::format_error;
+use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
+use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::render;
+use crate::infra::mcp::results::{
+    SshConnectResult, SshExecuteResult, SshGetCommandOutputResult, SshGetTransferProgressResult,
+    SshShellOpenResult, SshShellReadResult,
+};
 use crate::ports::auth_strategy::AuthStrategyPort;
 use crate::ports::clock::ClockPort;
 use crate::ports::command_repo::CommandRepository;
@@ -91,12 +97,14 @@ use super::server::McpSshServer;
 // ---------------------------------------------------------------------------
 
 /// Build a `CallToolResult::error` body using the v3 standardized
-/// `TOOL: ERROR / REASON: [CODE] message` format. The mapping picks a
-/// stable code per [`DomainError`] variant so the LLM can branch on it.
+/// `TOOL: ERROR / REASON: [CODE] message` format and the v4.7 structured
+/// JSON twin. The mapping picks a stable code per [`DomainError`]
+/// variant so the LLM can branch on it.
 fn render_tool_error(tool: &str, err: &DomainError) -> CallToolResult {
     let (code, reason, detail) = classify_error(err);
     let body = format_error(tool, code, &reason, detail.as_deref());
-    CallToolResult::error(vec![Content::text(body)])
+    let structured = format_error_structured(tool, code, &reason, detail.as_deref());
+    error_text_and_structured(body, structured)
 }
 
 /// Tags surfaced through [`DomainError::InvalidArgument`] messages. Each
@@ -228,11 +236,6 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
     }
 }
 
-/// Wrap a successful render body in [`CallToolResult::success`].
-fn ok_text(body: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(body)])
-}
-
 /// Convert a string `host[:port]` into a domain [`Address`].
 fn parse_address(input: &str) -> Result<Address, DomainError> {
     if let Some((host, port_str)) = input.rsplit_once(':') {
@@ -334,7 +337,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward.\n- `AGENT_ID`: optional grouping; passed to ssh_list_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_execute `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto."
+        description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_execute, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward.\n- `AGENT_ID`: optional grouping; passed to ssh_list_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_execute `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.",
+        output_schema = schema_for_type::<SshConnectResult>()
     )]
     async fn ssh_connect(
         &self,
@@ -364,7 +368,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::disconnect_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::connection::disconnect_structured(&outcome);
+                let body = render::connection::disconnect_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DISCONNECT", &err)),
         }
     }
@@ -382,6 +390,7 @@ where
         &self,
         Parameters(args): Parameters<SshListSessionsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = args.agent_id.clone();
         match self
             .use_cases
             .list_sessions
@@ -391,7 +400,12 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::list_sessions_render(outcome))),
+            Ok(outcome) => {
+                let structured =
+                    render::connection::list_sessions_structured(&outcome, filter.as_deref());
+                let body = render::connection::list_sessions_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_LIST_SESSIONS", &err)),
         }
     }
@@ -417,9 +431,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::disconnect_agent_render(
-                &outcome,
-            ))),
+            Ok(outcome) => {
+                let structured = render::connection::disconnect_agent_structured(&outcome);
+                let body = render::connection::disconnect_agent_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
         }
     }
@@ -433,7 +449,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and polling its output via ssh_get_command_output.\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: passed to ssh_get_command_output, ssh_cancel_command.\n\nWorkflow:\n1. Call ssh_execute with the SESSION_ID and command line.\n2. Use ssh_get_command_output to fetch progress / completion.\n3. Optional ssh_cancel_command to interrupt.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async)."
+        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and polling its output via ssh_get_command_output.\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: passed to ssh_get_command_output, ssh_cancel_command.\n\nWorkflow:\n1. Call ssh_execute with the SESSION_ID and command line.\n2. Use ssh_get_command_output to fetch progress / completion.\n3. Optional ssh_cancel_command to interrupt.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+        output_schema = schema_for_type::<SshExecuteResult>()
     )]
     async fn ssh_execute(
         &self,
@@ -446,7 +463,11 @@ where
             use_pty: args.pty.unwrap_or(false),
         };
         match self.use_cases.execute.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::execute_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::execute_structured(&outcome);
+                let body = render::execute::execute_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_EXECUTE", &err)),
         }
     }
@@ -458,7 +479,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs."
+        description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
         &self,
@@ -471,7 +493,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         match self.use_cases.get_command_output.execute(req).await {
-            Ok(result) => Ok(ok_text(render::execute::get_command_output_render(result))),
+            Ok(result) => {
+                let structured = render::execute::get_command_output_structured(&result);
+                let body = render::execute::get_command_output_render(result);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_GET_COMMAND_OUTPUT", &err)),
         }
     }
@@ -497,7 +523,11 @@ where
             max_items: args.max_items,
         };
         match self.use_cases.list_commands.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::list_commands_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::list_commands_structured(&outcome);
+                let body = render::execute::list_commands_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_LIST_COMMANDS", &err)),
         }
     }
@@ -520,7 +550,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         match self.use_cases.cancel_command.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::cancel_command_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::cancel_command_structured(&outcome);
+                let body = render::execute::cancel_command_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_CANCEL_COMMAND", &err)),
         }
     }
@@ -534,7 +568,8 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- Prefer subscribing to `shell://<shell_id>/output` over polling ssh_shell_read.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_send_key, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id."
+        description = "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- Prefer subscribing to `shell://<shell_id>/output` over polling ssh_shell_read.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_send_key, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
+        output_schema = schema_for_type::<SshShellOpenResult>()
     )]
     async fn ssh_shell_open(
         &self,
@@ -549,7 +584,11 @@ where
             max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
         };
         match self.use_cases.open_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_open_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_open_structured(&outcome);
+                let body = render::shell::shell_open_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_OPEN", &err)),
         }
     }
@@ -572,7 +611,11 @@ where
             bytes: Bytes::from(args.input.into_bytes()),
         };
         match self.use_cases.write_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_write_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_write_structured(&outcome);
+                let body = render::shell::shell_write_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_WRITE", &err)),
         }
     }
@@ -597,7 +640,11 @@ where
             repeat: args.repeat.unwrap_or(1),
         };
         match self.use_cases.send_key.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_send_key_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_send_key_structured(&outcome);
+                let body = render::shell::shell_send_key_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_SEND_KEY", &err)),
         }
     }
@@ -609,22 +656,28 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Read the buffered output of a PTY shell.\n\nWhen to use:\n- FALLBACK polling when subscribing to `shell://<shell_id>/output` is not feasible.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs."
+        description = "Read the buffered output of a PTY shell.\n\nWhen to use:\n- FALLBACK polling when subscribing to `shell://<shell_id>/output` is not feasible.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        output_schema = schema_for_type::<SshShellReadResult>()
     )]
     async fn ssh_shell_read(
         &self,
         Parameters(args): Parameters<SshShellReadArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let cleared = args.clear.unwrap_or(true);
         let req = ReadShellRequest {
             shell_id: ShellId::new(args.shell_id),
-            clear: args.clear.unwrap_or(true),
+            clear: cleared,
             max_output_bytes: args.max_output_bytes,
             wait: args.wait.unwrap_or(false),
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
             min_bytes: args.min_bytes,
         };
         match self.use_cases.read_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_read_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_read_structured(&outcome, cleared);
+                let body = render::shell::shell_read_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_READ", &err)),
         }
     }
@@ -650,7 +703,11 @@ where
             clear: args.clear.unwrap_or(true),
         };
         match self.use_cases.wait_for_pattern.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_wait_for_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_wait_for_structured(&outcome);
+                let body = render::shell::shell_wait_for_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_WAIT_FOR", &err)),
         }
     }
@@ -676,7 +733,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_close_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_close_structured(&outcome);
+                let body = render::shell::shell_close_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_CLOSE", &err)),
         }
     }
@@ -702,7 +763,11 @@ where
             remote_path: args.remote_path,
         };
         match self.use_cases.upload_file.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::sftp::upload_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::sftp::upload_structured(&outcome);
+                let body = render::sftp::upload_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_UPLOAD", &err)),
         }
     }
@@ -726,7 +791,11 @@ where
             local_path: args.local_path,
         };
         match self.use_cases.download_file.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::sftp::download_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::sftp::download_structured(&outcome);
+                let body = render::sftp::download_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DOWNLOAD", &err)),
         }
     }
@@ -738,7 +807,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs."
+        description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.",
+        output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
         &self,
@@ -750,7 +820,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
         match self.use_cases.get_transfer_progress.execute(req).await {
-            Ok(result) => Ok(ok_text(render::sftp::transfer_progress_render(&result))),
+            Ok(result) => {
+                let structured = render::sftp::transfer_progress_structured(&result);
+                let body = render::sftp::transfer_progress_render(&result);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_GET_TRANSFER_PROGRESS", &err)),
         }
     }
@@ -777,7 +851,11 @@ where
             remote_port: args.remote_port,
         };
         match self.use_cases.forward_port.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::forward::forward_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::forward::forward_structured(&outcome);
+                let body = render::forward::forward_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_FORWARD", &err)),
         }
     }
@@ -828,7 +906,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Connect to an SSH server and store the session.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto."
+        description = "Connect to an SSH server and store the session.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.",
+        output_schema = schema_for_type::<SshConnectResult>()
     )]
     async fn ssh_connect(
         &self,
@@ -858,7 +937,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::disconnect_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::connection::disconnect_structured(&outcome);
+                let body = render::connection::disconnect_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DISCONNECT", &err)),
         }
     }
@@ -876,6 +959,7 @@ where
         &self,
         Parameters(args): Parameters<SshListSessionsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = args.agent_id.clone();
         match self
             .use_cases
             .list_sessions
@@ -885,7 +969,12 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::list_sessions_render(outcome))),
+            Ok(outcome) => {
+                let structured =
+                    render::connection::list_sessions_structured(&outcome, filter.as_deref());
+                let body = render::connection::list_sessions_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_LIST_SESSIONS", &err)),
         }
     }
@@ -911,9 +1000,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::connection::disconnect_agent_render(
-                &outcome,
-            ))),
+            Ok(outcome) => {
+                let structured = render::connection::disconnect_agent_structured(&outcome);
+                let body = render::connection::disconnect_agent_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
         }
     }
@@ -927,7 +1018,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async)."
+        description = "Spawn an asynchronous command on an SSH session.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+        output_schema = schema_for_type::<SshExecuteResult>()
     )]
     async fn ssh_execute(
         &self,
@@ -940,7 +1032,11 @@ where
             use_pty: args.pty.unwrap_or(false),
         };
         match self.use_cases.execute.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::execute_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::execute_structured(&outcome);
+                let body = render::execute::execute_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_EXECUTE", &err)),
         }
     }
@@ -952,7 +1048,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs."
+        description = "Fetch the current output of an asynchronous command.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
         &self,
@@ -965,7 +1062,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         match self.use_cases.get_command_output.execute(req).await {
-            Ok(result) => Ok(ok_text(render::execute::get_command_output_render(result))),
+            Ok(result) => {
+                let structured = render::execute::get_command_output_structured(&result);
+                let body = render::execute::get_command_output_render(result);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_GET_COMMAND_OUTPUT", &err)),
         }
     }
@@ -991,7 +1092,11 @@ where
             max_items: args.max_items,
         };
         match self.use_cases.list_commands.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::list_commands_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::list_commands_structured(&outcome);
+                let body = render::execute::list_commands_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_LIST_COMMANDS", &err)),
         }
     }
@@ -1014,7 +1119,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         match self.use_cases.cancel_command.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::execute::cancel_command_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::execute::cancel_command_structured(&outcome);
+                let body = render::execute::cancel_command_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_CANCEL_COMMAND", &err)),
         }
     }
@@ -1028,7 +1137,8 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open an interactive PTY shell.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id."
+        description = "Open an interactive PTY shell.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
+        output_schema = schema_for_type::<SshShellOpenResult>()
     )]
     async fn ssh_shell_open(
         &self,
@@ -1043,7 +1153,11 @@ where
             max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
         };
         match self.use_cases.open_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_open_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_open_structured(&outcome);
+                let body = render::shell::shell_open_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_OPEN", &err)),
         }
     }
@@ -1066,7 +1180,11 @@ where
             bytes: Bytes::from(args.input.into_bytes()),
         };
         match self.use_cases.write_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_write_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_write_structured(&outcome);
+                let body = render::shell::shell_write_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_WRITE", &err)),
         }
     }
@@ -1091,7 +1209,11 @@ where
             repeat: args.repeat.unwrap_or(1),
         };
         match self.use_cases.send_key.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_send_key_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_send_key_structured(&outcome);
+                let body = render::shell::shell_send_key_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_SEND_KEY", &err)),
         }
     }
@@ -1103,22 +1225,28 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Read the buffered output of a PTY shell.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs."
+        description = "Read the buffered output of a PTY shell.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        output_schema = schema_for_type::<SshShellReadResult>()
     )]
     async fn ssh_shell_read(
         &self,
         Parameters(args): Parameters<SshShellReadArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let cleared = args.clear.unwrap_or(true);
         let req = ReadShellRequest {
             shell_id: ShellId::new(args.shell_id),
-            clear: args.clear.unwrap_or(true),
+            clear: cleared,
             max_output_bytes: args.max_output_bytes,
             wait: args.wait.unwrap_or(false),
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
             min_bytes: args.min_bytes,
         };
         match self.use_cases.read_shell.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_read_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_read_structured(&outcome, cleared);
+                let body = render::shell::shell_read_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_READ", &err)),
         }
     }
@@ -1144,7 +1272,11 @@ where
             clear: args.clear.unwrap_or(true),
         };
         match self.use_cases.wait_for_pattern.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_wait_for_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_wait_for_structured(&outcome);
+                let body = render::shell::shell_wait_for_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_WAIT_FOR", &err)),
         }
     }
@@ -1170,7 +1302,11 @@ where
             })
             .await
         {
-            Ok(outcome) => Ok(ok_text(render::shell::shell_close_render(&outcome))),
+            Ok(outcome) => {
+                let structured = render::shell::shell_close_structured(&outcome);
+                let body = render::shell::shell_close_render(&outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_SHELL_CLOSE", &err)),
         }
     }
@@ -1196,7 +1332,11 @@ where
             remote_path: args.remote_path,
         };
         match self.use_cases.upload_file.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::sftp::upload_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::sftp::upload_structured(&outcome);
+                let body = render::sftp::upload_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_UPLOAD", &err)),
         }
     }
@@ -1220,7 +1360,11 @@ where
             local_path: args.local_path,
         };
         match self.use_cases.download_file.execute(req).await {
-            Ok(outcome) => Ok(ok_text(render::sftp::download_render(outcome))),
+            Ok(outcome) => {
+                let structured = render::sftp::download_structured(&outcome);
+                let body = render::sftp::download_render(outcome);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_DOWNLOAD", &err)),
         }
     }
@@ -1232,7 +1376,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs."
+        description = "Snapshot the progress of an SFTP transfer.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.",
+        output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
         &self,
@@ -1244,7 +1389,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
         match self.use_cases.get_transfer_progress.execute(req).await {
-            Ok(result) => Ok(ok_text(render::sftp::transfer_progress_render(&result))),
+            Ok(result) => {
+                let structured = render::sftp::transfer_progress_structured(&result);
+                let body = render::sftp::transfer_progress_render(&result);
+                Ok(ok_text_and_structured(body, structured))
+            }
             Err(err) => Ok(render_tool_error("SSH_GET_TRANSFER_PROGRESS", &err)),
         }
     }
@@ -1273,7 +1422,11 @@ where
         Err(err) => return Ok(render_tool_error("SSH_CONNECT", &err)),
     };
     match use_case.execute(req).await {
-        Ok(outcome) => Ok(ok_text(render::connection::connect_render(outcome))),
+        Ok(outcome) => {
+            let structured = render::connection::connect_structured(&outcome);
+            let body = render::connection::connect_render(outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
         Err(err) => Ok(render_tool_error("SSH_CONNECT", &err)),
     }
 }
@@ -1366,11 +1519,9 @@ fn build_implementation() -> Implementation {
         )
         .with_website_url("https://github.com/farchanjo/ssh-mcp")
         .with_icons(vec![
-            Icon::new(
-                "https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg",
-            )
-            .with_mime_type("image/svg+xml")
-            .with_sizes(vec!["any".to_string()]),
+            Icon::new("https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg")
+                .with_mime_type("image/svg+xml")
+                .with_sizes(vec!["any".to_string()]),
         ])
 }
 
@@ -1766,5 +1917,133 @@ mod tests {
         let (code, reason, _detail) = classify_error(&err);
         assert_eq!(code, "REMOTE_METADATA_ERROR");
         assert_eq!(reason, "cannot stat remote path: permission denied");
+    }
+
+    // ---------------------------------------------------------------
+    // v4.7 — structured_content payload mirrors the Markdown body.
+    //
+    // Each tool now emits both the legacy block-style Markdown body
+    // (byte-identical with v4.6) and a typed JSON object on
+    // `CallToolResult::structured_content`. Smaller LLMs index by key;
+    // the schema is exposed via `tools/list` for the six stretch-goal
+    // tools (connect, execute, get_command_output, shell_open,
+    // shell_read, get_transfer_progress).
+    // ---------------------------------------------------------------
+
+    use super::render_tool_error;
+    use crate::application::connect_session::ConnectOutcome;
+    use crate::application::execute_command::ExecuteOutcome;
+    use crate::application::open_shell::OpenShellOutcome;
+    use crate::domain::identity::Address;
+    use crate::domain::ids::{CommandId, SessionId, ShellId};
+    use crate::domain::session::SessionEntity;
+    use crate::domain::shell::{ShellEntity, ShellTerminal};
+    use crate::infra::mcp::helpers::structured::ok_text_and_structured;
+    use crate::infra::mcp::render;
+    use chrono::{TimeZone, Utc};
+    use std::time::Duration;
+
+    fn sample_session(id: &str) -> SessionEntity {
+        SessionEntity {
+            id: SessionId::new(id.to_string()),
+            name: None,
+            agent_id: None,
+            address: Address::new("h.example.com".to_string(), 22).expect("address"),
+            username: "alice".to_string(),
+            connected_at: Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap(),
+            default_timeout: Duration::from_secs(30),
+            retry_attempts: 0,
+            compression_enabled: true,
+            last_health_check: None,
+            healthy: Some(true),
+        }
+    }
+
+    #[test]
+    fn structured_content_mirrors_text_for_ssh_connect_ok() {
+        let session = sample_session("sess-abc");
+        let outcome = ConnectOutcome::Connected {
+            session,
+            replaced: 0,
+            retries: 0,
+            persistent: false,
+            inactivity_timeout: Duration::from_secs(300),
+        };
+        let structured = render::connection::connect_structured(&outcome);
+        let body = render::connection::connect_render(outcome);
+        let result = ok_text_and_structured(body.clone(), structured.clone());
+        // Markdown side stays byte-identical with v4.6.
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("markdown body present");
+        assert!(text.starts_with("SSH_CONNECT: OK"));
+        // Structured side carries the discriminating keys.
+        let json = result.structured_content.expect("structured present");
+        assert_eq!(json["tool"], "ssh_connect");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["session_id"], "sess-abc");
+        assert!(json["next"].is_array(), "next must be a list of tool names");
+    }
+
+    #[test]
+    fn structured_content_mirrors_text_for_ssh_execute_started() {
+        let outcome = ExecuteOutcome {
+            command_id: CommandId::new("cmd-xyz".to_string()),
+            session_id: SessionId::new("sess-1".to_string()),
+            agent_id: None,
+            started_at: "2026-04-18T10:30:00+00:00".to_string(),
+        };
+        let structured = render::execute::execute_structured(&outcome);
+        let body = render::execute::execute_render(outcome);
+        let result = ok_text_and_structured(body, structured);
+        let json = result.structured_content.expect("structured present");
+        assert_eq!(json["tool"], "ssh_execute");
+        assert_eq!(json["status"], "started");
+        assert_eq!(json["command_id"], "cmd-xyz");
+        assert_eq!(json["session_id"], "sess-1");
+        assert!(json["next"].is_array());
+    }
+
+    #[test]
+    fn structured_content_mirrors_text_for_ssh_shell_open() {
+        let shell = ShellEntity::new(
+            ShellId::new("sh-1".to_string()),
+            SessionId::new("sess-1".to_string()),
+            ShellTerminal::new("xterm".to_string(), 80, 24),
+            Utc::now(),
+            Duration::from_secs(900),
+            1024,
+        );
+        let outcome = OpenShellOutcome {
+            shell,
+            session_id: SessionId::new("sess-1".to_string()),
+            agent_id: None,
+        };
+        let structured = render::shell::shell_open_structured(&outcome);
+        let body = render::shell::shell_open_render(outcome);
+        let result = ok_text_and_structured(body, structured);
+        let json = result.structured_content.expect("structured present");
+        assert_eq!(json["tool"], "ssh_shell_open");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["shell_id"], "sh-1");
+        assert_eq!(json["term"], "xterm");
+        assert_eq!(json["cols"], 80);
+        assert_eq!(json["rows"], 24);
+        assert!(json["next"].is_array());
+    }
+
+    #[test]
+    fn structured_error_carries_code_and_reason() {
+        let err = DomainError::InvalidArgument("EMPTY_PATTERNS: must contain >=1".to_string());
+        let result = render_tool_error("SSH_SHELL_WAIT_FOR", &err);
+        assert_eq!(result.is_error, Some(true));
+        let json = result.structured_content.expect("structured present");
+        assert_eq!(json["tool"], "ssh_shell_wait_for");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["code"], "EMPTY_PATTERNS");
+        assert_eq!(json["reason"], "must contain >=1");
+        assert!(json["detail"].is_null());
     }
 }
