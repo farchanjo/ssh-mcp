@@ -59,6 +59,24 @@ impl SessionEntity {
         self.healthy = Some(healthy);
         self
     }
+
+    /// Overwrite the timestamp of the most recent health probe.
+    ///
+    /// Provided for repository adapters that mutate an entity in place
+    /// behind a shard lock (e.g. [`crate::ports::session_repo::SessionRepository::update_health`]).
+    /// Prefer [`Self::with_health`] in builder-style code.
+    pub const fn set_last_health_check(&mut self, at: DateTime<Utc>) {
+        self.last_health_check = Some(at);
+    }
+
+    /// Overwrite the outcome of the most recent health probe.
+    ///
+    /// Provided for repository adapters that mutate an entity in place
+    /// behind a shard lock (e.g. [`crate::ports::session_repo::SessionRepository::update_health`]).
+    /// Prefer [`Self::with_health`] in builder-style code.
+    pub const fn set_healthy(&mut self, healthy: bool) {
+        self.healthy = Some(healthy);
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +117,22 @@ mod tests {
         let updated = s.with_health(now, true);
         assert_eq!(updated.healthy, Some(true));
         assert_eq!(updated.last_health_check, Some(now));
+    }
+
+    #[test]
+    fn set_last_health_check_overwrites_in_place() {
+        let mut s = sample();
+        let now = Utc::now();
+        s.set_last_health_check(now);
+        assert_eq!(s.last_health_check, Some(now));
+    }
+
+    #[test]
+    fn set_healthy_overwrites_in_place() {
+        let mut s = sample();
+        s.set_healthy(false);
+        assert_eq!(s.healthy, Some(false));
+        s.set_healthy(true);
+        assert_eq!(s.healthy, Some(true));
     }
 }
