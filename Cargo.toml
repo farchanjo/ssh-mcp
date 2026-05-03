@@ -45,10 +45,13 @@ harness = true
 #   * `trait-variant` added to enable AFIT on dyn-safe ports, replacing the
 #     v3 `async-trait` `Box<dyn Future>` pattern as ports/adapters land.
 #   * `async-trait` is kept transitionally because the v3 auth strategy chain
-#     (`src/mcp/auth/*.rs`) still uses `#[async_trait]`. Slated for removal in
-#     etapa E1 once the auth ports are migrated to the AFIT/`trait-variant`
-#     pattern. Until then both crates coexist; only `async-trait` reaches
-#     production code.
+#     (`src/mcp/auth/*.rs`) still uses `#[async_trait]`. The v4 replacement
+#     landed in etapa H8 (`src/adapters/auth/`) using `trait-variant` AFIT
+#     and the [`crate::ports::auth_strategy::AuthStrategyPort`] port; the
+#     direct `async-trait` dep is slated for removal in etapa H17 once the
+#     v3 path is decommissioned. Until then both crates coexist; only the
+#     v3 module reaches `async-trait` directly (the rmcp transitive copy is
+#     outside our control).
 
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [
@@ -75,8 +78,8 @@ russh = "0.55"
 russh-sftp = "2"
 
 # Trait abstraction (v3 -> v4 transition window)
-async-trait = "0.1"     # legacy: v3 auth chain (`src/mcp/auth/*.rs`); removed in E1
-trait-variant = "0.1"   # v4: dyn-safe AFIT pattern for ports/adapters
+async-trait = "0.1"     # legacy: v3 auth chain (`src/mcp/auth/*.rs`) only; removed in H17
+trait-variant = "0.1"   # v4: AFIT pattern for ports/adapters (auth chain refit landed in H8)
 
 # Lock-free primitives
 arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>

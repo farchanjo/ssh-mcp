@@ -11,6 +11,7 @@
 //! by an independent agent so this module is intentionally minimal —
 //! just `pub mod` declarations.
 
+pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod id_generator;
