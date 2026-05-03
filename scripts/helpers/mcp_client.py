@@ -26,11 +26,8 @@ from typing import Any, Iterable
 
 try:
     import requests  # type: ignore
-except ImportError as exc:  # pragma: no cover - fail fast at import
-    raise ImportError(
-        "ssh-mcp test helpers require the `requests` package. "
-        "Install with `pip install requests`."
-    ) from exc
+except ImportError:  # pragma: no cover - HTTP is optional for stdio-only callers
+    requests = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +66,11 @@ class HttpTransport(Transport):
     """
 
     def __init__(self, base_url: str = "http://127.0.0.1:8000", *, request_timeout: float = 60.0) -> None:
+        if requests is None:  # pragma: no cover - module-level guard
+            raise ImportError(
+                "HttpTransport requires the `requests` package. "
+                "Install with `pip install requests` or use StdioTransport."
+            )
         self.base_url = base_url.rstrip("/") + "/"
         self.session_id: str | None = None
         self._notifications: queue.Queue[dict] = queue.Queue()

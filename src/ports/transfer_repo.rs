@@ -14,6 +14,35 @@ pub trait LocalTransferRepository: Send + Sync {
     /// Returns `DomainError::Storage` on backend failure.
     async fn insert(&self, entity: TransferEntity) -> Result<(), DomainError>;
 
+    /// Atomic check-and-insert: insert `entity` only if the count of
+    /// transfers owned by `entity.session_id` is strictly below `cap`.
+    ///
+    /// This closes the TOCTOU race observed in
+    /// [`crate::application::upload_file`] /
+    /// [`crate::application::download_file`] when many concurrent uploads
+    /// land on the same session: a non-atomic
+    /// `count_by_session` + `insert` pair could observe N concurrent
+    /// readers below the cap and let N inserts past the gate (so the
+    /// shard ended up with `N` running transfers when `cap` was the
+    /// agreed ceiling).
+    ///
+    /// Implementations must perform the count probe and the insert under
+    /// a single shard guard — no `await` between them — so the cap is
+    /// honoured globally rather than per-caller.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::MaxTransfersExceeded`] when the session bucket
+    ///   already holds `cap` entries.
+    /// - [`DomainError::Internal`] when the id collides with an existing
+    ///   row (matches the [`Self::insert`] contract).
+    /// - [`DomainError::Storage`] on backend failure.
+    async fn insert_if_under_cap(
+        &self,
+        entity: TransferEntity,
+        cap: usize,
+    ) -> Result<(), DomainError>;
+
     /// Update a stored transfer.
     ///
     /// # Errors

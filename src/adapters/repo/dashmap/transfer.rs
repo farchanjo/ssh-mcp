@@ -101,6 +101,42 @@ impl TransferRepository for DashMapTransferRepo {
         }
     }
 
+    async fn insert_if_under_cap(
+        &self,
+        entity: TransferEntity,
+        cap: usize,
+    ) -> Result<(), DomainError> {
+        let id = entity.id.clone();
+        let session_id = entity.session_id.clone();
+
+        // Take the session bucket's shard guard FIRST so the count probe
+        // and the membership update happen atomically against any other
+        // `insert_if_under_cap` racing on the same session. Holding this
+        // guard blocks concurrent `index_session` / `deindex_session`
+        // calls on the same key — exactly the TOCTOU window we are
+        // closing here.
+        let mut bucket = self.by_session.entry(session_id.clone()).or_default();
+        if bucket.len() >= cap {
+            // The shard guard drops at end of scope; nothing else changed.
+            return Err(DomainError::MaxTransfersExceeded { limit: cap });
+        }
+
+        // Now bind the primary row. `entry` provides per-shard atomicity
+        // against another `insert` racing on the same id. The `by_id`
+        // shard is independent of `by_session`, so no nested-guard
+        // dead-lock window exists.
+        match self.by_id.entry(id.clone()) {
+            Entry::Vacant(slot) => {
+                drop(slot.insert(entity));
+                bucket.insert(id);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(DomainError::Internal(format!(
+                "transfer {id} already exists; remove() before re-insert"
+            ))),
+        }
+    }
+
     async fn update(&self, entity: TransferEntity) -> Result<(), DomainError> {
         let id = entity.id.clone();
         let new_session = entity.session_id.clone();
@@ -420,6 +456,95 @@ mod tests {
             .await
             .expect("get b");
         assert!(in_b.is_none(), "fresh repo must not see other repo's data");
+    }
+
+    #[tokio::test]
+    async fn insert_if_under_cap_rejects_at_cap() {
+        let repo = DashMapTransferRepo::new();
+        let cap = 3_usize;
+        for i in 0..cap {
+            repo.insert_if_under_cap(
+                entity(&format!("t-{i}"), "s-cap", TransferDirection::Upload),
+                cap,
+            )
+            .await
+            .expect("under cap insert");
+        }
+        let err = repo
+            .insert_if_under_cap(
+                entity("t-overflow", "s-cap", TransferDirection::Upload),
+                cap,
+            )
+            .await
+            .expect_err("must reject at cap");
+        match err {
+            DomainError::MaxTransfersExceeded { limit } => assert_eq!(limit, cap),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let count = repo
+            .count_by_session(&SessionId::new("s-cap".to_string()))
+            .await
+            .expect("count");
+        assert_eq!(count, cap, "exactly cap rows must persist");
+    }
+
+    #[tokio::test]
+    async fn insert_if_under_cap_is_atomic_under_concurrency() {
+        // 50 concurrent inserts targeting the same session with cap=10.
+        // Without the atomic shard guard, the read-then-insert pattern in
+        // the use case let multiple inserts past the gate. The new
+        // method must converge on exactly 10 rows.
+        let repo = std::sync::Arc::new(DashMapTransferRepo::new());
+        let cap = 10_usize;
+        let session = SessionId::new("burst".to_string());
+        let mut handles = Vec::with_capacity(50);
+        for i in 0..50_u32 {
+            let repo_c = std::sync::Arc::clone(&repo);
+            let sid = session.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = repo_c
+                    .insert_if_under_cap(
+                        TransferEntity::new(
+                            TransferId::new(format!("t-burst-{i}")),
+                            sid,
+                            TransferDirection::Upload,
+                            "/tmp/local".to_string(),
+                            "/srv/remote".to_string(),
+                            chrono::Utc::now(),
+                            1024,
+                        ),
+                        cap,
+                    )
+                    .await;
+            }));
+        }
+        for h in handles {
+            h.await.expect("join");
+        }
+        let count = repo.count_by_session(&session).await.expect("count");
+        assert_eq!(count, cap, "atomic gate must converge on cap (got {count})");
+    }
+
+    #[tokio::test]
+    async fn insert_if_under_cap_rejects_duplicate_id() {
+        let repo = DashMapTransferRepo::new();
+        repo.insert_if_under_cap(
+            entity("t-dup", "s-1", TransferDirection::Upload),
+            10,
+        )
+        .await
+        .expect("first");
+        let err = repo
+            .insert_if_under_cap(
+                entity("t-dup", "s-1", TransferDirection::Upload),
+                10,
+            )
+            .await
+            .expect_err("second must fail");
+        match err {
+            DomainError::Internal(msg) => assert!(msg.contains("t-dup")),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[tokio::test]

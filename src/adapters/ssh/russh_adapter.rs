@@ -72,7 +72,9 @@ use crate::adapters::ssh::internal::shell::{
     ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms,
 };
 use crate::adapters::ssh::internal::status_sink::{
-    NoopCommandStatusSink, NoopShellStatusSink, SharedCommandStatusSink, SharedShellStatusSink,
+    NoopCommandRegistrationSink, NoopCommandStatusSink, NoopShellRegistrationSink,
+    NoopShellStatusSink, SharedCommandRegistrationSink, SharedCommandStatusSink,
+    SharedShellRegistrationSink, SharedShellStatusSink,
 };
 use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::domain::auth::AuthError;
@@ -245,6 +247,15 @@ pub struct RusshAdapter {
     /// domain `ShellRepository`. Defaults to a no-op for the same
     /// reason as [`Self::command_status_sink`].
     shell_status_sink: SharedShellStatusSink,
+    /// Bridge that mirrors the in-memory async-command lifecycle into
+    /// the domain `CommandRepository` (v4.3 fix: closes the registration
+    /// race window between adapter-side bind and use-case-side
+    /// `CommandRepository::insert`). Defaults to a no-op for tests /
+    /// fixtures.
+    command_registration_sink: SharedCommandRegistrationSink,
+    /// Bridge that mirrors the in-memory PTY shell lifecycle into the
+    /// domain `ShellRepository`. See [`Self::command_registration_sink`].
+    shell_registration_sink: SharedShellRegistrationSink,
 }
 
 impl fmt::Debug for RusshAdapter {
@@ -257,6 +268,8 @@ impl fmt::Debug for RusshAdapter {
             .field("sftp_handle_registry", &self.sftp_handle_registry)
             .field("command_status_sink", &"<dyn CommandStatusSink>")
             .field("shell_status_sink", &"<dyn ShellStatusSink>")
+            .field("command_registration_sink", &"<dyn CommandRegistrationSink>")
+            .field("shell_registration_sink", &"<dyn ShellRegistrationSink>")
             .finish()
     }
 }
@@ -276,6 +289,8 @@ impl RusshAdapter {
             sftp_handle_registry: SshHandleRegistry::new(),
             command_status_sink: Arc::new(NoopCommandStatusSink),
             shell_status_sink: Arc::new(NoopShellStatusSink),
+            command_registration_sink: Arc::new(NoopCommandRegistrationSink),
+            shell_registration_sink: Arc::new(NoopShellRegistrationSink),
         }
     }
 
@@ -314,6 +329,32 @@ impl RusshAdapter {
     #[must_use]
     pub fn with_shell_status_sink(mut self, sink: SharedShellStatusSink) -> Self {
         self.shell_status_sink = sink;
+        self
+    }
+
+    /// Wire a bridge that registers / unregisters async commands in the
+    /// domain `CommandRepository` as the adapter binds them in / removes
+    /// them from its private DashMap. v4.3 fix: closes the race window
+    /// where `resources/subscribe command://X/output` could observe an
+    /// adapter row but no repo row.
+    #[must_use]
+    pub fn with_command_registration_sink(
+        mut self,
+        sink: SharedCommandRegistrationSink,
+    ) -> Self {
+        self.command_registration_sink = sink;
+        self
+    }
+
+    /// Wire a bridge that registers / unregisters PTY shells in the
+    /// domain `ShellRepository`. Mirrors
+    /// [`Self::with_command_registration_sink`].
+    #[must_use]
+    pub fn with_shell_registration_sink(
+        mut self,
+        sink: SharedShellRegistrationSink,
+    ) -> Self {
+        self.shell_registration_sink = sink;
         self
     }
 
@@ -669,6 +710,10 @@ impl SshClientPort for RusshAdapter {
         };
         let CommandRecord { running, .. } = record;
         running.cancel_token.cancel();
+        // The status watcher will mark the row `Cancelled` shortly; the
+        // registration sink intentionally does NOT remove the row here so
+        // the use case (`cancel_command`) can still snapshot the final
+        // status / output before any explicit caller-driven removal.
         Ok(())
     }
 
@@ -714,6 +759,12 @@ impl SshClientPort for RusshAdapter {
         // so `read_shell` long-polls observe the terminal state without
         // having to wait for a downstream entity-removal path.
         self.shell_status_sink.mark_closed(shell_id).await;
+        // Adapter-side teardown is the source of truth for shell
+        // lifecycle — the use case calls `close_shell` then issues its
+        // own `ShellRepository::remove`, but defensive `unregister`
+        // keeps the repo in sync if a non-use-case path (inactivity
+        // sweep, future bulk-close) drives the close. v4.3 fix.
+        self.shell_registration_sink.unregister(shell_id).await;
         Ok(())
     }
 
@@ -743,8 +794,14 @@ impl RusshAdapter {
     /// and the adapter-side counter. Lives here (outside the trait
     /// impl) so the function can stay short and self-explanatory.
     fn mint_shell_id(&self, session_id: &SessionId) -> ShellId {
-        let next = self.shells.len().saturating_add(1);
-        ShellId::new(format!("{}-shell-{}", session_id.as_str(), next))
+        // Use a UUIDv4 suffix so concurrent `ssh_shell_open` calls on the
+        // same session never mint colliding ids. The previous `len()`-based
+        // counter was racy: multiple callers could observe the same length
+        // and produce identical ids, causing `bind_shell` to surface
+        // `INTERNAL_ERROR: shell id already bound` instead of the proper
+        // `MAX_SHELLS_EXCEEDED` or success.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        ShellId::new(format!("{}-shell-{suffix}", session_id.as_str()))
     }
 
     /// Body of [`SshClientPort::connect`] kept on a private method so
@@ -857,7 +914,23 @@ impl RusshAdapter {
             running,
         };
         self.register_async_command(&command_id, record)?;
-        let entity = CommandEntity::new(command_id, session_id, command, started_at);
+        let entity = CommandEntity::new(
+            command_id.clone(),
+            session_id.clone(),
+            command.clone(),
+            started_at,
+        );
+        // v4.3 fix: register the row in the domain `CommandRepository`
+        // immediately so resource subscribers can observe the live
+        // command without waiting for the use-case-side `insert`. The
+        // sink swallows duplicate-id errors so a use case that already
+        // inserted is still happy. Spawned because `do_execute_async`
+        // stays synchronous (the background driver is fired-and-forget).
+        let sink = Arc::clone(&self.command_registration_sink);
+        let entity_for_sink = entity.clone();
+        tokio::spawn(async move {
+            sink.register(entity_for_sink).await;
+        });
         Ok(CommandHandle { entity })
     }
 
@@ -908,6 +981,18 @@ impl RusshAdapter {
             DEFAULT_SHELL_BUFFER_SIZE,
         );
         self.bind_shell(&shell_id, session_id, &terminal, channel)?;
+        // v4.3 fix: bridge the row into the domain `ShellRepository` as
+        // a defensive cleanup safety net. The use case (`open_shell`) is
+        // the canonical writer of this row — the sink only fires for
+        // adapter-driven paths (inactivity timer close, future
+        // bulk-cleanup, runtime adapter constructed without a use case
+        // in front). Spawned so the adapter return path stays narrow
+        // and `open_shell` does not block on a redundant repo read.
+        let sink = Arc::clone(&self.shell_registration_sink);
+        let entity_for_sink = entity.clone();
+        tokio::spawn(async move {
+            sink.register(entity_for_sink).await;
+        });
         Ok(entity)
     }
 

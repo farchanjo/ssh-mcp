@@ -158,6 +158,13 @@ where
     ///   streaming task does not outlive the failed insert.
     pub async fn execute(&self, req: UploadRequest) -> Result<UploadOutcome, DomainError> {
         let session = self.lookup_session(&req.session_id).await?;
+        // NB: the optimistic pre-check (cheap, no SFTP work spent on
+        // breaches) is *not* the cap enforcer — the canonical gate runs
+        // atomically inside `persist_or_rollback` via
+        // `TransferRepository::insert_if_under_cap`. The pre-check exists
+        // only to short-circuit obvious overflows before any SFTP RTT is
+        // paid; it is allowed (and expected) to under-report under
+        // contention.
         self.guard_transfer_cap(&req.session_id).await?;
 
         let transfer_id = self.ids.new_transfer_id();
@@ -173,7 +180,7 @@ where
             )
             .await?;
 
-        // Snapshot before the move into `insert`.
+        // Snapshot before the move into `insert_if_under_cap`.
         let resolved_local = entity.local_path.clone();
         let resolved_remote = entity.remote_path.clone();
         let total_bytes = entity.total_bytes;
@@ -225,12 +232,19 @@ where
 
     /// Persist the freshly minted entity and roll the SFTP-side task back
     /// on insert failure so the adapter does not orphan a streaming task.
+    ///
+    /// Uses [`TransferRepository::insert_if_under_cap`] so the per-session
+    /// cap check happens **inside** the same shard guard as the insert.
+    /// The earlier `count_by_session` + `insert` pair was a TOCTOU window:
+    /// 50 concurrent uploads on the same session could observe `count <
+    /// cap` before any of them inserted, and `cap + N` rows would land.
     async fn persist_or_rollback(
         &self,
         transfer_id: &TransferId,
         entity: crate::domain::transfer::TransferEntity,
     ) -> Result<(), DomainError> {
-        if let Err(err) = self.transfers.insert(entity).await {
+        let cap = self.config.max_transfers_per_session();
+        if let Err(err) = self.transfers.insert_if_under_cap(entity, cap).await {
             // Storage errors during rollback are swallowed: the insert
             // error is the actionable signal.
             let _ = self.sftp.cancel(transfer_id).await;
