@@ -71,6 +71,9 @@ use crate::application::upload_file::UploadFileUseCase;
 use crate::application::wait_for_pattern::WaitForPatternUseCase;
 use crate::application::write_shell::WriteShellUseCase;
 use crate::composition::UseCases;
+use crate::composition::status_sinks::{
+    RepoCommandStatusSink, RepoShellStatusSink, RepoTransferStatusSink,
+};
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 
@@ -168,18 +171,34 @@ pub type ProdUseCases = UseCases<
     reason = "composition root naturally instantiates every adapter + use case (22 use cases x ~5 lines each); H17 may extract sub-builders per domain"
 )]
 pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
-    // Single shared SFTP handle registry: the SSH adapter publishes
-    // every session it opens into the registry; the SFTP adapter reads
-    // from the same registry. Without sharing the SFTP layer would see
-    // an empty session table.
-    let sftp_registry = SshHandleRegistry::new();
-    let ssh = Arc::new(RusshAdapter::new().with_sftp_registry(sftp_registry.clone()));
-    let sftp = Arc::new(RusshSftpAdapter::new(sftp_registry, 256, 10));
-
     let sessions = Arc::new(DashMapSessionRepo::new());
     let commands = Arc::new(DashMapCommandRepo::new());
     let shells = Arc::new(DashMapShellRepo::new());
     let transfers = Arc::new(DashMapTransferRepo::new());
+
+    // Single shared SFTP handle registry: the SSH adapter publishes
+    // every session it opens into the registry; the SFTP adapter reads
+    // from the same registry. Without sharing the SFTP layer would see
+    // an empty session table.
+    //
+    // Both adapters also receive a status sink so the v4.2 status
+    // pump can transition CommandEntity / ShellEntity / TransferEntity
+    // into terminal states from the live `RunningCommand` /
+    // `RunningShell` / `TransferShared` watch channels owned by the
+    // background streaming tasks. Without this bridge `wait`-mode use
+    // cases would observe `Running` forever (v4.2 fix).
+    let sftp_registry = SshHandleRegistry::new();
+    let command_sink = Arc::new(RepoCommandStatusSink::new(Arc::clone(&commands)));
+    let shell_sink = Arc::new(RepoShellStatusSink::new(Arc::clone(&shells)));
+    let transfer_sink = Arc::new(RepoTransferStatusSink::new(Arc::clone(&transfers)));
+    let ssh = Arc::new(
+        RusshAdapter::new()
+            .with_sftp_registry(sftp_registry.clone())
+            .with_command_status_sink(command_sink)
+            .with_shell_status_sink(shell_sink),
+    );
+    let sftp =
+        Arc::new(RusshSftpAdapter::new(sftp_registry, 256, 10).with_status_sink(transfer_sink));
     #[cfg(feature = "port_forward")]
     let forwards = Arc::new(DashMapForwardRepo::new());
 

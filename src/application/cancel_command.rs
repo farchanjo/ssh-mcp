@@ -62,7 +62,7 @@ use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::ids::CommandId;
 use crate::ports::command_repo::CommandRepository;
-use crate::ports::output_stream::OutputStreamPort;
+use crate::ports::output_stream::{OutputSnapshot, OutputStreamPort};
 use crate::ports::ssh_client::SshClientPort;
 
 /// Maximum amount of time the use case waits for the SSH cancellation to
@@ -179,6 +179,16 @@ where
                 status: snapshot.status,
             });
         }
+        // Take the output snapshot *before* requesting cancellation:
+        // [`SshClientPort::cancel`] tears the SSH-internal command
+        // record down, which makes a subsequent
+        // [`OutputStreamPort::snapshot_command`] return
+        // `CommandNotFound`. The "captured up to the moment of
+        // cancellation" semantics is satisfied either way, and a
+        // pre-cancel snapshot is the only source-of-truth we can read
+        // without coupling the cancel UC to the adapter's internal
+        // bookkeeping order. v4.2 fix.
+        let pre_snap = self.output.snapshot_command(&req.command_id).await.ok();
         // Best-effort: a transport-level failure on the cancel call does
         // not abort the operation. The SSH adapter may still drive the
         // status transition through other paths (e.g. a process exit
@@ -187,7 +197,14 @@ where
         let _ = self.ssh.cancel(&req.command_id).await;
         self.wait_for_status_transition(&req.command_id).await;
         sleep(POST_DRAIN_SLEEP).await;
-        let snap = self.output.snapshot_command(&req.command_id).await?;
+        // Try to re-snapshot in case the adapter kept the record alive
+        // (test fakes, future adapters that defer tear-down). Fall back
+        // to the pre-snapshot when the SSH-internal record is gone.
+        let snap = self
+            .output
+            .snapshot_command(&req.command_id)
+            .await
+            .unwrap_or_else(|_| pre_snap.unwrap_or_else(empty_snapshot));
         let stdout = truncate_head(snap.stdout, req.max_output_bytes);
         let stderr = truncate_head(snap.stderr, req.max_output_bytes);
         Ok(CancelCommandOutcome::Cancelled {
@@ -236,6 +253,21 @@ fn truncate_head(bytes: Bytes, cap: Option<usize>) -> Bytes {
     match cap {
         Some(n) if n < bytes.len() => bytes.slice(bytes.len().saturating_sub(n)..),
         Some(_) | None => bytes,
+    }
+}
+
+/// Build an empty [`OutputSnapshot`].
+/// Used by [`CancelCommandUseCase::execute`] when both the pre-cancel
+/// and the post-cancel snapshots fail (e.g. the SSH-internal record was
+/// already gone before the cancel landed). Returning an empty snapshot
+/// keeps the cancel pipeline best-effort and matches the v3 fallback
+/// rendering of an empty stdout/stderr block.
+const fn empty_snapshot() -> OutputSnapshot {
+    OutputSnapshot {
+        byte_cursor: 0,
+        last_seq: 0,
+        stdout: Bytes::new(),
+        stderr: Bytes::new(),
     }
 }
 
