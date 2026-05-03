@@ -9,4 +9,9 @@
 //! (`command`, `shell`, `transfer`, `forward`) land in H5 as sibling
 //! submodules behind this same module path.
 
+pub mod command;
+#[cfg(feature = "port_forward")]
+pub mod forward;
 pub mod session;
+pub mod shell;
+pub mod transfer;
