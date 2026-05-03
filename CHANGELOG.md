@@ -5,6 +5,42 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] — 2026-05-03
+
+### Highlights
+
+- LLM UX overhaul. Smaller LLMs (27B-30B class) now have everything they need to drive ssh-mcp without external docs: real bytes + `_meta` envelope on `resources/read`, stable peer identity across subscribe / unsubscribe, 14 granular wire error codes, per-tool `Tool.title` + `ToolAnnotations` hints, server-level `Implementation.title` / `description` / `website_url`, and a few-shot `instructions` field with three canonical workflows. Public MCP API stays byte-compatible with v4.4.0 / v4.3.0 / v4.2.0 / v4.1.0 / v4.0.0 / v3.0.0 — same 18 tools, same 5 resource schemes, same env vars, same defaults; the markdown shape is extended **additively** (forward render adds `FORWARD_ID:` and `SESSION_ID:`) so existing v3 / v4 hosts continue to parse responses without any change.
+
+### Fixed
+
+- **Stable peer identity** — `subscribe` and `unsubscribe` now share the same `PeerId` derived from the `Mcp-Session-Id` header (HTTP transport) or a `Stdio` singleton key. Previously `RmcpPeerHandle::new` minted a fresh UUID per call, so `unsubscribe` was a silent no-op (the registry never matched). The shared `PeerTable` now exposes `get_or_mint`, `lookup_peer`, `drop_by_id`, and `gc_closed_peers`. Wired to the existing peer-GC pump on the stdio path; HTTP path is session-scoped so each session gets its own table cleared on session drop.
+- **`resources/read` returns the real body and `_meta`** — the H17 placeholder is gone. Shell URIs now return UTF-8 lossy bytes (`text/plain`); command URIs return v3-style block payloads with shared nonce delimiters; transfer / session / forward URIs return the existing JSON snapshot with `application/json` mime. `_meta` carries `kind`, `cursor`, `buffer_size` (shell + command only), `last_seq`, and `status`. Subscribe-first contract is now byte-compatible with what `LLM_GUIDE.md` describes.
+- **Forward render exposes IDs** — `SSH_FORWARD: OK` blocks now emit `FORWARD_ID:` and `SESSION_ID:` lines so callers can construct the matching `forward://<FORWARD_ID>/events` resource URI directly from the tool response.
+
+### Added
+
+- **Granular wire error codes via tag-prefix dispatch** — `classify_error` now recognises 14 documented codes by parsing a `TAG:` prefix from `DomainError::InvalidArgument` / `Transport` / `Sftp` messages. Application and adapter layers prefix every known failure site so smaller LLMs can branch recovery logic on a specific code instead of guessing from the collapsed `INVALID_ARGUMENT` / `TRANSPORT_ERROR` / `SFTP_ERROR` codes. Tags surfaced today: `EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG`, `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT`, `FEATURE_DISABLED`, `WRITE_FAILED`, `CHANNEL_FAILED`, `COMMAND_FAILED`, `LOCAL_FILE_ERROR`, `SFTP_OPEN_FAILED`. Reserved (dispatcher recognises but no live raise yet): `FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR`. Untagged messages still fall through to the legacy flat codes.
+- **Rich MCP server identity** — `Implementation` now carries:
+  - `title = "SSH Remote Shell"`
+  - `description = "Run remote commands, drive PTY shells, transfer files via SFTP, and forward TCP ports over SSH..."`
+  - `website_url = "https://github.com/farchanjo/ssh-mcp"`
+  - `icons = None` (TODO until the SVG asset lands at a hosted URL).
+- **Per-tool `title` + `ToolAnnotations`** — every one of the 18 tools (or 17 without `port_forward`) now declares a human-readable `title` and the `read_only_hint` / `destructive_hint` / `idempotent_hint` annotations so MCP hosts can rank, filter, and warn before destructive use. Read-only tools: `ssh_list_sessions`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_shell_wait_for`, `ssh_get_transfer_progress`. Idempotent destructive: disconnect / cancel / shell_close. Open-world hint left unset (defaults to true).
+- **Few-shot `instructions` field** — replaces the previous one-liner with three canonical workflows (run command, interactive shell, upload) plus the v4.4 `EXPIRES_AT` / `HINT` / `agent_id` steering cues. Two flavours: `INSTRUCTIONS_WITH_FORWARD` (797 bytes) and `INSTRUCTIONS_WITHOUT_FORWARD` (785 bytes). The non-`port_forward` build advertises 17 tools and 4 streams.
+- **Schema documents per-key modifier policy** — `ssh_shell_send_key` `key` field now spells out the allowed modifier set per key class in its JsonSchema description (arrows / nav / F-keys accept any of `shift`/`alt`/`ctrl`; `tab` accepts only `shift`; control bytes reject every modifier). `ssh_shell_wait_for` `patterns` field documents the wire codes returned on validation failure.
+- **Doc surface** — `docs/LLM_GUIDE.md`, `docs/API.md`, `docs/ERRORS.md`, `docs/RESOURCES.md`, `docs/FLOWS.md`, `README.md`, and `CLAUDE.md` are now in sync with v4.5.0 behaviour. New LLM_GUIDE sections cover connection lifecycle (v4.4), granular error codes (v4.5), server identity (v4.5), and a smaller-LLM cookbook with three canonical workflows.
+
+### Tests
+
+- Lib tests: **1060 → 1074** (+5 from `_meta` + PeerTable + render coverage; +9 from granular-error-code classifier coverage).
+- 14 Mermaid diagrams (LLM_GUIDE/RESOURCES/FLOWS) re-validated with `mmdc 11.14.0`.
+- No public wire-shape regressions: existing v3 / v4 hosts parse v4.5 responses without modification.
+
+### Behaviour notes
+
+- `Tool.title` arrived through `#[tool(title = "...")]` at the macro top level (verified in rmcp-macros 1.6 source). `ToolAnnotations` arrived through `#[tool(annotations(read_only_hint = ..., destructive_hint = ..., idempotent_hint = ...))]`.
+- Peer-GC pump on the stdio path now also prunes closed peers from the new `PeerTable`. HTTP path is session-scoped — each rmcp service factory call yields a fresh `McpSshServer` and a fresh `PeerTable`, naturally collected on session drop.
+
 ## [4.4.0] — 2026-05-03
 
 ### Highlights
