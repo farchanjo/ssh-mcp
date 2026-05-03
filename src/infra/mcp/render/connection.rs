@@ -14,6 +14,7 @@ use crate::application::connect_session::ConnectOutcome;
 use crate::application::disconnect_agent::DisconnectAgentOutcome;
 use crate::application::disconnect_session::DisconnectOutcome;
 use crate::application::list_sessions::ListSessionsOutcome;
+use crate::domain::ids::AgentId;
 use crate::domain::session::SessionEntity;
 use crate::infra::mcp::helpers::output::sanitize_value;
 
@@ -50,7 +51,7 @@ fn render_connected(
     inactivity_timeout: Duration,
 ) -> String {
     let host = format_host(session);
-    let mut out = String::with_capacity(224);
+    let mut out = String::with_capacity(288);
     out.push_str("SSH_CONNECT: OK\n");
     out.push_str("SESSION_ID: ");
     out.push_str(session.id.as_str());
@@ -59,7 +60,7 @@ fn render_connected(
     out.push('@');
     out.push_str(&sanitize_value(&host));
     if let Some(agent) = session.agent_id.as_ref() {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
     out.push_str("\nRETRY: ");
@@ -74,6 +75,7 @@ fn render_connected(
         out.push_str("\nREPLACED: ");
         out.push_str(&replaced.to_string());
     }
+    append_next_line(&mut out, &next_hint_for_session(session.id.as_str()));
     out
 }
 
@@ -83,7 +85,7 @@ fn render_reused(
     inactivity_timeout: Duration,
 ) -> String {
     let host = format_host(session);
-    let mut out = String::with_capacity(192);
+    let mut out = String::with_capacity(256);
     out.push_str("SSH_CONNECT: REUSED\n");
     out.push_str("SESSION_ID: ");
     out.push_str(session.id.as_str());
@@ -92,7 +94,7 @@ fn render_reused(
     out.push('@');
     out.push_str(&sanitize_value(&host));
     if let Some(agent) = session.agent_id.as_ref() {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
     append_persistent_or_expiry(
@@ -101,7 +103,25 @@ fn render_reused(
         persistent,
         inactivity_timeout,
     );
+    append_next_line(&mut out, &next_hint_for_session(session.id.as_str()));
     out
+}
+
+/// Append a single `NEXT: <hint>` advisory line listing concrete tool
+/// calls a smaller LLM can chain without consulting the cookbook.
+fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Successor tools after a connect-style response — execute / shell-open
+/// / disconnect, each pre-filled with the freshly minted `SESSION_ID`.
+fn next_hint_for_session(session_id: &str) -> String {
+    format!(
+        "ssh_execute(session_id={session_id}, command=...) | \
+         ssh_shell_open(session_id={session_id}) | \
+         ssh_disconnect(session_id={session_id})"
+    )
 }
 
 /// Append either `PERSISTENT: true` (when the session opts out of the
@@ -151,7 +171,7 @@ fn render_suggested(matches: &[SessionEntity]) -> String {
 
 fn render_suggested_single(m: &SessionEntity) -> String {
     let host = format_host(m);
-    let mut out = String::with_capacity(256);
+    let mut out = String::with_capacity(320);
     out.push_str("SSH_CONNECT: SUGGESTED\nEXISTING_SESSION_ID: ");
     out.push_str(m.id.as_str());
     out.push_str("\nHOST: ");
@@ -159,7 +179,7 @@ fn render_suggested_single(m: &SessionEntity) -> String {
     out.push('@');
     out.push_str(&sanitize_value(&host));
     if let Some(agent) = m.agent_id.as_ref() {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
     if let Some(name) = m.name.as_ref() {
@@ -175,6 +195,7 @@ fn render_suggested_single(m: &SessionEntity) -> String {
         "false"
     });
     out.push_str("\nHINT: use existing SESSION_ID, or retry with reuse=\"force_new\"");
+    append_next_line(&mut out, &next_hint_for_suggested(m.id.as_str()));
     out
 }
 
@@ -192,7 +213,17 @@ fn render_suggested_multi(matches: &[SessionEntity]) -> String {
         append_match_decorations(&mut out, m);
     }
     out.push_str("\nHINT: pick an existing SESSION_ID, or retry with reuse=\"force_new\"");
+    append_next_line(&mut out, &next_hint_for_suggested("<existing>"));
     out
+}
+
+/// Successor tools after a `SUGGESTED` response — caller picks an
+/// existing `session_id` or forces a new connection.
+fn next_hint_for_suggested(session_id: &str) -> String {
+    format!(
+        "ssh_connect(session_id={session_id}) | \
+         ssh_connect(reuse=\"force_new\")"
+    )
 }
 
 #[allow(
@@ -285,7 +316,27 @@ pub fn list_sessions_render(outcome: ListSessionsOutcome) -> String {
         append_session_item(&mut out, s);
     }
     append_anti_leak_hint(&mut out, &healthy);
+    append_next_line(&mut out, &next_hint_for_list_sessions(&healthy));
     out
+}
+
+/// Successor tools after a non-empty `ssh_list_sessions` — bulk-cleanup
+/// with `ssh_disconnect_agent` when an agent owns sessions, else a
+/// targeted `ssh_disconnect` against any listed `session_id`.
+fn next_hint_for_list_sessions(healthy: &[SessionEntity]) -> String {
+    let agent = healthy
+        .iter()
+        .find_map(|s| s.agent_id.as_ref().map(AgentId::as_str));
+    let session_id = healthy.first().map_or("<id>", |s| s.id.as_str());
+    agent.map_or_else(
+        || format!("ssh_disconnect(session_id={session_id})"),
+        |agent_id| {
+            format!(
+                "ssh_disconnect_agent(agent_id={agent_id}) | \
+                 ssh_disconnect(session_id={session_id})"
+            )
+        },
+    )
 }
 
 /// When any agent owns more than [`ANTI_LEAK_HINT_THRESHOLD`] healthy
@@ -371,7 +422,7 @@ fn append_session_flags(out: &mut String, s: &SessionEntity) {
 #[must_use]
 pub fn disconnect_agent_render(outcome: &DisconnectAgentOutcome) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_DISCONNECT_AGENT: OK\nAGENT: ");
+    out.push_str("SSH_DISCONNECT_AGENT: OK\nAGENT_ID: ");
     out.push_str(&sanitize_value(outcome.agent_id.as_str()));
     out.push_str("\nSESSIONS: ");
     out.push_str(&outcome.sessions_disconnected.to_string());
@@ -447,7 +498,7 @@ mod tests {
         };
         assert_eq!(
             disconnect_agent_render(&outcome),
-            "SSH_DISCONNECT_AGENT: OK\nAGENT: alpha\nSESSIONS: 3\nCOMMANDS: 5"
+            "SSH_DISCONNECT_AGENT: OK\nAGENT_ID: alpha\nSESSIONS: 3\nCOMMANDS: 5"
         );
     }
 
@@ -497,7 +548,7 @@ mod tests {
             inactivity_timeout: Duration::from_secs(120),
         });
         assert!(body.starts_with("SSH_CONNECT: REUSED"));
-        assert!(body.contains("AGENT: agent-X"));
+        assert!(body.contains("AGENT_ID: agent-X"));
         // 12:00 + 120s = 12:02
         assert!(
             body.contains("EXPIRES_AT: 2026-05-03T12:02:00+00:00"),

@@ -78,14 +78,14 @@ fn render_started(
         TransferDirection::Upload => (local_path, remote_path),
         TransferDirection::Download => (remote_path, local_path),
     };
-    let mut out = String::with_capacity(256);
+    let mut out = String::with_capacity(384);
     out.push_str(tool);
     out.push_str(": STARTED\nTRANSFER_ID: ");
     out.push_str(transfer_id);
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id);
     if let Some(agent) = agent_id {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent));
     }
     out.push_str("\nFROM: ");
@@ -98,7 +98,33 @@ fn render_started(
     out.push_str(&total_bytes.to_string());
     out.push_str(" bytes)\nBYTES: ");
     out.push_str(&total_bytes.to_string());
+    append_subscribe_hint(
+        &mut out,
+        &format!("subscribe to transfer://{transfer_id}/progress for realtime progress"),
+    );
+    append_next_line(&mut out, &next_hint_for_transfer(transfer_id));
     out
+}
+
+/// Successor tools after an SFTP `STARTED` response — long-poll the
+/// transfer to terminal state.
+fn next_hint_for_transfer(transfer_id: &str) -> String {
+    format!("ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true)")
+}
+
+/// Append a single `NEXT: <hint>` advisory line listing concrete tool
+/// calls a smaller LLM can chain without consulting the cookbook.
+fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Append a `HINT:` line steering 27B-class models toward the
+/// subscribe-first resource pattern (push notifications) instead of
+/// hot-polling tool calls.
+fn append_subscribe_hint(out: &mut String, hint: &str) {
+    out.push_str("\nHINT: ");
+    out.push_str(hint);
 }
 
 /// Render a [`GetTransferProgressResult`] as the v3
@@ -132,6 +158,7 @@ pub fn transfer_progress_render(result: &GetTransferProgressResult) -> String {
         percent,
         result.bytes_transferred,
         result.total_bytes,
+        matches!(result.status, TransferStatus::Running),
     )
 }
 
@@ -142,8 +169,9 @@ fn render_progress_block(
     percent: u8,
     bytes_transferred: u64,
     total_bytes: u64,
+    in_flight: bool,
 ) -> String {
-    let mut out = String::with_capacity(160);
+    let mut out = String::with_capacity(224);
     out.push_str("SSH_GET_TRANSFER_PROGRESS: ");
     out.push_str(status);
     out.push_str("\nTRANSFER_ID: ");
@@ -157,7 +185,19 @@ fn render_progress_block(
     out.push('/');
     out.push_str(&total_bytes.to_string());
     out.push_str(" bytes)");
+    if in_flight {
+        append_next_line(&mut out, &next_hint_for_in_flight_transfer(transfer_id));
+    }
     out
+}
+
+/// Successor advisory while a transfer is still in flight — subscribe
+/// for push progress events or long-poll the same tool to terminal.
+fn next_hint_for_in_flight_transfer(transfer_id: &str) -> String {
+    format!(
+        "resources/subscribe transfer://{transfer_id}/progress | \
+         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true)"
+    )
 }
 
 fn render_progress_failed(
