@@ -146,27 +146,6 @@ where
         })
     }
 
-    /// Walk every subscriber and drop the ones whose transport has
-    /// closed. Returns the number of peers dropped. Used by the binary
-    /// entry points as a periodic GC pass since rmcp 1.6 does not raise
-    /// a peer-disconnect callback.
-    pub fn gc_closed_peers(&self) -> usize {
-        let mut closed: Vec<PeerId> = Vec::new();
-        let mut seen: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
-        for entry in &self.subscribers {
-            for sub in entry.value() {
-                if seen.insert(sub.peer_id.clone()) && sub.peer.is_closed() {
-                    closed.push(sub.peer_id.clone());
-                }
-            }
-        }
-        let dropped = closed.len();
-        for peer_id in closed {
-            self.drop_peer_sync(&peer_id);
-        }
-        dropped
-    }
-
     /// Get-or-create the cursor entry for `(peer_id, uri)`.
     #[must_use]
     pub fn peer_progress(&self, peer_id: &PeerId, uri: &str) -> Arc<PeerProgress> {
@@ -331,6 +310,35 @@ where
                 })
                 .collect()
         })
+    }
+
+    fn peer_byte_cursor(&self, peer_id: &PeerId, uri: &str) -> u64 {
+        self.peer_progress
+            .get(&(peer_id.clone(), uri.to_string()))
+            .map_or(0, |entry| entry.byte_cursor.load(Ordering::Relaxed))
+    }
+
+    fn advance_peer_byte_cursor(&self, peer_id: &PeerId, uri: &str, target: u64) -> u64 {
+        let progress = self.peer_progress(peer_id, uri);
+        progress.byte_cursor.fetch_max(target, Ordering::Relaxed);
+        progress.byte_cursor.load(Ordering::Relaxed)
+    }
+
+    fn gc_closed_peers(&self) -> usize {
+        let mut closed: Vec<PeerId> = Vec::new();
+        let mut seen: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+        for entry in &self.subscribers {
+            for sub in entry.value() {
+                if seen.insert(sub.peer_id.clone()) && sub.peer.is_closed() {
+                    closed.push(sub.peer_id.clone());
+                }
+            }
+        }
+        let dropped = closed.len();
+        for peer_id in closed {
+            self.drop_peer_sync(&peer_id);
+        }
+        dropped
     }
 }
 

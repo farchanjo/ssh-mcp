@@ -295,6 +295,23 @@ mod tests {
         fn snapshot_subscribers(&self, _uri: &str) -> Vec<SubscriberSnapshot> {
             Vec::new()
         }
+
+        fn peer_byte_cursor(&self, _peer_id: &crate::domain::ids::PeerId, _uri: &str) -> u64 {
+            0
+        }
+
+        fn advance_peer_byte_cursor(
+            &self,
+            _peer_id: &crate::domain::ids::PeerId,
+            _uri: &str,
+            target: u64,
+        ) -> u64 {
+            target
+        }
+
+        fn gc_closed_peers(&self) -> usize {
+            0
+        }
     }
 
     type UseCaseUnderTest = ExecuteCommandUseCase<
