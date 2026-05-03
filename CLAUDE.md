@@ -4,84 +4,71 @@
 
 ```bash
 cargo build --release                              # Build all binaries (default + port_forward)
-cargo build --release --bin ssh-mcp                # HTTP server only (axum + rmcp 1.6)
+cargo build --release --bin ssh-mcp                # HTTP server only (axum 0.8 + rmcp 1.6)
 cargo build --release --bin ssh-mcp-stdio          # Stdio transport only (rmcp 1.6 stdio)
 cargo build --release --no-default-features        # Without port forwarding
-cargo test --lib --quiet                           # 820 lib tests
-cargo test --tests --quiet                         # 12 integration tests
+cargo test --lib --quiet                           # 1021 lib tests
+cargo test --tests --quiet                         # 2 integration tests (incl. v4 smoke)
 cargo test --all-features                          # Combined run
+cargo test --features test-fixtures                # Use cases with deterministic in-memory adapters
 cargo fmt --all -- --check                         # Check formatting
-cargo clippy -- -D warnings                        # Lint (strict baseline)
+cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
 ```
 
-## Architecture (v3.0.0)
+## Architecture (v4.0.0 — Hexagonal / Ports and Adapters)
+
+The public MCP API is unchanged from v3 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4 is an internal restructuring; see `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
 
 ### Binary Targets
-- **ssh-mcp** (`src/main.rs`): HTTP transport via `axum` 0.7 + `rmcp::transport::streamable_http_server::StreamableHttpService`. Tracks sessions through `Mcp-Session-Id` header. Default bind `0.0.0.0:8000`, path `/`.
-- **ssh-mcp-stdio** (`src/bin/ssh_mcp_stdio.rs`): Stdio MCP transport via `rmcp::transport::io::stdio()`. Logs to stderr via `RUST_LOG`. The legacy custom JSON-RPC shim (cancel-id parser, fallback responses) was removed in v3 — rmcp handles it natively.
 
-Both binaries spawn a background **peer-GC task** (`spawn_peer_gc`) that scans `SUBSCRIPTION_REGISTRY` on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30s) and drops peers whose rmcp transport closed. rmcp 1.6 does not surface a peer-disconnect callback.
+- **ssh-mcp** (`src/main.rs`): HTTP transport via `axum` 0.8 + `rmcp::transport::streamable_http_server::StreamableHttpService`. Tracks sessions through `Mcp-Session-Id` header. Default bind `0.0.0.0:8000`, path `/`. Root mount uses `Router::fallback_service` (axum 0.8 panics on a nested `/` mount).
+- **ssh-mcp-stdio** (`src/bin/ssh_mcp_stdio.rs`): Stdio MCP transport via `rmcp::transport::io::stdio()`. Logs to stderr via `RUST_LOG`.
 
-### Module Structure (`src/mcp/`)
+Both binaries are thin shells over `composition::prod` — only the transport differs. They each spawn a background **peer-GC task** that scans the subscription registry on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30s) and drops peers whose rmcp transport closed (rmcp 1.6 does not surface a peer-disconnect callback).
 
-| Module | Description |
-|--------|-------------|
-| **server.rs** | `McpSshServer` — the rmcp `ServerHandler` + `#[tool_router]`. Wires all 18 tools and the 5 resource handlers. |
-| **tools/** | Per-domain tool implementations split out of the v2 `commands.rs` monolith. |
-| **tools/connection.rs** | `ssh_connect` (typed `ReusePolicy` enum), `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`. |
-| **tools/execute.rs** | `ssh_execute`, `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus` enum), `ssh_cancel_command`. |
-| **tools/shell.rs** | `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_read` (long-poll: `wait`/`wait_timeout_secs`/`min_bytes`), `ssh_shell_wait_for`, `ssh_shell_close`. |
-| **tools/sftp.rs** | `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`. |
-| **tools/forward.rs** | `ssh_forward` (feature-gated: `port_forward`). |
-| **tools/legacy_helpers.rs** | Shared helpers re-exported across the tool modules. |
-| **resources.rs** | URI parser (`parse_resource_uri`) + read handlers for the 5 resource schemes. |
-| **subscription.rs** | `SUBSCRIPTION_REGISTRY` + per-resource debouncer + per-(peer, uri) cursor + sequence numbers + lagged auto-recovery + peer GC task. |
-| **keys.rs** | Semantic keystroke encoder for `ssh_shell_send_key` (control codes, navigation, F1-F12, modifier composition, back-tab). |
-| **types.rs** | Internal data carriers (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, `TransferInfo`, status enums). All MCP responses are markdown strings built by `message::builder`. |
-| **config.rs** | Configuration resolution: Parameter -> Env Var -> Default (with floors and caps). |
-| **error.rs** | Error classification for retry logic (retryable vs non-retryable). |
-| **client.rs** | SSH connection, authentication, command execution, PTY channels (russh). |
-| **sftp.rs** | SFTP session management and streaming file transfer (32 KiB chunks). |
-| **transfer.rs** | `RunningTransfer` (lock-free: `OnceCell<String>` error + `broadcast::Sender<ProgressEvent>` + `Notify`), `TransferStatus`, `TransferDirection`. |
-| **async_command.rs** | `RunningCommand` (lock-free: `ArcSwap<OutputBuffer>` + `broadcast::Sender<OutputChunk>` + `OnceCell<i32>` exit + `OnceCell<String>` error). |
-| **shell.rs** | `RunningShell` (lock-free: `ArcSwap<RingBuffer>` + `broadcast::Sender<Bytes>` + `mpsc::Sender<WriteRequest>` writer-task ownership + `AtomicU64` activity + `Notify`). |
-| **session.rs** | `SshClientHandler` for russh callbacks; `SessionRef` carries `broadcast::Sender<HealthEvent>`. |
-| **schema.rs** | JSON schema helpers for LLM-friendly schemas. |
-| **forward.rs** | Port forwarding (feature-gated). `ForwardHandle` carries `broadcast::Sender<ForwardEvent>`. |
+### Layers
 
-### Storage Layer (`src/mcp/storage/`)
+| Layer | Path | Responsibility |
+|-------|------|----------------|
+| **domain** | `src/domain/` | Pure entities, value objects, errors, live event variants. No I/O, no async. |
+| **ports** | `src/ports/` | Trait skeletons. Sync via plain trait, async via `trait-variant` AFIT. No `Box<dyn Future>` / `async-trait` for v4 ports. |
+| **application** | `src/application/` | 22 use cases (one struct per business operation). Generic over the ports they depend on — static dispatch, no virtual calls in hot paths. Unit-testable against in-memory fakes with zero rmcp / russh / SFTP machinery. |
+| **adapters** | `src/adapters/` | Concrete implementations of every port. Production: russh, russh-sftp, DashMap, env-config, UUID v4. Test: in-memory + `FakeClock` + `DeterministicIdGen` (gated by the `test-fixtures` feature). |
+| **infra** | `src/infra/mcp/` | Inbound rmcp surface: `McpSshServer<UC>`, the 18 `#[tool]` entry points (`tool_router.rs`), `resources/*` handlers, `PeerHandle` plumbing, per-tool args (`Deserialize + JsonSchema`), per-domain markdown render, helpers (error / nonce / output). |
+| **composition** | `src/composition/` | Wiring root. `prod.rs` pins concrete adapters at compile time so wiring errors surface at `cargo build` rather than runtime. `fixtures.rs` wires deterministic adapters for tests. |
 
-All traits in `traits.rs`, implementations in `DashMap` for lock-free concurrent access:
+### Adapters quick map
 
-| Trait | Implementation | Global Instance |
-|-------|---------------|-----------------|
-| `SessionStorage` | `DashMapSessionStorage` | `SESSION_STORAGE` |
-| `CommandStorage` | `DashMapCommandStorage` | `COMMAND_STORAGE` |
-| `ShellStorage` | `DashMapShellStorage` | `SHELL_STORAGE` |
-| `TransferStorage` | `DashMapTransferStorage` | `TRANSFER_STORAGE` |
+| Adapter | Path | Port |
+|---------|------|------|
+| `RusshClient` (+ `SshHandleRegistry`) | `src/adapters/ssh/` | `ports::ssh_client::SshClientPort` |
+| `RusshSftpClient` (+ `InMemorySftp`) | `src/adapters/sftp/` | `ports::sftp_client::SftpClientPort` |
+| `DashMap*Repo` (session, command, shell, transfer, forward) | `src/adapters/repo/dashmap/` | `ports::*_repo::*RepoPort` |
+| `AuthChain` (`PasswordAuth` → `KeyAuth` → `AgentAuth`) | `src/adapters/auth/` | `ports::auth_strategy::AuthStrategyPort` |
+| `MemoryRegistry<N>` (generic over notifier) | `src/adapters/subscription/` | `ports::subscriber_registry::SubscriberRegistryPort` |
+| `RmcpAdapter` + `RmcpPeer` | `src/adapters/notifier/` | `ports::notifier::NotifierPort` + `PeerHandle` |
+| `RusshOutput` + `InMemory` | `src/adapters/output_stream/` | `ports::output_stream::OutputStreamPort` |
+| `SystemClock` + `FakeClock` | `src/adapters/clock/` | `ports::clock::ClockPort` |
+| `EnvConfig` | `src/adapters/config/` | `ports::config::ConfigPort` |
+| `UuidIdGenerator` + `DeterministicIdGenerator` | `src/adapters/id_generator/` | `ports::id_generator::IdGeneratorPort` |
 
-Secondary indices for O(1) lookups: agent-to-sessions, session-to-commands, session-to-shells, session-to-transfers.
+### Foundational `src/mcp/` modules (still runtime-active)
 
-### Authentication Layer (`src/mcp/auth/`)
+These v3 modules survived H17.5a because the v4 adapters delegate into them. Slated for absorption in **v4.1 (etapa H17.6)**:
 
-Strategy pattern via `AuthStrategy` trait with `AuthChain` for fallback:
-- `PasswordAuth`, `KeyAuth` (RSA / Ed25519), `AgentAuth` (SSH agent).
+- `mcp::client` — low-level russh helpers reused by `adapters::ssh::russh_adapter`.
+- `mcp::session` — `SshClientHandler` russh callback type.
+- `mcp::sftp` — streaming SFTP transfer state used by the SFTP adapter.
+- `mcp::shell` — `RunningShell` + `RingBuffer` consumed by the russh adapter.
+- `mcp::async_command` — `RunningCommand` lock-free state consumed by the russh adapter.
+- `mcp::transfer` — `RunningTransfer` lock-free state.
+- `mcp::subscription` — `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc` task; runtime-active alongside `MemoryRegistry`.
+- `mcp::auth` — v3 strategy chain on `#[async_trait]`. Runtime-unreachable in v4 (every use case uses `adapters::auth`); kept until H17.6 deletes the `async-trait` direct dep.
+- `mcp::config`, `mcp::error`, `mcp::types` — env resolvers + retry classification + shared payload structs.
 
-### Message Layer (`src/mcp/message/`)
+### Response Format (block-only, byte-compatible with v3)
 
-**helpers.rs** — shared primitives:
-- `generate_nonce()` (8-hex-char random from UUIDv4) for delimiter anti-injection.
-- `truncate_utf8_safe_tail` / `truncate_utf8_safe_head` for UTF-8 safe cropping.
-- `sanitize_value` (escapes `\n`, `\r`, `\t`).
-- `format_bytes_human` (human-readable B/KB/MB/GB).
-- `format_error(tool, code, reason, detail?)` standardized error format.
-- `render_output_block(name, nonce, &[u8], max_bytes, status_hint?)` borrow-based stdout/stderr/data renderer.
-
-**builder.rs** — per-tool markdown builders.
-
-### Response Format (block-only since v3)
-
-All 18 MCP tools return a single markdown `Text<String>` — block-style only:
+All 18 MCP tools return a single markdown `Text<String>`:
 
 - First line: `TOOL_NAME: STATUS` (e.g. `SSH_CONNECT: OK`).
 - One `KEY: value` per line.
@@ -89,19 +76,19 @@ All 18 MCP tools return a single markdown `Text<String>` — block-style only:
 - Output blocks use an 8-hex-char nonce per response: `--- stdout [a3f2b1d7] ---\n<content>\n--- stderr [a3f2b1d7] (empty) ---`.
 - Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: optional detail`.
 
-The v2 inline form (`TOOL: STATUS | KEY: v | KEY: v`) was dropped in v3.
+The v4 markdown shape is byte-identical to v3 (verified by snapshot tests in `tests/v4_smoke.rs`). v3 hosts work against v4 servers without any change.
 
-### MCP Tools (18 total)
+### MCP Tools (18 total — unchanged from v3)
 
 - **Connection**: `ssh_connect` (typed `ReusePolicy { Suggest, Auto, ForceNew }`), `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`.
 - **Commands**: `ssh_execute` (optional `pty=true`), `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command`.
-- **Shell** (subscribe-first via `shell://<id>/output`): `ssh_shell_open` (tunable `inactivity_ttl`, `max_buffer_size`), `ssh_shell_write`, **`ssh_shell_send_key`** (semantic keystrokes + modifiers + repeat), `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`; head-paginated with `clear=true`), **`ssh_shell_wait_for`** (multi-pattern gate), `ssh_shell_close`.
+- **Shell** (subscribe-first via `shell://<id>/output`): `ssh_shell_open` (tunable `inactivity_ttl`, `max_buffer_size`), `ssh_shell_write`, `ssh_shell_send_key` (semantic keystrokes + modifiers + repeat), `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`; head-paginated with `clear=true`), `ssh_shell_wait_for` (multi-pattern gate), `ssh_shell_close`.
 - **SFTP**: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`.
 - **Network**: `ssh_forward` (feature-gated: `port_forward`).
 
-Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget.
+Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
 
-### MCP Resources (5 schemes, subscribe-first)
+### MCP Resources (5 schemes, subscribe-first — unchanged from v3)
 
 | Scheme | Description | Cursor |
 |--------|-------------|--------|
@@ -111,32 +98,19 @@ Each session serializes one russh channel at a time through a per-session semaph
 | `session://<id>/health` | Session health snapshot | no |
 | `forward://<id>/events` | Port-forward event log (feature-gated) | yes |
 
-Subscriptions go through `SUBSCRIPTION_REGISTRY`. The debouncer coalesces events on `SSH_NOTIFY_DEBOUNCE_MS` (default 50ms), force-flushes after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1000ms), and sends a keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default 30s). Each event carries a sequence number for gap detection; lagged subscribers auto-recover by serving a snapshot from the buffer.
+Subscriptions go through the `MemoryRegistry<N>` (generic over the notifier port — no `Box<dyn>`). The debouncer coalesces events on `SSH_NOTIFY_DEBOUNCE_MS` (default 50ms), force-flushes after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1000ms), and sends a keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default 30s). Each event carries a sequence number for gap detection; lagged subscribers auto-recover by serving a snapshot from the buffer.
 
 See `docs/RESOURCES.md` for the full resource contract.
 
 ### Configuration
 
-All settings follow: **Parameter -> Environment Variable -> Default**. The full table (now 25+ env vars including the 9 added in v3) lives in `docs/CONFIGURATION.md`.
-
-v3 additions:
-
-| Env Variable | Default | Floor | Cap |
-|--------------|---------|-------|-----|
-| `SSH_COMMAND_BROADCAST_CAP` | 1024 | 16 | 65536 |
-| `SSH_SHELL_BROADCAST_CAP` | 1024 | 16 | 65536 |
-| `SSH_TRANSFER_BROADCAST_CAP` | 256 | 8 | 4096 |
-| `SSH_SESSION_BROADCAST_CAP` | 256 | 8 | 4096 |
-| `SSH_FORWARD_BROADCAST_CAP` | 256 | 8 | 4096 (feature-gated) |
-| `SSH_NOTIFY_DEBOUNCE_MS` | 50 | 5 | 5000 |
-| `SSH_NOTIFY_FORCE_FLUSH_MS` | 1000 | 100 | 60000 |
-| `SSH_NOTIFY_KEEPALIVE_S` | 30 | 5 | 300 |
-| `SSH_MCP_PEER_GC_INTERVAL_S` | 30 | 5 | 300 |
+All settings follow: **Parameter -> Environment Variable -> Default**. The full table (25+ env vars) lives in `docs/CONFIGURATION.md`. Identical to v3 — every name, default, floor, and cap kept.
 
 ### Error Handling
+
 - **Retryable**: Connection refused, timeout, network unreachable (exponential backoff via `backon`, max 10s).
 - **Non-retryable**: Authentication failures, permission denied.
-- All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers still use `Result<T, String>`.
+- All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers use `Result<T, DomainError>` (`thiserror`) with structured variants per failure class.
 
 ## Code Standards
 
@@ -146,29 +120,31 @@ Strict clippy enforcement via `Cargo.toml` `[lints.clippy]`:
 
 - **Lint groups**: `clippy::all`, `clippy::pedantic`, `clippy::nursery`, `clippy::cargo` at `deny`.
 - **Layer A (forbid)**: `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_stdout`, `print_stderr`.
-- **v3 lock-free invariants** (deny): `await_holding_lock`, `await_holding_refcell_ref`, `significant_drop_in_scrutinee`, `significant_drop_tightening`, `mutex_atomic`, `mutex_integer`. Hot-path state types (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`) carry **zero** `Mutex` fields.
+- **Lock-free invariants** (deny): `await_holding_lock`, `await_holding_refcell_ref`, `significant_drop_in_scrutinee`, `significant_drop_tightening`, `mutex_atomic`, `mutex_integer`. Hot-path state types (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`) carry **zero** `Mutex` fields.
 - **Quality denies**: `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, `allow_attributes_without_reason`, `format_push_string`, `if_then_some_else_none`, `rc_mutex`, `redundant_type_annotations`, `same_name_method`, `tests_outside_test_module`, etc.
 - **Thresholds** (`clippy.toml`): `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`, `type-complexity-threshold = 250`.
 - **Allowed**: `multiple_crate_versions` (transitive deps from russh / axum).
 
 All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disable a lint to silence a warning — fix the code instead.
 
-See `docs/LOCKS.md` for the lock-free invariants enforced by these lints.
+See `docs/LOCKS.md` for the lock-free invariants enforced by these lints (rewritten for v4 — maps every invariant to the layer that owns it).
 
 ### General
 
 - Methods < 30 lines, SOLID principles.
 - Lock-free everywhere on the hot path: `DashMap`, `ArcSwap`, `OnceCell`, `Atomic*`, `tokio::sync::broadcast`, `tokio::sync::Notify`, `mpsc` for owned-resource serialization.
-- 820 lib tests + 12 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
-- Feature flag: `port_forward` (default: enabled).
+- v4 use cases generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT.
+- Match exhaustively (no `_ =>` for closed enums; use `wildcard_enum_match_arm = "deny"`).
+- `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
+- 1021 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
+- Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - 8 loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`; full loom mode currently blocked by upstream tokio/loom incompatibility in russh + axum — documented in the test file and `Cargo.toml`).
 
-## v3 Migration Notes
+## v4 Migration Notes
 
-- `poem` and `poem-mcpserver` removed; HTTP transport is now `axum` + `rmcp::transport::streamable_http_server`.
-- `commands.rs` (the v2 monolithic 2272-LOC tools file) split into `src/mcp/tools/{connection,execute,shell,sftp,forward,legacy_helpers}.rs`.
-- Inline response form removed — all responses are block-style markdown.
-- `ssh_connect.reuse` and `ssh_list_commands.status` are now typed enums; the wire format is unchanged for valid values, but typos now produce a JSON-schema validation error instead of falling through to the default branch.
-- Two new tools (`ssh_shell_send_key`, `ssh_shell_wait_for`); shell consumers should prefer subscribing to `shell://<id>/output` over polling `ssh_shell_read`.
+- Public MCP API is **unchanged** from v3. v3 hosts work against v4 servers without any change to wire format, tool catalogue, env vars, or markdown response shape.
+- The v3 modules `src/mcp/{tools, server, resources, message, storage, schema, keys, forward}` were hard-deleted in H17.5a (~14k LOC) after every consumer migrated to the new layers.
+- The foundational `src/mcp/{client, session, sftp, shell, async_command, transfer, subscription, auth, config, error, types}` set is still runtime-active and slated for absorption in v4.1 (etapa H17.6).
+- `async-trait` direct dep retained transitionally for the orphaned v3 `src/mcp/auth/` chain only; every v4 port already uses `trait-variant` AFIT.
 
-See `docs/MIGRATION_v2_to_v3.md` for the full client-facing migration guide.
+See `docs/MIGRATION_v3_to_v4.md` for the full contributor migration guide (file-path table, per-layer responsibility map, before/after dependency graphs).
