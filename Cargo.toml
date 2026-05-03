@@ -104,6 +104,7 @@ loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariant
 [features]
 default = ["port_forward"]
 port_forward = []           # Port forwarding support
+test-fixtures = []          # Expose deterministic in-memory adapters (FakeClock, ...) for downstream tests
 
 [lints.clippy]
 # Layer A — forbid (cannot be downgraded)
