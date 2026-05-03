@@ -7,7 +7,7 @@ cargo build --release                              # Build all binaries (default
 cargo build --release --bin ssh-mcp                # HTTP server only (axum 0.8 + rmcp 1.6)
 cargo build --release --bin ssh-mcp-stdio          # Stdio transport only (rmcp 1.6 stdio)
 cargo build --release --no-default-features        # Without port forwarding
-cargo test --lib --quiet                           # 1021 lib tests
+cargo test --lib --quiet                           # 1014 lib tests
 cargo test --tests --quiet                         # 2 integration tests (incl. v4 smoke)
 cargo test --all-features                          # Combined run
 cargo test --features test-fixtures                # Use cases with deterministic in-memory adapters
@@ -15,9 +15,9 @@ cargo fmt --all -- --check                         # Check formatting
 cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
 ```
 
-## Architecture (v4.0.0 — Hexagonal / Ports and Adapters)
+## Architecture (v4.1.0 — Hexagonal / Ports and Adapters, deep-decoupled)
 
-The public MCP API is unchanged from v3 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4 is an internal restructuring; see `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
+The public MCP API is unchanged from v3 / v4.0 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
 
 ### Binary Targets
 
@@ -31,7 +31,7 @@ Both binaries are thin shells over `composition::prod` — only the transport di
 | Layer | Path | Responsibility |
 |-------|------|----------------|
 | **domain** | `src/domain/` | Pure entities, value objects, errors, live event variants. No I/O, no async. |
-| **ports** | `src/ports/` | Trait skeletons. Sync via plain trait, async via `trait-variant` AFIT. No `Box<dyn Future>` / `async-trait` for v4 ports. |
+| **ports** | `src/ports/` | Trait skeletons. Sync via plain trait, async via `trait-variant` AFIT. No `Box<dyn Future>` for v4 ports. |
 | **application** | `src/application/` | 22 use cases (one struct per business operation). Generic over the ports they depend on — static dispatch, no virtual calls in hot paths. Unit-testable against in-memory fakes with zero rmcp / russh / SFTP machinery. |
 | **adapters** | `src/adapters/` | Concrete implementations of every port. Production: russh, russh-sftp, DashMap, env-config, UUID v4. Test: in-memory + `FakeClock` + `DeterministicIdGen` (gated by the `test-fixtures` feature). |
 | **infra** | `src/infra/mcp/` | Inbound rmcp surface: `McpSshServer<UC>`, the 18 `#[tool]` entry points (`tool_router.rs`), `resources/*` handlers, `PeerHandle` plumbing, per-tool args (`Deserialize + JsonSchema`), per-domain markdown render, helpers (error / nonce / output). |
@@ -45,26 +45,22 @@ Both binaries are thin shells over `composition::prod` — only the transport di
 | `RusshSftpClient` (+ `InMemorySftp`) | `src/adapters/sftp/` | `ports::sftp_client::SftpClientPort` |
 | `DashMap*Repo` (session, command, shell, transfer, forward) | `src/adapters/repo/dashmap/` | `ports::*_repo::*RepoPort` |
 | `AuthChain` (`PasswordAuth` → `KeyAuth` → `AgentAuth`) | `src/adapters/auth/` | `ports::auth_strategy::AuthStrategyPort` |
-| `MemoryRegistry<N>` (generic over notifier) | `src/adapters/subscription/` | `ports::subscriber_registry::SubscriberRegistryPort` |
+| `MemoryRegistry<N>` (generic over notifier) | `src/adapters/subscription/memory_registry.rs` | `ports::subscriber_registry::SubscriberRegistryPort` |
 | `RmcpAdapter` + `RmcpPeer` | `src/adapters/notifier/` | `ports::notifier::NotifierPort` + `PeerHandle` |
 | `RusshOutput` + `InMemory` | `src/adapters/output_stream/` | `ports::output_stream::OutputStreamPort` |
 | `SystemClock` + `FakeClock` | `src/adapters/clock/` | `ports::clock::ClockPort` |
 | `EnvConfig` | `src/adapters/config/` | `ports::config::ConfigPort` |
 | `UuidIdGenerator` + `DeterministicIdGenerator` | `src/adapters/id_generator/` | `ports::id_generator::IdGeneratorPort` |
 
-### Foundational `src/mcp/` modules (still runtime-active)
+### Adapter-internal modules
 
-These v3 modules survived H17.5a because the v4 adapters delegate into them. Slated for absorption in **v4.1 (etapa H17.6)**:
+Each runtime adapter owns its private internals under `internal/` (or, for the subscription registry, a transitional `legacy.rs`). Use cases never touch these — they consume the port surface only.
 
-- `mcp::client` — low-level russh helpers reused by `adapters::ssh::russh_adapter`.
-- `mcp::session` — `SshClientHandler` russh callback type.
-- `mcp::sftp` — streaming SFTP transfer state used by the SFTP adapter.
-- `mcp::shell` — `RunningShell` + `RingBuffer` consumed by the russh adapter.
-- `mcp::async_command` — `RunningCommand` lock-free state consumed by the russh adapter.
-- `mcp::transfer` — `RunningTransfer` lock-free state.
-- `mcp::subscription` — `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc` task; runtime-active alongside `MemoryRegistry`.
-- `mcp::auth` — v3 strategy chain on `#[async_trait]`. Runtime-unreachable in v4 (every use case uses `adapters::auth`); kept until H17.6 deletes the `async-trait` direct dep.
-- `mcp::config`, `mcp::error`, `mcp::types` — env resolvers + retry classification + shared payload structs.
+- `src/adapters/ssh/internal/{client,session,async_command,shell,types,error}.rs` — russh wiring (`connect_to_ssh_with_retry`, `execute_ssh_command`, `open_pty_shell`, `SshClientHandler`), `RunningCommand`, `RunningShell` + `RingBuffer`, shared payload structs (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, `TransferInfo`), retry classification.
+- `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain}.rs` — internal `AuthStrategyPort` trait + native AFIT chain (PasswordAuth -> KeyAuth -> AgentAuth) statically dispatched through an enum (no `async-trait`).
+- `src/adapters/sftp/internal/{sftp,transfer,types}.rs` — streaming SFTP session helpers, `RunningTransfer` lock-free state, shared payload structs.
+- `src/adapters/config/internal/mod.rs` — env-var resolvers backing `EnvConfig`.
+- `src/adapters/subscription/legacy.rs` — transitional `SubscriptionRegistry` + `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc`. The hexagonal `MemoryRegistry<N>` adapter at `memory_registry.rs` is the forward-looking replacement consumed by use cases; the legacy adapter coexists until the SSH/SFTP runtime adapters are wired through the port surface end to end.
 
 ### Response Format (block-only, byte-compatible with v3)
 
@@ -136,15 +132,15 @@ See `docs/LOCKS.md` for the lock-free invariants enforced by these lints (rewrit
 - v4 use cases generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT.
 - Match exhaustively (no `_ =>` for closed enums; use `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 1021 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
+- 1014 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - 8 loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`; full loom mode currently blocked by upstream tokio/loom incompatibility in russh + axum — documented in the test file and `Cargo.toml`).
 
 ## v4 Migration Notes
 
-- Public MCP API is **unchanged** from v3. v3 hosts work against v4 servers without any change to wire format, tool catalogue, env vars, or markdown response shape.
-- The v3 modules `src/mcp/{tools, server, resources, message, storage, schema, keys, forward}` were hard-deleted in H17.5a (~14k LOC) after every consumer migrated to the new layers.
-- The foundational `src/mcp/{client, session, sftp, shell, async_command, transfer, subscription, auth, config, error, types}` set is still runtime-active and slated for absorption in v4.1 (etapa H17.6).
-- `async-trait` direct dep retained transitionally for the orphaned v3 `src/mcp/auth/` chain only; every v4 port already uses `trait-variant` AFIT.
+- Public MCP API is **unchanged** from v3 and v4.0. v3 / v4.0 hosts work against v4.1 servers without any change to wire format, tool catalogue, env vars, or markdown response shape.
+- The v3 monolith modules `src/mcp/{tools, server, resources, message, storage, schema, keys, forward}` were hard-deleted in H17.5a (~14k LOC).
+- The remaining foundational `src/mcp/{client, session, sftp, shell, async_command, transfer, subscription, auth, config, error, types}` set was relocated under the owning adapters in v4.1 (etapa H17.6 P1+P2+P3+P4) and the `src/mcp/` directory deleted entirely.
+- `async-trait` is no longer a direct dependency. The v3 strategy chain that pinned it now uses native AFIT inside `src/adapters/ssh/internal/auth/` with an enum dispatcher.
 
-See `docs/MIGRATION_v3_to_v4.md` for the full contributor migration guide (file-path table, per-layer responsibility map, before/after dependency graphs).
+See `docs/MIGRATION_v3_to_v4.md` for the full contributor migration guide (file-path table, per-layer responsibility map, v4.1 deep-decouple addendum).
