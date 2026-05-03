@@ -97,6 +97,13 @@ pub trait LocalSshClientPort: Send + Sync {
 
     /// Open a fresh interactive PTY shell.
     ///
+    /// `max_buffer_size` overrides the per-shell rolling-buffer cap when
+    /// supplied (in bytes); `None` falls back to the adapter's default
+    /// (10 MiB for the production russh adapter). The cap is wired
+    /// directly into the runtime [`std::sync::atomic::AtomicU64`] backing
+    /// the reader task's flush threshold so caller overrides actually
+    /// bound the buffer at runtime — not just on the persisted entity.
+    ///
     /// # Errors
     ///
     /// Returns `DomainError::MaxShellsExceeded`, `DomainError::Transport`,
@@ -105,6 +112,7 @@ pub trait LocalSshClientPort: Send + Sync {
         &self,
         session_id: &SessionId,
         terminal: ShellTerminal,
+        max_buffer_size: Option<u64>,
     ) -> Result<ShellEntity, DomainError>;
 
     /// Write raw bytes to an interactive shell (text input or escape sequences).
