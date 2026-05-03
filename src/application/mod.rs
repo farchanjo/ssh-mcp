@@ -11,11 +11,11 @@
 //! | Etapa | Use case(s) |
 //! |-------|-------------|
 //! | H10   | [`connect_session`] — canary establishing the pattern |
-//! | H11   | disconnect_session, list_sessions, disconnect_agent |
-//! | H12   | execute, get_command_output, list_commands, cancel_command |
-//! | H13   | shell_open, shell_write, shell_read, shell_close |
-//! | H14   | upload, download, get_transfer_progress |
-//! | H15   | forward (feature-gated) |
+//! | H11   | [`disconnect_session`], [`list_sessions`], [`disconnect_agent`] |
+//! | H12   | [`execute_command`], [`get_command_output`], [`list_commands`], [`cancel_command`] |
+//! | H13   | [`open_shell`], [`write_shell`], [`send_key`], [`read_shell`], [`wait_for_pattern`], [`close_shell`] |
+//! | H14   | [`upload_file`], [`download_file`], [`get_transfer_progress`] |
+//! | H15   | [`forward_port`] (feature-gated), [`list_resources`], [`read_resource`], [`subscribe_resource`], [`unsubscribe_resource`], [`peer_gc`] |
 //!
 //! All use cases follow the same shape:
 //!
@@ -30,3 +30,30 @@
 //!   inline.
 
 pub mod connect_session;
+pub mod disconnect_session;
+pub mod list_sessions;
+pub mod disconnect_agent;
+
+pub mod execute_command;
+pub mod get_command_output;
+pub mod list_commands;
+pub mod cancel_command;
+
+pub mod open_shell;
+pub mod write_shell;
+pub mod send_key;
+pub mod read_shell;
+pub mod wait_for_pattern;
+pub mod close_shell;
+
+pub mod upload_file;
+pub mod download_file;
+pub mod get_transfer_progress;
+
+#[cfg(feature = "port_forward")]
+pub mod forward_port;
+pub mod list_resources;
+pub mod read_resource;
+pub mod subscribe_resource;
+pub mod unsubscribe_resource;
+pub mod peer_gc;
