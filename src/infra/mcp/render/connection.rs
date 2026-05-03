@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::{Value, json};
 
 use crate::application::connect_session::ConnectOutcome;
 use crate::application::disconnect_agent::DisconnectAgentOutcome;
@@ -429,6 +430,216 @@ pub fn disconnect_agent_render(outcome: &DisconnectAgentOutcome) -> String {
     out.push_str("\nCOMMANDS: ");
     out.push_str(&outcome.commands_cancelled.to_string());
     out
+}
+
+// ---------------------------------------------------------------------------
+// v4.7 — structured_content payloads (JSON parallel to the Markdown body)
+// ---------------------------------------------------------------------------
+
+/// Compute the RFC 3339 expiry timestamp from `connected_at` plus the
+/// inactivity timeout. Mirrors the markdown side so the structured
+/// payload echoes the same value.
+fn expires_at_iso(
+    connected_at: DateTime<Utc>,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> Option<String> {
+    if persistent {
+        return None;
+    }
+    compute_expires_at(connected_at, inactivity_timeout).map(|d| d.to_rfc3339())
+}
+
+/// Encode a [`SessionEntity`] as a JSON object suitable for the
+/// list-sessions structured payload and connect/suggest matches array.
+fn session_json(s: &SessionEntity) -> Value {
+    json!({
+        "session_id":  s.id.as_str(),
+        "host":        s.address.host(),
+        "port":        s.address.port(),
+        "username":    s.username,
+        "agent_id":    s.agent_id.as_ref().map(AgentId::as_str),
+        "name":        s.name,
+        "connected_at": s.connected_at.to_rfc3339(),
+        "healthy":     s.healthy,
+        "compression_enabled": s.compression_enabled,
+    })
+}
+
+/// Build the connect-session structured payload mirroring
+/// [`connect_render`].
+#[must_use]
+pub fn connect_structured(outcome: &ConnectOutcome) -> Value {
+    match outcome {
+        ConnectOutcome::Connected {
+            session,
+            replaced,
+            retries,
+            persistent,
+            inactivity_timeout,
+        } => connect_connected_json(
+            session,
+            *replaced,
+            *retries,
+            *persistent,
+            *inactivity_timeout,
+        ),
+        ConnectOutcome::Reused {
+            session,
+            persistent,
+            inactivity_timeout,
+        } => connect_reused_json(session, *persistent, *inactivity_timeout),
+        ConnectOutcome::Suggested { matches } => connect_suggested_json(matches),
+    }
+}
+
+fn connect_connected_json(
+    session: &SessionEntity,
+    replaced: usize,
+    retries: u32,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> Value {
+    json!({
+        "tool":     "ssh_connect",
+        "status":   "ok",
+        "session_id": session.id.as_str(),
+        "host":     session.address.host(),
+        "port":     session.address.port(),
+        "username": session.username,
+        "agent_id": session.agent_id.as_ref().map(AgentId::as_str),
+        "name":     session.name,
+        "retry":    retries,
+        "compression_enabled": session.compression_enabled,
+        "persistent": persistent,
+        "expires_at": expires_at_iso(session.connected_at, persistent, inactivity_timeout),
+        "replaced": replaced,
+        "next": [
+            "ssh_execute",
+            "ssh_shell_open",
+            "ssh_disconnect",
+        ],
+    })
+}
+
+fn connect_reused_json(
+    session: &SessionEntity,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> Value {
+    json!({
+        "tool":     "ssh_connect",
+        "status":   "reused",
+        "session_id": session.id.as_str(),
+        "host":     session.address.host(),
+        "port":     session.address.port(),
+        "username": session.username,
+        "agent_id": session.agent_id.as_ref().map(AgentId::as_str),
+        "name":     session.name,
+        "compression_enabled": session.compression_enabled,
+        "persistent": persistent,
+        "expires_at": expires_at_iso(session.connected_at, persistent, inactivity_timeout),
+        "next": [
+            "ssh_execute",
+            "ssh_shell_open",
+            "ssh_disconnect",
+        ],
+    })
+}
+
+fn connect_suggested_json(matches: &[SessionEntity]) -> Value {
+    let entries: Vec<Value> = matches.iter().map(session_json).collect();
+    json!({
+        "tool":   "ssh_connect",
+        "status": "suggested",
+        "matches": entries,
+        "count": matches.len(),
+        "next": [
+            "ssh_connect(session_id=<existing>)",
+            "ssh_connect(reuse=\"force_new\")",
+        ],
+    })
+}
+
+/// Build the disconnect-session structured payload mirroring
+/// [`disconnect_render`].
+#[must_use]
+pub fn disconnect_structured(outcome: &DisconnectOutcome) -> Value {
+    json!({
+        "tool":   "ssh_disconnect",
+        "status": "ok",
+        "session_id": outcome.session_id.as_str(),
+        "commands_cancelled": outcome.commands_cancelled,
+        "shells_closed":      outcome.shells_closed,
+        "transfers_aborted":  outcome.transfers_aborted,
+    })
+}
+
+/// Build the list-sessions structured payload mirroring
+/// [`list_sessions_render`].
+#[must_use]
+pub fn list_sessions_structured(
+    outcome: &ListSessionsOutcome,
+    filter_agent: Option<&str>,
+) -> Value {
+    let healthy: Vec<Value> = outcome.healthy.iter().map(session_json).collect();
+    let hint = anti_leak_hint_text(&outcome.healthy);
+    let next = next_for_list_sessions(&outcome.healthy, hint.is_some());
+    json!({
+        "tool":   "ssh_list_sessions",
+        "status": "ok",
+        "agent_id_filter": filter_agent,
+        "sessions": healthy,
+        "count":   outcome.healthy.len(),
+        "total":   outcome.total,
+        "hint":    hint,
+        "next":    next,
+    })
+}
+
+fn anti_leak_hint_text(healthy: &[SessionEntity]) -> Option<String> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for s in healthy {
+        if let Some(agent) = s.agent_id.as_ref() {
+            *counts.entry(agent.as_str()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n > ANTI_LEAK_HINT_THRESHOLD)
+        .max_by_key(|(_, n)| *n)
+        .map(|(agent, n)| {
+            format!(
+                "agent '{agent}' owns {n} sessions; consider ssh_disconnect_agent to bulk-cleanup"
+            )
+        })
+}
+
+fn next_for_list_sessions(healthy: &[SessionEntity], leak: bool) -> Option<Value> {
+    if healthy.is_empty() {
+        return None;
+    }
+    let mut next: Vec<Value> = Vec::with_capacity(2);
+    if leak {
+        next.push(Value::String("ssh_disconnect_agent".to_string()));
+    }
+    next.push(Value::String("ssh_disconnect".to_string()));
+    Some(Value::Array(next))
+}
+
+/// Build the disconnect-agent structured payload mirroring
+/// [`disconnect_agent_render`].
+#[must_use]
+pub fn disconnect_agent_structured(outcome: &DisconnectAgentOutcome) -> Value {
+    json!({
+        "tool":   "ssh_disconnect_agent",
+        "status": "ok",
+        "agent_id": outcome.agent_id.as_str(),
+        "sessions_closed":    outcome.sessions_disconnected,
+        "commands_cancelled": outcome.commands_cancelled,
+        "shells_closed":      outcome.shells_closed,
+        "transfers_aborted":  outcome.transfers_aborted,
+    })
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@
 //! Mirrors v3 `src/mcp/message/builder.rs::render_forward_ok` but takes
 //! the v4 use case Outcome as input.
 
+use serde_json::{Value, json};
+
 use crate::application::forward_port::ForwardPortOutcome;
 use crate::infra::mcp::helpers::output::sanitize_value;
 
@@ -58,6 +60,28 @@ fn append_next_line(out: &mut String, hint: &str) {
 fn append_subscribe_hint(out: &mut String, hint: &str) {
     out.push_str("\nHINT: ");
     out.push_str(hint);
+}
+
+// ---------------------------------------------------------------------------
+// v4.7 — structured_content payload (JSON parallel to the Markdown body)
+// ---------------------------------------------------------------------------
+
+/// Build the forward-port structured payload mirroring [`forward_render`].
+#[must_use]
+pub fn forward_structured(outcome: &ForwardPortOutcome) -> Value {
+    let forward_id = outcome.forward_id.as_str();
+    json!({
+        "tool":     "ssh_forward",
+        "status":   "ok",
+        "forward_id": forward_id,
+        "session_id": outcome.session_id.as_str(),
+        "local":      format!("0.0.0.0:{}", outcome.local_port),
+        "remote":     format!("{}:{}", outcome.remote_address, outcome.remote_port),
+        "active":     true,
+        "next": [
+            format!("resources/subscribe forward://{forward_id}/events"),
+        ],
+    })
 }
 
 #[cfg(test)]

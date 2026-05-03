@@ -6,13 +6,18 @@
 //! `render_cancel_command_noop` — but takes the v4 use case Outcomes
 //! as input.
 
+use serde_json::{Value, json};
+
 use crate::application::cancel_command::CancelCommandOutcome;
 use crate::application::execute_command::ExecuteOutcome;
 use crate::application::get_command_output::GetCommandOutputResult;
 use crate::application::list_commands::ListCommandsOutcome;
 use crate::domain::command::{CommandEntity, CommandStatus};
+use crate::domain::ids::AgentId;
 use crate::infra::mcp::helpers::nonce::generate_nonce;
-use crate::infra::mcp::helpers::output::{render_output_block, sanitize_value};
+use crate::infra::mcp::helpers::output::{
+    render_output_block, sanitize_value, truncate_utf8_safe_tail,
+};
 
 /// Default byte cap applied to output blocks when the request did not
 /// supply one. Mirrors the v3 `output_default_bytes` config knob (16
@@ -264,6 +269,134 @@ fn render_cancel_noop(command_id: &str, status: CommandStatus) -> String {
     out.push_str("\nREASON: ");
     out.push_str(status_name_upper(status));
     out
+}
+
+// ---------------------------------------------------------------------------
+// v4.7 — structured_content payloads (JSON parallel to the Markdown body)
+// ---------------------------------------------------------------------------
+
+/// Build the execute-command structured payload mirroring [`execute_render`].
+///
+/// Status is always `started`; the synchronous completion path is
+/// reserved for a future use case and is not exposed by this tool today.
+#[must_use]
+pub fn execute_structured(outcome: &ExecuteOutcome) -> Value {
+    json!({
+        "tool":   "ssh_execute",
+        "status": "started",
+        "session_id": outcome.session_id.as_str(),
+        "command_id": outcome.command_id.as_str(),
+        "agent_id":   outcome.agent_id.as_ref().map(AgentId::as_str),
+        "next": [
+            "ssh_get_command_output",
+            "ssh_cancel_command",
+        ],
+    })
+}
+
+/// Lower-cased wire status label per [`CommandStatus`]. Mirrors the
+/// `running` / `completed` / `cancelled` / `failed` set the markdown
+/// renderer uses (with `timeout` collapsed into `completed`).
+const fn command_status_lower(status: CommandStatus) -> &'static str {
+    match status {
+        CommandStatus::Running => "running",
+        CommandStatus::Completed => "completed",
+        CommandStatus::Cancelled => "cancelled",
+        CommandStatus::Failed => "failed",
+    }
+}
+
+/// Build the get-command-output structured payload mirroring [`get_command_output_render`].
+///
+/// Stdout/stderr are tail-truncated using the same UTF-8-safe helper so
+/// the structured payload matches the rendered Markdown block
+/// byte-for-byte.
+#[must_use]
+pub fn get_command_output_structured(result: &GetCommandOutputResult) -> Value {
+    let (stdout, stdout_info) = truncate_utf8_safe_tail(&result.stdout, DEFAULT_OUTPUT_BYTES);
+    let (stderr, stderr_info) = truncate_utf8_safe_tail(&result.stderr, DEFAULT_OUTPUT_BYTES);
+    let status_label = if result.timed_out && matches!(result.status, CommandStatus::Completed) {
+        "timeout"
+    } else {
+        command_status_lower(result.status)
+    };
+    let next = matches!(result.status, CommandStatus::Running).then(|| {
+        let id = result.command_id.as_str();
+        json!([
+            format!("resources/subscribe command://{id}/output"),
+            format!("ssh_get_command_output(command_id={id}, wait=true)"),
+        ])
+    });
+    json!({
+        "tool":     "ssh_get_command_output",
+        "status":   status_label,
+        "command_id": result.command_id.as_str(),
+        "exit_code": result.exit_code,
+        "stdout":   stdout,
+        "stderr":   stderr,
+        "stdout_truncated": stdout_info.was_truncated(),
+        "stderr_truncated": stderr_info.was_truncated(),
+        "timed_out": result.timed_out,
+        "error":    result.error,
+        "next":     next,
+    })
+}
+
+/// Encode a [`CommandEntity`] as a JSON object suitable for the
+/// list-commands structured payload.
+fn command_json(c: &CommandEntity) -> Value {
+    json!({
+        "command_id": c.id.as_str(),
+        "session_id": c.session_id.as_str(),
+        "command":    c.command,
+        "status":     command_status_lower(c.status),
+        "started_at": c.started_at.to_rfc3339(),
+    })
+}
+
+/// Build the list-commands structured payload mirroring
+/// [`list_commands_render`].
+#[must_use]
+pub fn list_commands_structured(outcome: &ListCommandsOutcome) -> Value {
+    let commands: Vec<Value> = outcome.commands.iter().map(command_json).collect();
+    json!({
+        "tool":   "ssh_list_commands",
+        "status": "ok",
+        "commands": commands,
+        "count":   outcome.commands.len(),
+        "total":   outcome.total,
+    })
+}
+
+/// Build the cancel-command structured payload mirroring
+/// [`cancel_command_render`].
+#[must_use]
+pub fn cancel_command_structured(outcome: &CancelCommandOutcome) -> Value {
+    match outcome {
+        CancelCommandOutcome::Cancelled {
+            command_id,
+            stdout,
+            stderr,
+        } => {
+            let (stdout_str, stdout_info) = truncate_utf8_safe_tail(stdout, DEFAULT_OUTPUT_BYTES);
+            let (stderr_str, stderr_info) = truncate_utf8_safe_tail(stderr, DEFAULT_OUTPUT_BYTES);
+            json!({
+                "tool":   "ssh_cancel_command",
+                "status": "ok",
+                "command_id": command_id.as_str(),
+                "stdout":   stdout_str,
+                "stderr":   stderr_str,
+                "stdout_truncated": stdout_info.was_truncated(),
+                "stderr_truncated": stderr_info.was_truncated(),
+            })
+        }
+        CancelCommandOutcome::NotRunning { command_id, status } => json!({
+            "tool":   "ssh_cancel_command",
+            "status": "noop",
+            "command_id": command_id.as_str(),
+            "reason": command_status_lower(*status),
+        }),
+    }
 }
 
 #[cfg(test)]
