@@ -18,4 +18,5 @@ pub mod id_generator;
 pub mod notifier;
 pub mod repo;
 pub mod sftp;
+pub mod ssh;
 pub mod subscription;
