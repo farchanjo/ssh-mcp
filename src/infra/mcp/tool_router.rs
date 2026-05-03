@@ -19,7 +19,7 @@ use bytes::Bytes;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ListResourcesResult, PaginatedRequestParams,
+    CallToolResult, Content, Icon, Implementation, ListResourcesResult, PaginatedRequestParams,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -1365,8 +1365,13 @@ fn build_implementation() -> Implementation {
              session, and forward streams for push notifications.",
         )
         .with_website_url("https://github.com/farchanjo/ssh-mcp")
-    // TODO(v4.5+): wire `.with_icons(vec![Icon::new("...").with_mime_type("image/svg+xml")])`
-    // once a stable asset URL ships under `assets/icon.svg`.
+        .with_icons(vec![
+            Icon::new(
+                "https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg",
+            )
+            .with_mime_type("image/svg+xml")
+            .with_sizes(vec!["any".to_string()]),
+        ])
 }
 
 /// Shared [`ServerCapabilities`] fingerprint advertised on the
