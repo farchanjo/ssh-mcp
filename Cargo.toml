@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2024"
 rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
@@ -39,18 +39,18 @@ path = "tests/lockfree_invariants.rs"
 harness = true
 
 [dependencies]
-# Toolchain choice (v4 hexagonal):
+# Toolchain choice (v4.1 deep-decoupled hexagonal):
 #   * MSRV pinned to 1.85 — Rust 2024 edition baseline with AFIT (async fn in
 #     traits) and RPITIT (return-position impl Trait in trait) stable.
 #   * `trait-variant` enables AFIT on dyn-safe ports (`AuthStrategyPort`,
 #     `SshClientPort`, ...), replacing the legacy `async-trait`
 #     `Box<dyn Future>` pattern across the crate.
-#   * `async-trait` is no longer a direct dependency. H17.6 P2 relocated the
-#     v3 russh-handshake strategy chain into
-#     `src/adapters/ssh/internal/auth/` and converted it to native AFIT
-#     (statically dispatched through an enum). Any remaining `async-trait`
-#     copies in the dependency tree are transitive (e.g. via rmcp) and
-#     outside our control.
+#   * `async-trait` is no longer a direct dependency (dropped in v4.1
+#     H17.6 P2). The v3 russh-handshake strategy chain lives at
+#     `src/adapters/ssh/internal/auth/` and uses native AFIT
+#     (statically dispatched through an enum exposed via the adapter-internal
+#     `AuthStrategyPort` trait). Any remaining `async-trait` copies in the
+#     dependency tree are transitive (e.g. via rmcp) and outside our control.
 
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [

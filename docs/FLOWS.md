@@ -1,6 +1,6 @@
-# SSH MCP Flow Diagrams (v4.0.0)
+# SSH MCP Flow Diagrams (v4.1.0)
 
-Sequence diagrams for the most common workflows on top of the v4.0.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4 hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs`, and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/*` (which delegate into the foundational `src/mcp/{shell,async_command,sftp,transfer}` modules pending the H17.6 cleanup — see [ARCHITECTURE.md Future work](./ARCHITECTURE.md#future-work)).
+Sequence diagrams for the most common workflows on top of the v4.1.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4.1 hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs` (with the transitional global registry at `src/adapters/subscription/legacy.rs`), and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/internal/*` after the H17.6 deep decouple — see [ARCHITECTURE.md](./ARCHITECTURE.md#v41-deep-decouple-completed).
 
 [[_TOC_]]
 
