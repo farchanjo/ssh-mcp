@@ -54,6 +54,8 @@ SUITES: list[tuple[str, str, str, str]] = [
     ("chaos_locks", "chaos_locks.py", "chaos_locks", "chaos"),
     ("chaos_recovery", "chaos_recovery.py", "chaos_recovery", "chaos"),
     ("chaos_exhaustion", "chaos_exhaustion.py", "chaos_exhaustion", "chaos"),
+    ("chaos_v47", "chaos_v47.py", "chaos_v47", "chaos"),
+    ("chaos_v47_subscribe", "chaos_v47_subscribe.py", "chaos_v47_subscribe", "chaos"),
 ]
 
 
@@ -196,6 +198,23 @@ def main() -> int:
         suffix = f"  ({elapsed:.1f}s)" if elapsed > 0.0 else ""
         print(f"  {label:<{width}}{status}{suffix}", flush=True)
 
+    # Final JSON summary line per the v4.7 spec.
+    suites_passed = sum(1 for _, s, _ in results if "ok" in s)
+    suites_failed = sum(1 for _, s, _ in results if "fail" in s.lower())
+    suites_skipped = sum(1 for _, s, _ in results if "skip" in s.lower())
+    final = {
+        "status": "ok" if overall_ok else "fail",
+        "suites_passed": suites_passed,
+        "suites_failed": suites_failed,
+        "suites_skipped": suites_skipped,
+        "total_scenarios": len(results),
+        "errors": [
+            {"label": label, "status": status}
+            for label, status, _ in results
+            if "fail" in status.lower()
+        ],
+    }
+    print(json.dumps(final), flush=True)
     return 0 if overall_ok else 1
 
 
