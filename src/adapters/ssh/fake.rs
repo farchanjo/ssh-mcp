@@ -112,10 +112,12 @@ pub enum FakeSshCall {
         /// Probed session.
         session_id: SessionId,
     },
-    /// `open_shell(session_id, terminal)` was invoked. The H13 shell
-    /// open use case hands the terminal description through unchanged
-    /// so the call log captures the negotiated `TERM` value and the
-    /// initial PTY geometry alongside the owning session.
+    /// `open_shell(session_id, terminal, max_buffer_size)` was invoked.
+    /// The H13 shell open use case hands the terminal description through
+    /// unchanged so the call log captures the negotiated `TERM` value
+    /// and the initial PTY geometry alongside the owning session.
+    /// `max_buffer_size` records the per-call rolling-buffer override
+    /// (None means "use the adapter default" — see v4.7.1 BUG #1 fix).
     OpenShell {
         /// Session that owns the spawned shell.
         session_id: SessionId,
@@ -125,6 +127,8 @@ pub enum FakeSshCall {
         cols: u32,
         /// Initial PTY height in rows.
         rows: u32,
+        /// Caller-supplied rolling buffer cap (bytes) when present.
+        max_buffer_size: Option<u64>,
     },
     /// `write_shell(shell_id, bytes)` was invoked. The H13 shell write
     /// and key-press use cases route every input frame through the same
@@ -581,12 +585,14 @@ impl SshClientPort for FakeSshClient {
         &self,
         session_id: &SessionId,
         terminal: ShellTerminal,
+        max_buffer_size: Option<u64>,
     ) -> Result<ShellEntity, DomainError> {
         self.record(FakeSshCall::OpenShell {
             session_id: session_id.clone(),
             term: terminal.term_type.clone(),
             cols: terminal.cols,
             rows: terminal.rows,
+            max_buffer_size,
         });
         match self.pop_open_shell_outcome(session_id) {
             OpenShellOutcome::Ok { shell_id } => Ok(ShellEntity::new(
@@ -595,7 +601,7 @@ impl SshClientPort for FakeSshClient {
                 terminal,
                 Utc::now(),
                 FAKE_SHELL_DEFAULT_INACTIVITY_TTL,
-                FAKE_SHELL_DEFAULT_BUFFER_BYTES,
+                max_buffer_size.unwrap_or(FAKE_SHELL_DEFAULT_BUFFER_BYTES),
             )),
             OpenShellOutcome::Err(err) => Err(err),
         }
@@ -719,7 +725,7 @@ mod tests {
         let client = FakeSshClient::new();
         let sid = SessionId::new("sess-shell".to_string());
         let entity = client
-            .open_shell(&sid, sample_terminal())
+            .open_shell(&sid, sample_terminal(), None)
             .await
             .expect("open_shell ok");
         assert_eq!(entity.session_id, sid);
@@ -736,13 +742,21 @@ mod tests {
                 term,
                 cols,
                 rows,
-            } => (session_id.clone(), term.clone(), *cols, *rows),
+                max_buffer_size,
+            } => (
+                session_id.clone(),
+                term.clone(),
+                *cols,
+                *rows,
+                *max_buffer_size,
+            ),
             other => panic!("expected OpenShell, got {other:?}"),
         };
         assert_eq!(recorded.0, sid);
         assert_eq!(recorded.1, "xterm-256color");
         assert_eq!(recorded.2, 80);
         assert_eq!(recorded.3, 24);
+        assert_eq!(recorded.4, None);
     }
 
     #[tokio::test]
@@ -751,7 +765,7 @@ mod tests {
         let sid = SessionId::new("s-1".to_string());
         client.queue_open_shell_ok(ShellId::new("custom-shell".to_string()));
         let entity = client
-            .open_shell(&sid, sample_terminal())
+            .open_shell(&sid, sample_terminal(), None)
             .await
             .expect("open_shell ok");
         assert_eq!(entity.id.as_str(), "custom-shell");
@@ -763,7 +777,7 @@ mod tests {
         let sid = SessionId::new("s-1".to_string());
         client.queue_open_shell_error(DomainError::MaxShellsExceeded { limit: 4 });
         let err = client
-            .open_shell(&sid, sample_terminal())
+            .open_shell(&sid, sample_terminal(), None)
             .await
             .expect_err("queued error must propagate");
         match err {
