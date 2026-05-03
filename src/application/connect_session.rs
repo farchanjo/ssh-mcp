@@ -107,6 +107,13 @@ pub enum ConnectOutcome {
         replaced: usize,
         /// Retry attempts consumed by the SSH client adapter.
         retries: u32,
+        /// Whether the session must survive the inactivity sweeper.
+        /// Sourced from [`ConnectRequest::persistent`].
+        persistent: bool,
+        /// Configured inactivity timeout. Used by the renderer to compute
+        /// the `EXPIRES_AT` line so LLMs can ping before the TTL fires.
+        /// Skipped in the render when `persistent = true`.
+        inactivity_timeout: Duration,
     },
     /// An existing session was reused (either via explicit id or via the
     /// [`ReusePolicy::Auto`] path).
@@ -114,11 +121,20 @@ pub enum ConnectOutcome {
         /// The reused session entity, with its `last_health_check` /
         /// `healthy` fields refreshed.
         session: SessionEntity,
+        /// Whether the original connect request was persistent. The use
+        /// case treats reused sessions as non-persistent unless the caller
+        /// supplied an `explicit_session_id` plus `persistent = true`,
+        /// matching the way the SSH adapter scopes the inactivity sweeper.
+        persistent: bool,
+        /// Configured inactivity timeout, mirrored into the response so
+        /// the LLM can ping before TTL fires.
+        inactivity_timeout: Duration,
     },
     /// One or more identity matches were found under
     /// [`ReusePolicy::Suggest`]; the caller decides whether to reuse one.
     Suggested {
-        /// Healthy matches, newest first.
+        /// Healthy matches, newest first (or owned-first when
+        /// [`ConnectRequest::agent_id`] is supplied).
         matches: Vec<SessionEntity>,
     },
 }
@@ -176,16 +192,24 @@ where
     /// Propagates any [`DomainError`] returned by the underlying ports
     /// (chiefly `ConnectFailed`, `Auth`, `Storage`).
     pub async fn execute(&self, req: ConnectRequest) -> Result<ConnectOutcome, DomainError> {
+        let inactivity_timeout = self.config.inactivity_timeout();
         if let Some(sid) = req.explicit_session_id.clone() {
             if let Some(reused) = self.try_explicit_reuse(&sid).await? {
-                return Ok(ConnectOutcome::Reused { session: reused });
+                return Ok(ConnectOutcome::Reused {
+                    session: reused,
+                    persistent: req.persistent,
+                    inactivity_timeout,
+                });
             }
         }
         let probed = self.probe_for_policy(&req).await?;
-        if let Some(short_circuit) = decide_reuse(&probed, req.reuse) {
+        if let Some(short_circuit) =
+            decide_reuse(&probed, req.reuse, req.persistent, inactivity_timeout)
+        {
             return Ok(short_circuit);
         }
-        self.create_new_connection(req, probed.replaced).await
+        self.create_new_connection(req, probed.replaced, inactivity_timeout)
+            .await
     }
 
     /// Identity probing dispatcher. Skipped entirely for
@@ -195,8 +219,11 @@ where
         match req.reuse {
             ReusePolicy::ForceNew => Ok(IdentityMatches::default()),
             ReusePolicy::Auto | ReusePolicy::Suggest => {
-                self.probe_identity_matches(&req.address, &req.username)
-                    .await
+                let mut matches = self
+                    .probe_identity_matches(&req.address, &req.username)
+                    .await?;
+                rank_by_agent_affinity(&mut matches.healthy, req.agent_id.as_ref());
+                Ok(matches)
             }
         }
     }
@@ -287,6 +314,7 @@ where
         &self,
         req: ConnectRequest,
         replaced: usize,
+        inactivity_timeout: Duration,
     ) -> Result<ConnectOutcome, DomainError> {
         let connect_timeout = req
             .timeout_secs
@@ -303,11 +331,14 @@ where
             .await?;
         let enriched = enrich_entity(entity, &req);
         let retries = enriched.retry_attempts;
+        let persistent = req.persistent;
         self.persist_session(&enriched).await?;
         Ok(ConnectOutcome::Connected {
             session: enriched,
             replaced,
             retries,
+            persistent,
+            inactivity_timeout,
         })
     }
 
@@ -349,19 +380,51 @@ fn enrich_entity(mut entity: SessionEntity, req: &ConnectRequest) -> SessionEnti
     entity
 }
 
+/// Stable-sort `healthy` so sessions owned by `requester_agent_id` rank first.
+///
+/// Tiebreaker is the existing `connected_at desc` ordering already produced
+/// by [`ConnectSessionUseCase::probe_identity_matches`]; this helper relies
+/// on Rust's stable sort to preserve that ordering inside each group.
+///
+/// LLM steering: when an agent passes its own `agent_id`, it should reuse
+/// its own session over another agent's session for the same host/user
+/// (Improvement A — see `feat/v4.4-llm-steering`). When no agent id is
+/// supplied, the previous "newest first" ordering is left untouched.
+fn rank_by_agent_affinity(healthy: &mut [SessionEntity], requester_agent_id: Option<&AgentId>) {
+    let Some(requester) = requester_agent_id else {
+        return;
+    };
+    healthy.sort_by_key(|entry| {
+        let same_agent = entry.agent_id.as_ref() == Some(requester);
+        // `false` < `true`, so invert with `!same_agent` to push matches up.
+        !same_agent
+    });
+}
+
 /// Apply the reuse policy to already-probed identity matches. Returns
 /// `Some(outcome)` to short-circuit the caller, `None` to fall through to a
 /// fresh connect.
-fn decide_reuse(probed: &IdentityMatches, policy: ReusePolicy) -> Option<ConnectOutcome> {
+fn decide_reuse(
+    probed: &IdentityMatches,
+    policy: ReusePolicy,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> Option<ConnectOutcome> {
     if probed.healthy.is_empty() {
         return None;
     }
     match policy {
-        ReusePolicy::Auto => probed
-            .healthy
-            .first()
-            .cloned()
-            .map(|session| ConnectOutcome::Reused { session }),
+        ReusePolicy::Auto => {
+            probed
+                .healthy
+                .first()
+                .cloned()
+                .map(|session| ConnectOutcome::Reused {
+                    session,
+                    persistent,
+                    inactivity_timeout,
+                })
+        }
         ReusePolicy::Suggest => Some(ConnectOutcome::Suggested {
             matches: probed.healthy.clone(),
         }),
@@ -451,10 +514,19 @@ mod tests {
     }
 
     fn seed_existing(repo: &DashMapSessionRepo, id: &str, ts_year: i32) -> SessionEntity {
+        seed_existing_with_agent(repo, id, ts_year, None)
+    }
+
+    fn seed_existing_with_agent(
+        repo: &DashMapSessionRepo,
+        id: &str,
+        ts_year: i32,
+        agent: Option<&AgentId>,
+    ) -> SessionEntity {
         let entity = SessionEntity {
             id: SessionId::new(id.to_string()),
             name: Some("seeded".to_string()),
-            agent_id: None,
+            agent_id: agent.cloned(),
             address: sample_address(),
             username: "alice".to_string(),
             connected_at: Utc.with_ymd_and_hms(ts_year, 1, 1, 0, 0, 0).unwrap(),
@@ -465,10 +537,18 @@ mod tests {
             healthy: None,
         };
         let blocking = entity.clone();
+        let agent_clone = agent.cloned();
+        let id_clone = entity.id.clone();
         let repo_clone = repo.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 repo_clone.insert(blocking).await.expect("seed insert");
+                if let Some(a) = agent_clone.as_ref() {
+                    repo_clone
+                        .register_agent(a, &id_clone)
+                        .await
+                        .expect("register_agent");
+                }
             });
         });
         entity
@@ -485,6 +565,7 @@ mod tests {
                 session,
                 replaced,
                 retries,
+                ..
             } => {
                 assert_eq!(session.id.as_str(), "sess-0");
                 assert_eq!(replaced, 0);
@@ -512,7 +593,7 @@ mod tests {
         req.explicit_session_id = Some(seeded.id.clone());
         let outcome = uc.execute(req).await.expect("execute");
         match outcome {
-            ConnectOutcome::Reused { session } => {
+            ConnectOutcome::Reused { session, .. } => {
                 assert_eq!(session.id.as_str(), "explicit-1");
                 assert_eq!(session.healthy, Some(true));
                 assert!(session.last_health_check.is_some());
@@ -544,6 +625,7 @@ mod tests {
                 session,
                 replaced,
                 retries: _,
+                ..
             } => {
                 assert_ne!(session.id.as_str(), "explicit-dead");
                 assert_eq!(replaced, 0);
@@ -590,7 +672,7 @@ mod tests {
         req.reuse = ReusePolicy::Auto;
         let outcome = uc.execute(req).await.expect("execute");
         match outcome {
-            ConnectOutcome::Reused { session } => {
+            ConnectOutcome::Reused { session, .. } => {
                 assert_eq!(session.id, seeded.id);
                 assert_eq!(session.healthy, Some(true));
             }
@@ -640,6 +722,7 @@ mod tests {
                 session,
                 replaced,
                 retries: _,
+                ..
             } => {
                 assert_ne!(session.id, seeded.id);
                 assert_eq!(replaced, 0);
@@ -672,6 +755,7 @@ mod tests {
                 session,
                 replaced,
                 retries: _,
+                ..
             } => {
                 assert_eq!(replaced, 1);
                 assert_ne!(session.id, seeded.id);
@@ -698,7 +782,7 @@ mod tests {
         req.reuse = ReusePolicy::Auto;
         let outcome = uc.execute(req).await.expect("execute");
         match outcome {
-            ConnectOutcome::Reused { session } => {
+            ConnectOutcome::Reused { session, .. } => {
                 assert_eq!(
                     session.id.as_str(),
                     "newer",
@@ -761,5 +845,189 @@ mod tests {
         }
         let bound = repo.list_by_agent(&agent).await.expect("list_by_agent");
         assert_eq!(bound.len(), 1, "agent secondary index must contain one id");
+    }
+
+    // --- v4.4 LLM steering: agent_id-aware ranking ---------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_reuse_prefers_session_owned_by_requester_agent() {
+        // Two healthy matches for the same host/user. The OLDER one belongs
+        // to the requester; the NEWER one belongs to a different agent.
+        // Without ranking, Auto would pick the newer (other-agent) session.
+        // With ranking, Auto must pick the older session that belongs to
+        // the requester agent.
+        let (uc, ssh, repo, _clock) = build_use_case();
+        let mine = AgentId::new("agent-mine".to_string());
+        let theirs = AgentId::new("agent-theirs".to_string());
+        let _ = seed_existing_with_agent(&repo, "mine-old", 2024, Some(&mine));
+        let _ = seed_existing_with_agent(&repo, "theirs-newer", 2025, Some(&theirs));
+        ssh.queue_health_ok();
+        ssh.queue_health_ok();
+        let mut req = base_request();
+        req.reuse = ReusePolicy::Auto;
+        req.agent_id = Some(mine.clone());
+        let outcome = uc.execute(req).await.expect("execute");
+        match outcome {
+            ConnectOutcome::Reused { session, .. } => {
+                assert_eq!(
+                    session.id.as_str(),
+                    "mine-old",
+                    "Auto must prefer the session owned by the requesting agent"
+                );
+                assert_eq!(session.agent_id.as_ref(), Some(&mine));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_reuse_falls_back_to_newest_when_no_agent_match() {
+        // Both healthy matches belong to other agents — ranking must leave
+        // the newest-first ordering intact.
+        let (uc, ssh, repo, _clock) = build_use_case();
+        let mine = AgentId::new("agent-mine".to_string());
+        let other = AgentId::new("agent-other".to_string());
+        let _ = seed_existing_with_agent(&repo, "other-old", 2024, Some(&other));
+        let _ = seed_existing_with_agent(&repo, "other-newer", 2025, Some(&other));
+        ssh.queue_health_ok();
+        ssh.queue_health_ok();
+        let mut req = base_request();
+        req.reuse = ReusePolicy::Auto;
+        req.agent_id = Some(mine.clone());
+        let outcome = uc.execute(req).await.expect("execute");
+        match outcome {
+            ConnectOutcome::Reused { session, .. } => {
+                assert_eq!(
+                    session.id.as_str(),
+                    "other-newer",
+                    "Auto with no agent match must fall back to newest"
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suggest_orders_owned_sessions_first() {
+        // Suggest must list owned sessions ahead of foreign ones.
+        let (uc, ssh, repo, _clock) = build_use_case();
+        let mine = AgentId::new("agent-mine".to_string());
+        let other = AgentId::new("agent-other".to_string());
+        let _ = seed_existing_with_agent(&repo, "other-newer", 2025, Some(&other));
+        let _ = seed_existing_with_agent(&repo, "mine-old", 2024, Some(&mine));
+        ssh.queue_health_ok();
+        ssh.queue_health_ok();
+        let mut req = base_request();
+        req.reuse = ReusePolicy::Suggest;
+        req.agent_id = Some(mine.clone());
+        let outcome = uc.execute(req).await.expect("execute");
+        match outcome {
+            ConnectOutcome::Suggested { matches } => {
+                assert_eq!(matches.len(), 2);
+                assert_eq!(
+                    matches[0].id.as_str(),
+                    "mine-old",
+                    "owned session must rank first under Suggest"
+                );
+                assert_eq!(matches[1].id.as_str(), "other-newer");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_by_agent_affinity_is_stable_within_groups() {
+        use super::rank_by_agent_affinity;
+        let mine = AgentId::new("mine".to_string());
+        let theirs = AgentId::new("theirs".to_string());
+        let mut entries = vec![
+            SessionEntity {
+                id: SessionId::new("their-newer".to_string()),
+                name: None,
+                agent_id: Some(theirs.clone()),
+                address: sample_address(),
+                username: "alice".to_string(),
+                connected_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                default_timeout: Duration::from_secs(30),
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: Some(true),
+            },
+            SessionEntity {
+                id: SessionId::new("mine-newer".to_string()),
+                name: None,
+                agent_id: Some(mine.clone()),
+                address: sample_address(),
+                username: "alice".to_string(),
+                connected_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+                default_timeout: Duration::from_secs(30),
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: Some(true),
+            },
+            SessionEntity {
+                id: SessionId::new("mine-older".to_string()),
+                name: None,
+                agent_id: Some(mine.clone()),
+                address: sample_address(),
+                username: "alice".to_string(),
+                connected_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                default_timeout: Duration::from_secs(30),
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: Some(true),
+            },
+        ];
+        rank_by_agent_affinity(&mut entries, Some(&mine));
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["mine-newer", "mine-older", "their-newer"],
+            "owned sessions must come first; original newest-first order preserved within each group"
+        );
+    }
+
+    #[test]
+    fn rank_by_agent_affinity_no_op_when_requester_has_no_agent_id() {
+        use super::rank_by_agent_affinity;
+        let theirs = AgentId::new("theirs".to_string());
+        let mut entries = vec![
+            SessionEntity {
+                id: SessionId::new("a".to_string()),
+                name: None,
+                agent_id: None,
+                address: sample_address(),
+                username: "alice".to_string(),
+                connected_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+                default_timeout: Duration::from_secs(30),
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: Some(true),
+            },
+            SessionEntity {
+                id: SessionId::new("b".to_string()),
+                name: None,
+                agent_id: Some(theirs.clone()),
+                address: sample_address(),
+                username: "alice".to_string(),
+                connected_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                default_timeout: Duration::from_secs(30),
+                retry_attempts: 0,
+                compression_enabled: true,
+                last_health_check: None,
+                healthy: Some(true),
+            },
+        ];
+        rank_by_agent_affinity(&mut entries, None);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "no-op ranking must preserve incoming order"
+        );
     }
 }
