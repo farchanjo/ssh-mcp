@@ -28,7 +28,7 @@
 //!
 //! # AFIT migration
 //!
-//! H17.6 P2 relocated this module from `crate::mcp::auth::*` and
+//! H17.6 P2 relocated this module from the legacy v3 auth namespace and
 //! converted the [`traits::AuthStrategy`] trait to native AFIT (async
 //! `fn` in trait). Static dispatch through the
 //! [`chain::AuthChain`] enum kept the adapter dyn-free, dropping the

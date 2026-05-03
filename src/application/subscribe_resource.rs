@@ -1,7 +1,7 @@
 //! Use case: register a peer for `resources/updated` notifications on a
 //! ssh-mcp resource URI.
 //!
-//! Translates the v3 [`crate::mcp::resources::subscribe_impl`] into a
+//! Translates the legacy v3 `subscribe_impl` into a
 //! hexagonal use case orchestrating the URI parser, the four/five
 //! repositories (to confirm the resource exists), and the
 //! [`SubscriberRegistryAsync`] port.

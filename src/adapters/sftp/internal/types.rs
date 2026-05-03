@@ -1,5 +1,6 @@
-//! Internal data types used by the SFTP adapter (v3 leftover, relocated in
-//! H17.6 P1 from `crate::mcp::types` to `crate::adapters::sftp::internal::types`).
+//! Internal data types used by the SFTP adapter (legacy leftover,
+//! relocated in H17.6 P1 from the former v3 types module to
+//! `crate::adapters::sftp::internal::types`).
 //!
 //! These carriers feed the lock-free transfer state in
 //! [`super::transfer::RunningTransfer`] and the streaming chunk loop in
@@ -10,7 +11,7 @@
 /// resource.
 ///
 /// Each variant carries a `seq` allocated by
-/// [`crate::mcp::subscription::SubscriptionRegistry::next_seq`] so subscribers
+/// `crate::adapters::subscription::legacy::SubscriptionRegistry::next_seq` so subscribers
 /// recovering from `Lagged` can detect gaps.
 #[derive(Debug, Clone, Copy)]
 pub enum ProgressEvent {

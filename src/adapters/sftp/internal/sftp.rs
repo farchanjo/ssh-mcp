@@ -27,7 +27,7 @@ use tracing::{error, info};
 use super::transfer::{CHUNK_SIZE, TransferStatus};
 use super::types::ProgressEvent;
 use crate::adapters::ssh::internal::session::SshClientHandler;
-use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
+use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
 
 /// Bag of lock-free shared state plumbed into the streaming SFTP loops.
 ///

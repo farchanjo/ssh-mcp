@@ -1,7 +1,8 @@
 //! In-process [`SubscriberRegistryPort`] +
 //! [`SubscriberRegistryAsync`] implementation.
 //!
-//! Direct port of the v3 [`crate::mcp::subscription::SubscriptionRegistry`]
+//! Direct port of the legacy
+//! [`crate::adapters::subscription::legacy::SubscriptionRegistry`]
 //! semantics with two changes for the v4 hexagonal layout:
 //!
 //! 1. **No global singleton.** The registry is instantiated by the
@@ -40,11 +41,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior, interval};
 use tracing::debug;
 
-use crate::domain::error::DomainError;
-use crate::domain::ids::PeerId;
-use crate::mcp::config::{
+use crate::adapters::config::internal::{
     resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
+use crate::domain::error::DomainError;
+use crate::domain::ids::PeerId;
 use crate::ports::notifier::{NotifierPort, PeerHandle};
 use crate::ports::subscriber_registry::{
     ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,

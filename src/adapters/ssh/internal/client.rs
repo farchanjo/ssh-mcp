@@ -51,14 +51,14 @@ use russh::{Channel, ChannelMsg, Preferred, client};
 use tokio::time;
 use tracing::{error, info, warn};
 
+use crate::adapters::config::internal::{MAX_RETRY_DELAY, resolve_command_max_buffer_size};
 use crate::adapters::ssh::internal::async_command::{OutputBuffer, OutputChunk, RunningCommand};
 use crate::adapters::ssh::internal::auth::chain::AuthChain;
 use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
+use crate::adapters::ssh::internal::error::is_retryable_error;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::ssh::internal::types::{AsyncCommandStatus, SshCommandResponse};
-use crate::mcp::config::{MAX_RETRY_DELAY, resolve_command_max_buffer_size};
-use crate::mcp::error::is_retryable_error;
-use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
+use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
 
 /// Build russh client configuration with the specified settings.
 ///

@@ -2,7 +2,7 @@
 //! PTY shell.
 //!
 //! Mirrors the v3 `ssh_shell_send_key_impl`
-//! (see [`crate::mcp::tools::shell`]) translated into the hexagonal stack:
+//! (see the legacy v3 shell-tools module) translated into the hexagonal stack:
 //! the request DTO is shaped after the rmcp tool arguments without any
 //! `Option<bool>` clutter, and every side-effect is routed through ports.
 //!
