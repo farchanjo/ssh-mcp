@@ -52,10 +52,10 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::adapters::ssh::internal::async_command::{OutputBuffer, OutputChunk, RunningCommand};
+use crate::adapters::ssh::internal::auth::chain::AuthChain;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::ssh::internal::types::{AsyncCommandStatus, SshCommandResponse};
-use crate::mcp::auth::chain::AuthChain;
-use crate::mcp::auth::traits::AuthStrategy;
 use crate::mcp::config::{MAX_RETRY_DELAY, resolve_command_max_buffer_size};
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};

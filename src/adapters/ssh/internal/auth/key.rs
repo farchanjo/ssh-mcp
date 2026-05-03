@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use russh::{client, keys};
 use tracing::debug;
 
@@ -14,9 +13,9 @@ use super::traits::AuthStrategy;
 
 /// Private key file authentication strategy.
 ///
-/// Loads a private key from a file and uses it for public key authentication.
-/// Currently supports passphrase-less keys.
-pub struct KeyAuth {
+/// Loads a private key from a file and uses it for public key
+/// authentication. Currently supports passphrase-less keys.
+pub(crate) struct KeyAuth {
     key_path: PathBuf,
 }
 
@@ -25,8 +24,8 @@ impl KeyAuth {
     ///
     /// # Arguments
     ///
-    /// * `key_path` - Path to the private key file
-    pub fn new(key_path: impl Into<PathBuf>) -> Self {
+    /// * `key_path` - Path to the private key file.
+    pub(crate) fn new(key_path: impl Into<PathBuf>) -> Self {
         let raw: PathBuf = key_path.into();
         let expanded = expand_tilde(&raw.to_string_lossy());
         Self {
@@ -35,7 +34,6 @@ impl KeyAuth {
     }
 }
 
-#[async_trait]
 impl AuthStrategy for KeyAuth {
     async fn authenticate(
         &self,
@@ -44,13 +42,13 @@ impl AuthStrategy for KeyAuth {
     ) -> Result<bool, String> {
         let path = Path::new(&self.key_path);
 
-        // Load the secret key (supports passphrase-less keys)
+        // Load the secret key (supports passphrase-less keys).
         let key_pair = keys::load_secret_key(path, None).map_err(|e| {
             let path = &self.key_path;
             format!("Failed to load private key from {}: {e}", path.display())
         })?;
 
-        // For RSA keys, use the best supported hash algorithm
+        // For RSA keys, use the best supported hash algorithm.
         let hash_alg = handle
             .best_supported_rsa_hash()
             .await
@@ -59,7 +57,7 @@ impl AuthStrategy for KeyAuth {
             .flatten();
         debug!("Using RSA hash algorithm for key auth: {:?}", hash_alg);
 
-        // Wrap the key with the preferred hash algorithm
+        // Wrap the key with the preferred hash algorithm.
         let key_with_hash = keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
 
         let result = handle
@@ -77,43 +75,42 @@ impl AuthStrategy for KeyAuth {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AuthStrategy, KeyAuth, PathBuf};
 
     #[test]
-    fn test_key_auth_name() {
+    fn name_is_key() {
         let auth = KeyAuth::new("/path/to/key");
         assert_eq!(auth.name(), "key");
     }
 
     #[test]
-    fn test_key_auth_creation() {
+    fn stores_path() {
         let auth = KeyAuth::new("/home/user/.ssh/id_rsa");
         assert_eq!(auth.key_path, PathBuf::from("/home/user/.ssh/id_rsa"));
     }
 
     #[test]
-    fn test_key_auth_from_pathbuf() {
+    fn accepts_owned_pathbuf() {
         let path = PathBuf::from("/path/to/key");
         let auth = KeyAuth::new(path.clone());
         assert_eq!(auth.key_path, path);
     }
 
     #[test]
-    fn test_key_auth_from_str() {
+    fn accepts_str_slice() {
         let auth = KeyAuth::new("/path/to/key");
         assert_eq!(auth.key_path.to_str(), Some("/path/to/key"));
     }
 
     #[test]
-    fn test_key_auth_tilde_expansion() {
+    fn tilde_is_expanded() {
         let auth = KeyAuth::new("~/.ssh/id_rsa");
-        // Tilde should be expanded to home directory
         assert!(!auth.key_path.starts_with("~"));
         assert!(auth.key_path.to_string_lossy().ends_with(".ssh/id_rsa"));
     }
 
     #[test]
-    fn test_key_auth_different_key_types() {
+    fn supports_different_key_types() {
         // RSA key
         let rsa = KeyAuth::new("/home/user/.ssh/id_rsa");
         assert_eq!(rsa.name(), "key");
@@ -140,19 +137,19 @@ mod tests {
     }
 
     #[test]
-    fn test_key_auth_path_with_spaces() {
+    fn path_with_spaces_round_trips() {
         let auth = KeyAuth::new("/path/with spaces/key file");
         assert_eq!(auth.key_path, PathBuf::from("/path/with spaces/key file"));
     }
 
     #[test]
-    fn test_key_auth_empty_path() {
+    fn empty_path_is_allowed() {
         let auth = KeyAuth::new("");
         assert_eq!(auth.key_path, PathBuf::from(""));
     }
 
     #[test]
-    fn test_key_auth_windows_style_path() {
+    fn windows_style_path_round_trips() {
         let auth = KeyAuth::new("C:\\Users\\user\\.ssh\\id_rsa");
         assert_eq!(
             auth.key_path,
@@ -161,13 +158,13 @@ mod tests {
     }
 
     #[test]
-    fn test_key_auth_unicode_path() {
+    fn unicode_path_round_trips() {
         let auth = KeyAuth::new("/home/usér/chaves/私の鍵");
         assert_eq!(auth.key_path, PathBuf::from("/home/usér/chaves/私の鍵"));
     }
 
     #[test]
-    fn test_key_auth_dot_files() {
+    fn dot_files_round_trip() {
         let auth = KeyAuth::new("/home/user/.ssh/.hidden_key");
         assert_eq!(
             auth.key_path.file_name().and_then(|n| n.to_str()),
@@ -176,20 +173,19 @@ mod tests {
     }
 
     #[test]
-    fn test_key_auth_symlink_style_path() {
-        // Path that looks like it could be a symlink target
+    fn symlink_style_path_round_trips() {
         let auth = KeyAuth::new("/proc/1/root/home/user/.ssh/id_rsa");
         assert!(auth.key_path.starts_with("/proc"));
     }
 
     #[test]
-    fn test_key_auth_path_with_dots() {
+    fn path_with_dots_round_trips() {
         let auth = KeyAuth::new("/home/user/../other_user/.ssh/id_rsa");
-        assert!(auth.key_path.to_str().unwrap_or("").contains(".."));
+        assert!(auth.key_path.to_string_lossy().contains(".."));
     }
 
     #[test]
-    fn test_key_auth_path_with_multiple_extensions() {
+    fn path_with_multiple_extensions_round_trips() {
         let auth = KeyAuth::new("/home/user/.ssh/id_rsa.backup.old");
         assert_eq!(
             auth.key_path.file_name().and_then(|n| n.to_str()),
@@ -198,64 +194,51 @@ mod tests {
     }
 
     #[test]
-    fn test_key_auth_is_send_sync() {
+    fn auth_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<KeyAuth>();
     }
 
     #[test]
-    fn test_key_auth_very_long_path() {
+    fn very_long_path_round_trips() {
         let long_path = format!("/home/user/{}/id_rsa", "subdir/".repeat(100));
         let auth = KeyAuth::new(&long_path);
-        assert!(auth.key_path.to_str().unwrap_or("").len() > 700);
+        assert!(auth.key_path.to_string_lossy().len() > 700);
     }
 
-    mod e15_extra {
-        use super::*;
+    #[test]
+    fn name_is_static_str() {
+        let auth = KeyAuth::new("/x");
+        let n: &'static str = auth.name();
+        assert_eq!(n, "key");
+    }
 
-        #[test]
-        fn name_is_static_str_key() {
-            let auth = KeyAuth::new("/x");
-            let n: &'static str = auth.name();
-            assert_eq!(n, "key");
-        }
+    #[test]
+    fn relative_path_preserved() {
+        let auth = KeyAuth::new("relative/path/to/key");
+        assert_eq!(auth.key_path, PathBuf::from("relative/path/to/key"));
+    }
 
-        #[test]
-        fn auth_strategy_trait_object_works() {
-            let auth: Box<dyn AuthStrategy> = Box::new(KeyAuth::new("/x"));
-            assert_eq!(auth.name(), "key");
-        }
+    #[test]
+    fn tilde_only_expanded_when_at_start() {
+        let auth = KeyAuth::new("/home/user/~/id_rsa");
+        assert!(auth.key_path.to_string_lossy().contains('~'));
+    }
 
-        #[test]
-        fn relative_path_preserved() {
-            // Relative paths should round-trip without the tilde-expansion
-            // pass mutating them.
-            let auth = KeyAuth::new("relative/path/to/key");
-            assert_eq!(auth.key_path, PathBuf::from("relative/path/to/key"));
-        }
+    #[test]
+    fn nested_tilde_path_expanded_at_start() {
+        let auth = KeyAuth::new("~/.ssh/keys/server-prod");
+        assert!(!auth.key_path.starts_with("~"));
+        assert!(
+            auth.key_path
+                .to_string_lossy()
+                .ends_with(".ssh/keys/server-prod")
+        );
+    }
 
-        #[test]
-        fn tilde_only_expanded_when_at_start() {
-            // A tilde NOT at the start should remain as-is (no expansion).
-            let auth = KeyAuth::new("/home/user/~/id_rsa");
-            assert!(auth.key_path.to_string_lossy().contains('~'));
-        }
-
-        #[test]
-        fn nested_tilde_path_expanded_at_start() {
-            let auth = KeyAuth::new("~/.ssh/keys/server-prod");
-            assert!(!auth.key_path.starts_with("~"));
-            assert!(
-                auth.key_path
-                    .to_string_lossy()
-                    .ends_with(".ssh/keys/server-prod")
-            );
-        }
-
-        #[test]
-        fn key_path_can_round_trip_to_string() {
-            let auth = KeyAuth::new("/etc/ssh/host_key");
-            assert_eq!(auth.key_path.to_string_lossy(), "/etc/ssh/host_key");
-        }
+    #[test]
+    fn key_path_can_round_trip_to_string() {
+        let auth = KeyAuth::new("/etc/ssh/host_key");
+        assert_eq!(auth.key_path.to_string_lossy(), "/etc/ssh/host_key");
     }
 }
