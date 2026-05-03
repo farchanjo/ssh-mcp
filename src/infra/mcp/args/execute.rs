@@ -39,6 +39,51 @@ impl CommandStatus {
     }
 }
 
+// Schemars 1.2 default-fn helpers — see `connection.rs` for the
+// rationale on the `() -> Option<T>` signature requirement.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_command_timeout_secs() -> Option<u64> {
+    Some(180)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_pty() -> Option<bool> {
+    Some(false)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_wait() -> Option<bool> {
+    Some(false)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_wait_timeout_secs() -> Option<u64> {
+    Some(30)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_max_output_bytes() -> Option<usize> {
+    Some(16384)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_max_items() -> Option<usize> {
+    Some(500)
+}
+
 /// Arguments for the `ssh_execute` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshExecuteArgs {
@@ -50,12 +95,14 @@ pub struct SshExecuteArgs {
 
     /// Command timeout in seconds. Default: 180. Env:
     /// `SSH_COMMAND_TIMEOUT`.
+    #[schemars(default = "default_command_timeout_secs")]
     pub timeout_secs: Option<u64>,
 
     /// Allocate a pseudo-terminal (PTY) for the command. Default: false.
     /// Use for commands that require a controlling terminal (e.g. `sudo`,
     /// `top`). All output is merged into stdout in PTY mode (no stderr
     /// separation).
+    #[schemars(default = "default_pty")]
     pub pty: Option<bool>,
 }
 
@@ -67,15 +114,18 @@ pub struct SshGetCommandOutputArgs {
 
     /// Block until completion or `wait_timeout_secs` expires. Default:
     /// false.
+    #[schemars(default = "default_wait")]
     pub wait: Option<bool>,
 
     /// Maximum seconds to block when `wait=true`. Default: 30. Cap: 300.
+    #[schemars(default = "default_wait_timeout_secs")]
     pub wait_timeout_secs: Option<u64>,
 
     /// Maximum bytes shown in stdout/stderr. Default: 16384. Cap:
     /// 1048576. Content head-truncated; tail (most recent output)
     /// preserved. Env: `SSH_MCP_OUTPUT_DEFAULT_BYTES` /
     /// `SSH_MCP_OUTPUT_MAX_BYTES_CAP`.
+    #[schemars(default = "default_max_output_bytes")]
     pub max_output_bytes: Option<usize>,
 }
 
@@ -92,6 +142,7 @@ pub struct SshListCommandsArgs {
 
     /// Maximum entries returned. Default: 500. Cap: 10000. Env:
     /// `SSH_MCP_LIST_MAX_ITEMS` / `SSH_MCP_LIST_MAX_ITEMS_CAP`.
+    #[schemars(default = "default_max_items")]
     pub max_items: Option<usize>,
 }
 
@@ -105,13 +156,19 @@ pub struct SshCancelCommandArgs {
     /// 1048576. Content head-truncated; tail (most recent output)
     /// preserved. Env: `SSH_MCP_OUTPUT_DEFAULT_BYTES` /
     /// `SSH_MCP_OUTPUT_MAX_BYTES_CAP`.
+    #[schemars(default = "default_max_output_bytes")]
     pub max_output_bytes: Option<usize>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CommandStatus;
+    use super::{
+        CommandStatus, SshCancelCommandArgs, SshExecuteArgs, SshGetCommandOutputArgs,
+        SshListCommandsArgs,
+    };
     use crate::domain::policy::CommandStatusFilter;
+    use schemars::schema_for;
+    use serde_json::Value;
 
     #[test]
     fn command_status_serde_round_trip() {
@@ -137,6 +194,64 @@ mod tests {
         assert_eq!(
             CommandStatus::Failed.into_domain(),
             CommandStatusFilter::Failed
+        );
+    }
+
+    /// See `connection::tests::property_default` for the helper rationale.
+    fn property_default<'a>(schema_json: &'a Value, field: &str) -> Option<&'a Value> {
+        let property = schema_json.get("properties")?.get(field)?;
+        property.get("default")
+    }
+
+    #[test]
+    fn ssh_execute_schema_emits_documented_defaults() {
+        let schema = schema_for!(SshExecuteArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "timeout_secs"),
+            Some(&Value::from(180_u64))
+        );
+        assert_eq!(
+            property_default(&schema_json, "pty"),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn ssh_get_command_output_schema_emits_documented_defaults() {
+        let schema = schema_for!(SshGetCommandOutputArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "wait"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            property_default(&schema_json, "wait_timeout_secs"),
+            Some(&Value::from(30_u64))
+        );
+        assert_eq!(
+            property_default(&schema_json, "max_output_bytes"),
+            Some(&Value::from(16384_usize))
+        );
+    }
+
+    #[test]
+    fn ssh_list_commands_schema_emits_max_items_default() {
+        let schema = schema_for!(SshListCommandsArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "max_items"),
+            Some(&Value::from(500_usize))
+        );
+    }
+
+    #[test]
+    fn ssh_cancel_command_schema_emits_documented_defaults() {
+        let schema = schema_for!(SshCancelCommandArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "max_output_bytes"),
+            Some(&Value::from(16384_usize))
         );
     }
 }
