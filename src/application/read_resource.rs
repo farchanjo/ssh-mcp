@@ -1,6 +1,6 @@
 //! Use case: read the current snapshot of a ssh-mcp resource URI.
 //!
-//! Translates the v3 [`crate::mcp::resources::read_resource_impl`] into a
+//! Translates the legacy v3 `read_resource_impl` into a
 //! hexagonal use case orchestrating the URI parser, the four/five
 //! repositories, the [`OutputStreamPort`] (for the byte-stream resources:
 //! shell + command), and the [`SubscriberRegistryPort`] (for cursor
@@ -10,8 +10,8 @@
 //!
 //! The use case re-parses the v3 wire format directly via
 //! [`parse_uri`]; we deliberately do not depend on
-//! [`crate::mcp::resources::parse_resource_uri`] because the v3 module is
-//! flagged for retirement in H17 and pulls rmcp types into scope.
+//! the legacy `parse_resource_uri` helper because the v3 module pulled
+//! rmcp types into scope; H17.6 P3 has now removed it entirely.
 //!
 //! Supported URIs (mirrors v3 verbatim):
 //!

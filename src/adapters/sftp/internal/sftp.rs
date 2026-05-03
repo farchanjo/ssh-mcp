@@ -24,10 +24,10 @@ use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use super::session::SshClientHandler;
-use super::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use super::transfer::{CHUNK_SIZE, TransferStatus};
 use super::types::ProgressEvent;
+use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
 
 /// Bag of lock-free shared state plumbed into the streaming SFTP loops.
 ///

@@ -8,7 +8,7 @@
 //! and dispatched via a single `match` per attempt — the v4 zero-cost
 //! abstraction promise H0 set out to deliver.
 //!
-//! Resolution rules (matches the v3 [`crate::mcp::auth::chain::AuthChain`]
+//! Resolution rules (matches the legacy v3 `AuthChain`
 //! semantics):
 //! - On the first [`AuthOutcome::Authenticated`] the chain stops and returns
 //!   that outcome.

@@ -29,7 +29,7 @@
 //! # Examples
 //!
 //! ```rust,ignore
-//! use ssh_mcp::mcp::error::is_retryable_error;
+//! use ssh_mcp::adapters::ssh::internal::error::is_retryable_error;
 //!
 //! // Authentication failures are NOT retryable
 //! assert!(!is_retryable_error("Permission denied"));

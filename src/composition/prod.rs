@@ -32,6 +32,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::adapters::auth::chain::AuthChainAdapter;
 use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::env::EnvConfig;
+use crate::adapters::config::internal::resolve_peer_gc_interval_s;
 use crate::adapters::id_generator::uuid::UuidIds;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
@@ -43,6 +44,7 @@ use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
 use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
 use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegistry};
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
+use crate::adapters::subscription::legacy::spawn_peer_gc;
 use crate::adapters::subscription::memory_registry::MemoryRegistry;
 use crate::application::cancel_command::CancelCommandUseCase;
 use crate::application::close_shell::CloseShellUseCase;
@@ -71,8 +73,6 @@ use crate::application::write_shell::WriteShellUseCase;
 use crate::composition::UseCases;
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
-use crate::mcp::config::resolve_peer_gc_interval_s;
-use crate::mcp::subscription::spawn_peer_gc;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
 /// as the legacy v3 `RuntimeError` so binaries do not need to change.
@@ -473,10 +473,11 @@ pub async fn run_http() -> Result<(), RuntimeError> {
     info!("ssh-mcp listening on {bind_addr}{path}");
 
     let gc_cancel = CancellationToken::new();
-    // Peer GC is wired into the v3 `mcp::subscription` global today; H17.5
-    // removes the v3 path. Until then the v4 use case
-    // `application::peer_gc` is invoked through the same legacy spawn so
-    // existing tests stay green.
+    // Peer GC walks the legacy `adapters::subscription::legacy` global
+    // today; the parallel hexagonal `application::peer_gc` use case
+    // exists but the SSH/SFTP runtime adapters still poke the legacy
+    // global directly, so the spawn stays here until the runtime
+    // migration completes.
     let gc_interval = resolve_peer_gc_interval_s();
     let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone());
     info!("peer GC task spawned (interval = {gc_interval}s)");

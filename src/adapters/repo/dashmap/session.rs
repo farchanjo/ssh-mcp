@@ -21,8 +21,8 @@
 //! - `insert` rejects re-binding an existing id with
 //!   [`DomainError::Internal`]; callers must `remove` first.
 //! - `register_agent` is idempotent — re-binding the same `(agent,
-//!   session)` pair is a no-op, matching the v3
-//!   `mcp::storage::session::DashMapSessionStorage` semantics.
+//!   session)` pair is a no-op, matching the legacy
+//!   `DashMapSessionStorage` semantics.
 //! - `unregister_agent` cleans the agent entry when the last session is
 //!   removed so empty buckets never linger.
 //! - The agent-secondary index is independent of the optional

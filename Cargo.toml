@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2024"
 rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
@@ -39,19 +39,18 @@ path = "tests/lockfree_invariants.rs"
 harness = true
 
 [dependencies]
-# Toolchain choice (v4 hexagonal):
+# Toolchain choice (v4.1 deep-decoupled hexagonal):
 #   * MSRV pinned to 1.85 — Rust 2024 edition baseline with AFIT (async fn in
 #     traits) and RPITIT (return-position impl Trait in trait) stable.
-#   * `trait-variant` added to enable AFIT on dyn-safe ports, replacing the
-#     v3 `async-trait` `Box<dyn Future>` pattern as ports/adapters land.
-#   * `async-trait` is kept transitionally because the v3 auth strategy chain
-#     (`src/mcp/auth/*.rs`) still uses `#[async_trait]`. The v4 replacement
-#     landed in etapa H8 (`src/adapters/auth/`) using `trait-variant` AFIT
-#     and the [`crate::ports::auth_strategy::AuthStrategyPort`] port; the
-#     direct `async-trait` dep is slated for removal in etapa H17 once the
-#     v3 path is decommissioned. Until then both crates coexist; only the
-#     v3 module reaches `async-trait` directly (the rmcp transitive copy is
-#     outside our control).
+#   * `trait-variant` enables AFIT on dyn-safe ports (`AuthStrategyPort`,
+#     `SshClientPort`, ...), replacing the legacy `async-trait`
+#     `Box<dyn Future>` pattern across the crate.
+#   * `async-trait` is no longer a direct dependency (dropped in v4.1
+#     H17.6 P2). The v3 russh-handshake strategy chain lives at
+#     `src/adapters/ssh/internal/auth/` and uses native AFIT
+#     (statically dispatched through an enum exposed via the adapter-internal
+#     `AuthStrategyPort` trait). Any remaining `async-trait` copies in the
+#     dependency tree are transitive (e.g. via rmcp) and outside our control.
 
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [
@@ -77,9 +76,8 @@ tokio-util = "0.7"
 russh = "0.55"
 russh-sftp = "2"
 
-# Trait abstraction (v3 -> v4 transition window)
-async-trait = "0.1"     # legacy: v3 auth chain (`src/mcp/auth/*.rs`) only; removed in H17
-trait-variant = "0.1"   # v4: AFIT pattern for ports/adapters (auth chain refit landed in H8)
+# Trait abstraction (v4 hexagonal)
+trait-variant = "0.1"   # AFIT pattern for ports/adapters (v3 `async-trait` direct dep dropped in H17.6 P2)
 
 # Lock-free primitives
 arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>

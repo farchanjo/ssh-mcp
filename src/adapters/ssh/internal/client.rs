@@ -51,14 +51,14 @@ use russh::{Channel, ChannelMsg, Preferred, client};
 use tokio::time;
 use tracing::{error, info, warn};
 
-use crate::mcp::async_command::{OutputBuffer, OutputChunk, RunningCommand};
-use crate::mcp::auth::chain::AuthChain;
-use crate::mcp::auth::traits::AuthStrategy;
-use crate::mcp::config::MAX_RETRY_DELAY;
-use crate::mcp::error::is_retryable_error;
-use crate::mcp::session::SshClientHandler;
-use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
-use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
+use crate::adapters::config::internal::{MAX_RETRY_DELAY, resolve_command_max_buffer_size};
+use crate::adapters::ssh::internal::async_command::{OutputBuffer, OutputChunk, RunningCommand};
+use crate::adapters::ssh::internal::auth::chain::AuthChain;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
+use crate::adapters::ssh::internal::error::is_retryable_error;
+use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::adapters::ssh::internal::types::{AsyncCommandStatus, SshCommandResponse};
+use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
 
 /// Build russh client configuration with the specified settings.
 ///
@@ -835,7 +835,7 @@ async fn collect_async_output(
     channel: &mut Channel<client::Msg>,
     command: &Arc<RunningCommand>,
 ) -> Option<i32> {
-    let max_buffer = super::config::resolve_command_max_buffer_size();
+    let max_buffer = resolve_command_max_buffer_size();
     let max = usize::try_from(max_buffer).unwrap_or(usize::MAX);
     let mut exit_code: Option<i32> = None;
     let mut owned = OutputBuffer::with_capacity(4096, 1024);

@@ -1,6 +1,6 @@
-# Locks Reference (v4.0.0)
+# Locks Reference (v4.1.0)
 
-ssh-mcp v4 preserves the v3 **lock-free** baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. The v4 hexagonal layout (see [ARCHITECTURE.md](./ARCHITECTURE.md)) moves the carriers into `src/adapters/` while preserving every lint, every channel size, and every acquisition rule.
+ssh-mcp v4 preserves the v3 **lock-free** baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. The v4.1 hexagonal layout (see [ARCHITECTURE.md](./ARCHITECTURE.md)) keeps the carriers inside the owning adapters' `internal/` subtrees (and a transitional `adapters/subscription/legacy.rs`) while preserving every lint, every channel size, and every acquisition rule.
 
 This document is the source of truth for the patterns, the lints that enforce them, and the acquisition order for the residual `DashMap` shard locks that are still in play (briefly, never across `.await`).
 
@@ -8,22 +8,22 @@ Cross references:
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — module map and threading overview.
 - [RESOURCES.md](./RESOURCES.md) — backpressure features that depend on these primitives.
-- [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) — file-path map between v3 and v4 modules.
+- [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) — file-path map between v3 and v4 modules (includes the v4.1 deep-decouple addendum).
 
-## Foundational `mcp::*` modules still live
+## Adapter-internal carriers (post-v4.1 deep decouple)
 
-H17.5a deleted ~14k LOC of orphaned v3 code (see [adr/0002](./adr/0002-adopt-hexagonal-architecture.md)). The lock-free state carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`) and the global `SUBSCRIPTION_REGISTRY` survived because the russh / SFTP adapters delegate into them. The patterns below describe both the runtime location (`mcp::*`) and the v4 surface (`adapters::*`) that consumers see.
+H17.5a deleted the v3 monolith. **v4.1 H17.6** finished the foundational decouple: the lock-free state carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`) and the global `SUBSCRIPTION_REGISTRY` were relocated under the owning adapters. The patterns below give the current owning module and the consumer that drives it.
 
-| Carrier | v3 owner module (still runtime-active) | v4 surface |
-|---------|----------------------------------------|------------|
-| `RunningCommand` | `src/mcp/async_command.rs` | consumed by `src/adapters/ssh/russh_adapter.rs`, snapshot-read via `src/adapters/output_stream/russh_output.rs` |
-| `RunningShell` | `src/mcp/shell.rs` | consumed by `src/adapters/ssh/russh_adapter.rs` |
-| `RunningTransfer` | `src/mcp/transfer.rs` | consumed by `src/adapters/sftp/russh_sftp_adapter.rs` |
-| `SUBSCRIPTION_REGISTRY` (global + `spawn_peer_gc` task) | `src/mcp/subscription.rs` | v4 use cases consume `MemoryRegistry<N>` at `src/adapters/subscription/memory_registry.rs`. Both coexist during the v4.0.0 transition window — H17.6 will collapse them. |
-| `SessionRef` (russh handle + health channel) | `src/mcp/session.rs` + `src/mcp/types.rs` | consumed by `src/adapters/ssh/russh_adapter.rs` |
-| `ForwardHandle` (feature-gated) | `src/mcp/types.rs` | consumed by the forward use case via `src/adapters/repo/dashmap/forward.rs` |
+| Carrier | Owner module (v4.1) | Consumer / surface |
+|---------|---------------------|--------------------|
+| `RunningCommand` | `src/adapters/ssh/internal/async_command.rs` | consumed by `src/adapters/ssh/russh_adapter.rs`, snapshot-read via `src/adapters/output_stream/russh_output.rs` |
+| `RunningShell` | `src/adapters/ssh/internal/shell.rs` | consumed by `src/adapters/ssh/russh_adapter.rs` |
+| `RunningTransfer` | `src/adapters/sftp/internal/transfer.rs` | consumed by `src/adapters/sftp/russh_sftp_adapter.rs` |
+| `SUBSCRIPTION_REGISTRY` (global + `spawn_peer_gc` task) | `src/adapters/subscription/legacy.rs` (transitional) | v4 use cases consume `MemoryRegistry<N>` at `src/adapters/subscription/memory_registry.rs`. The legacy adapter coexists with `MemoryRegistry` until the SSH/SFTP runtime adapters are wired through the port surface end to end. |
+| `SessionRef` (russh handle + health channel) | `src/adapters/ssh/internal/session.rs` + `src/adapters/ssh/internal/types.rs` | consumed by `src/adapters/ssh/russh_adapter.rs` |
+| `ForwardHandle` (feature-gated) | `src/adapters/ssh/internal/types.rs` | consumed by the forward use case via `src/adapters/repo/dashmap/forward.rs` |
 
-The new repository adapters (`src/adapters/repo/dashmap/{session,command,shell,transfer,forward}.rs`) and the new subscription registry (`src/adapters/subscription/memory_registry.rs`) are the v4 surface for use cases. Use cases never touch `SESSION_STORAGE` / `COMMAND_STORAGE` / `SHELL_STORAGE` / `TRANSFER_STORAGE` / `SUBSCRIPTION_REGISTRY` directly — they take `Arc<R: Repository>` / `Arc<R: SubscriberRegistryAsync>` generics and the composition root pins one concrete adapter per port.
+The repository adapters (`src/adapters/repo/dashmap/{session,command,shell,transfer,forward}.rs`) and the subscription registry (`src/adapters/subscription/memory_registry.rs`) are the port surface for use cases. Use cases never touch the legacy globals (`SESSION_STORAGE` / `COMMAND_STORAGE` / `SHELL_STORAGE` / `TRANSFER_STORAGE` / `SUBSCRIPTION_REGISTRY`) directly — they take `Arc<R: Repository>` / `Arc<R: SubscriberRegistryAsync>` generics and the composition root pins one concrete adapter per port.
 
 ## Lock-free invariants enforced
 
@@ -71,7 +71,7 @@ Combined with the standard `unwrap_used` / `panic` forbids, this guarantees that
 | `SessionRef.channel_permits` | `Arc<Semaphore>` (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) | Serialises russh channel openings per session — prevents `MaxSessions` exhaustion under rapid `execute + cancel` bursts. |
 | `SessionRef.health_tx` | `broadcast::Sender<HealthEvent>` | `Healthy \| Unhealthy \| Disconnected`, all carrying `seq`. |
 | `ForwardHandle.events_tx` (feature-gated) | `broadcast::Sender<ForwardEvent>` | `Accept \| Close \| Stopped`, all carrying `seq`. |
-| `DashMap*Repo` (session / command / shell / transfer / forward) | `Arc<DashMap<Id, Entity>>` primary + secondary `DashMap<AgentId, HashSet<SessionId>>` index | Lock-free externally; shard locks are held briefly inside operations. v4 surface for the v3 `SESSION_STORAGE` / `COMMAND_STORAGE` / `SHELL_STORAGE` / `TRANSFER_STORAGE` globals. |
+| `DashMap*Repo` (session / command / shell / transfer / forward) | `Arc<DashMap<Id, Entity>>` primary + secondary `DashMap<AgentId, HashSet<SessionId>>` index | Lock-free externally; shard locks are held briefly inside operations. Hexagonal port surface for the legacy v3 `SESSION_STORAGE` / `COMMAND_STORAGE` / `SHELL_STORAGE` / `TRANSFER_STORAGE` globals (the latter were deleted alongside the rest of `src/mcp/` in v4.1 H17.6). |
 | `MemoryRegistry.subscribers` | `DashMap<uri, Vec<SubscriberHandle>>` | Snapshot-clone-then-drop pattern before any `.await`. Generic over the notifier `N: NotifierPort`. |
 | `MemoryRegistry.peer_progress` | `DashMap<(peer_id, uri), Arc<PeerProgress>>` | Per-peer cursor; `byte_cursor: AtomicU64` + `last_seq_seen: AtomicU64`. |
 | `MemoryRegistry.sequence_counters` | `DashMap<(kind, id), Arc<AtomicU64>>` | Per-resource monotonic seq. |
@@ -97,7 +97,7 @@ DashMap acquires per-shard locks under the hood. They are not awaited across, bu
 11. adapters::notifier::rmcp_peer::PeerTable                  shard
 ```
 
-The foundational `src/mcp/{storage,subscription}` shards (still runtime-active) follow the same relative order behind the v4 adapter surface — adapters wrap calls into the foundational module without holding both shards simultaneously.
+The legacy global `adapters::subscription::legacy::SUBSCRIPTION_REGISTRY` (still runtime-active alongside `MemoryRegistry`) follows the same relative order — its shard layout is identical to `MemoryRegistry`'s, and the SSH/SFTP runtime adapters never hold both registries' shards simultaneously.
 
 Rules:
 
@@ -115,7 +115,7 @@ The current code base touches at most two shards in one critical section (subscr
 | `RunningCommand.output_tx` | `SSH_COMMAND_BROADCAST_CAP` | 1024 | Same — read from `output_history`. |
 | `RunningTransfer.progress_tx` | `SSH_TRANSFER_BROADCAST_CAP` | 256 | Re-read atomic counters (`bytes_transferred`, `total_bytes`) and `status_rx`. |
 | `SessionRef.health_tx` | `SSH_SESSION_BROADCAST_CAP` | 256 | Re-read `SessionInfo` via the session repository. |
-| `ForwardHandle.events_tx` | `SSH_FORWARD_BROADCAST_CAP` | 256 | Forward storage is not persisted yet — broadcast is best-effort until the H17.6 surface lands. |
+| `ForwardHandle.events_tx` | `SSH_FORWARD_BROADCAST_CAP` | 256 | Forward storage is not persisted yet — broadcast is best-effort until cross-adapter SFTP/forward refinements land. |
 | `RunningShell.input_tx` (mpsc) | hard-coded | 64 | Backpressure on the producer (`application::write_shell::WriteShellUseCase`); no Lagged path. |
 
 ## Loom invariants

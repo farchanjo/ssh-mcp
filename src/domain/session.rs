@@ -1,6 +1,6 @@
 //! Session aggregate value object.
 //!
-//! Mirrors the v3 [`crate::mcp::types::SessionInfo`] payload but lives in
+//! Mirrors the legacy v3 `SessionInfo` payload but lives in
 //! pure-domain territory: no `tokio`, `russh`, or `dashmap` dependencies.
 //! The aggregate is immutable beyond the helpers provided here; mutation
 //! happens through use cases that produce a new entity instance.

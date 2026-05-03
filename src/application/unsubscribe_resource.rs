@@ -1,6 +1,6 @@
 //! Use case: unsubscribe a peer from a ssh-mcp resource URI.
 //!
-//! Translates the v3 [`crate::mcp::resources::unsubscribe_impl`] into a
+//! Translates the legacy v3 `unsubscribe_impl` into a
 //! hexagonal use case orchestrating the URI parser and the
 //! [`SubscriberRegistryAsync`] port.
 //!
