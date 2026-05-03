@@ -416,7 +416,8 @@ where
                 read_session(&*self.sessions, &*self.subscribers, &parsed, &canonical).await
             }
             ResourceKind::Forward => Err(DomainError::InvalidArgument(
-                "forward:// resources require the port_forward Cargo feature".to_string(),
+                "FEATURE_DISABLED: forward:// resources require the port_forward Cargo feature"
+                    .to_string(),
             )),
         }
     }

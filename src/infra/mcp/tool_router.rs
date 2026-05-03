@@ -99,15 +99,68 @@ fn render_tool_error(tool: &str, err: &DomainError) -> CallToolResult {
     CallToolResult::error(vec![Content::text(body)])
 }
 
+/// Tags surfaced through [`DomainError::InvalidArgument`] messages. Each
+/// tag corresponds to a documented v4.5 wire error code that downstream
+/// LLMs branch on for recovery logic; tagged emissions prefix the
+/// reason with `{TAG}: {message}` so [`extract_tag`] can promote the
+/// specific code without adding new [`DomainError`] variants.
+const ARG_TAGS: &[&str] = &[
+    "EMPTY_PATTERNS",
+    "TOO_MANY_PATTERNS",
+    "PATTERN_TOO_LONG",
+    "MODIFIER_NOT_ALLOWED",
+    "INVALID_REPEAT",
+    "FEATURE_DISABLED",
+];
+
+/// Tags surfaced through [`DomainError::Transport`] messages.
+const TRANSPORT_TAGS: &[&str] = &[
+    "WRITE_FAILED",
+    "CHANNEL_FAILED",
+    "COMMAND_FAILED",
+    "FORWARD_FAILED",
+];
+
+/// Tags surfaced through [`DomainError::Sftp`] messages.
+const SFTP_TAGS: &[&str] = &[
+    "LOCAL_FILE_ERROR",
+    "LOCAL_NOT_FILE",
+    "SFTP_OPEN_FAILED",
+    "REMOTE_METADATA_ERROR",
+];
+
+/// Try to peel a `TAG: message` prefix off `msg` against `allowed`. On a
+/// hit returns the static tag and the trimmed remainder; on a miss
+/// returns `None` so the caller can fall back to the legacy flat code.
+fn extract_tag<'a>(msg: &'a str, allowed: &[&'static str]) -> Option<(&'static str, &'a str)> {
+    let (head, rest) = msg.split_once(':')?;
+    for &tag in allowed {
+        if head == tag {
+            return Some((tag, rest.trim_start()));
+        }
+    }
+    None
+}
+
 /// Pick a v3-compatible error code, reason and optional detail per
-/// [`DomainError`] variant.
+/// [`DomainError`] variant. v4.5 promotes per-site tag prefixes
+/// (see [`ARG_TAGS`], [`TRANSPORT_TAGS`], [`SFTP_TAGS`]) to specific wire
+/// codes so smaller LLMs can branch on a precise failure class instead
+/// of the collapsed `INVALID_ARGUMENT` / `TRANSPORT_ERROR` / `SFTP_ERROR`
+/// fallbacks. Untagged messages keep emitting the legacy flat code.
 #[allow(
     clippy::too_many_lines,
-    reason = "exhaustive match over the 17 DomainError variants is naturally long; restructuring to a HashMap or sub-helper hurts readability"
+    reason = "exhaustive match over the 17 DomainError variants plus the v4.5 tag dispatch is naturally long; restructuring to a HashMap or sub-helper hurts readability"
 )]
 fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
     match err {
-        DomainError::InvalidArgument(reason) => ("INVALID_ARGUMENT", reason.clone(), None),
+        DomainError::InvalidArgument(reason) => {
+            if let Some((tag, rest)) = extract_tag(reason, ARG_TAGS) {
+                (tag, rest.to_string(), None)
+            } else {
+                ("INVALID_ARGUMENT", reason.clone(), None)
+            }
+        }
         DomainError::SessionNotFound(id) => (
             "SESSION_NOT_FOUND",
             "no active SSH session with the given ID".to_string(),
@@ -135,10 +188,22 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
         ),
         DomainError::Auth(reason) => ("AUTH_FAILED", reason.to_string(), None),
         DomainError::ConnectFailed(reason) => ("CONNECTION_FAILED", reason.clone(), None),
-        DomainError::Transport(reason) => ("TRANSPORT_ERROR", reason.clone(), None),
+        DomainError::Transport(reason) => {
+            if let Some((tag, rest)) = extract_tag(reason, TRANSPORT_TAGS) {
+                (tag, rest.to_string(), None)
+            } else {
+                ("TRANSPORT_ERROR", reason.clone(), None)
+            }
+        }
         DomainError::Timeout(reason) => ("TIMEOUT", reason.clone(), None),
         DomainError::Storage(reason) => ("STORAGE_ERROR", reason.clone(), None),
-        DomainError::Sftp(reason) => ("SFTP_ERROR", reason.clone(), None),
+        DomainError::Sftp(reason) => {
+            if let Some((tag, rest)) = extract_tag(reason, SFTP_TAGS) {
+                (tag, rest.to_string(), None)
+            } else {
+                ("SFTP_ERROR", reason.clone(), None)
+            }
+        }
         DomainError::PortInUse(port) => (
             "PORT_IN_USE",
             format!("local port {port} already in use"),
@@ -1225,7 +1290,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_address, parse_human_bytes};
+    use super::{classify_error, parse_address, parse_human_bytes};
+    use crate::domain::error::DomainError;
 
     #[test]
     fn parse_address_with_explicit_port() {
@@ -1263,5 +1329,94 @@ mod tests {
         assert_eq!(parse_human_bytes(Some("nope")), None);
         assert_eq!(parse_human_bytes(Some("")), None);
         assert_eq!(parse_human_bytes(None), None);
+    }
+
+    // ---------------------------------------------------------------
+    // v4.5 — granular wire error code dispatch via tag prefixes.
+    //
+    // Each documented tag must promote `InvalidArgument` / `Transport`
+    // / `Sftp` payloads to the specific wire code, while untagged
+    // payloads must keep the legacy flat code for backwards
+    // compatibility.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn classifies_invalid_argument_with_known_tag_to_specific_code() {
+        let err = DomainError::InvalidArgument("EMPTY_PATTERNS: x".to_string());
+        let (code, reason, detail) = classify_error(&err);
+        assert_eq!(code, "EMPTY_PATTERNS");
+        assert_eq!(reason, "x");
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn classifies_invalid_argument_without_tag_to_generic_code() {
+        let err = DomainError::InvalidArgument("plain reason".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "INVALID_ARGUMENT");
+        assert_eq!(reason, "plain reason");
+    }
+
+    #[test]
+    fn classifies_transport_with_known_tag_to_specific_code() {
+        let err = DomainError::Transport("WRITE_FAILED: shell write blew up".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "WRITE_FAILED");
+        assert_eq!(reason, "shell write blew up");
+    }
+
+    #[test]
+    fn classifies_transport_without_tag_falls_back_to_transport_error() {
+        let err = DomainError::Transport("kaput".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "TRANSPORT_ERROR");
+        assert_eq!(reason, "kaput");
+    }
+
+    #[test]
+    fn classifies_sftp_with_known_tag_to_specific_code() {
+        let err = DomainError::Sftp(
+            "LOCAL_FILE_ERROR: [IO_ERROR] stat local file '/tmp/x': I/O error (raw: ENOENT)"
+                .to_string(),
+        );
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "LOCAL_FILE_ERROR");
+        assert!(reason.starts_with("[IO_ERROR]"), "got {reason}");
+    }
+
+    #[test]
+    fn classifies_sftp_without_tag_falls_back_to_sftp_error() {
+        let err = DomainError::Sftp("[IO_ERROR] write to remote file '/x': ...".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "SFTP_ERROR");
+        assert!(reason.starts_with("[IO_ERROR]"), "got {reason}");
+    }
+
+    #[test]
+    fn classify_error_strips_tag_from_reason() {
+        // The leading `TAG: ` prefix must be removed so the wire
+        // `REASON:` line carries only the human message.
+        let err = DomainError::InvalidArgument("INVALID_REPEAT: repeat must be 1..=64".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "INVALID_REPEAT");
+        assert_eq!(reason, "repeat must be 1..=64");
+    }
+
+    #[test]
+    fn classify_error_ignores_unknown_tags_in_invalid_argument() {
+        let err = DomainError::InvalidArgument("UNKNOWN: blah".to_string());
+        let (code, reason, _detail) = classify_error(&err);
+        assert_eq!(code, "INVALID_ARGUMENT");
+        assert_eq!(reason, "UNKNOWN: blah");
+    }
+
+    #[test]
+    fn classify_error_promotes_feature_disabled_tag() {
+        let err = DomainError::InvalidArgument(
+            "FEATURE_DISABLED: forward:// resources require the port_forward Cargo feature"
+                .to_string(),
+        );
+        let (code, _reason, _detail) = classify_error(&err);
+        assert_eq!(code, "FEATURE_DISABLED");
     }
 }

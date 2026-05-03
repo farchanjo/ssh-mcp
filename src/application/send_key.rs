@@ -151,11 +151,13 @@ where
     }
 }
 
-/// Reject `repeat` values outside the `1..=64` window.
+/// Reject `repeat` values outside the `1..=64` window. Tags the message
+/// with `INVALID_REPEAT:` so the rmcp tool router promotes it to the
+/// specific wire code (v4.5).
 fn validate_repeat(repeat: u8) -> Result<(), DomainError> {
     if repeat == 0 || repeat > MAX_SEND_KEY_REPEAT {
         return Err(DomainError::InvalidArgument(format!(
-            "repeat must be between 1 and {MAX_SEND_KEY_REPEAT} inclusive (requested={repeat})"
+            "INVALID_REPEAT: repeat must be between 1 and {MAX_SEND_KEY_REPEAT} inclusive (requested={repeat})"
         )));
     }
     Ok(())
@@ -172,7 +174,7 @@ fn encode_key(key: ShellKey, modifiers: KeyModifiers) -> Result<Vec<u8>, DomainE
         }) => {
             let detail = format_modifiers_label(requested).unwrap_or_else(|| "(none)".to_string());
             Err(DomainError::InvalidArgument(format!(
-                "key '{key_label}' rejects the requested modifier combination (requested={detail})"
+                "MODIFIER_NOT_ALLOWED: key '{key_label}' rejects the requested modifier combination (requested={detail})"
             )))
         }
     }
@@ -399,6 +401,10 @@ mod tests {
             .expect_err("repeat=0 must be rejected");
         match err {
             DomainError::InvalidArgument(msg) => {
+                assert!(
+                    msg.starts_with("INVALID_REPEAT:"),
+                    "expected INVALID_REPEAT prefix, got {msg}"
+                );
                 assert!(msg.contains("repeat"), "got message {msg}");
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
@@ -425,6 +431,10 @@ mod tests {
             .expect_err("repeat > 64 must be rejected");
         match err {
             DomainError::InvalidArgument(msg) => {
+                assert!(
+                    msg.starts_with("INVALID_REPEAT:"),
+                    "expected INVALID_REPEAT prefix, got {msg}"
+                );
                 assert!(msg.contains("64"), "message must echo the cap, got {msg}");
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
@@ -445,6 +455,10 @@ mod tests {
             .expect_err("CtrlC + shift must be rejected by the keys encoder");
         match err {
             DomainError::InvalidArgument(msg) => {
+                assert!(
+                    msg.starts_with("MODIFIER_NOT_ALLOWED:"),
+                    "expected MODIFIER_NOT_ALLOWED prefix, got {msg}"
+                );
                 assert!(msg.contains("ctrl_c"), "got {msg}");
                 assert!(msg.contains("shift"), "got {msg}");
             }
