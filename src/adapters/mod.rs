@@ -15,5 +15,7 @@ pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod id_generator;
+pub mod notifier;
 pub mod repo;
 pub mod sftp;
+pub mod subscription;
