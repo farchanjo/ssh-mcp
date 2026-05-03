@@ -460,9 +460,14 @@ pub async fn run_http() -> Result<(), RuntimeError> {
     let (bind_addr, path) = resolve_http_bind();
     info!(addr = %bind_addr, %path, "starting ssh-mcp HTTP transport (v4 hexagonal)");
 
-    let app = Router::new()
-        .nest_service(&path, build_http_service())
-        .layer(TraceLayer::new_for_http());
+    let app = if path == "/" {
+        // axum 0.8 rejects `nest_service("/", ...)` — use `fallback_service`
+        // so a root-mounted MCP server still binds successfully.
+        Router::new().fallback_service(build_http_service())
+    } else {
+        Router::new().nest_service(&path, build_http_service())
+    }
+    .layer(TraceLayer::new_for_http());
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("ssh-mcp listening on {bind_addr}{path}");
