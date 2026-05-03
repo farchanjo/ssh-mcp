@@ -17,3 +17,6 @@
 //! without touching this layout.
 
 pub mod russh_adapter;
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fake;
