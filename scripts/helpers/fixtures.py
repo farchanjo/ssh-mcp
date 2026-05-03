@@ -31,6 +31,47 @@ HTTP_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp"
 STDIO_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp-stdio"
 
 
+def stress_transport_mode() -> str:
+    """Return the transport selector for stress scripts.
+
+    Reads ``STRESS_TRANSPORT`` (case-insensitive), defaulting to ``stdio``.
+    Recognised values are ``stdio`` and ``http``; anything else raises a
+    ``ValueError`` so typos surface immediately.
+    """
+    raw = os.environ.get("STRESS_TRANSPORT", "stdio").strip().lower()
+    if raw in ("stdio", "http"):
+        return raw
+    raise ValueError(
+        f"unknown STRESS_TRANSPORT={raw!r}; expected 'stdio' or 'http'"
+    )
+
+
+def make_stress_client():
+    """Build a fresh, initialised :class:`McpClient` per the active mode.
+
+    Stdio mode spawns a dedicated ``ssh-mcp-stdio`` child per client (each
+    process IS the session). Http mode shares the caller-supplied port via
+    keyword argument — see :func:`make_stress_client_http`.
+    """
+    if not STDIO_BIN.exists():
+        raise FileNotFoundError(f"stdio binary not built: {STDIO_BIN}")
+    transport = StdioTransport(
+        [str(STDIO_BIN)],
+        env={"RUST_LOG": os.environ.get("RUST_LOG", "warn")},
+    )
+    client = McpClient(transport)
+    client.initialize()
+    return client
+
+
+def make_stress_client_http(port: int) -> "McpClient":
+    """Build a fresh, initialised :class:`McpClient` over HTTP on ``port``."""
+    transport = HttpTransport(f"http://127.0.0.1:{port}")
+    client = McpClient(transport)
+    client.initialize()
+    return client
+
+
 @dataclass
 class SshTarget:
     """SSH endpoint coordinates pulled from environment variables."""
@@ -170,4 +211,7 @@ __all__ = [
     "stdio_client",
     "ssh_target",
     "requires_sshd",
+    "stress_transport_mode",
+    "make_stress_client",
+    "make_stress_client_http",
 ]

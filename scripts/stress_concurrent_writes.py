@@ -3,6 +3,12 @@
 Verifies FIFO ordering — the shell receives 100 ``\\x1b[A`` sequences in
 order. We assert by counting the ``[A`` substrings rendered by ``cat`` (which
 echoes input verbatim).
+
+Transport selection (v4.3): set ``STRESS_TRANSPORT`` to ``stdio`` (default)
+or ``http`` to choose between spawning per-client ``ssh-mcp-stdio`` children
+and a single shared HTTP server. Stdio mode avoids the macOS
+"can't-assign-requested-address" port-exhaustion symptom that surfaces when
+many parallel HTTP clients churn ephemeral ports.
 """
 
 from __future__ import annotations
@@ -18,37 +24,52 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from helpers.fixtures import HTTP_BIN, find_free_port, wait_for_port, SshTarget
-from helpers.mcp_client import HttpTransport, McpClient, call_tool_text
+from helpers.fixtures import (
+    HTTP_BIN,
+    SshTarget,
+    find_free_port,
+    make_stress_client,
+    make_stress_client_http,
+    stress_transport_mode,
+    wait_for_port,
+)
+from helpers.mcp_client import McpClient, call_tool_text
 from helpers.parse_block import parse_block
 
 
 CONCURRENT_SENDS = 100
 
 
-def _spawn_server(port: int) -> subprocess.Popen:
+def _spawn_http_server(port: int) -> subprocess.Popen:
     env = {**os.environ, "MCP_PORT": str(port), "MCP_HOST": "127.0.0.1", "RUST_LOG": "warn"}
     return subprocess.Popen([str(HTTP_BIN)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def main() -> int:
-    if not HTTP_BIN.exists():
-        print(json.dumps({"status": "skip", "reason": "http binary not built"}))
-        return 0
-    target = SshTarget.from_env()
-    if target is None:
-        print(json.dumps({"status": "skip", "reason": "SSH_MCP_TEST_TARGET unset"}))
-        return 0
-
-    port = find_free_port()
-    proc = _spawn_server(port)
-    try:
-        if not wait_for_port("127.0.0.1", port, timeout=10.0):
+def _run(transport: str) -> int:
+    server_proc: subprocess.Popen | None = None
+    http_port: int | None = None
+    if transport == "http":
+        if not HTTP_BIN.exists():
+            print(json.dumps({"status": "skip", "reason": "http binary not built"}))
+            return 0
+        http_port = find_free_port()
+        server_proc = _spawn_http_server(http_port)
+        if not wait_for_port("127.0.0.1", http_port, timeout=10.0):
             print(json.dumps({"status": "fail", "reason": "server failed to bind"}))
             return 1
 
-        coordinator = McpClient(HttpTransport(f"http://127.0.0.1:{port}"))
-        coordinator.initialize()
+    try:
+        coordinator = make_stress_client_http(http_port) if transport == "http" else make_stress_client()
+    except Exception as exc:
+        print(json.dumps({"status": "fail", "reason": f"coordinator init failed: {exc}"}))
+        return 1
+
+    try:
+        target = SshTarget.from_env()
+        if target is None:
+            print(json.dumps({"status": "skip", "reason": "SSH_MCP_TEST_TARGET unset"}))
+            return 0
+
         sid = parse_block(
             call_tool_text(coordinator, "ssh_connect", target.connect_args(agent_id="stress-cw"))
         ).get("session_id")
@@ -64,12 +85,24 @@ def main() -> int:
             {"shell_id": shell_id, "clear": True, "max_output_bytes": 65536},
         )
 
-        # Spawn one client per worker for true parallelism.
+        # In stdio mode every worker reuses the coordinator client because
+        # each ``ssh-mcp-stdio`` child owns its own session/shell tables —
+        # the shell_id we just minted only exists on this process. The
+        # StdioTransport reader+writer are thread-safe (one stdin lock,
+        # one cv-driven response map). In HTTP mode we still spawn one
+        # client per worker so each request races on its own session
+        # cookie.
         clients: list[McpClient] = []
-        for _ in range(CONCURRENT_SENDS):
-            c = McpClient(HttpTransport(f"http://127.0.0.1:{port}"))
-            c.initialize()
-            clients.append(c)
+        if transport == "stdio":
+            clients = [coordinator] * CONCURRENT_SENDS
+        else:
+            for _ in range(CONCURRENT_SENDS):
+                try:
+                    c = make_stress_client_http(http_port)
+                except Exception as exc:
+                    print(json.dumps({"status": "fail", "reason": f"client init failed: {exc}"}))
+                    return 1
+                clients.append(c)
 
         ok_count = 0
         fail_count = 0
@@ -91,8 +124,12 @@ def main() -> int:
                     else:
                         fail_count += 1
         finally:
-            for c in clients:
-                c.close()
+            if transport == "http":
+                for c in clients:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
 
         # Allow the shell to flush.
         time.sleep(2.0)
@@ -116,22 +153,30 @@ def main() -> int:
         call_tool_text(coordinator, "ssh_disconnect", {"session_id": sid})
         coordinator.close()
 
+        server_alive = (server_proc is None) or (server_proc.poll() is None)
         summary = {
             "status": "ok" if ok_count == CONCURRENT_SENDS and substring_count > 0 else "fail",
+            "transport": transport,
             "ok_responses": ok_count,
             "fail_responses": fail_count,
             "rendered_arrow_substrings": substring_count,
             "rendered_total_bytes": len(rendered),
-            "server_alive": proc.poll() is None,
+            "server_alive": server_alive,
         }
         print(json.dumps(summary))
         return 0 if summary["status"] == "ok" else 1
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if server_proc is not None:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+
+
+def main() -> int:
+    transport = stress_transport_mode()
+    return _run(transport)
 
 
 if __name__ == "__main__":

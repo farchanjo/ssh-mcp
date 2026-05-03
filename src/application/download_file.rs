@@ -162,6 +162,10 @@ where
     ///   streaming task does not outlive the failed insert.
     pub async fn execute(&self, req: DownloadRequest) -> Result<DownloadOutcome, DomainError> {
         let session = self.lookup_session(&req.session_id).await?;
+        // NB: optimistic pre-check only. The atomic cap enforcer runs
+        // inside `persist_or_rollback` via
+        // `TransferRepository::insert_if_under_cap` — see
+        // [`crate::application::upload_file`] for the same rationale.
         self.guard_transfer_cap(&req.session_id).await?;
 
         let transfer_id = self.ids.new_transfer_id();
@@ -229,12 +233,17 @@ where
 
     /// Persist the freshly minted entity and roll the SFTP-side task back
     /// on insert failure so the adapter does not orphan a streaming task.
+    ///
+    /// Uses [`TransferRepository::insert_if_under_cap`] so the per-session
+    /// cap check happens atomically with the insert. See
+    /// [`crate::application::upload_file`] for the TOCTOU rationale.
     async fn persist_or_rollback(
         &self,
         transfer_id: &TransferId,
         entity: crate::domain::transfer::TransferEntity,
     ) -> Result<(), DomainError> {
-        if let Err(err) = self.transfers.insert(entity).await {
+        let cap = self.config.max_transfers_per_session();
+        if let Err(err) = self.transfers.insert_if_under_cap(entity, cap).await {
             // Storage errors during rollback are swallowed: the insert
             // error is the actionable signal.
             let _ = self.sftp.cancel(transfer_id).await;
