@@ -20,4 +20,5 @@ pub(crate) mod client;
 pub(crate) mod error;
 pub mod session;
 pub(crate) mod shell;
+pub mod status_sink;
 pub mod types;
