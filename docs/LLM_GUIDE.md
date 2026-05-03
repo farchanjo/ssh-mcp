@@ -1,6 +1,6 @@
-# LLM Guide (v4.6.0)
+# LLM Guide (v4.7.0)
 
-This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 and v4.0.x at the markdown / `_meta` level; v4.6 ships one narrow renaming (`AGENT:` -> `AGENT_ID:`) plus a richer steering surface (subscribe-first `_meta` envelope, granular wire error codes, `EXPIRES_AT` / `HINT` lines, `NEXT:` advisory line, server identity with icon, tool annotations, cost hints, JSON Schema defaults).
+This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 on the text channel; v4.7 layers a parallel `structured_content` JSON channel, new tools, and an inter-tool conversation surface on top — without touching the v4.6 Markdown body. v4.7 adds three new tools (`ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — catalogue moves from 18 to 21, or 17 to 20 without `port_forward`), `resources/templates/list`, `notifications/progress` during long async waits, an MCP `prompts/list` + `prompts/get` catalog with 5 canonical workflows, idempotent retries via `_meta.idempotency_key` (15 mutating tools), `NOT_FOUND` closest-match suggestions, and an optional `INITIAL_BUFFER` line on `ssh_shell_open`. v4.6 surface (subscribe-first `HINT:`, `NEXT:` advisory, `AGENT_ID:` rename, JSON Schema defaults, cost hints, wired icon) carries forward unchanged.
 
 Cross references:
 
@@ -326,7 +326,7 @@ Each tool also carries `Tool.title` plus `ToolAnnotations.{read_only_hint, destr
 
 ### Few-shot `instructions`
 
-The server's `instructions` field now ships three canonical workflows verbatim. Models trained to read MCP capability handshakes pick them up automatically:
+The server's `instructions` field ships three canonical workflows verbatim. Models trained to read MCP capability handshakes pick them up automatically. The text below is the **runtime body** as of v4.7 (the count line still claims 18 / 17 because `instructions` was last cut on v4.6; the actual tool list returned by `tools/list` carries the v4.7 catalogue of 21 / 20 plus the new `ssh_run` / `ssh_execute_batch` / `ssh_disconnect_many` entries — they all appear under `tools/list` regardless of the `instructions` claim).
 
 ```
 SSH MCP. 18 tools, 5 push streams (shell://, command://, transfer://,
@@ -347,7 +347,7 @@ Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close.
 Watch for HINT lines and EXPIRES_AT.
 ```
 
-The build without `port_forward` advertises 17 tools and 4 streams (everything else is identical).
+For the v4.7 tool count (21 / 20), prefer `tools/list` and `prompts/list` on initialize — both reflect the runtime catalogue exactly. The `prompts/list` catalog (see [section M](#m-prompts-catalog-v47)) covers the v4.7 short-circuit recipes (`run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`).
 
 ## D. Smaller-LLM cookbook
 
@@ -502,6 +502,328 @@ Examples (full text in the tool catalogue at `src/infra/mcp/tool_router.rs`):
 - `ssh_forward` -> `Cost: 1 listener bind + SSH tcpip-forward. Subscribe to forward://<id>/events for the event log.`
 
 Convention: every line is exactly one sentence, names the dominant cost, and points at the subscribe path when one exists. Read this once, cache it, and pick the right wait / subscribe strategy without round-tripping the docs.
+
+## J. Idempotency (v4.7)
+
+Mutating tools accept a request `_meta.idempotency_key` (1..=256 bytes). When present and the key+tool tuple has been seen within the TTL window, the server returns the cached response verbatim — the use case is NOT re-executed. Smaller LLMs that retry a stalled tool call (network blip, slow channel handshake) no longer create duplicate side effects (two transfers, two cancel attempts, two batched disconnects).
+
+### Defaults and tunables
+
+- TTL: `300` seconds (5 minutes). Override via `SSH_IDEMPOTENCY_TTL_SECS` (positive integer; otherwise falls back to default).
+- Cache cap: `1024` entries. Override via `SSH_IDEMPOTENCY_MAX_ENTRIES` (positive integer). Soft cap — when reached the oldest entries (by `inserted_at`) are pruned.
+- Key length cap: `256` bytes (`IDEMPOTENCY_KEY_MAX_BYTES`). Oversized keys raise `IDEMPOTENCY_KEY_TOO_LONG`. UUIDv4 (36 bytes) and similar identifiers fit comfortably.
+- Empty keys are treated as absent (idempotency OFF for that call).
+
+Reference: `src/infra/mcp/idempotency.rs::{extract_idempotency_key, IdempotencyCache, with_idempotency}`.
+
+### Mutating tools that honour the key (15 total)
+
+`ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_disconnect_many` (v4.7), `ssh_execute`, `ssh_execute_batch` (v4.7), `ssh_run` (v4.7), `ssh_cancel_command`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`.
+
+Read-only tools intentionally ignore the key (they are already safe to retry):
+
+- `ssh_list_sessions`, `ssh_list_commands`, `ssh_get_command_output`, `ssh_get_transfer_progress`, `ssh_shell_read`, `ssh_shell_wait_for`.
+
+### Request envelope shape
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "ssh_run",
+    "arguments": { "address": "h.example.com:22", "username": "alice", "command": "uptime" },
+    "_meta": { "idempotency_key": "retry-1-abc" }
+  }
+}
+```
+
+When the key matches a previous call within the TTL, the server returns the cached `CallToolResult` (Markdown body + structured payload) verbatim — including the original `command_id`, `session_id`, etc. Idempotency makes the tool path safe to retry; it does NOT make a brand-new server-side side effect (the cached response is the same one the original caller saw).
+
+### Anti-patterns
+
+- **Reusing the same key for different argument sets.** The key is keyed on `(tool_name, key)` only; the cache does not hash the arguments. A retry with mutated arguments and the same key returns the cached response from the first call. Always pair `idempotency_key` with stable arguments.
+- **Using a cryptographically random key per attempt.** Defeats dedup. Re-use the same key across retries of the *same* logical operation (e.g. derive it from a user-visible request id).
+
+## K. structured_content channel (v4.7)
+
+Every tool response now carries BOTH the existing block-style Markdown (`content[].text` channel) AND a typed JSON object (`structured_content`). The text channel is byte-identical with v4.6 — every existing host that consumes Markdown keeps working without change. Smaller LLMs (27B class) can index the structured channel by key without parsing the Markdown body.
+
+### Advertised `output_schema` (6 tools)
+
+The following 6 tools advertise an `output_schema` JSON Schema on `tools/list`, so clients can validate the structured payload against the published shape:
+
+- `ssh_connect` -> `SshConnectResult`
+- `ssh_execute` -> `SshExecuteResult`
+- `ssh_get_command_output` -> `SshGetCommandOutputResult`
+- `ssh_shell_open` -> `SshShellOpenResult` (carries optional `initial_buffer`)
+- `ssh_shell_read` -> `SshShellReadResult`
+- `ssh_get_transfer_progress` -> `SshGetTransferProgressResult`
+
+The other 15 tools (including v4.7 `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`) emit a free-form structured payload — keys are documented in [API.md](./API.md) per tool, but no `output_schema` is published. Lifting the remaining tools is mechanical and tracked in v4.8.
+
+### Canonical example shapes
+
+`ssh_connect: ok`:
+
+```json
+{
+  "tool": "ssh_connect",
+  "status": "ok",
+  "session_id": "a3f2b1d7-...",
+  "host": "example.com",
+  "port": 22,
+  "username": "alice",
+  "agent_id": "claude-code-1",
+  "retry": 0,
+  "compression_enabled": true,
+  "persistent": false,
+  "expires_at": "2026-05-03T18:30:00+00:00",
+  "next": ["ssh_execute(session_id=a3f2b1d7-..., command=...)",
+           "ssh_shell_open(session_id=a3f2b1d7-...)",
+           "ssh_disconnect(session_id=a3f2b1d7-...)"]
+}
+```
+
+`ssh_execute: started`:
+
+```json
+{
+  "tool": "ssh_execute",
+  "status": "started",
+  "session_id": "a3f2b1d7-...",
+  "command_id": "7d4c8e2a-...",
+  "next": ["ssh_get_command_output(command_id=7d4c8e2a-..., wait=true)",
+           "ssh_cancel_command(command_id=7d4c8e2a-...)"]
+}
+```
+
+`ssh_shell_open: ok` (with v4.7 `initial_buffer`):
+
+```json
+{
+  "tool": "ssh_shell_open",
+  "status": "ok",
+  "session_id": "a3f2b1d7-...",
+  "shell_id": "4b9c8e2a-...",
+  "term": "xterm",
+  "cols": 80,
+  "rows": 24,
+  "initial_buffer": "Last login: ...\r\n$ ",
+  "next": ["resources/subscribe shell://4b9c8e2a-.../output",
+           "ssh_shell_write(shell_id=4b9c8e2a-...)",
+           "ssh_shell_send_key(shell_id=4b9c8e2a-...)"]
+}
+```
+
+`ssh_get_transfer_progress: running`:
+
+```json
+{
+  "tool": "ssh_get_transfer_progress",
+  "status": "running",
+  "transfer_id": "8f7e6d5c-...",
+  "direction": "upload",
+  "progress_percent": 47,
+  "bytes_transferred": 1153024,
+  "total_bytes": 2412544,
+  "next": ["resources/subscribe transfer://8f7e6d5c-.../progress",
+           "ssh_get_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)"]
+}
+```
+
+`ssh_run: completed`:
+
+```json
+{
+  "tool": "ssh_run",
+  "status": "completed",
+  "session_id": "a3f2b1d7-...",
+  "command_id": "7d4c8e2a-...",
+  "disconnected": true,
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": "",
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "timed_out": false
+}
+```
+
+`ssh_execute_batch: halted`:
+
+```json
+{
+  "tool": "ssh_execute_batch",
+  "status": "halted",
+  "session_id": "a3f2b1d7-...",
+  "total": 3,
+  "executed": 2,
+  "results": [
+    { "index": 0, "command": "...", "status": "completed", "exit_code": 0, "command_id": "...", "stdout": "...", "stderr": "", "stdout_truncated": false, "stderr_truncated": false, "timed_out": false },
+    { "index": 1, "command": "...", "status": "failed", "exit_code": 2, "command_id": "...", "stdout": "", "stderr": "...", "stdout_truncated": false, "stderr_truncated": false, "timed_out": false },
+    { "index": 2, "command": "...", "status": "skipped", "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false, "timed_out": false }
+  ]
+}
+```
+
+`ssh_disconnect_many: ok`:
+
+```json
+{
+  "tool": "ssh_disconnect_many",
+  "status": "ok",
+  "results": [
+    { "session_id": "a3f2b1d7-...", "status": "ok" },
+    { "session_id": "9b1c2d3e-...", "status": "ok" },
+    { "session_id": "f0e1d2c3-...", "status": "error",
+      "code": "SESSION_NOT_FOUND",
+      "reason": "no session with id f0e1d2c3-..." }
+  ],
+  "disconnected": 2,
+  "failed": 1
+}
+```
+
+### Error shape
+
+Every tool error surfaces in the structured channel with the same shape:
+
+```json
+{
+  "tool": "ssh_execute",
+  "status": "error",
+  "code": "SESSION_NOT_FOUND",
+  "reason": "no session with id sess-x",
+  "detail": "closest matches: sess-1, sess-a"
+}
+```
+
+The `code` matches the v4.5 wire-error code catalogue ([ERRORS.md](./ERRORS.md)). When the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion (top-3 Levenshtein neighbors). Reference: `src/infra/mcp/helpers/structured.rs::ok_text_and_structured` (success dual-channel) + `error_text_and_structured` (error dual-channel).
+
+## L. Progress notifications (v4.7)
+
+When a request includes `_meta.progressToken`, the server fires periodic `notifications/progress` updates during long async waits — the LLM sees a "still alive" cue without polling. Three sites:
+
+| Tool | Cadence | Payload |
+| --- | --- | --- |
+| `ssh_get_command_output(wait=true)` | 5 s | `{ progress: <stdout_bytes>, total: null, message: "command running" }` |
+| `ssh_get_transfer_progress(wait=true)` | 5 s | `{ progress: <bytes_transferred>, total: <total_bytes>, message: "transfer running" }` |
+| `ssh_shell_wait_for` | 1 s | `{ progress: <elapsed_secs>, total: <timeout_secs>, message: "waiting for pattern" }` |
+
+The notification payload follows the MCP `ProgressNotificationParam` schema (`{ progress_token, progress, total, message }`).
+
+### Request envelope
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "ssh_get_command_output",
+    "arguments": { "command_id": "7d4c8e2a-...", "wait": true, "wait_timeout_secs": 60 },
+    "_meta": { "progressToken": "p-1" }
+  }
+}
+```
+
+The server replies with the long-poll result on the original request id and emits one or more `notifications/progress` notifications carrying `progress_token = "p-1"` while the wait is in flight.
+
+### Best-effort delivery
+
+- Notification errors are swallowed (transport hiccup, peer closed, etc.). The user-visible response is unchanged.
+- When `_meta.progressToken` is absent, every emit is a no-op (no syscall, no allocation, no transport traffic).
+- Cadence is bounded by `tokio::time::interval` — never `sleep` busy-waits.
+
+Reference: `src/infra/mcp/progress.rs::ProgressEmitter` (`COMMAND_TICK = 5s`, `WAIT_FOR_TICK = 1s`). The emitter is `Clone` and lock-free; no `Mutex` on the hot path.
+
+## M. Prompts catalog (v4.7)
+
+The server advertises `prompts/list` with 5 canonical workflows pre-baked so smaller LLMs can scan the catalogue and execute the recipe step by step. Each entry resolves to a single user-text message describing the canonical tool sequence.
+
+| Prompt name | Args | Purpose |
+| --- | --- | --- |
+| `run_one_shot_command` | `address`, `username`, `command` | Drive `ssh_run` with `reuse=auto`, `disconnect_after=true`. |
+| `investigate_session` | `session_id` | Snapshot async commands, read session health resource, then disconnect. |
+| `upload_and_verify` | `session_id`, `local_path`, `remote_path` | `ssh_upload`, wait for completion, `ssh_run sha256sum` to verify. |
+| `interactive_shell_drive` | `session_id`, `prompt_pattern` | `ssh_shell_open` + subscribe + `ssh_shell_wait_for` on the prompt pattern. |
+| `cleanup_agent` | `agent_id` | `ssh_disconnect_agent` against the supplied `AGENT_ID`. |
+
+### `prompts/get` flow
+
+Send a `prompts/get` request with `name` and `arguments` (a `Map<String, String>` keyed by argument name). The server returns a `GetPromptResult` carrying a single `User`-role message with the parameterised recipe text.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "prompts/get",
+  "params": {
+    "name": "run_one_shot_command",
+    "arguments": {
+      "address": "h.example.com:22",
+      "username": "alice",
+      "command": "uptime"
+    }
+  }
+}
+```
+
+Sample response body:
+
+```
+Run "uptime" on h.example.com:22 as alice. Use ssh_run with
+reuse=auto and disconnect_after=true.
+```
+
+Missing required arguments raise `invalid_params`; unknown prompt names raise `invalid_request`. All five prompts have only required arguments — there are no optional parameters in the v4.7 catalogue. Reference: `src/infra/mcp/prompts.rs::list_prompts` + `get_prompt`.
+
+## N. NOT_FOUND closest-match suggestions (v4.7)
+
+When `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires and the relevant repo holds at least one live entry, the `DETAIL:` line carries `closest matches: <id1>, <id2>, <id3>` (top-3 Levenshtein neighbors of the supplied id). Smaller LLMs recover from typos without round-tripping `ssh_list_*`.
+
+Example error response:
+
+```
+SSH_EXECUTE: ERROR
+REASON: [SESSION_NOT_FOUND] no session with id sess-abe
+DETAIL: closest matches: sess-abc, sess-abd, sess-abf
+```
+
+Structured:
+
+```json
+{
+  "tool": "ssh_execute",
+  "status": "error",
+  "code": "SESSION_NOT_FOUND",
+  "reason": "no session with id sess-abe",
+  "detail": "closest matches: sess-abc, sess-abd, sess-abf"
+}
+```
+
+When the repo is empty, the suggestion clause is omitted (the `DETAIL:` line falls back to its v4.6 shape, which may be absent entirely). Reference: `src/infra/mcp/suggestions.rs::closest_ids` (top-N picker) + `levenshtein` (byte-level edit distance, lock-free, deterministic tie-break on lexicographic order).
+
+## O. INITIAL_BUFFER on ssh_shell_open (v4.7)
+
+When the PTY emits stdout within the first ~100 ms after `ssh_shell_open` (e.g. a login banner or a shell prompt), the response embeds:
+
+- Markdown: `INITIAL_BUFFER: <escaped-bytes>` line (CR / LF escaped to `\r` / `\n`, head-truncated to 4 KiB).
+- Structured: `initial_buffer` field (UTF-8-lossy decoded bytes).
+
+Smaller LLMs that follow the `subscribe -> read` pattern can sometimes skip the first `resources/read` round-trip when the prompt is already visible.
+
+### Tunables
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `SSH_SHELL_OPEN_INITIAL_PEEK_MS` | `100` | Total budget the open call spends peeking for stdout before returning. |
+| `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS` | `5` | Polling tick within the budget; lower values catch the first chunk faster but cost CPU. |
+| `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES` | `4096` | Hard cap on the rendered slice (head bytes; tail dropped on overflow). |
+
+The line is omitted entirely when no stdout arrived within the budget — clients still need to subscribe + read to drive the shell. Reference: `src/infra/mcp/render/shell.rs::shell_open_render_with_initial` + `shell_open_structured_with_initial`.
 
 ## Sample prompts for the LLM
 

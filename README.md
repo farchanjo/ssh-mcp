@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1091%20passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-4.6.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1156%20passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-4.7.0-blue.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
 
@@ -23,16 +23,26 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 
 [[_TOC_]]
 
-## What's New in v4.6.0
+## What's New in v4.7.0
 
-- **`NEXT:` advisory line** — every response with a clear successor tool now ends with `NEXT: <pipe-separated tool calls>` listing concrete next-step calls a smaller LLM can chain without consulting the docs. Coverage matrix in [docs/LLM_GUIDE.md section E](docs/LLM_GUIDE.md#e-next-advisory-line-v46).
-- **Subscribe-first `HINT:` lines** — four new sites: `SSH_SHELL_OPEN: OK`, `SSH_EXECUTE: STARTED`, `SSH_UPLOAD/DOWNLOAD: STARTED`, and `SSH_FORWARD: OK`. Each carries `HINT: subscribe to <uri> for realtime ...` to nudge the LLM toward push notifications rather than polling.
-- **`AGENT:` -> `AGENT_ID:` (narrow wire change)** — the agent_id field key was renamed for consistency with every other ID field (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`, `FORWARD_ID`). Affects 7 render sites (`ssh_connect`, `ssh_list_sessions`, `ssh_execute`, `ssh_shell_open`, `ssh_upload/download`, `ssh_disconnect_agent`). Hosts that grep `^AGENT:` literally must update; key-value parsers walking the lines generically are unaffected.
-- **Three reserved error codes now live** — `FORWARD_FAILED` (forward bind failure other than `AddrInUse`), `LOCAL_NOT_FILE` (upload pre-flight `is_file` check), and `REMOTE_METADATA_ERROR` (download remote `stat` failure) now reach the wire from concrete raise sites. The "Reserved" column on [docs/ERRORS.md](docs/ERRORS.md) drops to zero entries — every documented code is live.
-- **JSON Schema `default` keywords visible** — `Option<T>` fields whose doc cites a default now emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]`. Smaller LLMs reading the schema mechanically can see the default value without parsing English from the description.
-- **One-line `Cost:` hints on every tool description** — every tool description ends with a `Cost:` line stating O() complexity, expected latency, and whether the call is blocking or async. Smaller LLMs can reason about retry / batch strategies without external benchmarks.
-- **`Implementation.icons` wired** — points at `https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg` (`image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description until then.
-- **Public MCP API structurally unchanged** — same 18 tools, same 5 resource schemes, same block markdown response shape, same env vars. The only narrow break is the `AGENT:` -> `AGENT_ID:` rename above. v3 / v4.0 / v4.1 / v4.5 hosts that walk the markdown body line-by-line into a key-value map keep working without change.
+- **MCP inter-tool conversation surface** — every tool now emits a parallel `structured_content` JSON object next to the existing block-style Markdown body. 6 tools advertise an `output_schema` JSON Schema (`ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress`); the other 15 emit a free-form structured payload. Errors land in the structured channel as `{ tool, status: "error", code, reason, detail }`. Text channel is byte-identical with v4.6 — every existing host keeps working without change. See [docs/LLM_GUIDE.md section K](docs/LLM_GUIDE.md#k-structured_content-channel-v47).
+- **Three new tools** — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session, stop-on-failure), `ssh_disconnect_many` (best-effort batch disconnect 1..=64 ids). Tool count moves from 18 to 21 (or 17 to 20 without `port_forward`). See [docs/API.md](docs/API.md).
+- **Resource templates** — `resources/templates/list` advertises 4 RFC 6570 URI shapes (5 with `port_forward`) so smaller LLMs can scan the URI catalogue without enumerating live instances. See [docs/RESOURCES.md - Resource Templates (v4.7)](docs/RESOURCES.md#resource-templates-v47).
+- **Progress notifications** — when a request includes `_meta.progressToken`, the server fires periodic `notifications/progress` updates during long async waits: `ssh_get_command_output(wait=true)` (5 s cadence), `ssh_get_transfer_progress(wait=true)` (5 s), `ssh_shell_wait_for` (1 s). Best-effort — transport errors are swallowed. See [docs/LLM_GUIDE.md section L](docs/LLM_GUIDE.md#l-progress-notifications-v47).
+- **MCP prompts catalog** — the server advertises `prompts/list` + `prompts/get` with 5 canonical workflows: `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`. See [docs/LLM_GUIDE.md section M](docs/LLM_GUIDE.md#m-prompts-catalog-v47).
+- **Idempotency cache** — mutating tools (15 total) accept a request `_meta.idempotency_key` (1..=256 bytes). Cached response replays within the TTL window (default 300 s, env `SSH_IDEMPOTENCY_TTL_SECS`; cap 1024 entries, env `SSH_IDEMPOTENCY_MAX_ENTRIES`). New error code `IDEMPOTENCY_KEY_TOO_LONG`. Read-only tools ignore the key. See [docs/LLM_GUIDE.md section J](docs/LLM_GUIDE.md#j-idempotency-v47).
+- **NOT_FOUND closest-match suggestions** — when `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires and the relevant repo is non-empty, the `DETAIL:` line carries `closest matches: <id1>, <id2>, <id3>` (top-3 Levenshtein neighbors). Smaller LLMs recover from typos without round-tripping `ssh_list_*`. See [docs/ERRORS.md](docs/ERRORS.md#v47-not_found-closest-match-suggestions).
+- **`INITIAL_BUFFER:` line on `ssh_shell_open`** — when the PTY emits stdout within ~100 ms after open, the response embeds the head-truncated bytes (cap 4 KiB) so the LLM can sometimes skip the first `resources/read` round-trip. Tunables: `SSH_SHELL_OPEN_INITIAL_PEEK_MS`, `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS`, `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES`. See [docs/LLM_GUIDE.md section O](docs/LLM_GUIDE.md#o-initial_buffer-on-ssh_shell_open-v47).
+- **Public MCP API additive** — every v4.6 wire shape is preserved. The text channel is byte-identical; the new `structured_content`, `prompts/*`, `resources/templates/*`, `notifications/progress`, and `_meta.idempotency_key` surfaces are additive. v3 / v4.0 / v4.1 / v4.5 / v4.6 hosts that walk the markdown body line-by-line into a key-value map keep working without change.
+
+### Carried forward from v4.6.0
+
+- **`NEXT:` advisory line** — every response with a clear successor ends with `NEXT: <pipe-separated tool calls>` listing concrete next-step calls. Coverage matrix in [docs/LLM_GUIDE.md section E](docs/LLM_GUIDE.md#e-next-advisory-line-v46).
+- **Subscribe-first `HINT:` lines** — `SSH_SHELL_OPEN: OK`, `SSH_EXECUTE: STARTED`, `SSH_UPLOAD/DOWNLOAD: STARTED`, `SSH_FORWARD: OK` — each carries `HINT: subscribe to <uri> for realtime ...`.
+- **`AGENT:` -> `AGENT_ID:` (narrow wire change)** — renamed for consistency with every other ID field. Affects 7 render sites; hosts that grep `^AGENT:` literally must update.
+- **JSON Schema `default` keywords + one-line `Cost:` hints** — every optional arg surfaces its default on the schema; every tool description ends with a `Cost:` line.
+- **`Implementation.icons` wired** — single hosted SVG entry on the `Implementation` advertised on `initialize`.
+- **All 14 wire error tags live** — `FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR` reached the wire in v4.6.
 
 ### Carried forward from v4.5.0
 
@@ -64,7 +74,7 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 ## Features
 
 - **rmcp 1.6 transport** — Streamable HTTP MCP (with SSE notifications) hosted by `axum`, plus stdio.
-- **18 MCP tools** — full SSH lifecycle, async commands, interactive shells, semantic keystrokes, SFTP, port forwarding (feature-gated).
+- **21 MCP tools** (20 without `port_forward`) — full SSH lifecycle, async commands, interactive shells, semantic keystrokes, SFTP, port forwarding (feature-gated). v4.7 adds `ssh_run` (one-shot connect+execute+disconnect), `ssh_execute_batch` (sequential 1..=16 commands), `ssh_disconnect_many` (batch disconnect 1..=64 ids).
 - **5 resource subscribe schemes** — push notifications for shell output, command output, transfer progress, session health, port-forward events.
 - **Native async SSH** — `russh` 0.55, no `spawn_blocking`, no C dependencies.
 - **Multiple auth methods** — Password, key file (explicit or auto-discovered in `~/.ssh/`), SSH agent.
@@ -81,7 +91,7 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/ARCHITECTURE.md) | v4 hexagonal layout, layer-by-layer module map, dependency graph, sequence diagrams |
-| [API Reference](docs/API.md) | All 18 MCP tools (inputs, outputs, errors) |
+| [API Reference](docs/API.md) | All 21 MCP tools (inputs, outputs, structured_content, errors) |
 | [Resources](docs/RESOURCES.md) | The 5 resource subscribe schemes + cursor / sequence semantics |
 | [LLM Guide](docs/LLM_GUIDE.md) | Token-efficient subscribe-first patterns for LLM clients |
 | [Flows](docs/FLOWS.md) | Sequence diagrams for connect / execute / shell / SFTP / subscribe |
@@ -101,7 +111,7 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --lib --quiet      # 1091 tests
+cargo test --lib --quiet      # 1156 tests
 cargo test --tests --quiet    # 2 integration tests (incl. v4 composition smoke)
 ```
 
@@ -219,13 +229,13 @@ launchctl load ~/Library/LaunchAgents/com.farchanjo.ssh-mcp.plist
 
 </details>
 
-## MCP Tools (18)
+## MCP Tools (21 with `port_forward`, 20 without)
 
 | Group | Tools |
 |-------|-------|
-| **Connection** | `ssh_connect` (typed `ReusePolicy`), `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent` |
-| **Commands** | `ssh_execute` (optional `pty=true`), `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command` |
-| **Shell** *(subscribe-first)* | `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`), `ssh_shell_wait_for`, `ssh_shell_close` |
+| **Connection** | `ssh_connect` (typed `ReusePolicy`), `ssh_disconnect`, `ssh_disconnect_many` *(v4.7)*, `ssh_list_sessions`, `ssh_disconnect_agent` |
+| **Commands** | `ssh_execute` (optional `pty=true`), `ssh_execute_batch` *(v4.7)*, `ssh_run` *(v4.7)*, `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command` |
+| **Shell** *(subscribe-first)* | `ssh_shell_open` *(v4.7 `INITIAL_BUFFER:`)*, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`), `ssh_shell_wait_for`, `ssh_shell_close` |
 | **SFTP** | `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress` |
 | **Network** *(feature-gated)* | `ssh_forward` |
 
@@ -251,7 +261,7 @@ See [docs/RESOURCES.md](docs/RESOURCES.md) for the full contract and [docs/LLM_G
 
 ## Response Format
 
-All 18 MCP tools return a **single markdown `String`** in block style:
+All 21 (or 20) MCP tools return BOTH a **single markdown `String`** in block style AND (v4.7) a typed JSON object on `structured_content`:
 
 - **First line**: `TOOL_NAME: STATUS` (`OK`, `REUSED`, `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`, …).
 - **Body**: one `KEY: value` per line. All identifiers carry the `_ID` suffix (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`).
@@ -274,7 +284,7 @@ All 18 MCP tools return a **single markdown `String`** in block style:
 
   The full error code catalogue lives in [docs/ERRORS.md](docs/ERRORS.md).
 
-> **Wire compatibility**: the v4 markdown shape is byte-identical to v3 (verified by snapshot tests in `tests/v4_smoke.rs`). v3 clients keep working without any change.
+> **Wire compatibility**: the v4 / v4.7 markdown shape is byte-identical to v3 on the text channel (verified by snapshot tests in `tests/v4_smoke.rs`). v3 / v4.x clients keep working without any change. The v4.7 `structured_content` payload sits next to the text body — clients that ignore it stay byte-compatible.
 
 A Python helper (`parse_mcp_response`) ships in `scripts/test_http.py` and `scripts/test_stdio.py` for clients that need to map markdown back into legacy field names.
 
@@ -494,7 +504,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layer-by-layer mod
 ## Testing
 
 ```bash
-# Rust unit tests (1091)
+# Rust unit tests (1156)
 cargo test --lib --quiet
 
 # Rust integration tests (2 — incl. v4 composition smoke)
@@ -507,8 +517,8 @@ cargo test --all-features
 cargo test --features test-fixtures
 
 # Python integration suites (require a reachable SSH server)
-python3 scripts/test_http.py        # HTTP transport — all 18 tools + resources
-python3 scripts/test_stdio.py       # Stdio transport — all 18 tools + resources
+python3 scripts/test_http.py        # HTTP transport — all 21 tools + resources
+python3 scripts/test_stdio.py       # Stdio transport — all 21 tools + resources
 python3 scripts/test_send_key.py    # ssh_shell_send_key coverage
 python3 scripts/test_wait_for.py    # ssh_shell_wait_for coverage
 python3 scripts/test_resources.py   # 5 resource schemes + subscribe + cursor
@@ -525,7 +535,7 @@ RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants
 
 | Suite | Count |
 |-------|-------|
-| Lib unit tests | **1091** |
+| Lib unit tests | **1156** |
 | Integration tests | **2** (incl. `tests/v4_smoke.rs`) |
 | Python integration scripts | 5 |
 | Python stress scripts | 4 |
