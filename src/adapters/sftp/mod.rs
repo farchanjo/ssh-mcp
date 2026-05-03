@@ -15,3 +15,6 @@
 //! composition root so both adapters reference the same instance.
 
 pub mod russh_sftp_adapter;
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fake;
