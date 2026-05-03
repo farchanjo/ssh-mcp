@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1074%20passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-4.5.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1091%20passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-4.6.0-blue.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
 
@@ -23,16 +23,26 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 
 [[_TOC_]]
 
-## What's New in v4.5.0
+## What's New in v4.6.0
+
+- **`NEXT:` advisory line** — every response with a clear successor tool now ends with `NEXT: <pipe-separated tool calls>` listing concrete next-step calls a smaller LLM can chain without consulting the docs. Coverage matrix in [docs/LLM_GUIDE.md section E](docs/LLM_GUIDE.md#e-next-advisory-line-v46).
+- **Subscribe-first `HINT:` lines** — four new sites: `SSH_SHELL_OPEN: OK`, `SSH_EXECUTE: STARTED`, `SSH_UPLOAD/DOWNLOAD: STARTED`, and `SSH_FORWARD: OK`. Each carries `HINT: subscribe to <uri> for realtime ...` to nudge the LLM toward push notifications rather than polling.
+- **`AGENT:` -> `AGENT_ID:` (narrow wire change)** — the agent_id field key was renamed for consistency with every other ID field (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`, `FORWARD_ID`). Affects 7 render sites (`ssh_connect`, `ssh_list_sessions`, `ssh_execute`, `ssh_shell_open`, `ssh_upload/download`, `ssh_disconnect_agent`). Hosts that grep `^AGENT:` literally must update; key-value parsers walking the lines generically are unaffected.
+- **Three reserved error codes now live** — `FORWARD_FAILED` (forward bind failure other than `AddrInUse`), `LOCAL_NOT_FILE` (upload pre-flight `is_file` check), and `REMOTE_METADATA_ERROR` (download remote `stat` failure) now reach the wire from concrete raise sites. The "Reserved" column on [docs/ERRORS.md](docs/ERRORS.md) drops to zero entries — every documented code is live.
+- **JSON Schema `default` keywords visible** — `Option<T>` fields whose doc cites a default now emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]`. Smaller LLMs reading the schema mechanically can see the default value without parsing English from the description.
+- **One-line `Cost:` hints on every tool description** — every tool description ends with a `Cost:` line stating O() complexity, expected latency, and whether the call is blocking or async. Smaller LLMs can reason about retry / batch strategies without external benchmarks.
+- **`Implementation.icons` wired** — points at `https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg` (`image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description until then.
+- **Public MCP API structurally unchanged** — same 18 tools, same 5 resource schemes, same block markdown response shape, same env vars. The only narrow break is the `AGENT:` -> `AGENT_ID:` rename above. v3 / v4.0 / v4.1 / v4.5 hosts that walk the markdown body line-by-line into a key-value map keep working without change.
+
+### Carried forward from v4.5.0
 
 - **LLM UX overhaul** — the wire contract documented for years is now actually emitted on every read.
 - **Stable `PeerId`** — derived from `Mcp-Session-Id` (HTTP) or a `Stdio` singleton key. Subscribe and unsubscribe addressed to the same connection share a single id, so per-peer cursors no longer reset between requests.
 - **`_meta` envelope on `resources/read`** — every response embeds `kind`, `cursor`, `buffer_size`, `last_seq`, and `status` (cursor + `buffer_size` only on the byte-stream resources). MIME types are explicit: `text/plain` for `shell://`, block-style `text/plain` for `command://`, `application/json` for `transfer:// session:// forward://`.
-- **Granular wire error codes** — 11 error tags now reach the wire (`EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG`, `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT`, `FEATURE_DISABLED`, `WRITE_FAILED`, `CHANNEL_FAILED`, `COMMAND_FAILED`, `LOCAL_FILE_ERROR`, `SFTP_OPEN_FAILED`); 3 reserved tags (`FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR`) are recognised by the dispatcher with no live raise site yet. Untagged messages still fall through to the flat codes (`INVALID_ARGUMENT`, `TRANSPORT_ERROR`, `SFTP_ERROR`).
-- **Server identity** — the `Implementation` advertised on `initialize` carries `title = "SSH Remote Shell"`, a multi-line `description`, and `website_url = "https://github.com/farchanjo/ssh-mcp"`. Icons are intentionally omitted until a stable hosted SVG asset URL ships.
+- **Granular wire error codes** — 14 error tags reach the wire as of v4.6 (the v4.5 set of 11 emitted plus `FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR` newly wired). Untagged messages still fall through to the flat codes (`INVALID_ARGUMENT`, `TRANSPORT_ERROR`, `SFTP_ERROR`).
+- **Server identity** — the `Implementation` advertised on `initialize` carries `title = "SSH Remote Shell"`, a multi-line `description`, `website_url = "https://github.com/farchanjo/ssh-mcp"`, and (v4.6) the icon URL above.
 - **18 tool annotations + few-shot `instructions`** — every tool emits a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}` so MCP hosts can rank, filter, and warn before destructive use. The `instructions` field carries three canonical workflows (run command, interactive shell, upload) for smaller LLMs.
 - **`ssh_forward` emits `FORWARD_ID` + `SESSION_ID`** — callers can construct the matching `forward://<FORWARD_ID>/events` subscribe URI without a round-trip through `resources/list`.
-- **Public MCP API unchanged** — same 18 tools, same 5 resource schemes, same markdown response shape, same env vars. v3 / v4.0 / v4.1 hosts work against v4.5 servers without any change.
 
 ### Carried forward from v4.4.0
 
@@ -91,7 +101,7 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --lib --quiet      # 1014 tests
+cargo test --lib --quiet      # 1091 tests
 cargo test --tests --quiet    # 2 integration tests (incl. v4 composition smoke)
 ```
 
@@ -289,7 +299,11 @@ SESSION_ID: 550e8400-e29b-41d4-a716-446655440000
 HOST: user@example.com:22
 RETRY: 0
 PERSISTENT: false
+EXPIRES_AT: 2026-05-03T18:30:00+00:00
+NEXT: ssh_execute(session_id=550e8400-..., command=...) | ssh_shell_open(session_id=550e8400-...) | ssh_disconnect(session_id=550e8400-...)
 ```
+
+The `AGENT_ID:` line is appended when `agent_id` is passed (renamed from `AGENT:` in v4.6). The trailing `NEXT:` line (v4.6) names the three most-likely successor calls.
 
 </details>
 
@@ -480,7 +494,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layer-by-layer mod
 ## Testing
 
 ```bash
-# Rust unit tests (1014)
+# Rust unit tests (1091)
 cargo test --lib --quiet
 
 # Rust integration tests (2 — incl. v4 composition smoke)
@@ -511,7 +525,7 @@ RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants
 
 | Suite | Count |
 |-------|-------|
-| Lib unit tests | **1014** |
+| Lib unit tests | **1091** |
 | Integration tests | **2** (incl. `tests/v4_smoke.rs`) |
 | Python integration scripts | 5 |
 | Python stress scripts | 4 |

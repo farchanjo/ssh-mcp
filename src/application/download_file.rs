@@ -561,21 +561,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_metadata_error_propagates_as_sftp_domain_error() {
+        // The production [`RusshSftpAdapter::download`] now stats the
+        // remote path synchronously before spawning the streaming task
+        // and tags the failure with `REMOTE_METADATA_ERROR:` (v4.5 wire
+        // tag). The use case must propagate the tagged message verbatim
+        // so the rmcp tool router can promote it onto the dedicated wire
+        // code without flattening to `SFTP_ERROR`.
         let wired = build_wired();
         let seeded = seed_session(&wired.sessions, "sess-meta", None);
-        wired.sftp.queue_download_error(DomainError::Sftp(
-            "get remote metadata: no such file".to_string(),
-        ));
+        let tagged = "REMOTE_METADATA_ERROR: cannot stat remote path: no such file";
+        wired
+            .sftp
+            .queue_download_error(DomainError::Sftp(tagged.to_string()));
 
         let err = wired
             .uc
             .execute(base_request(seeded.id))
             .await
             .expect_err("download must fail");
-        assert_eq!(
-            err,
-            DomainError::Sftp("get remote metadata: no such file".to_string())
-        );
+        match err {
+            DomainError::Sftp(msg) => {
+                assert!(
+                    msg.starts_with("REMOTE_METADATA_ERROR:"),
+                    "expected REMOTE_METADATA_ERROR prefix, got {msg}"
+                );
+                assert_eq!(msg, tagged);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
         let all = wired.transfers.list_filtered(None).await.expect("list");
         assert!(all.is_empty(), "failure path must not persist a transfer");
     }

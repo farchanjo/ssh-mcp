@@ -27,9 +27,10 @@ pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
         session_id,
         agent_id,
     } = outcome;
-    let mut out = String::with_capacity(192);
+    let shell_id = shell.id.as_str().to_string();
+    let mut out = String::with_capacity(320);
     out.push_str("SSH_SHELL_OPEN: OK\nSHELL_ID: ");
-    out.push_str(shell.id.as_str());
+    out.push_str(&shell_id);
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id.as_str());
     out.push_str("\nTERM: ");
@@ -39,10 +40,27 @@ pub fn shell_open_render(outcome: OpenShellOutcome) -> String {
     out.push('x');
     out.push_str(&shell.terminal.rows.to_string());
     if let Some(agent) = agent_id {
-        out.push_str("\nAGENT: ");
+        out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
+    append_subscribe_hint(
+        &mut out,
+        &format!(
+            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
+        ),
+    );
+    append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
     out
+}
+
+/// Successor tools after `ssh_shell_open` — subscribe-first push, or
+/// drive the shell with `ssh_shell_write` / `ssh_shell_send_key`.
+fn next_hint_for_shell_open(shell_id: &str) -> String {
+    format!(
+        "resources/subscribe shell://{shell_id}/output | \
+         ssh_shell_write | \
+         ssh_shell_send_key"
+    )
 }
 
 /// Render a [`WriteShellOutcome`] as the v3 `SSH_SHELL_WRITE` block.
@@ -53,11 +71,12 @@ pub fn shell_write_render(outcome: WriteShellOutcome) -> String {
         bytes_written,
         last_activity_at: _,
     } = outcome;
-    let mut out = String::with_capacity(80);
+    let mut out = String::with_capacity(192);
     out.push_str("SSH_SHELL_WRITE: OK\nSHELL_ID: ");
     out.push_str(shell_id.as_str());
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_written.to_string());
+    append_next_line(&mut out, &next_hint_for_shell_drive(shell_id.as_str()));
     out
 }
 
@@ -72,7 +91,7 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
         bytes_sent,
         sent_at: _,
     } = outcome;
-    let mut out = String::with_capacity(128);
+    let mut out = String::with_capacity(256);
     out.push_str("SSH_SHELL_SEND_KEY: OK\nSHELL_ID: ");
     out.push_str(shell_id.as_str());
     out.push_str("\nKEY: ");
@@ -85,7 +104,34 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
     out.push_str(&repeat.to_string());
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_sent.to_string());
+    append_next_line(&mut out, &next_hint_for_shell_drive(shell_id.as_str()));
     out
+}
+
+/// Successor tools after a shell drive call (`ssh_shell_write` /
+/// `ssh_shell_send_key`) — read the buffered response either via
+/// subscription or pull-mode read.
+fn next_hint_for_shell_drive(shell_id: &str) -> String {
+    format!(
+        "resources/read shell://{shell_id}/output?cursor=auto | \
+         ssh_shell_wait_for | \
+         ssh_shell_read"
+    )
+}
+
+/// Append a single `NEXT: <hint>` advisory line listing concrete tool
+/// calls a smaller LLM can chain without consulting the cookbook.
+fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Append a `HINT:` line steering 27B-class models toward the
+/// subscribe-first resource pattern (push notifications) instead of
+/// hot-polling tool calls.
+fn append_subscribe_hint(out: &mut String, hint: &str) {
+    out.push_str("\nHINT: ");
+    out.push_str(hint);
 }
 
 /// Render a [`ReadShellOutcome`] as the v3 `SSH_SHELL_READ` block.
@@ -127,7 +173,7 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
     };
     let data_block = render_output_block("data", &nonce, &outcome.data, DEFAULT_OUTPUT_BYTES, None);
     let bytes_returned = outcome.data.len().min(DEFAULT_OUTPUT_BYTES);
-    let mut out = String::with_capacity(128 + data_block.len());
+    let mut out = String::with_capacity(192 + data_block.len());
     out.push_str("SSH_SHELL_WAIT_FOR: ");
     out.push_str(status_label);
     out.push_str("\nSHELL_ID: ");
@@ -140,7 +186,29 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
     out.push_str(&bytes_returned.to_string());
     out.push('\n');
     out.push_str(&data_block);
+    if let Some(hint) = next_hint_for_wait_for(outcome.status, outcome.shell_id.as_str()) {
+        append_next_line(&mut out, &hint);
+    }
     out
+}
+
+/// Successor advisory after `ssh_shell_wait_for`. `Matched` invites a
+/// write / send-key / close. `Timeout` invites another wait, a pull
+/// read, or close. `Closed` is terminal — no `NEXT`.
+fn next_hint_for_wait_for(status: WaitForPatternStatus, shell_id: &str) -> Option<String> {
+    match status {
+        WaitForPatternStatus::Matched => Some(format!(
+            "ssh_shell_write(shell_id={shell_id}, ...) | \
+             ssh_shell_send_key(shell_id={shell_id}, ...) | \
+             ssh_shell_close(shell_id={shell_id})"
+        )),
+        WaitForPatternStatus::Timeout => Some(format!(
+            "ssh_shell_wait_for(shell_id={shell_id}, ...) | \
+             ssh_shell_read(shell_id={shell_id}) | \
+             ssh_shell_close(shell_id={shell_id})"
+        )),
+        WaitForPatternStatus::Closed => None,
+    }
 }
 
 /// Render a [`CloseShellOutcome`] as the v3 `SSH_SHELL_CLOSE` block.
@@ -182,7 +250,14 @@ mod tests {
             bytes_written: 42,
             last_activity_at: "2026-04-18T10:30:00+00:00".to_string(),
         });
-        assert_eq!(m, "SSH_SHELL_WRITE: OK\nSHELL_ID: shell-1\nBYTES_SENT: 42");
+        assert!(
+            m.starts_with("SSH_SHELL_WRITE: OK\nSHELL_ID: shell-1\nBYTES_SENT: 42\n"),
+            "body: {m}"
+        );
+        assert!(
+            m.contains("\nNEXT: resources/read shell://shell-1/output?cursor=auto"),
+            "body: {m}"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! 3. Mint a fresh [`TransferId`] via [`IdGeneratorPort::new_transfer_id`].
 //! 4. Hand the work to [`SftpClientPort::upload`] — the adapter spawns the
 //!    streaming task internally, performs the local-file stat, and returns a
-//!    [`crate::domain::transfer::TransferEntity`] in
+//!    [`TransferEntity`] in
 //!    [`crate::domain::transfer::TransferStatus::Running`] populated with the
 //!    resolved local path and total byte count.
 //! 5. Persist the entity through [`TransferRepository::insert`]. On insert
@@ -40,8 +40,11 @@
 
 use std::sync::Arc;
 
+use tokio::fs;
+
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, TransferId};
+use crate::domain::transfer::TransferEntity;
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
@@ -158,27 +161,15 @@ where
     ///   streaming task does not outlive the failed insert.
     pub async fn execute(&self, req: UploadRequest) -> Result<UploadOutcome, DomainError> {
         let session = self.lookup_session(&req.session_id).await?;
-        // NB: the optimistic pre-check (cheap, no SFTP work spent on
-        // breaches) is *not* the cap enforcer — the canonical gate runs
-        // atomically inside `persist_or_rollback` via
-        // `TransferRepository::insert_if_under_cap`. The pre-check exists
-        // only to short-circuit obvious overflows before any SFTP RTT is
-        // paid; it is allowed (and expected) to under-report under
-        // contention.
+        // Pre-flight gates: the optimistic cap pre-check shaves obvious
+        // overflows; the canonical cap enforcer runs atomically inside
+        // `persist_or_rollback`. The local-path guard tags directory /
+        // missing-file mistakes with the v4.5 wire codes.
         self.guard_transfer_cap(&req.session_id).await?;
+        Self::guard_local_path_is_file(&req.local_path).await?;
 
         let transfer_id = self.ids.new_transfer_id();
-        let entity = self
-            .sftp
-            .upload(
-                transfer_id.clone(),
-                PortUploadRequest {
-                    session_id: req.session_id.clone(),
-                    local_path: req.local_path.clone(),
-                    remote_path: req.remote_path.clone(),
-                },
-            )
-            .await?;
+        let entity = self.invoke_upload_adapter(&transfer_id, &req).await?;
 
         // Snapshot before the move into `insert_if_under_cap`.
         let resolved_local = entity.local_path.clone();
@@ -187,14 +178,10 @@ where
         let started_at = entity.started_at;
 
         self.persist_or_rollback(&transfer_id, entity).await?;
-
         self.subscribers
             .poke(ResourceKind::Transfer, transfer_id.as_str());
-
         // Touching the clock keeps the port plumbed even though the
-        // adapter owns the canonical `started_at`. A future iteration
-        // can route every timestamp through the clock without another
-        // constructor churn.
+        // adapter owns the canonical `started_at`.
         let _ = self.clock.utc_now();
 
         Ok(UploadOutcome {
@@ -206,6 +193,27 @@ where
             total_bytes,
             started_at: started_at.to_rfc3339(),
         })
+    }
+
+    /// Hand the upload off to the SFTP adapter and surface the snapshot
+    /// entity. Extracted from [`Self::execute`] so the orchestrator
+    /// stays under the project's 30-line method threshold after the
+    /// v4.6 pre-flight `LOCAL_NOT_FILE` guard.
+    async fn invoke_upload_adapter(
+        &self,
+        transfer_id: &TransferId,
+        req: &UploadRequest,
+    ) -> Result<TransferEntity, DomainError> {
+        self.sftp
+            .upload(
+                transfer_id.clone(),
+                PortUploadRequest {
+                    session_id: req.session_id.clone(),
+                    local_path: req.local_path.clone(),
+                    remote_path: req.remote_path.clone(),
+                },
+            )
+            .await
     }
 
     /// Resolve the session entity, mapping `Ok(None)` to
@@ -230,6 +238,34 @@ where
         Ok(())
     }
 
+    /// Reject the request when the local path resolves to anything other
+    /// than a regular file. Emits two distinct tagged failures so smaller
+    /// LLMs can branch on the precise cause:
+    ///
+    /// - `LOCAL_NOT_FILE:` when [`tokio::fs::metadata`] succeeds but
+    ///   `is_file()` is false (directory, symlink-to-directory, FIFO,
+    ///   block device, ...).
+    /// - `LOCAL_FILE_ERROR:` when the metadata call itself fails (path
+    ///   missing, permission denied, broken symlink). The existing
+    ///   adapter-side stat already emits this tag for downstream
+    ///   `stat_local_size` failures; we duplicate it here so the
+    ///   pre-flight check is consistent with the adapter classification.
+    ///
+    /// Tilde and home expansion remain the adapter's responsibility — we
+    /// stat the literal path the caller provided so directory-vs-file
+    /// mistakes surface before any SFTP RTT is paid.
+    async fn guard_local_path_is_file(local_path: &str) -> Result<(), DomainError> {
+        match fs::metadata(local_path).await {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(_) => Err(DomainError::Sftp(format!(
+                "LOCAL_NOT_FILE: local path '{local_path}' is not a regular file"
+            ))),
+            Err(err) => Err(DomainError::Sftp(format!(
+                "LOCAL_FILE_ERROR: cannot stat local path '{local_path}': {err}"
+            ))),
+        }
+    }
+
     /// Persist the freshly minted entity and roll the SFTP-side task back
     /// on insert failure so the adapter does not orphan a streaming task.
     ///
@@ -241,7 +277,7 @@ where
     async fn persist_or_rollback(
         &self,
         transfer_id: &TransferId,
-        entity: crate::domain::transfer::TransferEntity,
+        entity: TransferEntity,
     ) -> Result<(), DomainError> {
         let cap = self.config.max_transfers_per_session();
         if let Err(err) = self.transfers.insert_if_under_cap(entity, cap).await {
@@ -448,10 +484,28 @@ mod tests {
         entity
     }
 
+    /// Create a real temp file the use case can stat through its
+    /// pre-flight `LOCAL_NOT_FILE` guard. Returns the absolute path.
+    /// The file lives in the system temp dir; tests rely on the OS
+    /// reaping it (no explicit cleanup) — the v4.6 pre-flight only
+    /// requires the path to exist and be a regular file at execution
+    /// time.
+    fn seed_local_file(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "ssh-mcp-upload-{label}-{nano}.bin",
+            nano = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        ));
+        std::fs::write(&path, b"v4.6 fixture").expect("seed local file");
+        path.to_string_lossy().into_owned()
+    }
+
     fn base_request(session_id: SessionId) -> UploadRequest {
         UploadRequest {
             session_id,
-            local_path: "/tmp/source.bin".to_string(),
+            local_path: seed_local_file("base"),
             remote_path: "/srv/dest.bin".to_string(),
         }
     }
@@ -464,15 +518,13 @@ mod tests {
         let seeded = seed_session(&wired.sessions, "sess-1", None);
         wired.sftp.queue_upload_ok(2048);
 
-        let outcome = wired
-            .uc
-            .execute(base_request(seeded.id.clone()))
-            .await
-            .expect("upload ok");
+        let req = base_request(seeded.id.clone());
+        let local_path = req.local_path.clone();
+        let outcome = wired.uc.execute(req).await.expect("upload ok");
 
         assert_eq!(outcome.session_id, seeded.id);
         assert_eq!(outcome.transfer_id.as_str(), "xfer-0");
-        assert_eq!(outcome.local_path, "/tmp/source.bin");
+        assert_eq!(outcome.local_path, local_path);
         assert_eq!(outcome.remote_path, "/srv/dest.bin");
         assert_eq!(outcome.total_bytes, 2048);
         assert!(
@@ -564,19 +616,64 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_file_error_propagates_as_sftp_domain_error() {
+        // Pre-flight: a local path that does not exist must surface as
+        // `DomainError::Sftp` tagged `LOCAL_FILE_ERROR:` so the rmcp
+        // tool router promotes it onto the dedicated wire code.
         let wired = build_wired();
         let seeded = seed_session(&wired.sessions, "sess-local", None);
-        wired
-            .sftp
-            .queue_upload_error(DomainError::Sftp("local file missing".to_string()));
+        let mut req = base_request(seeded.id.clone());
+        req.local_path = "/this/path/cannot/exist-{ssh-mcp-tag}".to_string();
 
-        let err = wired
-            .uc
-            .execute(base_request(seeded.id))
-            .await
-            .expect_err("upload must fail");
-        assert_eq!(err, DomainError::Sftp("local file missing".to_string()));
-        // Repo was never touched.
+        let err = wired.uc.execute(req).await.expect_err("upload must fail");
+        match err {
+            DomainError::Sftp(msg) => {
+                assert!(
+                    msg.starts_with("LOCAL_FILE_ERROR:"),
+                    "expected LOCAL_FILE_ERROR prefix, got {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // SFTP adapter must not have been called — the pre-flight
+        // short-circuited before any SFTP RTT.
+        assert_eq!(
+            wired.sftp.call_count(),
+            0,
+            "missing local file must short-circuit before any SFTP call"
+        );
+        let all = wired.transfers.list_filtered(None).await.expect("list");
+        assert!(all.is_empty(), "failure path must not persist a transfer");
+    }
+
+    /// `LOCAL_NOT_FILE` is the v4.5 wire tag for upload requests where
+    /// the local path resolves to a directory (or any other non-regular
+    /// file). The pre-flight in `UploadFileUseCase::execute` must catch
+    /// this before paying any SFTP RTT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_path_is_directory_returns_local_not_file_tag() {
+        let wired = build_wired();
+        let seeded = seed_session(&wired.sessions, "sess-dir", None);
+
+        let mut req = base_request(seeded.id.clone());
+        // Aim at a guaranteed-directory path. The system temp dir
+        // always exists and is a directory.
+        req.local_path = std::env::temp_dir().to_string_lossy().into_owned();
+
+        let err = wired.uc.execute(req).await.expect_err("upload must fail");
+        match err {
+            DomainError::Sftp(msg) => {
+                assert!(
+                    msg.starts_with("LOCAL_NOT_FILE:"),
+                    "expected LOCAL_NOT_FILE prefix, got {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        assert_eq!(
+            wired.sftp.call_count(),
+            0,
+            "directory pre-flight must short-circuit before any SFTP call"
+        );
         let all = wired.transfers.list_filtered(None).await.expect("list");
         assert!(all.is_empty(), "failure path must not persist a transfer");
     }
@@ -623,7 +720,8 @@ mod tests {
         wired.sftp.queue_upload_ok(128);
 
         let mut req = base_request(seeded.id.clone());
-        req.local_path = "/tmp/data/photo.jpg".to_string();
+        let routed_local = seed_local_file("route");
+        req.local_path = routed_local.clone();
         req.remote_path = "/srv/uploads/photo.jpg".to_string();
         let outcome = wired.uc.execute(req).await.expect("upload ok");
 
@@ -636,7 +734,7 @@ mod tests {
             } => {
                 assert_eq!(transfer_id, &outcome.transfer_id);
                 assert_eq!(request.session_id, seeded.id);
-                assert_eq!(request.local_path, "/tmp/data/photo.jpg");
+                assert_eq!(request.local_path, routed_local);
                 assert_eq!(request.remote_path, "/srv/uploads/photo.jpg");
             }
             FakeSftpCall::Download { .. } | FakeSftpCall::Cancel { .. } => {

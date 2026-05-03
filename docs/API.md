@@ -1,10 +1,12 @@
-# SSH MCP API Reference (v4.5.0)
+# SSH MCP API Reference (v4.6.0)
 
-Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes exposed by the v4.5.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). The wire contract is byte-compatible with v3.0.0 / v4.0.x — v3 hosts still work without any change. v4.5 adds the `EXPIRES_AT` / `PERSISTENT` / `HINT` lines to the connection responses (carried forward from v4.4), the `_meta` envelope on every `resources/read`, granular wire error codes, server identity, tool annotations, and `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. The internal layout moved in v4.0/4.1 — see [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes exposed by the v4.6.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). The markdown / `_meta` wire contract is byte-compatible with v3.0.0 / v4.0.x at the structural level. **v4.6 ships one narrow renaming**: the agent_id field key changed from `AGENT:` to `AGENT_ID:` (see the v4.6 wire change callout below). v4.6 also layers `NEXT:` advisory lines on every response with a clear successor, four new subscribe-first `HINT:` sites, JSON Schema `default` keywords on optional args, one-line cost hints on every tool description, and a wired `Implementation.icons` URL. v4.5 added the `EXPIRES_AT` / `PERSISTENT` / `HINT` lines on connection responses, the `_meta` envelope on every `resources/read`, granular wire error codes, server identity, tool annotations, and `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
 
-> **Tool metadata note (v4.5).** Every tool below carries a `Tool.title` and `ToolAnnotations` (`read_only_hint`, `destructive_hint`, `idempotent_hint`) that MCP hosts use to rank suggestions, filter destructive tools out of safe-by-default modes, and warn before running. The full title/annotation matrix lives in [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45).
+> **v4.6 wire change — `AGENT:` -> `AGENT_ID:`.** Renamed for consistency with every other ID field. Affects 7 render sites: `ssh_connect` (OK / REUSED / SUGGESTED-single), `ssh_list_sessions` (per-row decoration), `ssh_execute`, `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. Hosts that grep `^AGENT:` literally must update; key-value parsers walking the lines generically are unaffected.
 
-> **Subscribe-first note.** For every tool that produces a stream resource (commands, shells, transfers, port forwards), prefer `resources/subscribe <scheme>://<id>/<sub-path>` over the long-poll `wait=true` variants. The polling tools (`ssh_shell_read.wait`, `ssh_get_command_output.wait`, `ssh_get_transfer_progress.wait`, `ssh_shell_wait_for`) are fallbacks for hosts that do not consume MCP notifications. See [LLM_GUIDE.md](./LLM_GUIDE.md) for token-efficient patterns.
+> **Tool metadata note (v4.5, icon wired in v4.6).** Every tool carries a `Tool.title` and `ToolAnnotations` (`read_only_hint`, `destructive_hint`, `idempotent_hint`). Full matrix in [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46). v4.6 wires `Implementation.icons` to a hosted SVG URL.
+
+> **Subscribe-first note.** Prefer `resources/subscribe <scheme>://<id>/<sub-path>` over long-poll `wait=true` for stream resources. v4.6 reinforces this with `HINT:` lines on every async-spawn response and `NEXT:` advisories that pre-fill the next call. See [LLM_GUIDE.md](./LLM_GUIDE.md) for token-efficient patterns.
 
 [[_TOC_]]
 
@@ -13,8 +15,10 @@ Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes
 - **Response format**: every tool returns a single markdown `Text<String>`. The format is **block-only** — one `KEY: value` per line. There is no inline `KEY: v | KEY: v` form in v3.
 - **Status case**: `SCREAMING_SNAKE_CASE` (`OK`, `RUNNING`, `MATCHED`, `TIMEOUT`, `CANCELLED`, `NOOP`, …).
 - **Filter enum case**: `snake_case` for input enums (`reuse: "suggest" | "auto" | "force_new"`, `status: "running" | "completed" | "cancelled" | "failed"`).
-- **Identifiers**: `*_ID` suffix in uppercase (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`, `AGENT_ID`).
+- **Identifiers**: `*_ID` suffix in uppercase (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`, `AGENT_ID`, `FORWARD_ID`). v4.6 renamed the agent line key from `AGENT:` to `AGENT_ID:` for consistency.
 - **Output blocks**: `--- stdout [<nonce>] ---`, `--- stderr [<nonce>] ---`, `--- data [<nonce>] ---`. The 8-hex `nonce` (regenerated per response) prevents the rendered content from forging the delimiter.
+- **HINT:** lines steer the LLM toward subscribe-first resource URIs (one per async-spawn response: shell open / execute / upload / download / forward) and toward bulk-cleanup when an agent leaks sessions. v4.6 ships four new subscribe-first HINT sites.
+- **NEXT:** lines (v4.6) end every response with a clear successor tool. Format: `NEXT: <tool>(args=...) | <tool>(args=...)` — pipe-separated concrete tool calls a smaller LLM can chain without consulting the docs. Terminal statuses (`COMPLETED`, `CLOSED`, `CANCELLED`, etc. — see the v4.6 coverage matrix in [LLM_GUIDE.md section E](./LLM_GUIDE.md#e-next-advisory-line-v46)) deliberately omit `NEXT:`.
 - **Errors**:
   ```
   TOOL_NAME: ERROR
@@ -46,7 +50,7 @@ Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes
 
 ### Capability handshake
 
-`McpSshServer::get_info()` advertises tools (`listChanged: true`), resources (`subscribe: true`, `listChanged: true`), protocol `V_2025_06_18`, and the v4.5 `Implementation` identity (title / description / website_url) plus a few-shot `instructions` block. See [Capability handshake (full payload)](#capability-handshake-1) below for the wire shape.
+`McpSshServer::get_info()` advertises tools (`listChanged: true`), resources (`subscribe: true`, `listChanged: true`), protocol `V_2025_06_18`, and the v4.5 `Implementation` identity (title / description / website_url) — plus the v4.6 `icons` entry — and a few-shot `instructions` block. See [Capability handshake (full payload)](#capability-handshake-1) below for the wire shape.
 
 ---
 
@@ -83,20 +87,22 @@ Connect to an SSH server and store the session.
 SSH_CONNECT: OK
 SESSION_ID: a3f2b1d7-1234-5678-9abc-def012345678
 HOST: alice@example.com:22
-AGENT: claude-code-instance-abc123
+AGENT_ID: claude-code-instance-abc123
 RETRY: 0
 PERSISTENT: false
 EXPIRES_AT: 2026-05-03T12:05:00+00:00
+NEXT: ssh_execute(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
-`HOST` always renders as `username@host:port`. `AGENT` is omitted when no `agent_id` was passed. `REPLACED: N` is appended when stale matches were purged before creating the session. `PERSISTENT: false` is followed by an `EXPIRES_AT:` RFC3339 deadline (= `connected_at + SSH_INACTIVITY_TIMEOUT`); ping the session before this fires (any cheap call works) to extend it. When the caller passes `persistent=true`, the response emits `PERSISTENT: true` and omits `EXPIRES_AT` entirely.
+`HOST` always renders as `username@host:port`. `AGENT_ID` (renamed from `AGENT:` in v4.6) is omitted when no `agent_id` was passed. `REPLACED: N` is appended when stale matches were purged before creating the session. `PERSISTENT: false` is followed by an `EXPIRES_AT:` RFC3339 deadline (= `connected_at + SSH_INACTIVITY_TIMEOUT`); ping the session before this fires (any cheap call works) to extend it. When the caller passes `persistent=true`, the response emits `PERSISTENT: true` and omits `EXPIRES_AT`. The trailing `NEXT:` line (v4.6) lists the three most-likely successor calls pre-filled with the freshly minted `SESSION_ID`.
 
 **Response — REUSED**:
 ```
 SSH_CONNECT: REUSED
 SESSION_ID: a3f2b1d7-...
 HOST: alice@example.com:22
-AGENT: claude-code-instance-abc123
+AGENT_ID: claude-code-instance-abc123
+NEXT: ssh_execute(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
 `RETRY`, `PERSISTENT`, and `EXPIRES_AT` are omitted on `REUSED` (the original connect already set them; query `ssh_list_sessions` to refresh).
@@ -106,11 +112,12 @@ AGENT: claude-code-instance-abc123
 SSH_CONNECT: SUGGESTED
 EXISTING_SESSION_ID: a3f2b1d7-...
 HOST: alice@example.com:22
-AGENT: claude
+AGENT_ID: claude
 NAME: prod-db
 CONNECTED_AT: 2026-05-02T18:00:00Z
 HEALTHY: true
 HINT: use existing SESSION_ID, or retry with reuse="force_new"
+NEXT: ssh_connect(session_id=a3f2b1d7-...) | ssh_connect(reuse="force_new")
 ```
 
 **Response — SUGGESTED (multi-match)**:
@@ -120,6 +127,7 @@ MATCHES: 2
 - a3f2b1d7-... alice@example.com:22 [agent: claude, name: prod-db, connected: 2026-05-02T18:00:00Z, healthy]
 - 9b1c2d3e-... alice@example.com:22 [agent: claude, name: prod-db-2, connected: 2026-05-02T17:50:00Z, healthy]
 HINT: pick an existing SESSION_ID, or retry with reuse="force_new"
+NEXT: ssh_connect(session_id=<existing>) | ssh_connect(reuse="force_new")
 ```
 
 When more than 5 healthy sessions are owned by the same `agent_id`, an extra anti-leak hint is appended on `SUGGESTED` and on `ssh_list_sessions`:
@@ -158,6 +166,8 @@ SSH_DISCONNECT: OK
 SESSION_ID: a3f2b1d7-...
 ```
 
+`SSH_DISCONNECT: OK` is terminal — no `NEXT:`.
+
 **Errors**: `SESSION_NOT_FOUND`, `TRANSPORT_ERROR`.
 
 **Wire codes**: `SESSION_NOT_FOUND`, `TRANSPORT_ERROR`.
@@ -183,9 +193,10 @@ SSH_LIST_SESSIONS: OK
 COUNT: 2
 - a3f2b1d7-... alice@prod-db:22 [agent: claude, healthy]
 - 9b1c2d3e-... alice@stage-db:22 [agent: claude, name: stage, healthy]
+NEXT: ssh_disconnect_agent(agent_id=claude) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
-Each item is `<SESSION_ID> <username>@<host>` followed by an optional `[…]` annotation block. Annotations include any of `agent: <id>`, `name: <label>`, `compression: off`, and the health label (`healthy` / `unhealthy`). When `max_items` truncates, the COUNT line becomes `COUNT: N (showing N of M)`. When more than 5 healthy sessions are owned by the same `agent_id`, an anti-leak `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` line is appended.
+Each item is `<SESSION_ID> <username>@<host>` followed by an optional `[…]` annotation block. Annotations include any of `agent: <id>`, `name: <label>`, `compression: off`, and the health label (`healthy` / `unhealthy`). When `max_items` truncates, the COUNT line becomes `COUNT: N (showing N of M)`. When >5 healthy sessions are owned by one `agent_id`, an anti-leak `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` line is appended. v4.6 `NEXT:` is emitted on non-empty lists (suggesting `ssh_disconnect_agent` when an agent owns sessions, else `ssh_disconnect`); empty list (`COUNT: 0`) omits `NEXT:`.
 
 **Wire codes**: `STORAGE_ERROR` (none on the happy path).
 
@@ -204,10 +215,12 @@ Cancels commands, closes shells, aborts transfers, and disconnects each session'
 **Response**:
 ```
 SSH_DISCONNECT_AGENT: OK
-AGENT: claude-code-instance-abc123
+AGENT_ID: claude-code-instance-abc123
 SESSIONS: 3
 COMMANDS: 5
 ```
+
+The `AGENT_ID:` key replaces the v4.5 `AGENT:` (v4.6 rename for consistency). Terminal — no `NEXT:`.
 
 **Wire codes**: `STORAGE_ERROR` (none on the happy path; unknown agent returns `SESSIONS: 0`).
 
@@ -235,7 +248,12 @@ Limits: up to 100 concurrent multiplexed commands per session.
 SSH_EXECUTE: STARTED
 COMMAND_ID: 7d4c8e2a-...
 SESSION_ID: a3f2b1d7-...
+AGENT_ID: claude-code-instance-abc123
+HINT: subscribe to command://7d4c8e2a-.../output for realtime output (preferred over polling)
+NEXT: ssh_get_command_output(command_id=7d4c8e2a-..., wait=true) | ssh_cancel_command(command_id=7d4c8e2a-...)
 ```
+
+`AGENT_ID:` is omitted when the session has no agent. The v4.6 `HINT:` line steers the LLM to subscribe rather than poll; `NEXT:` lists the two successor calls pre-filled with `COMMAND_ID`.
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR`.
 
@@ -266,6 +284,20 @@ total 8
 drwxr-xr-x  2 alice alice 4096 May  2 18:00 src
 --- stderr [a3f2b1d7] (empty) ---
 ```
+
+`COMPLETED` is terminal — no `NEXT:` line.
+
+**Response — RUNNING**:
+```
+SSH_GET_COMMAND_OUTPUT: RUNNING
+COMMAND_ID: 7d4c8e2a-...
+--- stdout [a3f2b1d7] (partial) ---
+... bytes so far ...
+--- stderr [a3f2b1d7] (empty) ---
+NEXT: resources/subscribe command://7d4c8e2a-.../output | ssh_get_command_output(command_id=7d4c8e2a-..., wait=true)
+```
+
+The v4.6 `NEXT:` on `RUNNING` steers toward subscribe-first push or a single long-poll instead of a tight polling loop.
 
 **Errors**: `COMMAND_NOT_FOUND`, `COMMAND_FAILED`.
 
@@ -348,10 +380,12 @@ SSH_SHELL_OPEN: OK
 SHELL_ID: 4b9c8e2a-...
 SESSION_ID: a3f2b1d7-...
 TERM: xterm 80x24
-AGENT: claude-code-instance-abc123
+AGENT_ID: claude-code-instance-abc123
+HINT: subscribe to shell://4b9c8e2a-.../output for realtime output (preferred over polling)
+NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_shell_send_key
 ```
 
-`TERM` carries the terminal type and the geometry on a single line (`<term> <cols>x<rows>`). `AGENT` is omitted when no agent owns the session.
+`TERM` carries the terminal type and the geometry on a single line (`<term> <cols>x<rows>`). `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when no agent owns the session. The v4.6 `HINT:` steers toward push notifications; `NEXT:` names the three successor calls.
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_SHELLS_EXCEEDED`, `CHANNEL_FAILED`, `TRANSPORT_ERROR`.
 
@@ -373,7 +407,10 @@ Send raw bytes to an interactive shell. Use `ssh_shell_send_key` for named keyst
 SSH_SHELL_WRITE: OK
 SHELL_ID: 4b9c8e2a-...
 BYTES_SENT: 7
+NEXT: resources/read shell://4b9c8e2a-.../output?cursor=auto | ssh_shell_wait_for | ssh_shell_read
 ```
+
+The v4.6 `NEXT:` names the three ways to consume the response: cursor-based push read, prompt-gating wait, or pull-mode read.
 
 **Errors**: `SHELL_NOT_FOUND`, `WRITE_FAILED`, `TRANSPORT_ERROR`.
 
@@ -411,6 +448,7 @@ SHELL_ID: 4b9c8e2a-...
 KEY: ctrl_c
 REPEAT: 1
 BYTES_SENT: 1
+NEXT: resources/read shell://4b9c8e2a-.../output?cursor=auto | ssh_shell_wait_for | ssh_shell_read
 ```
 
 **Response — modified key**:
@@ -421,9 +459,10 @@ KEY: arrow_up
 MODIFIERS: shift+ctrl
 REPEAT: 3
 BYTES_SENT: 18
+NEXT: resources/read shell://4b9c8e2a-.../output?cursor=auto | ssh_shell_wait_for | ssh_shell_read
 ```
 
-`MODIFIERS:` is omitted when no modifier flag is set; `BYTES_SENT` is `repeat * encoded_len(key, mods)`.
+`MODIFIERS:` is omitted when no modifier flag is set; `BYTES_SENT` is `repeat * encoded_len(key, mods)`. v4.6 `NEXT:` mirrors `ssh_shell_write` (three ways to consume the response).
 
 **Errors**: `SHELL_NOT_FOUND`, `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT`, `WRITE_FAILED`, `TRANSPORT_ERROR`.
 
@@ -482,19 +521,25 @@ Wait for one of up to 16 substring patterns to appear in shell output. Single-sh
 SSH_SHELL_WAIT_FOR: MATCHED
 SHELL_ID: 4b9c8e2a-...
 MATCHED_PATTERN: $
+BYTES_RETURNED: 30
 --- data [d8e9f0a1] ---
 some output
 followed by
 the prompt $
+NEXT: ssh_shell_write(shell_id=4b9c8e2a-..., ...) | ssh_shell_send_key(shell_id=4b9c8e2a-..., ...) | ssh_shell_close(shell_id=4b9c8e2a-...)
 ```
 
 **Response — TIMEOUT**:
 ```
 SSH_SHELL_WAIT_FOR: TIMEOUT
 SHELL_ID: 4b9c8e2a-...
+BYTES_RETURNED: 12
 --- data [d8e9f0a1] ---
 output collected so far
+NEXT: ssh_shell_wait_for(shell_id=4b9c8e2a-..., ...) | ssh_shell_read(shell_id=4b9c8e2a-...) | ssh_shell_close(shell_id=4b9c8e2a-...)
 ```
+
+`MATCHED` and `TIMEOUT` both emit `NEXT:` (different successors per status). `CLOSED` is terminal — no `NEXT:`.
 
 **Errors**: `SHELL_NOT_FOUND`, `EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG`.
 
@@ -545,18 +590,20 @@ Limits: up to 10 concurrent transfers per session.
 SSH_UPLOAD: STARTED
 TRANSFER_ID: 8f7e6d5c-...
 SESSION_ID: a3f2b1d7-...
-AGENT: claude
+AGENT_ID: claude
 FROM: /home/alice/data.csv
 TO: /tmp/data.csv
 SIZE: 2.3 MB (2412544 bytes)
 BYTES: 2412544
+HINT: subscribe to transfer://8f7e6d5c-.../progress for realtime progress
+NEXT: ssh_get_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 ```
 
-`FROM` is the source (local for upload, remote for download); `TO` is the destination. `SIZE` is the human-readable + raw byte count; `BYTES` is the raw count again for easy parsing. `AGENT` is omitted when the session has no agent.
+`FROM` is the source (local for upload, remote for download); `TO` is the destination. `SIZE` is the human-readable + raw byte count; `BYTES` is the raw count again. `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when the session has no agent. v4.6 `HINT:` steers toward subscribe; `NEXT:` names the long-poll fallback.
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `LOCAL_FILE_ERROR`, `LOCAL_NOT_FILE`, `SFTP_ERROR`.
 
-**Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `LOCAL_FILE_ERROR` (tagged SFTP — `fs::metadata` failed), `LOCAL_NOT_FILE` (reserved tag — recognised, no live raise yet), `SFTP_ERROR` (untagged catch-all).
+**Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `LOCAL_FILE_ERROR` (tagged SFTP — `fs::metadata` failed), `LOCAL_NOT_FILE` (live in v4.6 — emitted from `application/upload_file.rs::guard_local_path_is_file` when the local path resolves but is not a regular file), `SFTP_ERROR` (untagged catch-all).
 
 ---
 
@@ -579,13 +626,15 @@ FROM: /var/backups/backup.tar.gz
 TO: /home/alice/backup.tar.gz
 SIZE: 105.0 MB (110100480 bytes)
 BYTES: 110100480
+HINT: subscribe to transfer://1a2b3c4d-.../progress for realtime progress
+NEXT: ssh_get_transfer_progress(transfer_id=1a2b3c4d-..., wait=true)
 ```
 
-Same shape as upload — `FROM` is the remote source for downloads, `TO` is the local destination.
+Same shape as upload — `FROM` is the remote source, `TO` is the local destination. `AGENT_ID:`, `HINT:`, and `NEXT:` lines mirror upload.
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `SFTP_OPEN_FAILED`, `REMOTE_METADATA_ERROR`, `SFTP_ERROR`.
 
-**Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `SFTP_OPEN_FAILED` (tagged SFTP), `REMOTE_METADATA_ERROR` (reserved tag — recognised, no live raise yet), `SFTP_ERROR` (untagged catch-all).
+**Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `SFTP_OPEN_FAILED` (tagged SFTP), `REMOTE_METADATA_ERROR` (live in v4.6 — emitted from `adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` when the remote stat call fails), `SFTP_ERROR` (untagged catch-all).
 
 ---
 
@@ -601,7 +650,7 @@ Read the current progress of an SFTP transfer.
 
 Terminated transfers are cleaned from storage after `SSH_TRANSFER_CLEANUP_TTL` (default 300 s).
 
-**Status values**: `RUNNING`, `COMPLETED`, `FAILED`, `ERROR`.
+**Status values**: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `ERROR`.
 
 **Response — RUNNING**:
 ```
@@ -609,6 +658,7 @@ SSH_GET_TRANSFER_PROGRESS: RUNNING
 TRANSFER_ID: 8f7e6d5c-...
 DIRECTION: UPLOAD
 PROGRESS: 47% (1153024/2412544 bytes)
+NEXT: resources/subscribe transfer://8f7e6d5c-.../progress | ssh_get_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 ```
 
 **Response — COMPLETED**:
@@ -628,7 +678,7 @@ PROGRESS: 12% (307200/2412544 bytes)
 REASON: [PERMISSION_DENIED] write '/tmp/locked.csv': permission denied
 ```
 
-`DIRECTION` is uppercase (`UPLOAD` / `DOWNLOAD`). `PROGRESS` is rendered as `<integer>% (<bytes_transferred>/<total_bytes> bytes)` — raw bytes, not human-readable, so the value is easy to parse.
+`DIRECTION` is uppercase (`UPLOAD` / `DOWNLOAD`). `PROGRESS` is rendered as `<integer>% (<bytes_transferred>/<total_bytes> bytes)` — raw bytes, easy to parse. v4.6 `NEXT:` emitted only on `RUNNING`; terminal statuses (`COMPLETED` / `FAILED` / `CANCELLED`) omit it.
 
 **Errors**: `TRANSFER_NOT_FOUND`. SFTP failure codes (carried in `REASON: [...]` of a `FAILED` transfer body, not a tool ERROR): `FILE_NOT_FOUND`, `PERMISSION_DENIED`, `DISK_FULL`, `CONNECTION_LOST`, `REMOTE_DIR_NOT_FOUND`, `READ_ONLY_FS`, `SFTP_PROTOCOL`, `TIMEOUT`, `IO_ERROR`.
 
@@ -657,13 +707,15 @@ SESSION_ID: a3f2b1d7-...
 LOCAL: 0.0.0.0:8080
 REMOTE: 10.0.0.1:3306
 ACTIVE: true
+HINT: subscribe to forward://fwd-1/events for realtime event log
+NEXT: resources/subscribe forward://fwd-1/events
 ```
 
-`FORWARD_ID` and `SESSION_ID` were added in v4.5 so callers can construct the matching `forward://<FORWARD_ID>/events` resource subscribe URI without a round-trip through `resources/list`.
+`FORWARD_ID` + `SESSION_ID` (added in v4.5) let callers construct the `forward://<FORWARD_ID>/events` URI without round-tripping `resources/list`. v4.6 `HINT:` and `NEXT:` reinforce subscribe-first.
 
 **Errors**: `SESSION_NOT_FOUND`, `FORWARD_FAILED`, `FEATURE_DISABLED`, `PORT_IN_USE`.
 
-**Wire codes**: `SESSION_NOT_FOUND`, `PORT_IN_USE`, `FEATURE_DISABLED` (tagged invalid argument — emitted only on the no-`port_forward` build when subscribing to `forward://`), `FORWARD_FAILED` (reserved tag — recognised by the dispatcher, no live raise yet).
+**Wire codes**: `SESSION_NOT_FOUND`, `PORT_IN_USE`, `FEATURE_DISABLED` (tagged invalid argument — emitted only on the no-`port_forward` build when subscribing to `forward://`), `FORWARD_FAILED` (live in v4.6 — emitted from `application/forward_port.rs::ForwardPortUseCase::preflight_bind` when the local listener bind fails for reasons other than `AddrInUse`).
 
 ---
 
@@ -701,83 +753,9 @@ Every `resources/read` response embeds a `_meta` object on `ResourceContents`. S
 
 The peer identity used to track per-peer cursors is derived from transport: `Mcp-Session-Id` header on HTTP, singleton `Stdio` key on stdio. See [RESOURCES.md](./RESOURCES.md) for the full subscribe + truncation contract.
 
-### `resources/list`
+### `resources/list`, `read`, `subscribe`, `unsubscribe`, notifications
 
-Aggregates open shells, running commands, active transfers, connected sessions. `forward://` is intentionally empty until `ForwardStorage` ships (see [ARCHITECTURE.md Future work](./ARCHITECTURE.md#future-work)). Each entry shape:
-
-```json
-{
-  "uri": "shell://4b9c8e2a-.../output",
-  "name": "Shell 4b9c8e2a-... (session a3f2b1d7-...)",
-  "description": "PTY output buffer for shell 4b9c8e2a-... (xterm, 80x24).",
-  "mimeType": "text/plain"
-}
-```
-
-### `resources/read`
-
-Returns a single `TextResourceContents`:
-
-```json
-{
-  "uri": "shell://4b9c8e2a-.../output",
-  "mimeType": "text/plain",
-  "text": "$ ls -la\ntotal 8\n...",
-  "_meta": {
-    "kind": "shell",
-    "cursor": 4096,
-    "buffer_size": 4096,
-    "last_seq": 17,
-    "status": "open"
-  }
-}
-```
-
-For `command://`, the `text` body wraps the v3-style stdout/stderr blocks (one nonce per response):
-
-```text
---- stdout [a3f2b1d7] ---
-total 8
-drwxr-xr-x  2 alice alice 4096 May  2 18:00 src
---- stderr [a3f2b1d7] (empty) ---
-```
-
-For `transfer://`, `session://`, and `forward://`, `text` is the JSON payload itself (since the MIME is `application/json`) and `_meta` omits `cursor` / `buffer_size`:
-
-```json
-{
-  "uri": "transfer://8f7e6d5c-.../progress",
-  "mimeType": "application/json",
-  "text": "{\"transfer_id\":\"8f7e6d5c-...\",\"direction\":\"upload\",\"status\":\"running\",\"bytes_transferred\":1153024,\"total_bytes\":2412544,\"last_seq\":42}",
-  "_meta": {
-    "kind": "transfer",
-    "last_seq": 42,
-    "status": "running"
-  }
-}
-```
-
-### `resources/subscribe`
-
-Body: `{ "uri": "<scheme>://<id>/<sub-path>" }`.
-
-Server validates the URI and confirms the resource exists (`SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` map to `McpError::resource_not_found`). The first subscriber for `(kind, id)` spawns a debouncer task. Re-subscribing the same peer refreshes the live `Peer` handle without duplicating subscribers.
-
-Returns `()` on success.
-
-### `resources/unsubscribe`
-
-Body: `{ "uri": "<scheme>://<id>/<sub-path>" }`.
-
-Idempotent — unknown URIs / not-subscribed peers silently no-op (per MCP spec). The last unsubscribe drops the debouncer task.
-
-### Notifications outbound
-
-| Notification | Trigger |
-|--------------|---------|
-| `notifications/resources/updated` | Per debounce window per resource (50 ms default), plus force-flush every `SSH_NOTIFY_FORCE_FLUSH_MS` (default `1000`) and keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default `30`). |
-| `notifications/resources/list_changed` | Capability is advertised in `get_info()`. Wiring through tool entry points that create / destroy resources lands in a follow-up — see [ARCHITECTURE.md Future work](./ARCHITECTURE.md#future-work). |
-| `notifications/cancelled` | Routed natively by rmcp 1.6 — no custom handling required. Tools observing a `CancellationToken` (e.g. `ssh_cancel_command`'s internal cancel path) react as expected. |
+These four methods plus the outbound `notifications/resources/updated` / `list_changed` / `cancelled` notifications are documented in full in [RESOURCES.md](./RESOURCES.md) (URI grammar, list aggregation, `_meta` envelope per scheme, JSON / text body shape, subscribe lifecycle, debouncer + force-flush + keepalive timings, peer-GC). The wire shape is byte-compatible with v3.0.0 / v4.0.x; v4.5 made the `_meta` envelope live on every read; v4.6 leaves the resource pipeline unchanged.
 
 ### Capability handshake
 
@@ -791,7 +769,14 @@ Returned by `get_info()`:
     "version": "<CARGO_PKG_VERSION>",
     "title": "SSH Remote Shell",
     "description": "Run remote commands, drive PTY shells, transfer files via SFTP, and forward TCP ports over SSH. Subscribe to shell, command, transfer, session, and forward streams for push notifications.",
-    "websiteUrl": "https://github.com/farchanjo/ssh-mcp"
+    "websiteUrl": "https://github.com/farchanjo/ssh-mcp",
+    "icons": [
+      {
+        "src": "https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg",
+        "mimeType": "image/svg+xml",
+        "sizes": ["any"]
+      }
+    ]
   },
   "capabilities": {
     "tools": { "listChanged": true },
@@ -803,13 +788,21 @@ Returned by `get_info()`:
 
 The build without `port_forward` advertises `17 tools, 4 push streams (shell://, command://, transfer://, session://)` instead.
 
-`Implementation.icons` is intentionally omitted in v4.5 — flipping the field on requires a stable hosted SVG asset URL plus a tiny SVG. Track the TODO at `src/infra/mcp/tool_router.rs::build_implementation`.
+`Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description when the asset is unreachable. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
 
-Each of the 18 tools (or 17 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45) for the matrix.
+Each of the 18 tools (or 17 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer → debouncer → notification pipeline and [FLOWS.md](./FLOWS.md) for end-to-end sequence diagrams.
 
 ---
+
+## NEXT: advisory coverage matrix (v4.6)
+
+Every response with a clear successor tool ends with `NEXT: <pipe-separated tool calls>`. Each per-tool section above documents which statuses emit `NEXT:` and the literal hint string they emit. The full per-status coverage matrix is consolidated in [LLM_GUIDE.md section E](./LLM_GUIDE.md#e-next-advisory-line-v46). Reference implementations: `src/infra/mcp/render/{connection,execute,shell,sftp,forward}.rs::next_hint_for_*`. Convention: terminal statuses (`COMPLETED`, `CLOSED`, `CANCELLED`, `NOOP`, etc.) omit `NEXT:` because the next move depends entirely on the user prompt rather than the tool result.
+
+## Cost hints and JSON Schema defaults (v4.6)
+
+Every tool description now ends with a single-line `Cost:` hint stating O() complexity, expected latency, and whether the call is blocking or async. Optional `Option<T>` fields whose doc comment cites a default now emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]` so smaller LLMs that read the schema mechanically can see the default value without parsing English. The full cost matrix and the per-Args-struct default coverage live in [LLM_GUIDE.md sections H + I](./LLM_GUIDE.md#h-json-schema-defaults-v46). Reference implementations: `src/infra/mcp/tool_router.rs` (cost-hint strings) and `src/infra/mcp/args/{connection,execute,shell,sftp}.rs` (`#[schemars(default = ...)]` attributes).
 
 ## Cross-reference — keyboard input
 

@@ -1,6 +1,6 @@
-# Resources Reference (v4.5.0)
+# Resources Reference (v4.6.0)
 
-ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 puts the v3-promised `_meta` envelope on every read, formalises the per-resource MIME types, and derives a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests.
+ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 put the v3-promised `_meta` envelope on every read, formalised the per-resource MIME types, and derived a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests. v4.6 leaves the subscribe contract unchanged from v4.5; the only resource-related change is that every async-spawn tool response now carries a `HINT: subscribe to <uri> for realtime ...` line steering the LLM toward push.
 
 Cross references:
 
@@ -15,7 +15,7 @@ Cross references:
 - `protocol_version = 2025-06-18`.
 - `capabilities.tools = { list_changed: true }`.
 - `capabilities.resources = { subscribe: true, list_changed: true }`.
-- v4.5 `Implementation` identity: `title = "SSH Remote Shell"`, multi-line `description`, `website_url = "https://github.com/farchanjo/ssh-mcp"`. Icons left as TODO. See [API.md - Capability handshake](./API.md#capability-handshake-1).
+- v4.5 `Implementation` identity: `title = "SSH Remote Shell"`, multi-line `description`, `website_url = "https://github.com/farchanjo/ssh-mcp"`. v4.6 wires `icons` to a hosted SVG URL. See [API.md - Capability handshake](./API.md#capability-handshake-1).
 
 The `list_changed` advertisement is reserved for tool-driven lifecycle events. The current implementation does not emit `notifications/resources/list_changed`; clients should `resources/list` once and rely on `notifications/resources/updated` plus their own bookkeeping for new shells / commands / transfers. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the deferred plan.
 
