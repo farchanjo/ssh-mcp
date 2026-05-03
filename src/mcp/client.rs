@@ -41,25 +41,23 @@
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
+use bytes::Bytes;
 use russh::compression;
 use russh::{Channel, ChannelMsg, Preferred, client};
-use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{error, info, warn};
 
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-
-use crate::mcp::async_command::OutputBuffer;
+use crate::mcp::async_command::{OutputBuffer, OutputChunk, RunningCommand};
 use crate::mcp::auth::chain::AuthChain;
 use crate::mcp::auth::traits::AuthStrategy;
 use crate::mcp::config::MAX_RETRY_DELAY;
 use crate::mcp::error::is_retryable_error;
 use crate::mcp::session::SshClientHandler;
+use crate::mcp::subscription::{ResourceKind, SUBSCRIPTION_REGISTRY};
 use crate::mcp::types::{AsyncCommandStatus, SshCommandResponse};
 
 /// Build russh client configuration with the specified settings.
@@ -550,55 +548,29 @@ async fn collect_sync_output(
 
 /// Execute a command asynchronously on an SSH session.
 ///
-/// This function runs in a background task and collects output incrementally.
-/// The caller can poll for output, wait for completion, or cancel the command.
+/// This function runs in a background task and collects output incrementally
+/// into the lock-free state stored in `RunningCommand`. Subscribers see
+/// updates two ways:
 ///
-/// # Arguments
-///
-/// * `handle` - Shared handle to the SSH session
-/// * `command` - Shell command to execute
-/// * `timeout` - Command execution timeout duration
-/// * `output` - Shared buffer for collecting stdout/stderr
-/// * `status_tx` - Channel to send status updates
-/// * `cancel_token` - Token to signal cancellation
-/// * `exit_code` - Shared storage for exit code
-/// * `error` - Shared storage for error message
-/// * `timed_out` - Shared flag for timeout status
-#[allow(
-    clippy::too_many_arguments,
-    reason = "async command execution requires many shared state parameters"
-)]
+/// - `command.output_history` (`ArcSwap<OutputBuffer>`) holds the latest
+///   snapshot for new readers and recovery from broadcast lag.
+/// - `command.output_tx` broadcasts each delta as `OutputChunk`, terminating
+///   with `OutputChunk::Closed(exit_code)`.
 pub async fn execute_ssh_command_async(
     handle: Arc<client::Handle<SshClientHandler>>,
-    command: String,
+    command_text: String,
     timeout: Duration,
-    output: Arc<Mutex<OutputBuffer>>,
-    status_tx: watch::Sender<AsyncCommandStatus>,
-    cancel_token: CancellationToken,
-    exit_code: Arc<Mutex<Option<i32>>>,
-    error: Arc<Mutex<Option<String>>>,
-    timed_out: Arc<AtomicBool>,
+    command: Arc<RunningCommand>,
 ) {
-    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx, &cancel_token).await
-    else {
+    let Some(mut channel) = open_async_channel(&handle, &command).await else {
         return;
     };
 
-    if exec_async_command(&channel, &command, &error, &status_tx).await == Err(()) {
+    if exec_async_command(&channel, &command_text, &command).await == Err(()) {
         return;
     }
 
-    run_with_cancellation_and_timeout(
-        &mut channel,
-        &command,
-        timeout,
-        &output,
-        &status_tx,
-        &cancel_token,
-        &exit_code,
-        &timed_out,
-    )
-    .await;
+    run_with_cancellation_and_timeout(&mut channel, &command_text, timeout, &command).await;
 }
 
 /// Open a session channel for async command execution.
@@ -611,21 +583,16 @@ pub async fn execute_ssh_command_async(
 /// reclaim channel slots after a `CHANNEL_CLOSE`. The retry loop lets the
 /// client wait for slot reclamation instead of surfacing a transient
 /// failure as a permanent `Failed` command.
-#[allow(
-    clippy::too_many_lines,
-    reason = "cohesive retry loop with cancel checks; splitting hurts readability"
-)]
 async fn open_async_channel(
     handle: &Arc<client::Handle<SshClientHandler>>,
-    error: &Arc<Mutex<Option<String>>>,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
-    cancel_token: &CancellationToken,
+    command: &Arc<RunningCommand>,
 ) -> Option<Channel<client::Msg>> {
     const MAX_ATTEMPTS: u32 = 25;
     let mut attempt = 0_u32;
     loop {
-        if cancel_token.is_cancelled() {
-            let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+        if command.cancel_token.is_cancelled() {
+            broadcast_close(command, None);
+            let _ = command.status_tx.send(AsyncCommandStatus::Cancelled);
             return None;
         }
         attempt += 1;
@@ -640,14 +607,16 @@ async fn open_async_channel(
                 let msg = e.to_string();
                 warn!("channel_open_session attempt {attempt} failed: {msg}");
                 if is_transient_open_error(&msg) && attempt < MAX_ATTEMPTS {
-                    if wait_with_cancel(cancel_token, attempt).await {
-                        let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+                    if wait_with_cancel(&command.cancel_token, attempt).await {
+                        broadcast_close(command, None);
+                        let _ = command.status_tx.send(AsyncCommandStatus::Cancelled);
                         return None;
                     }
                     continue;
                 }
-                *error.lock().await = Some(format!("Failed to open channel: {e}"));
-                let _ = status_tx.send(AsyncCommandStatus::Failed);
+                let _ = command.error.set(format!("Failed to open channel: {e}"));
+                broadcast_close(command, None);
+                let _ = command.status_tx.send(AsyncCommandStatus::Failed);
                 return None;
             }
         }
@@ -664,7 +633,10 @@ fn is_transient_open_error(msg: &str) -> bool {
 }
 
 /// Sleep the exponential backoff for `attempt`, or return `true` if cancelled.
-async fn wait_with_cancel(cancel_token: &CancellationToken, attempt: u32) -> bool {
+async fn wait_with_cancel(
+    cancel_token: &tokio_util::sync::CancellationToken,
+    attempt: u32,
+) -> bool {
     const BASE_BACKOFF_MS: u64 = 100;
     const MAX_BACKOFF_MS: u64 = 1_000;
     let step = BASE_BACKOFF_MS.saturating_mul(u64::from(1_u32 << (attempt - 1)));
@@ -680,44 +652,39 @@ async fn wait_with_cancel(cancel_token: &CancellationToken, attempt: u32) -> boo
 /// Returns `Err(())` and sets the error/status if the command cannot be executed.
 async fn exec_async_command(
     channel: &Channel<client::Msg>,
-    command: &str,
-    error: &Arc<Mutex<Option<String>>>,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
+    command_text: &str,
+    command: &Arc<RunningCommand>,
 ) -> Result<(), ()> {
-    if let Err(e) = channel.exec(true, command).await {
-        *error.lock().await = Some(format!("Failed to execute command: {e}"));
-        let _ = status_tx.send(AsyncCommandStatus::Failed);
+    if let Err(e) = channel.exec(true, command_text).await {
+        let _ = command.error.set(format!("Failed to execute command: {e}"));
+        broadcast_close(command, None);
+        let _ = command.status_tx.send(AsyncCommandStatus::Failed);
         return Err(());
     }
     Ok(())
 }
 
 /// Run async output collection with cancellation and timeout support.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "async command state requires many shared references"
-)]
 async fn run_with_cancellation_and_timeout(
     channel: &mut Channel<client::Msg>,
-    command: &str,
+    command_text: &str,
     timeout: Duration,
-    output: &Arc<Mutex<OutputBuffer>>,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
-    cancel_token: &CancellationToken,
-    exit_code: &Arc<Mutex<Option<i32>>>,
-    timed_out: &Arc<AtomicBool>,
+    command: &Arc<RunningCommand>,
 ) {
     tokio::select! {
         biased;
-        () = cancel_token.cancelled() => {
-            handle_cancellation(channel, command, status_tx).await;
+        () = command.cancel_token.cancelled() => {
+            handle_cancellation(channel, command_text, command).await;
         }
         () = time::sleep(timeout) => {
-            handle_timeout(channel, command, timeout, timed_out, status_tx).await;
+            handle_timeout(channel, command_text, timeout, command).await;
         }
-        result = collect_async_output(channel, output) => {
-            *exit_code.lock().await = result;
-            let _ = status_tx.send(AsyncCommandStatus::Completed);
+        result = collect_async_output(channel, command) => {
+            if let Some(code) = result {
+                let _ = command.exit_code.set(code);
+            }
+            broadcast_close(command, result);
+            let _ = command.status_tx.send(AsyncCommandStatus::Completed);
         }
     }
 }
@@ -735,11 +702,11 @@ async fn run_with_cancellation_and_timeout(
 /// refuses with `ConnectFailed` / `Administratively prohibited`.
 async fn handle_cancellation(
     channel: &mut Channel<client::Msg>,
-    command: &str,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
+    command_text: &str,
+    command: &Arc<RunningCommand>,
 ) {
     use russh::ChannelMsg;
-    warn!("Async command cancelled: {command}");
+    warn!("Async command cancelled: {command_text}");
     let _ = channel.close().await;
     // Drain inbound messages until the server acknowledges the close.
     // Generous timeout so a slow server doesn't leave us guessing whether
@@ -753,21 +720,22 @@ async fn handle_cancellation(
         }
     };
     let _ = time::timeout(Duration::from_secs(2), drain).await;
-    let _ = status_tx.send(AsyncCommandStatus::Cancelled);
+    broadcast_close(command, None);
+    let _ = command.status_tx.send(AsyncCommandStatus::Cancelled);
 }
 
 /// Handle async command timeout.
 async fn handle_timeout(
     channel: &Channel<client::Msg>,
-    command: &str,
+    command_text: &str,
     timeout: Duration,
-    timed_out: &Arc<AtomicBool>,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
+    command: &Arc<RunningCommand>,
 ) {
-    warn!("Async command timed out after {timeout:?}: {command}");
-    timed_out.store(true, Ordering::SeqCst);
+    warn!("Async command timed out after {timeout:?}: {command_text}");
+    command.timed_out.store(true, Ordering::SeqCst);
     let _ = channel.close().await;
-    let _ = status_tx.send(AsyncCommandStatus::Completed);
+    broadcast_close(command, None);
+    let _ = command.status_tx.send(AsyncCommandStatus::Completed);
 }
 
 /// Open a PTY channel with an interactive shell.
@@ -816,45 +784,25 @@ pub async fn open_pty_shell(
 /// All output goes to the stdout buffer (no stderr separation in PTY mode).
 ///
 /// Use this for commands that require a terminal (sudo, top, etc.).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "async PTY command execution requires many shared state parameters"
-)]
 pub async fn execute_ssh_command_async_pty(
     handle: Arc<client::Handle<SshClientHandler>>,
-    command: String,
+    command_text: String,
     timeout: Duration,
-    output: Arc<Mutex<OutputBuffer>>,
-    status_tx: watch::Sender<AsyncCommandStatus>,
-    cancel_token: CancellationToken,
-    exit_code: Arc<Mutex<Option<i32>>>,
-    error: Arc<Mutex<Option<String>>>,
-    timed_out: Arc<AtomicBool>,
+    command: Arc<RunningCommand>,
 ) {
-    let Some(mut channel) = open_async_channel(&handle, &error, &status_tx, &cancel_token).await
-    else {
+    let Some(mut channel) = open_async_channel(&handle, &command).await else {
         return;
     };
 
-    if request_pty_on_channel(&channel, &error, &status_tx).await == Err(()) {
+    if request_pty_on_channel(&channel, &command).await == Err(()) {
         return;
     }
 
-    if exec_async_command(&channel, &command, &error, &status_tx).await == Err(()) {
+    if exec_async_command(&channel, &command_text, &command).await == Err(()) {
         return;
     }
 
-    run_with_cancellation_and_timeout(
-        &mut channel,
-        &command,
-        timeout,
-        &output,
-        &status_tx,
-        &cancel_token,
-        &exit_code,
-        &timed_out,
-    )
-    .await;
+    run_with_cancellation_and_timeout(&mut channel, &command_text, timeout, &command).await;
 }
 
 /// Request a PTY on an already-opened channel.
@@ -862,12 +810,12 @@ pub async fn execute_ssh_command_async_pty(
 /// Returns `Err(())` and sets the error/status if the PTY request fails.
 async fn request_pty_on_channel(
     channel: &Channel<client::Msg>,
-    error: &Arc<Mutex<Option<String>>>,
-    status_tx: &watch::Sender<AsyncCommandStatus>,
+    command: &Arc<RunningCommand>,
 ) -> Result<(), ()> {
     if let Err(e) = channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await {
-        *error.lock().await = Some(format!("Failed to request PTY: {e}"));
-        let _ = status_tx.send(AsyncCommandStatus::Failed);
+        let _ = command.error.set(format!("Failed to request PTY: {e}"));
+        broadcast_close(command, None);
+        let _ = command.status_tx.send(AsyncCommandStatus::Failed);
         return Err(());
     }
     Ok(())
@@ -876,19 +824,21 @@ async fn request_pty_on_channel(
 /// Flush threshold for batched output (8KB)
 const FLUSH_THRESHOLD: usize = 8192;
 
-/// Collect output from an SSH channel into the shared buffer.
+/// Collect output from an SSH channel into the lock-free state.
 ///
-/// Uses batched writes to reduce lock contention - data is accumulated
-/// in local buffers and flushed to the shared buffer periodically or on exit.
+/// The reader task owns the `OutputBuffer` exclusively (no shared mutex).
+/// After each batch is flushed it publishes a fresh snapshot through
+/// `output_history.store(...)` and broadcasts the delta as an `OutputChunk`.
 ///
 /// Returns the exit code when the channel closes.
 async fn collect_async_output(
     channel: &mut Channel<client::Msg>,
-    output: &Arc<Mutex<OutputBuffer>>,
+    command: &Arc<RunningCommand>,
 ) -> Option<i32> {
     let max_buffer = super::config::resolve_command_max_buffer_size();
     let max = usize::try_from(max_buffer).unwrap_or(usize::MAX);
     let mut exit_code: Option<i32> = None;
+    let mut owned = OutputBuffer::with_capacity(4096, 1024);
     let mut local_stdout = Vec::with_capacity(4096);
     let mut local_stderr = Vec::with_capacity(1024);
 
@@ -899,51 +849,52 @@ async fn collect_async_output(
             &mut exit_code,
             &mut local_stdout,
             &mut local_stderr,
-            output,
+            &mut owned,
+            command,
             max,
-        )
-        .await;
+        );
         if should_break {
             break;
         }
     }
 
-    flush_local_buffers(&mut local_stdout, &mut local_stderr, output, max).await;
+    flush_local_buffers(
+        &mut local_stdout,
+        &mut local_stderr,
+        &mut owned,
+        command,
+        max,
+    );
     let _ = channel.close().await;
     exit_code
 }
 
 /// Process a single channel message, returning true if the loop should break.
 #[allow(
-    clippy::too_many_lines,
-    reason = "full ChannelMsg match arms kept in one place for readability"
+    clippy::too_many_arguments,
+    reason = "channel message dispatch handles every shared piece of reader state"
 )]
-async fn process_channel_msg(
+fn process_channel_msg(
     msg: Option<ChannelMsg>,
     exit_code: &mut Option<i32>,
     local_stdout: &mut Vec<u8>,
     local_stderr: &mut Vec<u8>,
-    output: &Arc<Mutex<OutputBuffer>>,
+    owned: &mut OutputBuffer,
+    command: &Arc<RunningCommand>,
     max_buffer: usize,
 ) -> bool {
     match msg {
         Some(ChannelMsg::Data { data }) => {
             local_stdout.extend_from_slice(&data);
             if local_stdout.len() >= FLUSH_THRESHOLD {
-                output
-                    .lock()
-                    .await
-                    .append_stdout_slice(local_stdout, max_buffer);
+                publish_stdout(owned, local_stdout, command, max_buffer);
             }
             false
         }
         Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
             local_stderr.extend_from_slice(&data);
             if local_stderr.len() >= FLUSH_THRESHOLD {
-                output
-                    .lock()
-                    .await
-                    .append_stderr_slice(local_stderr, max_buffer);
+                publish_stderr(owned, local_stderr, command, max_buffer);
             }
             false
         }
@@ -953,22 +904,87 @@ async fn process_channel_msg(
         }
         Some(ChannelMsg::Eof) => exit_code.is_some(),
         Some(ChannelMsg::Close) | None => true,
+        Some(ChannelMsg::ExtendedData { .. } | ChannelMsg::OpenFailure(_)) => false,
         Some(_) => false,
     }
 }
 
-/// Flush remaining local buffers to the shared output buffer.
-async fn flush_local_buffers(
-    local_stdout: &mut Vec<u8>,
-    local_stderr: &mut Vec<u8>,
-    output: &Arc<Mutex<OutputBuffer>>,
+/// Publish a stdout batch: broadcast the delta and store a fresh snapshot.
+fn publish_stdout(
+    owned: &mut OutputBuffer,
+    local: &mut Vec<u8>,
+    command: &Arc<RunningCommand>,
     max_buffer: usize,
 ) {
-    if !local_stdout.is_empty() || !local_stderr.is_empty() {
-        let mut buf = output.lock().await;
-        buf.append_stdout_slice(local_stdout, max_buffer);
-        buf.append_stderr_slice(local_stderr, max_buffer);
+    let chunk = Bytes::copy_from_slice(local);
+    let before = owned.stdout.len();
+    owned.append_stdout_slice(local, max_buffer);
+    let after = owned.stdout.len();
+    let dropped = chunk.len().saturating_add(before).saturating_sub(after);
+    if dropped > 0 {
+        let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
+        let uri = format!("command://{}/output", command.info.command_id);
+        SUBSCRIPTION_REGISTRY.compensate_truncation(&uri, dropped_u64);
     }
+    command.output_history.store(Arc::new(owned.clone()));
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Stdout { seq, data: chunk });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
+}
+
+/// Publish a stderr batch: broadcast the delta and store a fresh snapshot.
+fn publish_stderr(
+    owned: &mut OutputBuffer,
+    local: &mut Vec<u8>,
+    command: &Arc<RunningCommand>,
+    max_buffer: usize,
+) {
+    let chunk = Bytes::copy_from_slice(local);
+    let before = owned.stderr.len();
+    owned.append_stderr_slice(local, max_buffer);
+    let after = owned.stderr.len();
+    let dropped = chunk.len().saturating_add(before).saturating_sub(after);
+    if dropped > 0 {
+        let dropped_u64 = u64::try_from(dropped).unwrap_or(u64::MAX);
+        let uri = format!("command://{}/output", command.info.command_id);
+        SUBSCRIPTION_REGISTRY.compensate_truncation(&uri, dropped_u64);
+    }
+    command.output_history.store(Arc::new(owned.clone()));
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Stderr { seq, data: chunk });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
+}
+
+/// Flush remaining local buffers to the lock-free output state.
+fn flush_local_buffers(
+    local_stdout: &mut Vec<u8>,
+    local_stderr: &mut Vec<u8>,
+    owned: &mut OutputBuffer,
+    command: &Arc<RunningCommand>,
+    max_buffer: usize,
+) {
+    let had_stdout = !local_stdout.is_empty();
+    let had_stderr = !local_stderr.is_empty();
+    if had_stdout {
+        publish_stdout(owned, local_stdout, command, max_buffer);
+    }
+    if had_stderr {
+        publish_stderr(owned, local_stderr, command, max_buffer);
+    }
+}
+
+/// Broadcast the terminal `Closed` frame. Errors are intentionally ignored:
+/// no subscribers means there's nobody to notify.
+fn broadcast_close(command: &Arc<RunningCommand>, exit_code: Option<i32>) {
+    let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let _ = command
+        .output_tx
+        .send(OutputChunk::Closed { seq, exit_code });
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
 }
 
 #[cfg(test)]

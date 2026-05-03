@@ -1,1050 +1,302 @@
-#!/usr/bin/env python3
-"""Integration test for ssh-mcp-stdio binary — all 16 tools."""
-import json
+"""Integration tests for ssh-mcp v3 stdio transport (rmcp 1.6 line-delimited JSON-RPC).
+
+Same coverage as ``test_http.py`` but driven over stdio against a freshly
+spawned ``target/release/ssh-mcp-stdio``. SSH-touching tests are gated by the
+``@pytest.mark.requires_sshd`` marker.
+"""
+
+from __future__ import annotations
+
 import os
-import subprocess
-import sys
 import time
-import threading
-import queue
-import uuid as _uuid
 
-BINARY = os.environ.get("SSH_MCP_STDIO", os.path.join(os.path.dirname(__file__), "..", "target", "release", "ssh-mcp-stdio"))
-HOST = os.environ.get("SSH_HOST", "vm.services:22")
-USER = os.environ.get("SSH_USER", "root")
-KEY_PATH = os.environ.get("SSH_KEY_PATH", "~/.ssh/id_rsa")
-LOCAL_FILE = os.environ.get("LOCAL_FILE", "/Users/farchanjo/Downloads/IMG_1267.MOV")
-REMOTE_DIR = "/tmp/ssh-mcp-test"
-REMOTE_FILE = f"{REMOTE_DIR}/{os.path.basename(LOCAL_FILE)}"
-DOWNLOAD_FILE = "/tmp/ssh-mcp-test-downloaded" + os.path.splitext(LOCAL_FILE)[1]
+import pytest
+
+from helpers.mcp_client import McpClient, call_tool_text, make_session_id
+from helpers.parse_block import parse_block
 
 
-def connect_args(agent_id=None, name=None, **extra):
-    """Build ssh_connect arguments with key_path.
-
-    Defaults `reuse="force_new"` so repeated connects in the test suite
-    always produce distinct sessions.
-    """
-    args = {"address": HOST, "username": USER, "key_path": KEY_PATH, "reuse": "force_new"}
-    if agent_id:
-        args["agent_id"] = agent_id
-    if name:
-        args["name"] = name
-    args.update(extra)
-    return args
+# ---------------------------------------------------------------------------
+# Smoke / handshake (no SSH server needed)
+# ---------------------------------------------------------------------------
 
 
-import re
+def test_stdio_initialize_returns_server_info(stdio_client: McpClient) -> None:
+    info = stdio_client.server_info or {}
+    assert info.get("serverInfo", {}).get("name") == "ssh-mcp"
+    assert info.get("protocolVersion") == "2025-06-18"
 
 
-def parse_mcp_response(text: str) -> dict:
-    """Parse the markdown MCP response format (v2.0+)."""
-    out = {"_text": text}
-    if not text:
-        return out
-    lines = text.splitlines()
-    if not lines:
-        return out
-    header = lines[0]
-    parts = [p.strip() for p in header.split("|")] if "|" in header else [header.strip()]
-    head = parts[0]
-    if ":" in head:
-        tool, status = head.split(":", 1)
-        out["_tool"] = tool.strip()
-        out["_status"] = status.strip()
-        out["status"] = status.strip().lower()
-    for p in parts[1:]:
-        if ":" in p:
-            k, v = p.split(":", 1)
-            _assign_field(out, k.strip(), v.strip())
-        else:
-            _assign_token(out, p)
-    current_block = None
-    block_lines = []
-    bullet_list = []
-    marker_re = re.compile(r"^--- (stdout|stderr|data)(?: \[[^\]]+\])?(?: \([^)]*\))? ---$")
-    for line in lines[1:]:
-        m = marker_re.match(line)
-        if m:
-            if current_block is not None:
-                out[current_block] = "\n".join(block_lines)
-                block_lines = []
-            current_block = m.group(1)
-            continue
-        if current_block is not None:
-            block_lines.append(line)
-            continue
-        if line.startswith("- "):
-            bullet_list.append(line[2:])
-            continue
-        if ":" in line:
-            k, v = line.split(":", 1)
-            _assign_field(out, k.strip(), v.strip())
-    if current_block is not None:
-        out[current_block] = "\n".join(block_lines)
-    if bullet_list:
-        _assign_bullets(out, bullet_list)
-    return out
+def test_stdio_tools_list_returns_eighteen(stdio_client: McpClient) -> None:
+    tools = stdio_client.list_tools()
+    assert len(tools) == 18, f"expected 18 tools, got {len(tools)}"
 
 
-def _assign_token(out, token):
-    m = re.match(r"^(UPLOAD|DOWNLOAD)\s+(\d+)%\s+\((\d+)/(\d+)\s+bytes\)$", token)
-    if m:
-        out["direction"] = m.group(1).lower()
-        out["progress_percent"] = int(m.group(2))
-        out["bytes_transferred"] = int(m.group(3))
-        out["total_bytes"] = int(m.group(4))
+def test_stdio_invalid_session_id_returns_error(stdio_client: McpClient) -> None:
+    text = call_tool_text(
+        stdio_client,
+        "ssh_execute",
+        {"session_id": make_session_id(), "command": "echo nope"},
+    )
+    parsed = parse_block(text)
+    assert parsed.get("__status") == "ERROR"
+    assert "SESSION_NOT_FOUND" in (parsed.get("reason") or text)
 
 
-def _assign_field(out, key, value):
-    k_lower = key.lower()
-    key_map = {
-        "session_id": "session_id", "existing_session_id": "session_id",
-        "command_id": "command_id", "shell_id": "shell_id",
-        "transfer_id": "transfer_id", "agent": "agent_id",
-        "exit": "exit_code", "bytes_sent": "bytes_sent",
-        "bytes": "total_bytes", "size": "size_raw",
-        "local": "local_address", "remote": "remote_address",
-        "active": "active", "count": "count", "matches": "matches_count",
-        "host": "host", "name": "name", "connected_at": "connected_at",
-        "healthy": "healthy", "retry": "retry_attempts",
-        "persistent": "persistent", "replaced": "replaced",
-        "sessions": "sessions_disconnected",
-        "commands": "commands_cancelled",
-        "term": "term_type", "reason": "error", "detail": "error_detail",
-        "direction": "direction", "progress": "progress_raw",
-        "from": "from_path", "to": "to_path", "hint": "_hint",
-    }
-    mapped = key_map.get(k_lower, k_lower)
-    if mapped in ("active", "healthy", "persistent"):
-        out[mapped] = value.lower() == "true"
-        return
-    if mapped in ("exit_code", "count", "matches_count", "retry_attempts",
-                  "sessions_disconnected", "commands_cancelled", "replaced", "bytes_sent"):
-        try:
-            out[mapped] = int(value.split()[0])
-        except (ValueError, IndexError):
-            out[mapped] = value
-        return
-    if mapped == "total_bytes":
-        try:
-            out[mapped] = int(value)
-        except ValueError:
-            out[mapped] = value
-        return
-    if mapped == "size_raw":
-        m = re.search(r"\((\d+)\s+bytes\)", value)
-        if m:
-            out["total_bytes"] = int(m.group(1))
-        out[mapped] = value
-        return
-    if mapped == "progress_raw":
-        m = re.match(r"^(\d+)%\s+\((\d+)/(\d+)\s+bytes\)$", value)
-        if m:
-            out["progress_percent"] = int(m.group(1))
-            out["bytes_transferred"] = int(m.group(2))
-            out["total_bytes"] = int(m.group(3))
-        out[mapped] = value
-        return
-    if mapped == "direction":
-        out[mapped] = value.lower()
-        return
-    out[mapped] = value
+# ---------------------------------------------------------------------------
+# SSH-touching tests
+# ---------------------------------------------------------------------------
 
 
-def _assign_bullets(out, bullets):
-    tool = out.get("_tool", "")
-    if tool == "SSH_LIST_SESSIONS":
-        parsed = []
-        for b in bullets:
-            m = re.match(r"^(\S+)\s+(\S+)(?:\s+\[([^\]]+)\])?$", b)
-            if not m:
-                continue
-            tags = m.group(3) or ""
-            item = {"session_id": m.group(1), "host": m.group(2)}
-            for tag in (t.strip() for t in tags.split(",") if t.strip()):
-                if tag == "healthy":
-                    item["healthy"] = True
-                elif tag == "unhealthy":
-                    item["healthy"] = False
-                elif ":" in tag:
-                    k, v = tag.split(":", 1)
-                    item[k.strip()] = v.strip()
-            parsed.append(item)
-        out["sessions"] = parsed
-    elif tool == "SSH_LIST_COMMANDS":
-        parsed = []
-        for b in bullets:
-            m = re.match(r"^(\S+)\s+\[(\w+)\]\s+(\S+):\s+(.+?)\s+\(([^)]+)\)$", b)
-            if not m:
-                continue
-            parsed.append({
-                "command_id": m.group(1),
-                "status": m.group(2).lower(),
-                "session_id": m.group(3),
-                "command": m.group(4),
-                "started_at": m.group(5),
-            })
-        out["commands"] = parsed
+@pytest.mark.requires_sshd
+def test_stdio_connect_disconnect_roundtrip(stdio_client: McpClient, ssh_target) -> None:
+    text = call_tool_text(
+        stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-rt")
+    )
+    parsed = parse_block(text)
+    assert parsed.get("__status") == "OK", text
+    sid = parsed.get("session_id")
+    assert sid
+
+    listed = parse_block(call_tool_text(stdio_client, "ssh_list_sessions", {"agent_id": "stdio-rt"}))
+    assert listed.get("count", 0) == 1
+
+    text = call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+    assert parse_block(text).get("__status") == "OK"
 
 
-class McpClient:
-    def __init__(self):
-        env = os.environ.copy()
-        env["RUST_LOG"] = "error"
-        self.proc = subprocess.Popen(
-            [BINARY],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
+@pytest.mark.requires_sshd
+def test_stdio_disconnect_agent_bulk(stdio_client: McpClient, ssh_target) -> None:
+    for i in range(3):
+        text = call_tool_text(
+            stdio_client,
+            "ssh_connect",
+            ssh_target.connect_args(agent_id="stdio-bulk", name=f"sb-{i}"),
         )
-        self.req_id = 0
-        self.response_queue = queue.Queue()
+        assert parse_block(text).get("session_id"), text
 
-        # Read stdout in background thread to avoid deadlocks
-        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
-        self._stdout_thread.start()
-        # Drain stderr
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._stderr_thread.start()
-
-        time.sleep(0.3)
-        if self.proc.poll() is not None:
-            raise RuntimeError(f"Process exited with code {self.proc.returncode}")
-
-    def _read_stdout(self):
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            try:
-                data = json.loads(line)
-                self.response_queue.put(data)
-            except json.JSONDecodeError:
-                pass
-
-    def _drain_stderr(self):
-        while True:
-            line = self.proc.stderr.readline()
-            if not line:
-                break
-
-    def send(self, method, params=None, is_notification=False):
-        self.req_id += 1
-        req = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        if not is_notification:
-            req["id"] = self.req_id
-        line = json.dumps(req) + "\n"
-        self.proc.stdin.write(line.encode())
-        self.proc.stdin.flush()
-        if is_notification:
-            return None
-        # Wait for response with timeout
-        try:
-            return self.response_queue.get(timeout=300)
-        except queue.Empty:
-            return {"error": "Timeout waiting for response"}
-
-    def tool_call(self, name, arguments):
-        resp = self.send("tools/call", {"name": name, "arguments": arguments})
-        if resp is None:
-            return {"error": "No response"}
-        if "error" in resp and isinstance(resp["error"], dict):
-            return {"error": resp["error"].get("message", str(resp["error"]))}
-        result = resp.get("result", {})
-        if result.get("isError"):
-            error_text = result["content"][0]["text"] if result.get("content") else "Unknown error"
-            parsed = parse_mcp_response(error_text)
-            return {"error": parsed.get("error", error_text), **parsed}
-        if result.get("content"):
-            text = result["content"][0].get("text", "")
-            parsed = parse_mcp_response(text)
-            if parsed.get("_status") == "ERROR" and "error" in parsed:
-                return {"error": parsed["error"], **parsed}
-            if parsed.get("_status") == "CANCELLED":
-                parsed["cancelled"] = True
-            if name == "ssh_shell_close" and parsed.get("_status") == "OK":
-                parsed["closed"] = True
-            return parsed
-        return result
-
-    def send_batch(self, calls):
-        """Send multiple tools/call requests without waiting. Returns {req_id: (name, args)}."""
-        sent = {}
-        for name, args in calls:
-            self.req_id += 1
-            rid = self.req_id
-            req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": name, "arguments": args}}
-            line = json.dumps(req) + "\n"
-            self.proc.stdin.write(line.encode())
-            sent[rid] = (name, args)
-        self.proc.stdin.flush()
-        return sent
-
-    def collect_responses(self, expected_ids, timeout=30):
-        """Collect responses matching expected_ids from the queue."""
-        results = {}
-        deadline = time.time() + timeout
-        remaining = set(expected_ids)
-        while remaining and time.time() < deadline:
-            try:
-                resp = self.response_queue.get(timeout=min(1, deadline - time.time()))
-                rid = resp.get("id")
-                if rid in remaining:
-                    results[rid] = resp
-                    remaining.discard(rid)
-            except queue.Empty:
-                continue
-        return results
-
-    def tool_call_parsed(self, resp):
-        """Parse a raw JSON-RPC response into the same format as tool_call()."""
-        if "error" in resp and isinstance(resp["error"], dict):
-            return {"error": resp["error"].get("message", str(resp["error"]))}
-        result = resp.get("result", {})
-        if result.get("isError"):
-            error_text = result["content"][0]["text"] if result.get("content") else "Unknown error"
-            return {"error": error_text}
-        if result.get("content"):
-            text = result["content"][0].get("text", "")
-            parsed = parse_mcp_response(text)
-            if parsed.get("_status") == "ERROR" and "error" in parsed:
-                return {"error": parsed["error"], **parsed}
-            if parsed.get("_status") == "CANCELLED":
-                parsed["cancelled"] = True
-            return parsed
-        return result
-
-    def close(self):
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
+    text = call_tool_text(stdio_client, "ssh_disconnect_agent", {"agent_id": "stdio-bulk"})
+    parsed = parse_block(text)
+    assert parsed.get("__status") == "OK"
+    assert parsed.get("sessions_disconnected", 0) >= 3
 
 
-def test(label, passed, detail=""):
-    status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] {label}", flush=True)
-    if detail:
-        print(f"         {detail}", flush=True)
-    return passed
+@pytest.mark.requires_sshd
+def test_stdio_execute_wait_completed(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-exec"))
+    ).get("session_id")
+    assert sid
+
+    text = call_tool_text(
+        stdio_client,
+        "ssh_execute",
+        {"session_id": sid, "command": "uname -s && whoami && echo STDIO_OK"},
+    )
+    cid = parse_block(text).get("command_id")
+    text = call_tool_text(
+        stdio_client,
+        "ssh_get_command_output",
+        {"command_id": cid, "wait": True, "wait_timeout_secs": 15},
+        timeout=30,
+    )
+    parsed = parse_block(text)
+    assert parsed.get("__status") == "COMPLETED"
+    assert parsed.get("exit_code") == 0
+    assert "STDIO_OK" in (parsed.get("stdout") or "")
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
 
 
-def main():
-    print("Starting MCP client...", flush=True)
-    client = McpClient()
-    passed = 0
-    failed = 0
-    total = 0
-
-    # 1. Initialize
-    print("=== INITIALIZE ===", flush=True)
-    resp = client.send("initialize", {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "test", "version": "1.0"},
-    })
-    ok = resp and "result" in resp
-    total += 1
-    if test("MCP Initialize", ok):
-        passed += 1
-    else:
-        failed += 1
-        print(f"         {resp}", flush=True)
-        client.close()
-        sys.exit(1)
-
-    # Notification - no response expected
-    client.send("notifications/initialized", is_notification=True)
-    time.sleep(0.2)
-
-    # 2. List tools
-    print("\n=== LIST TOOLS ===", flush=True)
-    resp = client.send("tools/list", {})
-    tools = [t["name"] for t in resp.get("result", {}).get("tools", [])]
-    sftp_tools = [t for t in tools if t in ("ssh_upload", "ssh_download", "ssh_get_transfer_progress")]
-    total += 1
-    if test("SFTP tools registered", len(sftp_tools) == 3, f"Found: {sftp_tools} in {len(tools)} total tools"):
-        passed += 1
-    else:
-        failed += 1
-    for t in sorted(tools):
-        marker = " <-- SFTP" if t in sftp_tools else ""
-        print(f"    {t}{marker}", flush=True)
-
-    # 3. Connect
-    print("\n=== SSH CONNECT ===", flush=True)
-    result = client.tool_call("ssh_connect", connect_args(agent_id="sftp-test", name="sftp-test-session"))
-    session_id = result.get("session_id", "")
-    total += 1
-    if test("SSH Connect", bool(session_id), f"session_id={session_id[:16]}..." if session_id else str(result)):
-        passed += 1
-    else:
-        failed += 1
-        client.close()
-        return
-
-    # 4. Prepare remote dir
-    print("\n=== PREPARE REMOTE ===", flush=True)
-    result = client.tool_call("ssh_execute", {
-        "session_id": session_id,
-        "command": f"mkdir -p {REMOTE_DIR} && rm -f {REMOTE_FILE}",
-    })
-    cmd_id = result.get("command_id", "")
-    output = client.tool_call("ssh_get_command_output", {"command_id": cmd_id, "wait": True, "wait_timeout_secs": 10})
-    total += 1
-    if test("Prepare remote dir", output.get("status") == "completed"):
-        passed += 1
-    else:
-        failed += 1
-
-    # 5. Upload
-    print("\n=== SFTP UPLOAD ===", flush=True)
-    t0 = time.time()
-    result = client.tool_call("ssh_upload", {
-        "session_id": session_id,
-        "local_path": LOCAL_FILE,
-        "remote_path": REMOTE_FILE,
-    })
-    transfer_id = result.get("transfer_id", "")
-    total_bytes = result.get("total_bytes", 0)
-    total += 1
-    if test("Upload started", bool(transfer_id),
-            f"transfer_id={transfer_id[:16]}..., total_bytes={total_bytes}" if transfer_id else str(result)):
-        passed += 1
-    else:
-        failed += 1
-
-    # 6. Poll upload progress
-    if transfer_id:
-        print("\n=== UPLOAD PROGRESS ===", flush=True)
-        progress = client.tool_call("ssh_get_transfer_progress", {
-            "transfer_id": transfer_id, "wait": True, "wait_timeout_secs": 300,
-        })
-        elapsed = time.time() - t0
-        total += 1
-        upload_ok = progress.get("status") == "completed"
-        xferred = progress.get("bytes_transferred", 0)
-        speed_mbps = (xferred / 1024 / 1024) / elapsed if elapsed > 0 else 0
-        if test("Upload completed", upload_ok,
-                f"status={progress.get('status')}, {xferred}/{progress.get('total_bytes')} bytes, "
-                f"{progress.get('progress_percent')}%, {elapsed:.1f}s, {speed_mbps:.1f} MB/s"):
-            passed += 1
-        else:
-            failed += 1
-            if progress.get("error"):
-                print(f"         ERROR: {progress['error']}", flush=True)
-
-    # 7. Verify on remote
-    print("\n=== VERIFY UPLOAD ON REMOTE ===", flush=True)
-    result = client.tool_call("ssh_execute", {
-        "session_id": session_id,
-        "command": f"stat -c '%s' {REMOTE_FILE}",
-    })
-    cmd_id = result.get("command_id", "")
-    output = client.tool_call("ssh_get_command_output", {"command_id": cmd_id, "wait": True, "wait_timeout_secs": 30})
-    remote_size = output.get("stdout", "").strip()
-    total += 1
-    if test("Remote file size matches", remote_size == str(total_bytes), f"remote={remote_size}, expected={total_bytes}"):
-        passed += 1
-    else:
-        failed += 1
-
-    # 8. Download
-    print("\n=== SFTP DOWNLOAD ===", flush=True)
-    t0 = time.time()
-    result = client.tool_call("ssh_download", {
-        "session_id": session_id,
-        "remote_path": REMOTE_FILE,
-        "local_path": DOWNLOAD_FILE,
-    })
-    dl_transfer_id = result.get("transfer_id", "")
-    total += 1
-    if test("Download started", bool(dl_transfer_id),
-            f"transfer_id={dl_transfer_id[:16]}..." if dl_transfer_id else str(result)):
-        passed += 1
-    else:
-        failed += 1
-
-    # 9. Poll download progress
-    if dl_transfer_id:
-        print("\n=== DOWNLOAD PROGRESS ===", flush=True)
-        progress = client.tool_call("ssh_get_transfer_progress", {
-            "transfer_id": dl_transfer_id, "wait": True, "wait_timeout_secs": 300,
-        })
-        elapsed = time.time() - t0
-        total += 1
-        dl_ok = progress.get("status") == "completed"
-        xferred = progress.get("bytes_transferred", 0)
-        speed_mbps = (xferred / 1024 / 1024) / elapsed if elapsed > 0 else 0
-        if test("Download completed", dl_ok,
-                f"status={progress.get('status')}, {xferred}/{progress.get('total_bytes')} bytes, "
-                f"{progress.get('progress_percent')}%, {elapsed:.1f}s, {speed_mbps:.1f} MB/s"):
-            passed += 1
-        else:
-            failed += 1
-            if progress.get("error"):
-                print(f"         ERROR: {progress['error']}", flush=True)
-
-    # 10. Verify downloaded file
-    print("\n=== VERIFY DOWNLOAD LOCALLY ===", flush=True)
-    orig_size = os.path.getsize(LOCAL_FILE) if os.path.exists(LOCAL_FILE) else 0
-    dl_size = os.path.getsize(DOWNLOAD_FILE) if os.path.exists(DOWNLOAD_FILE) else 0
-    total += 1
-    if test("Downloaded file size matches", orig_size == dl_size and dl_size > 0,
-            f"original={orig_size}, downloaded={dl_size}"):
-        passed += 1
-    else:
-        failed += 1
-
-    # 11. Error classification: upload to non-existent remote dir
-    print("\n=== ERROR CLASSIFICATION: non-existent remote dir ===", flush=True)
-    result = client.tool_call("ssh_upload", {
-        "session_id": session_id,
-        "local_path": LOCAL_FILE,
-        "remote_path": "/tmp/nonexistent/deep/nested/dir/file.mov",
-    })
-    err_transfer_id = result.get("transfer_id", "")
-    if err_transfer_id:
-        time.sleep(3)
-        progress = client.tool_call("ssh_get_transfer_progress", {
-            "transfer_id": err_transfer_id, "wait": True, "wait_timeout_secs": 10,
-        })
-        err_msg = progress.get("error", "")
-        total += 1
-        has_code = err_msg.startswith("[") and "]" in err_msg
-        if test("Error has classification code", has_code, f"error={err_msg[:150]}"):
-            passed += 1
-        else:
-            failed += 1
-    else:
-        err_msg = result.get("error", "")
-        total += 1
-        has_code = err_msg.startswith("[") and "]" in err_msg
-        if test("Error has classification code", has_code, f"error={err_msg[:150]}"):
-            passed += 1
-        else:
-            failed += 1
-
-    # 12. Error classification: non-existent local file
-    print("\n=== ERROR CLASSIFICATION: non-existent local file ===", flush=True)
-    result = client.tool_call("ssh_upload", {
-        "session_id": session_id,
-        "local_path": "/nonexistent/file.txt",
-        "remote_path": "/tmp/test.txt",
-    })
-    err_msg = result.get("error", "")
-    total += 1
-    has_code = err_msg.startswith("[") and "]" in err_msg
-    if test("Error has classification code", has_code, f"error={err_msg[:150]}"):
-        passed += 1
-    else:
-        failed += 1
-
-    # 13. Error classification: download non-existent remote file
-    print("\n=== ERROR CLASSIFICATION: non-existent remote file ===", flush=True)
-    result = client.tool_call("ssh_download", {
-        "session_id": session_id,
-        "remote_path": "/nonexistent/remote/file.txt",
-        "local_path": "/tmp/dl-err-test.txt",
-    })
-    err_msg = result.get("error", "")
-    total += 1
-    has_code = err_msg.startswith("[") and "]" in err_msg
-    if test("Error has classification code", has_code, f"error={err_msg[:150]}"):
-        passed += 1
-    else:
-        failed += 1
-
-    # =========================================================================
-    # CHAOS / CONCURRENCY / ERROR SIMULATION TESTS
-    # =========================================================================
-
-    # -- A. Concurrent Commands on Same Session --
-    print("\n=== A. CONCURRENT COMMANDS (SAME SESSION) ===", flush=True)
-    chaos_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-a", name="chaos-a"))
-    chaos_sid = chaos_r.get("session_id", "")
-    if chaos_sid:
-        N_CONCURRENT = 8
-        batch_calls = []
-        markers = []
-        for i in range(N_CONCURRENT):
-            marker = f"MARKER_{i}_{_uuid.uuid4().hex[:8]}"
-            markers.append(marker)
-            batch_calls.append(("ssh_execute", {"session_id": chaos_sid, "command": f"echo {marker}"}))
-        # Execute and immediately poll output for each command sequentially
-        # (completed commands are auto-cleaned from storage, so batch-then-poll can miss them)
-        all_ok = True
-        cmd_ids = {}
-        for i, marker in enumerate(markers):
-            r = client.tool_call("ssh_execute", {"session_id": chaos_sid, "command": f"echo {marker}"})
-            cid = r.get("command_id", "")
-            if cid:
-                cmd_ids[marker] = cid
-                r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
-                if marker not in r.get("stdout", ""):
-                    all_ok = False
-        total += 1
-        if test(f"8 concurrent cmds returned correct markers", all_ok, f"got {len(cmd_ids)}/{N_CONCURRENT}"):
-            passed += 1
-        else:
-            failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": chaos_sid})
-
-    # -- B. Concurrent Commands Across 3 Sessions --
-    print("\n=== B. CONCURRENT COMMANDS (CROSS SESSION) ===", flush=True)
-    cross_sids = []
-    for i in range(3):
-        r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-b", name=f"cross-{i}"))
-        sid = r.get("session_id", "")
-        if sid:
-            cross_sids.append(sid)
-    if len(cross_sids) == 3:
-        # Execute and immediately poll per command (auto-cleanup removes completed commands)
-        cross_ok = True
-        cmd_count = 0
-        for si, sid in enumerate(cross_sids):
-            for ci in range(2):
-                marker = f"CROSS_{si}_{ci}_{_uuid.uuid4().hex[:8]}"
-                r = client.tool_call("ssh_execute", {"session_id": sid, "command": f"echo {marker}"})
-                cid = r.get("command_id", "")
-                if cid:
-                    cmd_count += 1
-                    r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 15})
-                    if marker not in r.get("stdout", ""):
-                        cross_ok = False
-        total += 1
-        if test("6 cross-session cmds routed correctly", cross_ok, f"got {cmd_count}/6"):
-            passed += 1
-        else:
-            failed += 1
-        client.tool_call("ssh_disconnect_agent", {"agent_id": "chaos-b"})
-
-    # -- C. Shell Write During Disconnect Race --
-    print("\n=== C. SHELL WRITE + DISCONNECT RACE ===", flush=True)
-    race_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-c", name="race"))
-    race_sid = race_r.get("session_id", "")
-    if race_sid:
-        race_shell = client.tool_call("ssh_shell_open", {"session_id": race_sid}).get("shell_id", "")
-        if race_shell:
-            time.sleep(0.3)
-            batch_calls = [
-                ("ssh_shell_write", {"shell_id": race_shell, "input": "echo RACE\n"}),
-                ("ssh_disconnect", {"session_id": race_sid}),
-            ]
-            sent = client.send_batch(batch_calls)
-            responses = client.collect_responses(sent.keys(), timeout=10)
-            total += 1
-            if test("Shell write + disconnect both completed (no deadlock)", len(responses) == 2):
-                passed += 1
-            else:
-                failed += 1
-        else:
-            client.tool_call("ssh_disconnect", {"session_id": race_sid})
-            total += 1
-            if test("Shell write + disconnect race (skipped, shell open failed)", False):
-                passed += 1
-            else:
-                failed += 1
-    else:
-        total += 1
-        if test("Shell write + disconnect race (skipped, connect failed)", False):
-            passed += 1
-        else:
-            failed += 1
-
-    # -- D. Rapid Connect/Disconnect Stress --
-    print("\n=== D. RAPID CONNECT/DISCONNECT (10 cycles) ===", flush=True)
-    stress_ok = True
-    for i in range(10):
-        r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-d", name=f"stress-{i}"))
-        sid = r.get("session_id", "")
-        if not sid:
-            stress_ok = False
+@pytest.mark.requires_sshd
+def test_stdio_execute_polling(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-poll"))
+    ).get("session_id")
+    text = call_tool_text(
+        stdio_client, "ssh_execute", {"session_id": sid, "command": "sleep 1 && echo POLL_OK"}
+    )
+    cid = parse_block(text).get("command_id")
+    parsed = {}
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        text = call_tool_text(stdio_client, "ssh_get_command_output", {"command_id": cid})
+        parsed = parse_block(text)
+        if parsed.get("__status") == "COMPLETED":
             break
-        r = client.tool_call("ssh_disconnect", {"session_id": sid})
-        if "error" in r:
-            stress_ok = False
-            break
-    total += 1
-    if test("10 rapid connect/disconnect cycles", stress_ok):
-        passed += 1
-    else:
-        failed += 1
-
-    # -- E. Cancel Command While Polling Output --
-    print("\n=== E. CANCEL WHILE POLLING ===", flush=True)
-    cancel_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-e", name="cancel-race"))
-    cancel_sid = cancel_r.get("session_id", "")
-    if cancel_sid:
-        r = client.tool_call("ssh_execute", {"session_id": cancel_sid, "command": "sleep 60"})
-        long_cid = r.get("command_id", "")
-        if long_cid:
-            time.sleep(0.5)
-            batch_calls = [
-                ("ssh_get_command_output", {"command_id": long_cid, "wait": True, "wait_timeout_secs": 15}),
-                ("ssh_cancel_command", {"command_id": long_cid}),
-            ]
-            sent = client.send_batch(batch_calls)
-            responses = client.collect_responses(sent.keys(), timeout=20)
-            total += 1
-            if test("Cancel + poll both returned (no deadlock)", len(responses) == 2):
-                passed += 1
-            else:
-                failed += 1
-        else:
-            total += 1
-            if test("Cancel while polling (skipped, execute failed)", False):
-                passed += 1
-            else:
-                failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": cancel_sid})
-    else:
-        total += 1
-        if test("Cancel while polling (skipped, connect failed)", False):
-            passed += 1
-        else:
-            failed += 1
-
-    # -- F. Multi-Session Routing Verification --
-    print("\n=== F. MULTI-SESSION ROUTING ===", flush=True)
-    route_agent = f"chaos-f-{_uuid.uuid4().hex[:8]}"
-    route_sids = []
-    for i in range(3):
-        r = client.tool_call("ssh_connect", connect_args(agent_id=route_agent, name=f"route-{i}"))
-        sid = r.get("session_id", "")
-        if sid:
-            route_sids.append(sid)
-    if len(route_sids) == 3:
-        # Execute and immediately poll per session (auto-cleanup removes completed commands)
-        route_outputs = {}
-        for i, sid in enumerate(route_sids):
-            marker = f"SESSION_ROUTE_{i}_{sid[:8]}"
-            r = client.tool_call("ssh_execute", {"session_id": sid, "command": f"echo {marker}"})
-            cid = r.get("command_id", "")
-            if cid:
-                r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
-                route_outputs[i] = (marker, r.get("stdout", ""))
-        route_ok = True
-        for i, (marker, stdout) in route_outputs.items():
-            if marker not in stdout:
-                route_ok = False
-            for j, (other_marker, _) in route_outputs.items():
-                if j != i and other_marker in stdout:
-                    route_ok = False
-        total += 1
-        if test("Each session echoed only its own marker", route_ok, f"verified {len(route_outputs)} sessions"):
-            passed += 1
-        else:
-            failed += 1
-        r = client.tool_call("ssh_list_sessions", {"agent_id": route_agent})
-        total += 1
-        if test("ssh_list_sessions returns 3 for agent", r.get("count") == 3, f"count={r.get('count')}"):
-            passed += 1
-        else:
-            failed += 1
-        r = client.tool_call("ssh_list_sessions", {"agent_id": f"nonexistent-{_uuid.uuid4().hex[:8]}"})
-        total += 1
-        if test("Nonexistent agent sees 0 sessions", r.get("count", 0) == 0, f"count={r.get('count')}"):
-            passed += 1
-        else:
-            failed += 1
-        client.tool_call("ssh_disconnect_agent", {"agent_id": route_agent})
-    else:
-        total += 1
-        if test("Multi-session routing (skipped, connect failures)", False):
-            passed += 1
-        else:
-            failed += 1
-
-    # -- G. Error Simulation (Invalid IDs) --
-    print("\n=== G. ERROR SIMULATION (INVALID IDS) ===", flush=True)
-    fake_uuid = str(_uuid.uuid4())
-
-    r = client.tool_call("ssh_execute", {"session_id": fake_uuid, "command": "echo hi"})
-    total += 1
-    if test("Execute on fake session_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    r = client.tool_call("ssh_get_command_output", {"command_id": fake_uuid, "wait": False})
-    total += 1
-    if test("Get output for fake command_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    r = client.tool_call("ssh_shell_write", {"shell_id": fake_uuid, "input": "x\n"})
-    total += 1
-    if test("Shell write to fake shell_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    r = client.tool_call("ssh_shell_read", {"shell_id": fake_uuid})
-    total += 1
-    if test("Shell read from fake shell_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    r = client.tool_call("ssh_shell_close", {"shell_id": fake_uuid})
-    total += 1
-    if test("Shell close fake shell_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    r = client.tool_call("ssh_get_transfer_progress", {"transfer_id": fake_uuid})
-    total += 1
-    if test("Transfer progress for fake transfer_id -> error", "error" in r, str(r)[:100]):
-        passed += 1
-    else:
-        failed += 1
-
-    # Double disconnect
-    dd_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g", name="dd"))
-    dd_sid = dd_r.get("session_id", "")
-    if dd_sid:
-        client.tool_call("ssh_disconnect", {"session_id": dd_sid})
-        r = client.tool_call("ssh_disconnect", {"session_id": dd_sid})
-        total += 1
-        if test("Double disconnect -> error", "error" in r, str(r)[:100]):
-            passed += 1
-        else:
-            failed += 1
-
-    # Execute on disconnected session
-    disc_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g2", name="disc-exec"))
-    disc_sid = disc_r.get("session_id", "")
-    if disc_sid:
-        client.tool_call("ssh_disconnect", {"session_id": disc_sid})
-        r = client.tool_call("ssh_execute", {"session_id": disc_sid, "command": "echo should_fail"})
-        total += 1
-        if test("Execute on disconnected session -> error", "error" in r, str(r)[:100]):
-            passed += 1
-        else:
-            failed += 1
-
-    # Write/read to closed shell
-    closed_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g3", name="closed-shell"))
-    closed_sid = closed_r.get("session_id", "")
-    if closed_sid:
-        sh = client.tool_call("ssh_shell_open", {"session_id": closed_sid}).get("shell_id", "")
-        if sh:
-            client.tool_call("ssh_shell_close", {"shell_id": sh})
-            r = client.tool_call("ssh_shell_write", {"shell_id": sh, "input": "echo fail\n"})
-            total += 1
-            if test("Write to closed shell -> error", "error" in r, str(r)[:100]):
-                passed += 1
-            else:
-                failed += 1
-            r = client.tool_call("ssh_shell_read", {"shell_id": sh})
-            total += 1
-            if test("Read from closed shell -> error", "error" in r, str(r)[:100]):
-                passed += 1
-            else:
-                failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": closed_sid})
-
-    # Cancel already-completed command
-    comp_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-g4", name="comp-cancel"))
-    comp_sid = comp_r.get("session_id", "")
-    if comp_sid:
-        r = client.tool_call("ssh_execute", {"session_id": comp_sid, "command": "echo done"})
-        comp_cid = r.get("command_id", "")
-        if comp_cid:
-            client.tool_call("ssh_get_command_output", {"command_id": comp_cid, "wait": True, "wait_timeout_secs": 5})
-            r = client.tool_call("ssh_cancel_command", {"command_id": comp_cid})
-            total += 1
-            if test("Cancel completed command -> error or no-op", True, str(r)[:100]):
-                passed += 1
-            else:
-                failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": comp_sid})
-
-    # -- H. Mixed Concurrent Valid + Invalid Operations --
-    print("\n=== H. MIXED CONCURRENT VALID + INVALID ===", flush=True)
-    mix_r = client.tool_call("ssh_connect", connect_args(agent_id="chaos-h", name="mixed"))
-    mix_sid = mix_r.get("session_id", "")
-    if mix_sid:
-        fake1 = str(_uuid.uuid4())
-        fake2 = str(_uuid.uuid4())
-        mix_calls = [
-            ("ssh_execute", {"session_id": mix_sid, "command": "echo VALID_1"}),
-            ("ssh_execute", {"session_id": mix_sid, "command": "echo VALID_2"}),
-            ("ssh_execute", {"session_id": fake1, "command": "echo BAD1"}),
-            ("ssh_get_command_output", {"command_id": fake2, "wait": False}),
-            ("ssh_shell_write", {"shell_id": fake1, "input": "x\n"}),
-            ("ssh_shell_read", {"shell_id": fake2}),
-        ]
-        sent = client.send_batch(mix_calls)
-        responses = client.collect_responses(sent.keys(), timeout=15)
-        rid_list = list(sent.keys())
-        results = {}
-        for rid, resp in responses.items():
-            idx = rid_list.index(rid)
-            results[idx] = client.tool_call_parsed(resp)
-        valid_ok = all("command_id" in results.get(i, {}) for i in [0, 1])
-        invalid_ok = all("error" in results.get(i, {}) for i in [2, 3, 4, 5])
-        total += 1
-        if test("Valid operations succeeded", valid_ok, f"results[0]={str(results.get(0, {}))[:60]}"):
-            passed += 1
-        else:
-            failed += 1
-        total += 1
-        if test("Invalid operations returned errors", invalid_ok, f"errors={sum(1 for i in [2,3,4,5] if 'error' in results.get(i, {}))}/4"):
-            passed += 1
-        else:
-            failed += 1
-        total += 1
-        if test("Server did not crash (6 mixed concurrent calls)", len(responses) == 6):
-            passed += 1
-        else:
-            failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": mix_sid})
-    else:
-        total += 1
-        if test("Mixed concurrent (skipped, connect failed)", False):
-            passed += 1
-        else:
-            failed += 1
-
-    # Cleanup chaos agents
-    for agent in ["chaos-g", "chaos-g2", "chaos-g3", "chaos-g4", "chaos-h"]:
-        client.tool_call("ssh_disconnect_agent", {"agent_id": agent})
-
-    # =========================================================================
-    # COMMAND AUTO-CLEANUP TESTS
-    # =========================================================================
-
-    # -- I. Output read -> command cleaned up immediately --
-    print("\n=== I. CLEANUP: OUTPUT READ -> IMMEDIATE REMOVAL ===", flush=True)
-    cleanup_sid = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-i", name="cleanup-read")).get("session_id", "")
-    if cleanup_sid:
-        r = client.tool_call("ssh_execute", {"session_id": cleanup_sid, "command": "echo CLEANUP_READ"})
-        cid = r.get("command_id", "")
-        if cid:
-            # Read the output (marks output_read=true, triggers immediate cleanup)
-            r = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 10})
-            total += 1
-            if test("Command completed with output", "CLEANUP_READ" in r.get("stdout", ""), f"stdout={r.get('stdout', '').strip()}"):
-                passed += 1
-            else:
-                failed += 1
-
-            # Wait briefly for the cleanup task to run
-            time.sleep(2)
-
-            # Try to read output again — should fail because command was cleaned up
-            r2 = client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": False})
-            total += 1
-            if test("Command removed after output read", "error" in r2, str(r2)[:100]):
-                passed += 1
-            else:
-                failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid})
-
-    # -- J. Output NOT read -> command persists for TTL --
-    print("\n=== J. CLEANUP: OUTPUT UNREAD -> PERSISTS DURING TTL ===", flush=True)
-    cleanup_sid2 = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-j", name="cleanup-ttl")).get("session_id", "")
-    if cleanup_sid2:
-        r = client.tool_call("ssh_execute", {"session_id": cleanup_sid2, "command": "echo CLEANUP_TTL"})
-        cid2 = r.get("command_id", "")
-        if cid2:
-            # Wait for the command to complete but do NOT read the output
-            time.sleep(3)
-
-            # Command should still be in storage (TTL default=60s has not expired)
-            r2 = client.tool_call("ssh_get_command_output", {"command_id": cid2, "wait": False})
-            total += 1
-            if test("Unread command still in storage after 3s", "CLEANUP_TTL" in r2.get("stdout", ""), f"status={r2.get('status')}"):
-                passed += 1
-            else:
-                failed += 1
-        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid2})
-
-    # -- K. Completed commands don't block new executions --
-    print("\n=== K. CLEANUP: COMPLETED COMMANDS DON'T BLOCK LIMIT ===", flush=True)
-    cleanup_sid3 = client.tool_call("ssh_connect", connect_args(agent_id="cleanup-k", name="cleanup-limit")).get("session_id", "")
-    if cleanup_sid3:
-        # Run 5 commands and read their output (they get cleaned up)
-        for i in range(5):
-            r = client.tool_call("ssh_execute", {"session_id": cleanup_sid3, "command": f"echo BATCH_{i}"})
-            cid = r.get("command_id", "")
-            if cid:
-                client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5})
-        time.sleep(1)
-
-        # Run 5 more — should succeed because completed commands were cleaned up
-        # (if they counted toward the limit, we'd eventually hit 100)
-        batch_ok = True
-        for i in range(5):
-            r = client.tool_call("ssh_execute", {"session_id": cleanup_sid3, "command": f"echo MORE_{i}"})
-            if "error" in r:
-                batch_ok = False
-                break
-            cid = r.get("command_id", "")
-            if cid:
-                client.tool_call("ssh_get_command_output", {"command_id": cid, "wait": True, "wait_timeout_secs": 5})
-
-        total += 1
-        if test("10 sequential commands all succeeded (no limit hit)", batch_ok):
-            passed += 1
-        else:
-            failed += 1
-
-        # Verify list_commands shows 0 running (all completed and cleaned up)
-        time.sleep(1)
-        r = client.tool_call("ssh_list_commands", {"session_id": cleanup_sid3, "status": "running"})
-        running_count = r.get("count", -1)
-        total += 1
-        if test("No running commands after all completed", running_count == 0, f"running={running_count}"):
-            passed += 1
-        else:
-            failed += 1
-
-        client.tool_call("ssh_disconnect", {"session_id": cleanup_sid3})
-
-    # Cleanup test agents
-    for agent in ["cleanup-i", "cleanup-j", "cleanup-k"]:
-        client.tool_call("ssh_disconnect_agent", {"agent_id": agent})
-
-    # =========================================================================
-    # ORIGINAL DISCONNECT / CLEANUP TESTS
-    # =========================================================================
-
-    # 14. Disconnect agent
-    print("\n=== DISCONNECT AGENT ===", flush=True)
-    result = client.tool_call("ssh_disconnect_agent", {"agent_id": "sftp-test"})
-    total += 1
-    if test("Agent disconnected", result.get("sessions_disconnected", 0) > 0,
-            f"sessions_disconnected={result.get('sessions_disconnected')}"):
-        passed += 1
-    else:
-        failed += 1
-
-    # Cleanup
-    client.close()
-    subprocess.run(["rm", "-f", DOWNLOAD_FILE], capture_output=True)
-
-    # Summary
-    print(f"\n{'='*60}", flush=True)
-    print(f"RESULTS: {passed}/{total} passed, {failed} failed", flush=True)
-    if failed == 0:
-        print("ALL TESTS PASSED", flush=True)
-    else:
-        print(f"FAILURES: {failed}", flush=True)
-    print(f"{'='*60}", flush=True)
-    sys.exit(0 if failed == 0 else 1)
+        time.sleep(0.2)
+    assert parsed.get("__status") == "COMPLETED"
+    assert "POLL_OK" in (parsed.get("stdout") or "")
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.requires_sshd
+def test_stdio_cancel_running_command(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-cancel"))
+    ).get("session_id")
+    cid = parse_block(
+        call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "sleep 60"})
+    ).get("command_id")
+    time.sleep(0.5)
+    parsed = parse_block(call_tool_text(stdio_client, "ssh_cancel_command", {"command_id": cid}))
+    assert parsed.get("__status") in {"CANCELLED", "NOOP"}
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_stdio_shell_lifecycle(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-shell"))
+    ).get("session_id")
+    shell_id = parse_block(
+        call_tool_text(stdio_client, "ssh_shell_open", {"session_id": sid})
+    ).get("shell_id")
+    assert shell_id
+
+    call_tool_text(
+        stdio_client,
+        "ssh_shell_write",
+        {"shell_id": shell_id, "input": "echo STDIO_SHELL_OK\n"},
+    )
+    text = call_tool_text(
+        stdio_client,
+        "ssh_shell_read",
+        {"shell_id": shell_id, "wait": True, "wait_timeout_secs": 5, "min_bytes": 4},
+        timeout=15,
+    )
+    parsed = parse_block(text)
+    assert "STDIO_SHELL_OK" in (parsed.get("data") or ""), parsed
+    assert parse_block(call_tool_text(stdio_client, "ssh_shell_close", {"shell_id": shell_id})).get(
+        "__status"
+    ) == "OK"
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_stdio_shell_send_key_ctrl_c(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-key"))
+    ).get("session_id")
+    shell_id = parse_block(
+        call_tool_text(stdio_client, "ssh_shell_open", {"session_id": sid})
+    ).get("shell_id")
+    call_tool_text(stdio_client, "ssh_shell_write", {"shell_id": shell_id, "input": "yes\n"})
+    time.sleep(0.5)
+    parsed = parse_block(
+        call_tool_text(stdio_client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+    )
+    assert parsed.get("__status") == "OK"
+    assert parsed.get("key") == "ctrl_c"
+    call_tool_text(stdio_client, "ssh_shell_close", {"shell_id": shell_id})
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_stdio_shell_wait_for_match(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-waitfor"))
+    ).get("session_id")
+    shell_id = parse_block(
+        call_tool_text(stdio_client, "ssh_shell_open", {"session_id": sid})
+    ).get("shell_id")
+    call_tool_text(
+        stdio_client,
+        "ssh_shell_write",
+        {"shell_id": shell_id, "input": "printf 'foo\\nbar\\nbaz\\n'\n"},
+    )
+    parsed = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_shell_wait_for",
+            {"shell_id": shell_id, "patterns": ["bar"], "timeout_secs": 5},
+            timeout=15,
+        )
+    )
+    assert parsed.get("__status") == "MATCHED", parsed
+    assert parsed.get("matched_pattern") == "bar"
+    call_tool_text(stdio_client, "ssh_shell_close", {"shell_id": shell_id})
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_stdio_upload_download(stdio_client: McpClient, ssh_target, tmp_path) -> None:
+    payload = b"ssh-mcp stdio payload " * 1024  # ~22 KB
+    src = tmp_path / "upload.bin"
+    src.write_bytes(payload)
+    dst = tmp_path / "download.bin"
+    remote_dir = f"/tmp/ssh-mcp-stdio-{os.getpid()}"
+    remote_path = f"{remote_dir}/upload.bin"
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-xfer"))
+    ).get("session_id")
+    cid = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_execute",
+            {"session_id": sid, "command": f"mkdir -p {remote_dir} && rm -f {remote_path}"},
+        )
+    ).get("command_id")
+    call_tool_text(
+        stdio_client, "ssh_get_command_output", {"command_id": cid, "wait": True}, timeout=15
+    )
+    upload_xfer = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_upload",
+            {"session_id": sid, "local_path": str(src), "remote_path": remote_path},
+        )
+    ).get("transfer_id")
+    parsed = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_get_transfer_progress",
+            {"transfer_id": upload_xfer, "wait": True, "wait_timeout_secs": 60},
+            timeout=90,
+        )
+    )
+    assert parsed.get("__status") == "COMPLETED", parsed
+    dl_xfer = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_download",
+            {"session_id": sid, "remote_path": remote_path, "local_path": str(dst)},
+        )
+    ).get("transfer_id")
+    parsed = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_get_transfer_progress",
+            {"transfer_id": dl_xfer, "wait": True, "wait_timeout_secs": 60},
+            timeout=90,
+        )
+    )
+    assert parsed.get("__status") == "COMPLETED", parsed
+    assert dst.exists() and dst.read_bytes() == payload
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_stdio_forward(stdio_client: McpClient, ssh_target) -> None:
+    sid = parse_block(
+        call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-fwd"))
+    ).get("session_id")
+    from helpers.fixtures import find_free_port
+
+    local_port = find_free_port()
+    parsed = parse_block(
+        call_tool_text(
+            stdio_client,
+            "ssh_forward",
+            {
+                "session_id": sid,
+                "local_port": local_port,
+                "remote_address": "127.0.0.1",
+                "remote_port": 22,
+            },
+        )
+    )
+    if parsed.get("__status") == "ERROR" and "FEATURE_DISABLED" in (parsed.get("reason") or ""):
+        pytest.skip("port_forward feature not enabled in binary")
+    assert parsed.get("__status") == "OK", parsed
+    assert parsed.get("active") is True
+    call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
