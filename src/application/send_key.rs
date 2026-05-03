@@ -39,7 +39,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::ShellId;
-use crate::mcp::keys::{EncodeError, KeyModifiers, ShellKey};
+use crate::domain::keys::{EncodeError, KeyModifiers, ShellKey};
 use crate::ports::clock::ClockPort;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
@@ -219,8 +219,8 @@ mod tests {
     use crate::adapters::ssh::fake::{FakeSshCall, FakeSshClient};
     use crate::domain::error::DomainError;
     use crate::domain::ids::{SessionId, ShellId};
+    use crate::domain::keys::{KeyModifiers, ShellKey};
     use crate::domain::shell::{ShellEntity, ShellTerminal};
-    use crate::mcp::keys::{KeyModifiers, ShellKey};
     use crate::ports::clock::ClockPort;
     use crate::ports::shell_repo::ShellRepository;
     use chrono::Utc;

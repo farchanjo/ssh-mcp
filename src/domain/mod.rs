@@ -12,6 +12,7 @@ pub mod events;
 pub mod forward;
 pub mod identity;
 pub mod ids;
+pub mod keys;
 pub mod policy;
 pub mod ringbuffer;
 pub mod session;

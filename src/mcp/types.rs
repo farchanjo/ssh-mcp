@@ -27,10 +27,8 @@ pub struct SessionInfo {
     pub username: String,
     pub connected_at: String,
     /// Default timeout in seconds used for this session's connection
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub default_timeout_secs: u64,
     /// Number of retry attempts needed to establish the connection
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub retry_attempts: u32,
     /// Whether compression is enabled for this session
     pub compression_enabled: bool,
@@ -124,10 +122,8 @@ pub struct ShellInfo {
     /// Terminal type (e.g., "xterm", "vt100")
     pub term_type: String,
     /// Terminal width in columns
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub cols: u32,
     /// Terminal height in rows
-    #[schemars(schema_with = "crate::mcp::schema::uint")]
     pub rows: u32,
     /// When the shell was opened (RFC3339 format)
     pub opened_at: String,

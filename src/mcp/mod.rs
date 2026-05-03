@@ -1,55 +1,43 @@
-//! MCP SSH module providing SSH connection and command execution tools.
+//! Foundational SSH/PTY/SFTP runtime carriers (v3 leftovers consumed by v4 adapters).
 //!
-//! # v3.0.0 Architecture
+//! After the H17.5a hard-delete, this module no longer hosts the v3 MCP server,
+//! tools, resources, storage, message builders, port forwarder, or runtime.
+//! Those concerns now live under:
 //!
-//! Migrated from `poem-mcpserver` 0.3.1 to `rmcp` 1.6 (official Anthropic Rust SDK)
-//! to gain native `resources/subscribe` + `notifications/resources/updated` support.
+//! - `infra::mcp::server` / `infra::mcp::tool_router` / `infra::mcp::resource_handlers`
+//!   — the rmcp `ServerHandler` and tool/resource wiring.
+//! - `application::*` — use cases.
+//! - `adapters::repo::dashmap::*` — `DashMap`-backed repositories.
+//! - `adapters::repo::dashmap::forward` + `application::forward_port` — port forwarding.
+//! - `infra::mcp::render` / `infra::mcp::helpers` — markdown rendering.
+//! - `domain::keys` — semantic keystroke encoder.
 //!
-//! ## Core Modules
+//! What remains here is foundational state used by the russh / sftp adapters
+//! and by composition::prod (peer GC + config resolvers). H17.6 will absorb
+//! these into the hexagonal layout and retire the `mcp::` namespace entirely.
 //!
-//! - [`types`]: Internal data carriers (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`).
-//! - [`config`]: Parameter -> Env -> Default resolution with byte-size parser.
-//! - [`error`]: Retryable vs non-retryable error classification.
-//! - [`session`]: `SshClientHandler` for russh callbacks.
-//! - [`client`]: SSH connection, command execution, PTY channels.
-//! - [`async_command`]: Async command tracking and state.
-//! - [`shell`]: Interactive PTY shell session state.
-//! - [`forward`]: Port forwarding (feature-gated).
-//! - [`server`]: `McpSshServer` implementing `rmcp::ServerHandler` (the v3 entry point).
+//! Surviving modules:
 //!
-//! ## Subscribe-First Layer (v3.0.0)
-//!
-//! Realtime resource streams via MCP `resources/subscribe`:
-//! - `shell://<id>/output`     — PTY output buffer
-//! - `command://<id>/output`   — async command stdout/stderr
-//! - `transfer://<id>/progress` — SFTP transfer progress events
-//! - `session://<id>/health`    — session health change events
-//! - `forward://<id>/events`    — port forward accept/close events
-//!
-//! ## SOLID Architecture
-//!
-//! - [`storage`]: Lock-free `DashMap`-backed storage with secondary indices.
-//! - [`auth`]: `AuthChain` strategy (Password / Key / Agent).
-//! - [`message`]: Markdown response builders for LLM-friendly output.
+//! - [`async_command`] — `RunningCommand` + `OutputBuffer` consumed by the russh adapter.
+//! - [`auth`] — `AuthChain` strategies (still uses `async-trait`).
+//! - [`client`] — low-level SSH connect / exec / PTY helpers reused by adapters.
+//! - [`config`] — env-var resolvers; `adapters::config::env` delegates here.
+//! - [`error`] — retry classification consumed by `mcp::client`.
+//! - [`session`] — `SshClientHandler` russh callback handler.
+//! - [`sftp`] — streaming SFTP transfer state used by the sftp adapter.
+//! - [`shell`] — `RunningShell` + `RingBuffer` consumed by the russh adapter.
+//! - [`subscription`] — `SUBSCRIPTION_REGISTRY` + peer GC task spawned by composition.
+//! - [`transfer`] — `RunningTransfer` lock-free state.
+//! - [`types`] — shared payload structs (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, …).
 
 pub(crate) mod async_command;
 pub mod auth;
 pub(crate) mod client;
 pub mod config;
 pub(crate) mod error;
-#[cfg(feature = "port_forward")]
-pub(crate) mod forward;
-pub mod keys;
-pub mod message;
-pub mod resources;
-pub mod runtime;
-pub mod schema;
-pub mod server;
 pub mod session;
 pub(crate) mod sftp;
 pub(crate) mod shell;
-pub mod storage;
 pub mod subscription;
-pub mod tools;
 pub(crate) mod transfer;
 pub mod types;
