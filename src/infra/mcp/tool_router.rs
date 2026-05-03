@@ -3043,49 +3043,52 @@ fn server_capabilities() -> ServerCapabilities {
         .build()
 }
 
-/// Few-shot bootstrap text for the `port_forward` build (18 tools / 5
+/// Few-shot bootstrap text for the `port_forward` build (21 tools / 5
 /// streams). Three canonical workflows steer 27B-class models away from
 /// the most common failure modes (forgetting `wait=true`, leaking
-/// sessions, polling instead of subscribing).
+/// sessions, polling instead of subscribing). v4.7 adds ssh_run +
+/// batches and the structured_content channel.
 #[cfg(feature = "port_forward")]
-const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 18 tools, 5 push streams \
+const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 21 tools, 5 push streams \
 (shell://, command://, transfer://, session://, forward://). All tools return \
-block markdown: first line TOOL: STATUS, then KEY: value pairs. Output blocks \
-delimited by --- name [nonce] ---. IDs end in _ID.\n\
+block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
+structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
 Happy paths:\n\
-1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute. \
-Then ssh_get_command_output wait=true.\n\
-2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe \
-shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key. \
-Read deltas via resources/read?cursor=auto on each notification. \
-ssh_shell_close, ssh_disconnect.\n\
-3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
+2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
+ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
+3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. \
+Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
+resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
+4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
 \n\
-Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close. \
-Watch for HINT lines and EXPIRES_AT.";
+Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
+lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 /// Few-shot bootstrap text for the build without `port_forward`
-/// (17 tools / 4 streams). Identical workflows minus the `forward://`
+/// (20 tools / 4 streams). Identical workflows minus the `forward://`
 /// stream; the catalogue claim is dropped so callers do not look for
 /// `ssh_forward`.
 #[cfg(not(feature = "port_forward"))]
-const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 17 tools, 4 push streams \
+const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 20 tools, 4 push streams \
 (shell://, command://, transfer://, session://). All tools return block \
-markdown: first line TOOL: STATUS, then KEY: value pairs. Output blocks \
-delimited by --- name [nonce] ---. IDs end in _ID.\n\
+markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
+structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
 Happy paths:\n\
-1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute. \
-Then ssh_get_command_output wait=true.\n\
-2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe \
-shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key. \
-Read deltas via resources/read?cursor=auto on each notification. \
-ssh_shell_close, ssh_disconnect.\n\
-3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
+2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
+ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
+3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+prompt arrives within 100ms). Then resources/subscribe shell://<SHELL_ID>/output. \
+Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
+resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
+4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
 \n\
-Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close. \
-Watch for HINT lines and EXPIRES_AT.";
+Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
+lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 // ---------------------------------------------------------------------------
 // `#[tool_handler]` impl
