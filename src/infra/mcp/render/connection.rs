@@ -1,0 +1,333 @@
+//! Connection-domain markdown renderers.
+//!
+//! Mirrors v3 `src/mcp/message/builder.rs` — `ConnectOkBuilder`,
+//! `ConnectSuggestedBuilder`, `render_disconnect_ok`, `ListSessionsBuilder`,
+//! `render_disconnect_agent` — but takes the v4 use case Outcomes as
+//! input.
+
+use crate::application::connect_session::ConnectOutcome;
+use crate::application::disconnect_agent::DisconnectAgentOutcome;
+use crate::application::disconnect_session::DisconnectOutcome;
+use crate::application::list_sessions::ListSessionsOutcome;
+use crate::domain::session::SessionEntity;
+use crate::infra::mcp::helpers::output::sanitize_value;
+
+/// Render a [`ConnectOutcome`] as the v3 `SSH_CONNECT` block.
+#[must_use]
+pub fn connect_render(outcome: ConnectOutcome) -> String {
+    match outcome {
+        ConnectOutcome::Connected {
+            session,
+            replaced,
+            retries,
+        } => render_connected(&session, replaced, retries),
+        ConnectOutcome::Reused { session } => render_reused(&session),
+        ConnectOutcome::Suggested { matches } => render_suggested(&matches),
+    }
+}
+
+fn render_connected(session: &SessionEntity, replaced: usize, retries: u32) -> String {
+    let host = format_host(session);
+    let mut out = String::with_capacity(192);
+    out.push_str("SSH_CONNECT: OK\n");
+    out.push_str("SESSION_ID: ");
+    out.push_str(session.id.as_str());
+    out.push_str("\nHOST: ");
+    out.push_str(&sanitize_value(&session.username));
+    out.push('@');
+    out.push_str(&sanitize_value(&host));
+    if let Some(agent) = session.agent_id.as_ref() {
+        out.push_str("\nAGENT: ");
+        out.push_str(&sanitize_value(agent.as_str()));
+    }
+    out.push_str("\nRETRY: ");
+    out.push_str(&retries.to_string());
+    out.push_str("\nPERSISTENT: ");
+    out.push_str("false");
+    if replaced > 0 {
+        out.push_str("\nREPLACED: ");
+        out.push_str(&replaced.to_string());
+    }
+    out
+}
+
+fn render_reused(session: &SessionEntity) -> String {
+    let host = format_host(session);
+    let mut out = String::with_capacity(160);
+    out.push_str("SSH_CONNECT: REUSED\n");
+    out.push_str("SESSION_ID: ");
+    out.push_str(session.id.as_str());
+    out.push_str("\nHOST: ");
+    out.push_str(&sanitize_value(&session.username));
+    out.push('@');
+    out.push_str(&sanitize_value(&host));
+    if let Some(agent) = session.agent_id.as_ref() {
+        out.push_str("\nAGENT: ");
+        out.push_str(&sanitize_value(agent.as_str()));
+    }
+    out
+}
+
+fn render_suggested(matches: &[SessionEntity]) -> String {
+    if matches.len() == 1 {
+        if let Some(m) = matches.first() {
+            return render_suggested_single(m);
+        }
+    }
+    render_suggested_multi(matches)
+}
+
+fn render_suggested_single(m: &SessionEntity) -> String {
+    let host = format_host(m);
+    let mut out = String::with_capacity(256);
+    out.push_str("SSH_CONNECT: SUGGESTED\nEXISTING_SESSION_ID: ");
+    out.push_str(m.id.as_str());
+    out.push_str("\nHOST: ");
+    out.push_str(&sanitize_value(&m.username));
+    out.push('@');
+    out.push_str(&sanitize_value(&host));
+    if let Some(agent) = m.agent_id.as_ref() {
+        out.push_str("\nAGENT: ");
+        out.push_str(&sanitize_value(agent.as_str()));
+    }
+    if let Some(name) = m.name.as_ref() {
+        out.push_str("\nNAME: ");
+        out.push_str(&sanitize_value(name));
+    }
+    out.push_str("\nCONNECTED_AT: ");
+    out.push_str(&m.connected_at.to_rfc3339());
+    out.push_str("\nHEALTHY: ");
+    out.push_str(if m.healthy.unwrap_or(false) {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str("\nHINT: use existing SESSION_ID, or retry with reuse=\"force_new\"");
+    out
+}
+
+fn render_suggested_multi(matches: &[SessionEntity]) -> String {
+    let mut out = String::with_capacity(64 + matches.len() * 128);
+    out.push_str("SSH_CONNECT: SUGGESTED\nMATCHES: ");
+    out.push_str(&matches.len().to_string());
+    for m in matches {
+        out.push_str("\n- ");
+        out.push_str(m.id.as_str());
+        out.push(' ');
+        out.push_str(&sanitize_value(&m.username));
+        out.push('@');
+        out.push_str(&sanitize_value(&format_host(m)));
+        append_match_decorations(&mut out, m);
+    }
+    out.push_str("\nHINT: pick an existing SESSION_ID, or retry with reuse=\"force_new\"");
+    out
+}
+
+#[allow(
+    clippy::useless_let_if_seq,
+    reason = "accumulator tracking multiple optional fields is clearer than nested if/else"
+)]
+fn append_match_decorations(out: &mut String, m: &SessionEntity) {
+    out.push_str(" [");
+    let mut wrote_field = false;
+    if let Some(agent) = m.agent_id.as_ref() {
+        out.push_str("agent: ");
+        out.push_str(&sanitize_value(agent.as_str()));
+        wrote_field = true;
+    }
+    if let Some(name) = m.name.as_ref() {
+        if wrote_field {
+            out.push_str(", ");
+        }
+        out.push_str("name: ");
+        out.push_str(&sanitize_value(name));
+        wrote_field = true;
+    }
+    if wrote_field {
+        out.push_str(", ");
+    }
+    out.push_str("connected: ");
+    out.push_str(extract_time(&m.connected_at.to_rfc3339()));
+    out.push_str(", ");
+    out.push_str(if m.healthy.unwrap_or(false) {
+        "healthy"
+    } else {
+        "unhealthy"
+    });
+    out.push(']');
+}
+
+/// Extract `HH:MM:SS` from an RFC 3339 timestamp.
+fn extract_time(ts: &str) -> &str {
+    if let Some((_, rest)) = ts.split_once('T') {
+        let end = rest.find(['Z', '+', '-']).unwrap_or(rest.len());
+        &rest[..end]
+    } else {
+        ts
+    }
+}
+
+/// Format the host portion of a session entity, omitting the default port.
+fn format_host(session: &SessionEntity) -> String {
+    let host = session.address.host();
+    let port = session.address.port();
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Render a [`DisconnectOutcome`] as the v3 `SSH_DISCONNECT` block.
+#[must_use]
+pub fn disconnect_render(outcome: &DisconnectOutcome) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str("SSH_DISCONNECT: OK\nSESSION_ID: ");
+    out.push_str(outcome.session_id.as_str());
+    out
+}
+
+/// Render a [`ListSessionsOutcome`] as the v3 `SSH_LIST_SESSIONS` block.
+#[must_use]
+pub fn list_sessions_render(outcome: ListSessionsOutcome) -> String {
+    let ListSessionsOutcome {
+        healthy,
+        removed_dead: _,
+        total,
+    } = outcome;
+    if healthy.is_empty() && total == 0 {
+        return String::from("SSH_LIST_SESSIONS: OK\nCOUNT: 0");
+    }
+    let mut out = String::with_capacity(64 + healthy.len() * 128);
+    out.push_str("SSH_LIST_SESSIONS: OK\nCOUNT: ");
+    out.push_str(&healthy.len().to_string());
+    if total > healthy.len() {
+        out.push_str(" (showing ");
+        out.push_str(&healthy.len().to_string());
+        out.push_str(" of ");
+        out.push_str(&total.to_string());
+        out.push(')');
+    }
+    for s in &healthy {
+        out.push_str("\n- ");
+        append_session_item(&mut out, s);
+    }
+    out
+}
+
+fn append_session_item(out: &mut String, s: &SessionEntity) {
+    out.push_str(s.id.as_str());
+    out.push(' ');
+    out.push_str(&sanitize_value(&s.username));
+    out.push('@');
+    out.push_str(&sanitize_value(&format_host(s)));
+    append_session_flags(out, s);
+}
+
+#[allow(
+    clippy::useless_let_if_seq,
+    clippy::too_many_lines,
+    reason = "accumulator tracking multiple optional fields is clearer than nested if/else; restructuring to ranges hurts readability"
+)]
+fn append_session_flags(out: &mut String, s: &SessionEntity) {
+    let show_compression = !s.compression_enabled;
+    let health_label = match s.healthy {
+        Some(true) => Some("healthy"),
+        Some(false) => Some("unhealthy"),
+        None => None,
+    };
+    if s.agent_id.is_none() && s.name.is_none() && !show_compression && health_label.is_none() {
+        return;
+    }
+    out.push_str(" [");
+    let mut wrote = false;
+    if let Some(agent) = s.agent_id.as_ref() {
+        out.push_str("agent: ");
+        out.push_str(&sanitize_value(agent.as_str()));
+        wrote = true;
+    }
+    if let Some(name) = s.name.as_ref() {
+        if wrote {
+            out.push_str(", ");
+        }
+        out.push_str("name: ");
+        out.push_str(&sanitize_value(name));
+        wrote = true;
+    }
+    if show_compression {
+        if wrote {
+            out.push_str(", ");
+        }
+        out.push_str("compression: off");
+        wrote = true;
+    }
+    if let Some(label) = health_label {
+        if wrote {
+            out.push_str(", ");
+        }
+        out.push_str(label);
+    }
+    out.push(']');
+}
+
+/// Render a [`DisconnectAgentOutcome`] as the v3
+/// `SSH_DISCONNECT_AGENT` block.
+#[must_use]
+pub fn disconnect_agent_render(outcome: &DisconnectAgentOutcome) -> String {
+    let mut out = String::with_capacity(96);
+    out.push_str("SSH_DISCONNECT_AGENT: OK\nAGENT: ");
+    out.push_str(&sanitize_value(outcome.agent_id.as_str()));
+    out.push_str("\nSESSIONS: ");
+    out.push_str(&outcome.sessions_disconnected.to_string());
+    out.push_str("\nCOMMANDS: ");
+    out.push_str(&outcome.commands_cancelled.to_string());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{disconnect_agent_render, disconnect_render, list_sessions_render};
+    use crate::application::disconnect_agent::DisconnectAgentOutcome;
+    use crate::application::disconnect_session::DisconnectOutcome;
+    use crate::application::list_sessions::ListSessionsOutcome;
+    use crate::domain::ids::{AgentId, SessionId};
+
+    #[test]
+    fn disconnect_render_emits_block() {
+        let m = disconnect_render(&DisconnectOutcome {
+            session_id: SessionId::new("sess-abc".to_string()),
+            commands_cancelled: 0,
+            shells_closed: 0,
+            transfers_aborted: 0,
+        });
+        assert_eq!(m, "SSH_DISCONNECT: OK\nSESSION_ID: sess-abc");
+    }
+
+    #[test]
+    fn list_sessions_empty() {
+        let outcome = ListSessionsOutcome {
+            healthy: vec![],
+            removed_dead: vec![],
+            total: 0,
+        };
+        assert_eq!(
+            list_sessions_render(outcome),
+            "SSH_LIST_SESSIONS: OK\nCOUNT: 0"
+        );
+    }
+
+    #[test]
+    fn disconnect_agent_renders_counts() {
+        let outcome = DisconnectAgentOutcome {
+            agent_id: AgentId::new("alpha".to_string()),
+            sessions_disconnected: 3,
+            commands_cancelled: 5,
+            shells_closed: 0,
+            transfers_aborted: 0,
+        };
+        assert_eq!(
+            disconnect_agent_render(&outcome),
+            "SSH_DISCONNECT_AGENT: OK\nAGENT: alpha\nSESSIONS: 3\nCOMMANDS: 5"
+        );
+    }
+}

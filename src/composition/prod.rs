@@ -168,8 +168,12 @@ pub type ProdUseCases = UseCases<
     reason = "composition root naturally instantiates every adapter + use case (22 use cases x ~5 lines each); H17 may extract sub-builders per domain"
 )]
 pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
-    let ssh = Arc::new(RusshAdapter::new());
+    // Single shared SFTP handle registry: the SSH adapter publishes
+    // every session it opens into the registry; the SFTP adapter reads
+    // from the same registry. Without sharing the SFTP layer would see
+    // an empty session table.
     let sftp_registry = SshHandleRegistry::new();
+    let ssh = Arc::new(RusshAdapter::new().with_sftp_registry(sftp_registry.clone()));
     let sftp = Arc::new(RusshSftpAdapter::new(sftp_registry, 256, 10));
 
     let sessions = Arc::new(DashMapSessionRepo::new());

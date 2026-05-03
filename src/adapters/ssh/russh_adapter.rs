@@ -61,6 +61,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::adapters::sftp::russh_sftp_adapter::SshHandleRegistry;
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
@@ -223,6 +224,11 @@ pub struct RusshAdapter {
     sessions: Arc<DashMap<SessionId, SessionRecord>>,
     commands: Arc<DashMap<CommandId, CommandRecord>>,
     shells: Arc<DashMap<ShellId, ShellRecord>>,
+    /// Shared registry handed to the sibling
+    /// [`crate::adapters::sftp::russh_sftp_adapter::RusshSftpAdapter`].
+    /// Populated on `connect` and drained on `disconnect` so SFTP tools
+    /// see every session opened through this adapter.
+    sftp_handle_registry: SshHandleRegistry,
 }
 
 impl fmt::Debug for RusshAdapter {
@@ -232,12 +238,16 @@ impl fmt::Debug for RusshAdapter {
             .field("sessions", &self.sessions.len())
             .field("commands", &self.commands.len())
             .field("shells", &self.shells.len())
+            .field("sftp_handle_registry", &self.sftp_handle_registry)
             .finish()
     }
 }
 
 impl RusshAdapter {
-    /// Build an adapter from explicit tuning.
+    /// Build an adapter from explicit tuning. Mints a fresh
+    /// [`SshHandleRegistry`] internally; the composition root replaces it
+    /// with [`Self::with_sftp_registry`] when it needs the SFTP adapter
+    /// to observe the same sessions.
     #[must_use]
     pub fn with_config(config: RusshAdapterConfig) -> Self {
         Self {
@@ -245,6 +255,7 @@ impl RusshAdapter {
             sessions: Arc::new(DashMap::new()),
             commands: Arc::new(DashMap::new()),
             shells: Arc::new(DashMap::new()),
+            sftp_handle_registry: SshHandleRegistry::new(),
         }
     }
 
@@ -252,6 +263,23 @@ impl RusshAdapter {
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(RusshAdapterConfig::default())
+    }
+
+    /// Wire an externally-owned [`SshHandleRegistry`] so the sibling
+    /// [`crate::adapters::sftp::russh_sftp_adapter::RusshSftpAdapter`]
+    /// sees every session this adapter opens. The composition root holds
+    /// the same registry handle and feeds it to the SFTP adapter
+    /// constructor — that keeps the bridge contract explicit.
+    #[must_use]
+    pub fn with_sftp_registry(mut self, registry: SshHandleRegistry) -> Self {
+        self.sftp_handle_registry = registry;
+        self
+    }
+
+    /// Borrow the shared SFTP handle registry. Composition-root helper.
+    #[must_use]
+    pub const fn sftp_handle_registry(&self) -> &SshHandleRegistry {
+        &self.sftp_handle_registry
     }
 
     /// Borrow the active configuration. Useful for tests that assert
@@ -372,7 +400,10 @@ impl RusshAdapter {
     }
 
     /// Internal: bind a freshly built session record to its id, tearing
-    /// the russh handle down on a race.
+    /// the russh handle down on a race. On a successful bind the russh
+    /// handle is also pushed into the shared
+    /// [`SshHandleRegistry`] so the sibling SFTP adapter resolves the
+    /// same session.
     async fn bind_session(
         &self,
         session_id: &SessionId,
@@ -380,7 +411,10 @@ impl RusshAdapter {
     ) -> Result<(), DomainError> {
         match self.sessions.entry(session_id.clone()) {
             Entry::Vacant(slot) => {
+                let handle = Arc::clone(&record.handle);
                 slot.insert(record);
+                self.sftp_handle_registry
+                    .register(session_id.clone(), handle);
                 Ok(())
             }
             Entry::Occupied(_) => {
@@ -460,6 +494,9 @@ impl SshClientPort for RusshAdapter {
         let Some((_, record)) = removed else {
             return Err(DomainError::SessionNotFound(session_id.clone()));
         };
+        // Drain the SFTP-shared registry so future SFTP lookups for this
+        // session id return `SessionNotFound` instead of stale handles.
+        let _stale = self.sftp_handle_registry.unregister(session_id);
         let SessionRecord { handle, .. } = record;
         let result = handle
             .disconnect(Disconnect::ByApplication, "Session closed by client", "en")
