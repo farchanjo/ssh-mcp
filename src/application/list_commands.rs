@@ -349,9 +349,30 @@ mod tests {
     async fn results_are_sorted_by_started_at_ascending() {
         let (uc, repo) = build_use_case();
         // Insert deliberately out of chronological order.
-        let _ = seed(&repo, "newest", "s1", CommandStatus::Running, ts(2025, 6, 1)).await;
-        let _ = seed(&repo, "oldest", "s1", CommandStatus::Running, ts(2024, 6, 1)).await;
-        let _ = seed(&repo, "middle", "s1", CommandStatus::Running, ts(2025, 1, 1)).await;
+        let _ = seed(
+            &repo,
+            "newest",
+            "s1",
+            CommandStatus::Running,
+            ts(2025, 6, 1),
+        )
+        .await;
+        let _ = seed(
+            &repo,
+            "oldest",
+            "s1",
+            CommandStatus::Running,
+            ts(2024, 6, 1),
+        )
+        .await;
+        let _ = seed(
+            &repo,
+            "middle",
+            "s1",
+            CommandStatus::Running,
+            ts(2025, 1, 1),
+        )
+        .await;
         let outcome = uc
             .execute(ListCommandsRequest::default())
             .await

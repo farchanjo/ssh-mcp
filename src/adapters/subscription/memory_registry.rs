@@ -411,10 +411,7 @@ struct DebouncerConfig {
     keepalive_s: u64,
 }
 
-fn collect_uris_for_peer(
-    subs: &DashMap<String, Vec<Subscriber>>,
-    peer_id: &PeerId,
-) -> Vec<String> {
+fn collect_uris_for_peer(subs: &DashMap<String, Vec<Subscriber>>, peer_id: &PeerId) -> Vec<String> {
     subs.iter()
         .filter_map(|entry| {
             entry
@@ -477,11 +474,7 @@ where
     }
     for peer in subs {
         let peer_id = peer.id();
-        if let Err(err) = registry
-            .notifier
-            .notify_resource_updated(peer, uri)
-            .await
-        {
+        if let Err(err) = registry.notifier.notify_resource_updated(peer, uri).await {
             debug!("notify_resource_updated failed for peer {peer_id}: {err}");
         }
     }
@@ -671,8 +664,7 @@ mod tests {
         .await
         .unwrap();
         let _progress = reg.peer_progress(&peer_id, "shell://abc/output");
-        SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output")
-            .await;
+        SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output").await;
         assert!(reg.snapshot_subscribers("shell://abc/output").is_empty());
     }
 
