@@ -1,6 +1,6 @@
-# LLM Guide (v4.5.0)
+# LLM Guide (v4.6.0)
 
-This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 and v4.0.x; v4.5 layers a richer steering surface on top (subscribe-first `_meta` envelope, granular wire error codes, `EXPIRES_AT` / `HINT` lines, server identity, tool annotations, few-shot `instructions`).
+This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 and v4.0.x at the markdown / `_meta` level; v4.6 ships one narrow renaming (`AGENT:` -> `AGENT_ID:`) plus a richer steering surface (subscribe-first `_meta` envelope, granular wire error codes, `EXPIRES_AT` / `HINT` lines, `NEXT:` advisory line, server identity with icon, tool annotations, cost hints, JSON Schema defaults).
 
 Cross references:
 
@@ -35,6 +35,8 @@ The single most important table in this document. Pick the star-marked path when
 | Check what is still running before disconnect      | `ssh_list_commands`                                           |
 
 * = preferred path (lowest latency, lowest token cost).
+
+> **v4.6 quick-pick:** if the response contains a `NEXT:` line, prefer one of those tool calls over guessing the next move. See [section E](#e-next-advisory-line-v46) for the full coverage matrix.
 
 ## Subscribe-first contract (live as of v4.5)
 
@@ -158,7 +160,8 @@ Step-by-step prose:
 - **Calling `ssh_disconnect` on a session with running async commands without first checking `ssh_list_commands`.** The disconnect cancels every running command — useful when you mean it, surprising when you do not.
 - **Ignoring `_meta.last_seq` after a long pause.** If `last_seq` jumped by more than 1 since your previous read, you may have lagged on the broadcast channel. Re-read with `?cursor=0` to get a full snapshot, then resume `?cursor=auto`.
 - **Spamming `resources/read` between notifications.** The notification is the signal — read once per notification.
-- **Ignoring `HINT:` lines.** The server appends `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent` when an agent leaks sessions. Treat it as actionable, not chatter.
+- **Ignoring `HINT:` lines.** The server appends `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent` when an agent leaks sessions, plus subscribe-first `HINT:` lines on every async-spawn response (`SSH_SHELL_OPEN`, `SSH_EXECUTE: STARTED`, `SSH_UPLOAD/DOWNLOAD: STARTED`, `SSH_FORWARD: OK`). Treat them as actionable, not chatter.
+- **Ignoring `NEXT:` lines.** Every response with a clear successor tool ends with `NEXT: <pipe-separated tool calls>` listing concrete next-step calls. A 27B-class model can chain a workflow without ever consulting the cookbook by simply trusting `NEXT:`.
 
 ## Token efficiency tips
 
@@ -255,11 +258,11 @@ Small LLMs should treat `HINT:` as actionable. The most common cause is a workfl
 - `reuse=auto` — return the most recent healthy match (or open a new session). Right for "I just want to run a command".
 - `reuse=force_new` — skip the lookup entirely. Right when you want a guaranteed fresh transport.
 
-## B. Granular error codes (v4.5)
+## B. Granular error codes (v4.5, all 14 live as of v4.6)
 
-The wire codes are now ALL granular when the failure has a known cause. The dispatcher recognises 14 tag prefixes that `DomainError` carriers can attach to their reason string.
+The wire codes are now ALL granular when the failure has a known cause. The dispatcher recognises 14 tag prefixes that `DomainError` carriers can attach to their reason string. v4.6 wires the last three reserved tags to concrete raise sites — every documented code now reaches the wire.
 
-### Emitted today (11)
+### Emitted today (14)
 
 - `EMPTY_PATTERNS`, `TOO_MANY_PATTERNS`, `PATTERN_TOO_LONG` — from `ssh_shell_wait_for`.
 - `MODIFIER_NOT_ALLOWED`, `INVALID_REPEAT` — from `ssh_shell_send_key`.
@@ -269,14 +272,13 @@ The wire codes are now ALL granular when the failure has a known cause. The disp
 - `COMMAND_FAILED` — async command's transport failed before completion.
 - `LOCAL_FILE_ERROR` — `fs::metadata` failed on a local upload path.
 - `SFTP_OPEN_FAILED` — SFTP subsystem could not be opened on the remote.
+- `FORWARD_FAILED` (**v4.6 live**) — local listener bind failed for reasons other than `AddrInUse` (raised from `application/forward_port.rs::ForwardPortUseCase::preflight_bind`).
+- `LOCAL_NOT_FILE` (**v4.6 live**) — upload pre-flight `is_file` check failed (raised from `application/upload_file.rs::UploadFileUseCase::guard_local_path_is_file`).
+- `REMOTE_METADATA_ERROR` (**v4.6 live**) — download remote `stat` failed (raised from `adapters/sftp/russh_sftp_adapter.rs::stat_remote_size`).
 
-### Reserved (3)
+### Reserved
 
-The dispatcher recognises the tag and will promote it to a granular wire code, but no live raise site exists today. Treat them like the emitted codes when they show up:
-
-- `FORWARD_FAILED` — port-forward listener bind or stream-open failed.
-- `LOCAL_NOT_FILE` — the local upload path resolved but is not a regular file.
-- `REMOTE_METADATA_ERROR` — `sftp.metadata(remote_path)` failed.
+None as of v4.6. The "Reserved" column in the per-tool tables of [ERRORS.md](./ERRORS.md) is now empty.
 
 ### Untagged fallbacks
 
@@ -288,14 +290,14 @@ Any failure without a recognised tag prefix falls through to the legacy flat cod
 
 See [ERRORS.md](./ERRORS.md) for the full table including emission-site references and recovery guidance.
 
-## C. Server identity for the host (v4.5)
+## C. Server identity for the host (v4.5, icon wired in v4.6)
 
 The server now advertises a richer `Implementation` descriptor on `initialize` so MCP hosts (Claude mobile, remote clients, registries) can render a humanised server card:
 
 - `Implementation.title = "SSH Remote Shell"`
 - `Implementation.description = "Run remote commands, drive PTY shells, transfer files via SFTP, and forward TCP ports over SSH. Subscribe to shell, command, transfer, session, and forward streams for push notifications."`
 - `Implementation.website_url = "https://github.com/farchanjo/ssh-mcp"`
-- `Implementation.icons` — currently omitted (TODO until a stable hosted SVG asset URL ships under `assets/icon.svg`).
+- `Implementation.icons` (**v4.6, wired**) — single `Icon` entry pointing at `https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg` with `mime_type = "image/svg+xml"` and `sizes = ["any"]`. The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description when the asset is unreachable.
 
 Each tool also carries `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. Hosts use these to rank suggestions, filter destructive tools out of safe-by-default modes, and warn before running anything tagged `destructive`.
 
@@ -355,11 +357,14 @@ Three canonical workflows that map 1:1 to the few-shot `instructions` constant. 
 
 ```
 1. ssh_connect { address, username, agent_id="my-agent", reuse="auto" }
-   -> capture SESSION_ID + EXPIRES_AT
+   -> capture SESSION_ID + AGENT_ID + EXPIRES_AT
+   -> follow NEXT: ssh_execute(session_id=...) | ssh_shell_open(...) | ssh_disconnect(...)
 2. ssh_execute { session_id, command="uname -a" }
    -> capture COMMAND_ID
+   -> HINT: subscribe to command://<id>/output (preferred)
+   -> NEXT: ssh_get_command_output(wait=true) | ssh_cancel_command
 3. ssh_get_command_output { command_id, wait=true, wait_timeout_secs=30 }
-   -> COMPLETED + EXIT + stdout block
+   -> COMPLETED + EXIT + stdout block (no NEXT — terminal)
 4. (Optional) ssh_disconnect_agent { agent_id="my-agent" } when the task is over.
 ```
 
@@ -393,6 +398,110 @@ Three canonical workflows that map 1:1 to the few-shot `instructions` constant. 
    -> ssh_get_command_output wait=true
 5. ssh_disconnect_agent { agent_id="my-agent" } when done.
 ```
+
+## E. NEXT: advisory line (v4.6)
+
+Every response with a clear successor tool ends with a single `NEXT:` line listing one or more concrete tool calls (pipe-separated). A 27B-class model can chain a workflow by reading `NEXT:` instead of consulting the cookbook.
+
+Example:
+
+```
+SSH_CONNECT: OK
+SESSION_ID: s-abc
+HOST: example.com:22
+USERNAME: alice
+AGENT_ID: claude-code-1
+RETRY: 0
+PERSISTENT: false
+EXPIRES_AT: 2026-05-03T18:30:00+00:00
+NEXT: ssh_execute(session_id=s-abc, command=...) | ssh_shell_open(session_id=s-abc) | ssh_disconnect(session_id=s-abc)
+```
+
+### Coverage matrix
+
+| Status | NEXT: emitted? | Hint string |
+| --- | --- | --- |
+| `SSH_CONNECT: OK` / `REUSED` | yes | `ssh_execute` / `ssh_shell_open` / `ssh_disconnect` |
+| `SSH_CONNECT: SUGGESTED` | yes | reuse existing `session_id` or retry with `force_new` |
+| `SSH_LIST_SESSIONS: OK` (non-empty) | yes | `ssh_disconnect_agent` (when agent owns sessions) / `ssh_disconnect` |
+| `SSH_DISCONNECT: OK` / `SSH_DISCONNECT_AGENT: OK` | no (terminal) | — |
+| `SSH_EXECUTE: STARTED` | yes | `ssh_get_command_output(wait=true)` / `ssh_cancel_command` |
+| `SSH_EXECUTE: COMPLETED` | no (terminal) | — |
+| `SSH_GET_COMMAND_OUTPUT: RUNNING` | yes | `resources/subscribe command://<id>/output` / `ssh_get_command_output(wait=true)` |
+| `SSH_GET_COMMAND_OUTPUT: COMPLETED` | no (terminal) | — |
+| `SSH_LIST_COMMANDS: OK` | no | — |
+| `SSH_CANCEL_COMMAND: OK` / `NOOP` | no (terminal) | — |
+| `SSH_SHELL_OPEN: OK` | yes | `resources/subscribe shell://<id>/output` / `ssh_shell_write` / `ssh_shell_send_key` |
+| `SSH_SHELL_WRITE: OK` | yes | `resources/read shell://<id>/output?cursor=auto` / `ssh_shell_wait_for` / `ssh_shell_read` |
+| `SSH_SHELL_SEND_KEY: OK` | yes | `resources/read shell://<id>/output?cursor=auto` / `ssh_shell_wait_for` / `ssh_shell_read` |
+| `SSH_SHELL_READ: OK` | no | — |
+| `SSH_SHELL_WAIT_FOR: MATCHED` | yes | `ssh_shell_write` / `ssh_shell_send_key` / `ssh_shell_close` |
+| `SSH_SHELL_WAIT_FOR: TIMEOUT` | yes | `ssh_shell_wait_for` / `ssh_shell_read` / `ssh_shell_close` |
+| `SSH_SHELL_WAIT_FOR: CLOSED` | no (terminal) | — |
+| `SSH_SHELL_CLOSE: OK` | no (terminal) | — |
+| `SSH_UPLOAD: STARTED` | yes | `ssh_get_transfer_progress(wait=true)` |
+| `SSH_DOWNLOAD: STARTED` | yes | `ssh_get_transfer_progress(wait=true)` |
+| `SSH_GET_TRANSFER_PROGRESS: RUNNING` | yes | `resources/subscribe transfer://<id>/progress` / `ssh_get_transfer_progress(wait=true)` |
+| `SSH_GET_TRANSFER_PROGRESS: COMPLETED` / `FAILED` / `CANCELLED` | no (terminal) | — |
+| `SSH_FORWARD: OK` | yes | `resources/subscribe forward://<id>/events` |
+
+Terminal statuses (the work has reached a final state and there is no obvious successor) deliberately omit `NEXT:`. The model's next move depends entirely on the user prompt rather than the tool result.
+
+## F. Subscribe-first HINT lines (v4.6)
+
+In v4.6 every async-spawn response carries a subscribe-first `HINT:` line steering the LLM toward push notifications instead of polling. Four new sites:
+
+- `SSH_SHELL_OPEN: OK` -> `HINT: subscribe to shell://<id>/output for realtime output (preferred over polling)`
+- `SSH_EXECUTE: STARTED` -> `HINT: subscribe to command://<id>/output for realtime output (preferred over polling)`
+- `SSH_UPLOAD: STARTED` and `SSH_DOWNLOAD: STARTED` -> `HINT: subscribe to transfer://<id>/progress for realtime progress`
+- `SSH_FORWARD: OK` -> `HINT: subscribe to forward://<id>/events for realtime event log`
+
+These coexist with the existing `HINT:` lines on `SSH_LIST_SESSIONS` and `SSH_CONNECT: SUGGESTED` (anti-leak / reuse advice). The body line order is `... -> HINT: <subscribe> -> NEXT: <successors>`.
+
+## G. AGENT_ID rename (narrow v4.6 wire change)
+
+The wire key for the agent_id field changed from `AGENT:` to `AGENT_ID:` for consistency with every other ID field (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`, `FORWARD_ID`, `PEER_ID`).
+
+Affected render sites (7 total):
+
+- `ssh_connect` — both `OK` and `REUSED` responses.
+- `ssh_list_sessions` — per-row decoration `[agent: <id>, ...]`.
+- `ssh_execute: STARTED` — when the session has an agent.
+- `ssh_shell_open: OK` — when the session has an agent.
+- `ssh_upload: STARTED` and `ssh_download: STARTED` — when the session has an agent.
+- `ssh_disconnect_agent: OK` — final summary line.
+- `ssh_connect: SUGGESTED` (single match, where agent is shown as a separate line).
+
+Hosts that grep for `^AGENT:` literally must update; hosts that walk the markdown body line-by-line into a key-value map are unaffected (they just see the new `AGENT_ID:` key). The block-style "one `KEY: value` per line" convention is preserved.
+
+## H. JSON Schema defaults (v4.6)
+
+`Option<T>` fields whose doc comment cites a default now emit the JSON Schema `default` keyword via `#[schemars(default = "fn_name")]`. Smaller LLMs that read the input schema mechanically can now see the default value without having to parse English from the description.
+
+Coverage by Args struct:
+
+- `SshConnectArgs` — `timeout_secs`, `max_retries`, `retry_delay_ms`, `compress`, `persistent`.
+- `SshListSessionsArgs` — `max_items`.
+- `SshExecuteArgs` / `SshGetCommandOutputArgs` / `SshListCommandsArgs` / `SshCancelCommandArgs` — `timeout_secs`, `pty`, `wait`, `wait_timeout_secs`, `max_output_bytes`, `max_items`.
+- `SshShellOpenArgs` / `SshShellSendKeyArgs` / `SshShellReadArgs` / `SshShellWaitForArgs` — `term`, `cols`, `rows`, `inactivity_ttl`, `max_buffer_size`, `shift`, `alt`, `ctrl`, `repeat`, `clear`, `max_output_bytes`, `wait`, `wait_timeout_secs`, `min_bytes`, `timeout_secs`.
+- `SshGetTransferProgressArgs` — `wait`, `wait_timeout_secs`.
+
+Net effect: every optional argument that has a non-trivial default surfaces it on the schema as a real JSON value (e.g. `"default": 30`, `"default": 16384`, `"default": "xterm"`). Smaller LLMs no longer need to parse the description prose to discover the right default.
+
+## I. Cost hints (v4.6)
+
+Every tool description now ends with a one-line `Cost:` hint stating O() complexity, expected latency, and whether the call is blocking or async. Smaller LLMs can reason about retry / batch strategies without external benchmarks.
+
+Examples (full text in the tool catalogue at `src/infra/mcp/tool_router.rs`):
+
+- `ssh_connect` -> `Cost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.`
+- `ssh_execute` -> `Cost: 1 SSH channel open. Returns immediately when wait=false (default async).`
+- `ssh_get_command_output` -> `Cost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.`
+- `ssh_shell_open` -> `Cost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.`
+- `ssh_upload` / `ssh_download` -> `Cost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.`
+- `ssh_forward` -> `Cost: 1 listener bind + SSH tcpip-forward. Subscribe to forward://<id>/events for the event log.`
+
+Convention: every line is exactly one sentence, names the dominant cost, and points at the subscribe path when one exists. Read this once, cache it, and pick the right wait / subscribe strategy without round-tripping the docs.
 
 ## Sample prompts for the LLM
 

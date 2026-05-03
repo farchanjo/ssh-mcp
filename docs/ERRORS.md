@@ -1,6 +1,6 @@
-# Error Code Reference (v4.5.0)
+# Error Code Reference (v4.6.0)
 
-This is the exhaustive catalog of error codes returned by ssh-mcp tools and `resources/*` methods. Error wire shapes are byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)). v4.5 promotes 14 tag-prefixed reasons into granular wire codes (see [Granular tag dispatcher](#granular-tag-dispatcher)); every code listed here is grounded in the source — `src/application/*.rs` for use case validation, `src/infra/mcp/{tool_router,resource_handlers,helpers/error}.rs` for the rmcp-facing error mapping, and `src/domain/error.rs` for the central `DomainError` enum.
+This is the exhaustive catalog of error codes returned by ssh-mcp tools and `resources/*` methods. Error wire shapes are byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)). v4.5 promoted 14 tag-prefixed reasons into granular wire codes; v4.6 wires the last three reserved tags (`FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR`) to live raise sites — every documented code now reaches the wire. See [Granular tag dispatcher](#granular-tag-dispatcher) below. Every code listed here is grounded in the source — `src/application/*.rs` for use case validation, `src/infra/mcp/{tool_router,resource_handlers,helpers/error}.rs` for the rmcp-facing error mapping, and `src/domain/error.rs` for the central `DomainError` enum.
 
 Cross references:
 
@@ -32,7 +32,7 @@ DETAIL: <optional context>
 - `TRANSPORT_TAGS` (matched against `DomainError::Transport`): `WRITE_FAILED`, `CHANNEL_FAILED`, `COMMAND_FAILED`, `FORWARD_FAILED`. Untagged messages emit `TRANSPORT_ERROR`.
 - `SFTP_TAGS` (matched against `DomainError::Sftp`): `LOCAL_FILE_ERROR`, `LOCAL_NOT_FILE`, `SFTP_OPEN_FAILED`, `REMOTE_METADATA_ERROR`. Untagged messages emit `SFTP_ERROR`.
 
-11 tags reach the wire today. Three are reserved (recognised by the dispatcher; no live raise site yet) — flagged inline below.
+**v4.6**: all 14 documented tags reach the wire. The "Reserved" column is now empty — `FORWARD_FAILED`, `LOCAL_NOT_FILE`, and `REMOTE_METADATA_ERROR` are wired to concrete raise sites in v4.6 (see the per-tool tables below).
 
 ## ssh_connect
 
@@ -149,7 +149,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | `SESSION_NOT_FOUND`        | No session with the given `SESSION_ID`.                                                 | `src/application/upload_file.rs::execute`                                | Reconnect via `ssh_connect`.                                                        |
 | `MAX_TRANSFERS_EXCEEDED`   | Per-session transfer cap (10) reached. `DETAIL: limit=10`.                              | `src/application/upload_file.rs::execute`                                | Wait for an in-flight transfer or cancel one via session disconnect.                |
 | `LOCAL_FILE_ERROR`         | `fs::metadata` failed on `local_path` (tagged SFTP via `sftp_error_tag`).               | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `stat`) | Inspect `REASON`; verify path, permissions, and that the file is reachable locally. |
-| `LOCAL_NOT_FILE`           | **Reserved**: `local_path` resolved but is not a regular file. Tag recognised, no live raise site yet. | reserved tag                                                              | Pass an actual file path when the tag goes live.                                    |
+| `LOCAL_NOT_FILE`           | `local_path` resolved but is not a regular file (directory, symlink loop, special file). v4.6 live. | `src/application/upload_file.rs::UploadFileUseCase::guard_local_path_is_file` | Pass an actual regular-file path. |
 | `SFTP_ERROR`               | Untagged catch-all for `DomainError::Sftp` (any other SFTP failure).                    | `src/adapters/sftp/russh_sftp_adapter.rs`                                | Inspect `REASON`; check remote disk, permissions, SFTP availability.                |
 
 ## ssh_download
@@ -159,7 +159,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | `SESSION_NOT_FOUND`        | No session with the given `SESSION_ID`.                                                                | `src/application/download_file.rs::execute`                              | Reconnect via `ssh_connect`.                                                                                      |
 | `MAX_TRANSFERS_EXCEEDED`   | Per-session transfer cap (10) reached. `DETAIL: limit=10`.                                             | `src/application/download_file.rs::execute`                              | Wait for an in-flight transfer.                                                                                   |
 | `SFTP_OPEN_FAILED`         | Failed to open the SFTP subsystem on the SSH session (tagged SFTP via `sftp_error_tag`).               | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `open`) | Verify the remote host has SFTP enabled (`Subsystem sftp`); fall back to `ssh_execute` + manual `cat`.            |
-| `REMOTE_METADATA_ERROR`    | **Reserved**: `sftp.metadata(remote_path)` failed (file missing, permission denied, etc.). Tag recognised, no live raise site yet. | reserved tag                                                              | Inspect `REASON`; verify the path and remote user permissions when the tag goes live.                             |
+| `REMOTE_METADATA_ERROR`    | Remote `stat` failed during download — file missing, permission denied, transport blip mid-stat. v4.6 live. | `src/adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` | Inspect `REASON`; verify the remote path and the download user's permissions. |
 | `SFTP_ERROR`               | Untagged catch-all for `DomainError::Sftp`.                                                            | `src/adapters/sftp/russh_sftp_adapter.rs`                                | Inspect `REASON`; check remote disk, permissions, SFTP availability.                                              |
 
 ## ssh_get_transfer_progress
@@ -177,7 +177,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID` (when feature `port_forward` is enabled).                                                                     | `src/application/forward_port.rs::execute`                               | Reconnect via `ssh_connect`.                                                            |
 | `PORT_IN_USE`       | Local port already bound. `DETAIL: port=<n>`.                                                                                                        | `src/adapters/ssh/russh_adapter.rs::start_port_forward`                  | Pick a different `local_port` or release the current binder.                            |
 | `FEATURE_DISABLED`  | Resource subscribe to `forward://` on a build compiled without `--features port_forward` (tagged invalid argument).                                   | `src/application/read_resource.rs::execute` + `subscribe_resource.rs::execute` | Use a build with the feature enabled (default).                                         |
-| `FORWARD_FAILED`    | **Reserved**: listener bind or russh stream-open failed. Tag recognised by the dispatcher; current adapter raises `PORT_IN_USE` for the bind path and untagged `TRANSPORT_ERROR` for the stream-open path. | reserved tag                                                              | Inspect `REASON`; common causes: local port already in use, remote target unreachable. |
+| `FORWARD_FAILED`    | Local listener bind failed for reasons other than `AddrInUse` (e.g. `EACCES` on a privileged port, `EADDRNOTAVAIL` on a host without the requested address, IPv6/IPv4 family mismatch). v4.6 live. | `src/application/forward_port.rs::ForwardPortUseCase::preflight_bind` | Inspect `REASON`; common causes: insufficient privileges (try a port >= 1024), invalid bind address, or the host lacks the requested family. `PORT_IN_USE` is still emitted separately for `AddrInUse`. |
 
 ## resources/list
 
