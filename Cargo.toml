@@ -86,6 +86,7 @@ bytes = "1.10"              # COW byte slices for broadcast / history
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 schemars = "1.0"
+thiserror = "2"             # v4 hexagonal: structured DomainError variants
 
 # Utilities
 backon = "1"                                                            # Retry with backoff
