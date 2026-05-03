@@ -1,6 +1,6 @@
-# Resources Reference (v3.0.0)
+# Resources Reference (v4.0.0)
 
-ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features.
+ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, and backpressure features. The wire contract is unchanged from v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); the implementation moved into the v4 hexagonal layout.
 
 Cross references:
 
@@ -10,7 +10,7 @@ Cross references:
 
 ## Capabilities advertised
 
-`McpSshServer::get_info()` (in `src/mcp/server.rs`) returns:
+`McpSshServer::get_info()` (in `src/infra/mcp/tool_router.rs`, see [ARCHITECTURE.md](./ARCHITECTURE.md#srcinframcp--inbound-mcp-transport)) returns:
 
 - `protocol_version = 2025-06-18`.
 - `capabilities.tools = { list_changed: true }`.
@@ -28,7 +28,7 @@ The `list_changed` advertisement is reserved for tool-driven lifecycle events. T
 | `session://<id>/health`             | Session health snapshot           | `application/json` | no                       |
 | `forward://<id>/events`             | Port-forward event log            | `application/json` | yes                      |
 
-Reference implementation: `src/mcp/resources.rs` (parser + reader) and `src/mcp/subscription.rs` (registry + debouncer).
+Reference implementation: `src/application/{list_resources,read_resource,subscribe_resource,unsubscribe_resource}.rs` (use cases), `src/infra/mcp/resource_handlers.rs` (rmcp wiring + URI parser), and `src/adapters/subscription/memory_registry.rs` (registry + per-resource debouncer + per-peer cursor).
 
 ### URI grammar
 
@@ -96,7 +96,7 @@ Pagination is currently disabled (`next_cursor = null`).
 
 The cursor argument controls how much history the server replays:
 
-- `?cursor=auto` — server returns only the bytes / events newer than the previous read for **this peer**. The server tracks the per-peer offset in `SUBSCRIPTION_REGISTRY.peer_progress`.
+- `?cursor=auto` — server returns only the bytes / events newer than the previous read for **this peer**. The server tracks the per-peer offset in `MemoryRegistry.peer_progress` (`src/adapters/subscription/memory_registry.rs`).
 - `?cursor=<N>` — return the slice starting at absolute byte offset `N`. The server clamps `N` to the current buffer length.
 - `?cursor=0` (or no `?cursor`) — full snapshot. Useful after a gap is detected via `_meta.last_seq`.
 
@@ -159,7 +159,7 @@ Notes:
 
 - The debouncer is a per-`(kind, resource_id)` Tokio task. It is created on first subscribe and aborted on last unsubscribe.
 - Re-subscribing from the same `peer_id` to the same URI **replaces** the previous handle (the live `Peer` is refreshed). No duplicates.
-- When the rmcp transport closes for a peer, the background peer-GC task scans `SUBSCRIPTION_REGISTRY` and drops every subscription owned by that peer (interval: `SSH_MCP_PEER_GC_INTERVAL_S`, default 30 s).
+- When the rmcp transport closes for a peer, the background peer-GC task scans the subscription registry and drops every subscription owned by that peer (interval: `SSH_MCP_PEER_GC_INTERVAL_S`, default 30 s). v4 entry point: `application::peer_gc::PeerGcUseCase`.
 
 ## Notification: `resources/updated`
 
@@ -176,7 +176,7 @@ Fires once per debounce window per subscribed URI.
 
 When it fires:
 
-- The producer (shell reader, command reader, transfer task, health probe, forward task) called `SUBSCRIPTION_REGISTRY.poke(kind, id)`.
+- The producer (shell reader, command reader, transfer task, health probe, forward task) called `SubscriberRegistryPort::poke(kind, id)`.
 - The debouncer slept `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms) to coalesce multiple pokes into one notification.
 - The debouncer also fires on every `SSH_NOTIFY_FORCE_FLUSH_MS` tick (default 1000 ms) and every `SSH_NOTIFY_KEEPALIVE_S` tick (default 30 s) regardless of producer activity.
 
@@ -188,7 +188,7 @@ ssh-mcp implements three independent backpressure compensations.
 
 ### A. Sequence numbers
 
-Every `OutputChunk`, `ProgressEvent`, `HealthEvent`, and `ForwardEvent` carries a `seq: u64` allocated from a per-resource `AtomicU64` (`SubscriptionRegistry::next_seq`). The registry exposes `current_seq(kind, id)` so `resources/read._meta.last_seq` can advertise the latest allocated sequence.
+Every `OutputChunk`, `ProgressEvent`, `HealthEvent`, and `ForwardEvent` carries a `seq: u64` allocated from a per-resource `AtomicU64` (`MemoryRegistry::next_seq`). The registry exposes `current_seq(kind, id)` so `resources/read._meta.last_seq` can advertise the latest allocated sequence.
 
 If your peer receives a `notifications/resources/updated` and the `last_seq` in the next `resources/read` jumped by more than 1 since your previous read, you have lagged on the broadcast channel. Recover by reading with `?cursor=0` (full snapshot), then resume `?cursor=auto`.
 
@@ -215,11 +215,11 @@ peer A read ?cursor=auto -> 1024..2048
 peer B read ?cursor=auto -> (no new bytes; keepalive=true)
 ```
 
-Implementation: `SubscriptionRegistry::peer_progress(peer_id, uri) -> Arc<PeerProgress>` returns the same `Arc` for the same `(peer_id, uri)` tuple and a fresh one for any other combination. This is verified in `tests::peer_progress_returns_independent_arc_for_different_peers` and friends.
+Implementation: `MemoryRegistry::peer_progress(peer_id, uri) -> Arc<PeerProgress>` (`src/adapters/subscription/memory_registry.rs`) returns the same `Arc` for the same `(peer_id, uri)` tuple and a fresh one for any other combination. This is verified in `tests::peer_progress_returns_independent_arc_for_different_peers` and friends.
 
 ## Truncation compensation
 
-When a producer drops bytes from the head of its ring buffer (because `max_buffer_size` was exceeded), `SubscriptionRegistry::compensate_truncation(uri, bytes_dropped)` is called. Every peer cursor on that URI is decremented by `bytes_dropped` (saturating at 0). Two consequences:
+When a producer drops bytes from the head of its ring buffer (because `max_buffer_size` was exceeded), `MemoryRegistry::compensate_truncation(uri, bytes_dropped)` is called. Every peer cursor on that URI is decremented by `bytes_dropped` (saturating at 0). Two consequences:
 
 1. A peer that had already consumed past the drop window keeps reading new bytes seamlessly.
 2. A peer that was mid-window now reads from offset 0 of the surviving buffer.

@@ -1,6 +1,6 @@
-# Error Code Reference (v3.0.0)
+# Error Code Reference (v4.0.0)
 
-This is the exhaustive catalog of error codes returned by ssh-mcp tools and `resources/*` methods. Every code listed here is grounded in the source — `src/mcp/tools/*.rs` for tools, `src/mcp/resources.rs` for resources.
+This is the exhaustive catalog of error codes returned by ssh-mcp tools and `resources/*` methods. Error codes and wire shapes are unchanged from v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)). Every code listed here is grounded in the source — `src/application/*.rs` for use case validation, `src/infra/mcp/{tool_router,resource_handlers,helpers/error}.rs` for the rmcp-facing error mapping, and `src/domain/error.rs` for the central `DomainError` enum.
 
 Cross references:
 
@@ -94,7 +94,7 @@ No error codes. Filters that match nothing return an empty list.
 | `INVALID_REPEAT`         | `repeat` outside the range 1..=64. `DETAIL: requested=<n>`.                                          | Clamp client-side to [1, 64].                                                                                |
 | `WRITE_FAILED`           | The dedicated background writer task closed.                                                         | Treat the shell as dead and reopen.                                                                          |
 
-Modifier rules (enforced in `src/mcp/keys.rs`):
+Modifier rules (enforced in `src/domain/keys.rs`):
 
 - Allowed on arrows, navigation keys (`home`, `end`, `page_up`, `page_down`, `insert`, `delete`), and `f1..f12` — any combination of `shift`, `alt`, `ctrl`.
 - `tab` accepts `shift` only (produces back-tab `\x1b[Z`).

@@ -1,6 +1,6 @@
-# SSH MCP Configuration Guide (v3.0.0)
+# SSH MCP Configuration Guide (v4.0.0)
 
-Reference for every tunable exposed by the v3.0.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX).
+Reference for every tunable exposed by the v4.0.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
 
 [[_TOC_]]
 
@@ -71,9 +71,9 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 |----------|------|---------|-------|-------------|
 | `SSH_TRANSFER_CLEANUP_TTL` | `u64` (s) | `300` | `>= 0` | TTL before terminated (completed/failed/cancelled) transfers are removed from `TRANSFER_STORAGE`. Gives clients a window to poll the final state. |
 
-## Subscribe layer (NEW v3)
+## Subscribe layer
 
-The v3 subscription layer adds eight new env vars covering broadcast channel sizing, debouncer timing, and peer GC. See [ARCHITECTURE.md](./ARCHITECTURE.md#subscription-pipeline) for the producer → debouncer → notification pipeline.
+The subscription layer (introduced in v3, preserved in v4) adds eight env vars covering broadcast channel sizing, debouncer timing, and peer GC. See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer → debouncer → notification pipeline.
 
 ### Broadcast channel capacities
 
@@ -101,7 +101,7 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 
 | Variable | Type | Default | Floor | Cap | Description |
 |----------|------|---------|-------|-----|-------------|
-| `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans `SUBSCRIPTION_REGISTRY` for peers whose rmcp transport has closed. rmcp 1.6 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
+| `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans the subscription registry for peers whose rmcp transport has closed. rmcp 1.6 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
 
 ## Server transport
 
