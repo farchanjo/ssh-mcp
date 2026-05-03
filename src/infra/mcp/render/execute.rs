@@ -399,6 +399,253 @@ pub fn cancel_command_structured(outcome: &CancelCommandOutcome) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v4.7-step3 — ssh_run + ssh_execute_batch render helpers
+// ---------------------------------------------------------------------------
+
+/// Status string used by both Markdown and structured payloads when
+/// rendering [`crate::infra::mcp::results::SshRunResult`] /
+/// [`crate::infra::mcp::results::SshExecuteBatchEntry`].
+#[must_use]
+pub const fn run_status_label(result: &GetCommandOutputResult) -> &'static str {
+    if result.timed_out && matches!(result.status, CommandStatus::Completed) {
+        "TIMEOUT"
+    } else {
+        match result.status {
+            CommandStatus::Running => "RUNNING",
+            CommandStatus::Completed => "COMPLETED",
+            CommandStatus::Cancelled => "CANCELLED",
+            CommandStatus::Failed => "FAILED",
+        }
+    }
+}
+
+/// Lower-cased twin of [`run_status_label`].
+#[must_use]
+pub const fn run_status_lower(result: &GetCommandOutputResult) -> &'static str {
+    if result.timed_out && matches!(result.status, CommandStatus::Completed) {
+        "timeout"
+    } else {
+        command_status_lower(result.status)
+    }
+}
+
+/// Render the Markdown body for the `ssh_run` tool.
+///
+/// The block layout mirrors `ssh_get_command_output`'s body so
+/// existing parsers keep extracting `EXIT:` / `--- stdout ---` lines
+/// unchanged; the session/disconnect lines are unique to `ssh_run`.
+#[must_use]
+pub fn run_render(result: &GetCommandOutputResult, session_id: &str, disconnected: bool) -> String {
+    let nonce = generate_nonce();
+    let hint = run_block_hint(result);
+    let stdout_block =
+        render_output_block("stdout", &nonce, &result.stdout, DEFAULT_OUTPUT_BYTES, hint);
+    let stderr_block =
+        render_output_block("stderr", &nonce, &result.stderr, DEFAULT_OUTPUT_BYTES, hint);
+    let mut out = String::with_capacity(192 + stdout_block.len() + stderr_block.len());
+    out.push_str("SSH_RUN: ");
+    out.push_str(run_status_label(result));
+    out.push_str("\nSESSION_ID: ");
+    out.push_str(session_id);
+    out.push_str("\nCOMMAND_ID: ");
+    out.push_str(result.command_id.as_str());
+    if let Some(code) = result.exit_code {
+        out.push_str("\nEXIT: ");
+        out.push_str(&code.to_string());
+    }
+    out.push_str("\nDISCONNECTED: ");
+    out.push_str(if disconnected { "true" } else { "false" });
+    out.push('\n');
+    out.push_str(&stdout_block);
+    out.push('\n');
+    out.push_str(&stderr_block);
+    out
+}
+
+/// Pick the truncation `(partial)` annotation based on the terminal
+/// state of the snapshot. `Completed` / non-timeout runs skip the
+/// hint so the block reads "clean"; everything else carries
+/// `partial` so the caller knows the buffers may be incomplete.
+const fn run_block_hint(result: &GetCommandOutputResult) -> Option<&'static str> {
+    match result.status {
+        CommandStatus::Completed if !result.timed_out => None,
+        CommandStatus::Running
+        | CommandStatus::Completed
+        | CommandStatus::Cancelled
+        | CommandStatus::Failed => Some("partial"),
+    }
+}
+
+/// Build the structured payload for the `ssh_run` tool. Stdout/stderr
+/// truncation matches the Markdown side byte-for-byte.
+#[must_use]
+pub fn run_structured(
+    result: &GetCommandOutputResult,
+    session_id: &str,
+    disconnected: bool,
+) -> Value {
+    let (stdout, stdout_info) = truncate_utf8_safe_tail(&result.stdout, DEFAULT_OUTPUT_BYTES);
+    let (stderr, stderr_info) = truncate_utf8_safe_tail(&result.stderr, DEFAULT_OUTPUT_BYTES);
+    json!({
+        "tool":     "ssh_run",
+        "status":   run_status_lower(result),
+        "session_id": session_id,
+        "command_id": result.command_id.as_str(),
+        "disconnected": disconnected,
+        "exit_code": result.exit_code,
+        "stdout":   stdout,
+        "stderr":   stderr,
+        "stdout_truncated": stdout_info.was_truncated(),
+        "stderr_truncated": stderr_info.was_truncated(),
+        "timed_out": result.timed_out,
+        "error":    result.error,
+    })
+}
+
+/// Lower-cased status surfaced by [`crate::infra::mcp::results::SshExecuteBatchEntry`].
+///
+/// Same set as [`run_status_lower`] plus the `"skipped"` stop-on-
+/// failure label.
+#[must_use]
+pub const fn batch_entry_status(result: &GetCommandOutputResult) -> &'static str {
+    run_status_lower(result)
+}
+
+/// Build the per-command structured entry for `ssh_execute_batch`.
+/// Returns the `index`/`command_id`/`stdout`/`stderr` shape consumed
+/// by [`crate::infra::mcp::results::SshExecuteBatchResult`].
+#[must_use]
+pub fn batch_entry_structured(
+    index: usize,
+    command_text: &str,
+    result: &GetCommandOutputResult,
+) -> Value {
+    let (stdout, stdout_info) = truncate_utf8_safe_tail(&result.stdout, DEFAULT_OUTPUT_BYTES);
+    let (stderr, stderr_info) = truncate_utf8_safe_tail(&result.stderr, DEFAULT_OUTPUT_BYTES);
+    json!({
+        "index":      index,
+        "command":    command_text,
+        "status":     batch_entry_status(result),
+        "command_id": result.command_id.as_str(),
+        "exit_code":  result.exit_code,
+        "stdout":     stdout,
+        "stderr":     stderr,
+        "stdout_truncated": stdout_info.was_truncated(),
+        "stderr_truncated": stderr_info.was_truncated(),
+        "timed_out":  result.timed_out,
+        "error":      result.error,
+    })
+}
+
+/// Build a `"skipped"` per-command entry surfaced after a stop-on-
+/// failure short-circuit. Carries the index + command text so the LLM
+/// sees the unexecuted slots without having to diff against the input.
+#[must_use]
+pub fn batch_skipped_entry(index: usize, command_text: &str) -> Value {
+    json!({
+        "index":   index,
+        "command": command_text,
+        "status":  "skipped",
+        "stdout":  "",
+        "stderr":  "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "timed_out": false,
+    })
+}
+
+/// Render the Markdown body for `ssh_execute_batch`. Each executed
+/// command emits a per-index header line plus a stdout/stderr block
+/// pair; skipped commands surface as `--- skipped #N: <command> ---`.
+#[must_use]
+pub fn batch_render(
+    session_id: &str,
+    halted: bool,
+    executed: usize,
+    total: usize,
+    entries: &[BatchEntryView<'_>],
+) -> String {
+    let label = if halted { "HALTED" } else { "OK" };
+    let mut out = String::with_capacity(96 + entries.len() * 192);
+    out.push_str("SSH_EXECUTE_BATCH: ");
+    out.push_str(label);
+    out.push_str("\nSESSION_ID: ");
+    out.push_str(session_id);
+    out.push_str("\nEXECUTED: ");
+    out.push_str(&executed.to_string());
+    out.push_str("\nTOTAL: ");
+    out.push_str(&total.to_string());
+    for entry in entries {
+        out.push('\n');
+        match entry {
+            BatchEntryView::Executed {
+                index,
+                command,
+                result,
+            } => append_batch_executed_block(&mut out, *index, command, result),
+            BatchEntryView::Skipped { index, command } => {
+                out.push_str("--- skipped #");
+                out.push_str(&index.to_string());
+                out.push_str(": ");
+                out.push_str(&sanitize_value(command));
+                out.push_str(" ---");
+            }
+        }
+    }
+    out
+}
+
+/// Lightweight view consumed by [`batch_render`]. Borrows command text
+/// + result so the renderer never owns the underlying buffers.
+#[derive(Debug)]
+pub enum BatchEntryView<'a> {
+    /// One actually executed command — header + stdout/stderr blocks.
+    Executed {
+        index: usize,
+        command: &'a str,
+        result: &'a GetCommandOutputResult,
+    },
+    /// Stop-on-failure short-circuited the loop before this entry.
+    Skipped { index: usize, command: &'a str },
+}
+
+fn append_batch_executed_block(
+    out: &mut String,
+    index: usize,
+    command: &str,
+    result: &GetCommandOutputResult,
+) {
+    let nonce = generate_nonce();
+    let label = run_status_label(result);
+    out.push_str("--- command #");
+    out.push_str(&index.to_string());
+    out.push_str(" [");
+    out.push_str(label);
+    out.push_str("] ");
+    out.push_str(&sanitize_value(command));
+    if let Some(code) = result.exit_code {
+        out.push_str(" exit=");
+        out.push_str(&code.to_string());
+    }
+    out.push_str(" ---\n");
+    out.push_str(&render_output_block(
+        "stdout",
+        &nonce,
+        &result.stdout,
+        DEFAULT_OUTPUT_BYTES,
+        Some("partial"),
+    ));
+    out.push('\n');
+    out.push_str(&render_output_block(
+        "stderr",
+        &nonce,
+        &result.stderr,
+        DEFAULT_OUTPUT_BYTES,
+        Some("partial"),
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -461,5 +708,146 @@ mod tests {
         });
         assert!(m.contains("SSH_GET_COMMAND_OUTPUT: COMPLETED"));
         assert!(m.contains("EXIT: 0"));
+    }
+
+    // ---------- v4.7-step3 ssh_run / ssh_execute_batch render tests ----
+
+    #[test]
+    fn run_render_emits_session_command_disconnected_lines() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-1".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::from_static(b"hi"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            error: None,
+            timed_out: false,
+            last_seq: 0,
+        };
+        let body = super::run_render(&result, "sess-1", true);
+        assert!(body.starts_with("SSH_RUN: COMPLETED"));
+        assert!(body.contains("SESSION_ID: sess-1"));
+        assert!(body.contains("COMMAND_ID: cmd-1"));
+        assert!(body.contains("EXIT: 0"));
+        assert!(body.contains("DISCONNECTED: true"));
+    }
+
+    #[test]
+    fn run_render_emits_disconnected_false_when_session_kept() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-2".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            exit_code: Some(2),
+            error: None,
+            timed_out: false,
+            last_seq: 0,
+        };
+        let body = super::run_render(&result, "sess-x", false);
+        assert!(body.contains("DISCONNECTED: false"));
+        assert!(body.contains("EXIT: 2"));
+    }
+
+    #[test]
+    fn run_structured_mirrors_run_render() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-3".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::from_static(b"out"),
+            stderr: Bytes::from_static(b"err"),
+            exit_code: Some(0),
+            error: None,
+            timed_out: false,
+            last_seq: 0,
+        };
+        let json = super::run_structured(&result, "sess-9", true);
+        assert_eq!(json["tool"], "ssh_run");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["session_id"], "sess-9");
+        assert_eq!(json["command_id"], "cmd-3");
+        assert_eq!(json["disconnected"], true);
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["stdout"], "out");
+        assert_eq!(json["stderr"], "err");
+        assert_eq!(json["timed_out"], false);
+    }
+
+    #[test]
+    fn run_render_promotes_timeout_status_when_timed_out() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-t".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            exit_code: None,
+            error: None,
+            timed_out: true,
+            last_seq: 0,
+        };
+        let body = super::run_render(&result, "sess-1", true);
+        assert!(body.starts_with("SSH_RUN: TIMEOUT"));
+        let structured = super::run_structured(&result, "sess-1", true);
+        assert_eq!(structured["status"], "timeout");
+    }
+
+    #[test]
+    fn batch_render_emits_per_index_blocks() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-0".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::from_static(b"yes"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            error: None,
+            timed_out: false,
+            last_seq: 0,
+        };
+        let entries = vec![
+            super::BatchEntryView::Executed {
+                index: 0,
+                command: "uptime",
+                result: &result,
+            },
+            super::BatchEntryView::Skipped {
+                index: 1,
+                command: "false",
+            },
+        ];
+        let body = super::batch_render("sess-b", true, 1, 2, &entries);
+        assert!(body.starts_with("SSH_EXECUTE_BATCH: HALTED"));
+        assert!(body.contains("SESSION_ID: sess-b"));
+        assert!(body.contains("EXECUTED: 1"));
+        assert!(body.contains("TOTAL: 2"));
+        assert!(body.contains("--- command #0 [COMPLETED] uptime exit=0 ---"));
+        assert!(body.contains("--- skipped #1: false ---"));
+    }
+
+    #[test]
+    fn batch_entry_structured_carries_index_and_status() {
+        let result = GetCommandOutputResult {
+            command_id: CommandId::new("cmd-7".to_string()),
+            status: CommandStatus::Completed,
+            stdout: Bytes::from_static(b"o"),
+            stderr: Bytes::new(),
+            exit_code: Some(1),
+            error: None,
+            timed_out: false,
+            last_seq: 0,
+        };
+        let json = super::batch_entry_structured(2, "ls", &result);
+        assert_eq!(json["index"], 2);
+        assert_eq!(json["command"], "ls");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["exit_code"], 1);
+        assert_eq!(json["command_id"], "cmd-7");
+    }
+
+    #[test]
+    fn batch_skipped_entry_marks_status() {
+        let json = super::batch_skipped_entry(3, "tail -n 3");
+        assert_eq!(json["index"], 3);
+        assert_eq!(json["status"], "skipped");
+        assert_eq!(json["command"], "tail -n 3");
     }
 }
