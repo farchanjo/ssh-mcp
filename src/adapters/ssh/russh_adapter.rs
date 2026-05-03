@@ -54,7 +54,9 @@ use dashmap::mapref::entry::Entry;
 use russh::Disconnect;
 use russh::client::{self, Msg};
 use russh::{Channel, ChannelMsg};
+use tokio::sync::mpsc;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::domain::auth::AuthError;
@@ -70,6 +72,7 @@ use crate::mcp::client::{
     execute_ssh_command_async_pty, open_pty_shell,
 };
 use crate::mcp::session::SshClientHandler;
+use crate::mcp::shell::{ChannelWriter, WriteRequest};
 use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus};
 use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
 
@@ -168,28 +171,30 @@ impl fmt::Debug for CommandRecord {
 
 /// Adapter-internal record bound to one open PTY shell id.
 struct ShellRecord {
-    /// Owning session.
+    /// Owning session — used to scope bulk-close logic when a
+    /// `disconnect` tears the parent session down.
     #[allow(
         dead_code,
-        reason = "session linkage will drive bulk-close when the shell-IO ports land"
+        reason = "session linkage will drive bulk-close when the H13 shell-IO use cases land"
     )]
     session_id: SessionId,
-    /// Live russh channel hosting the PTY. Reads and writes will go
-    /// through dedicated ports in a later etapa; the field exists today
-    /// so the channel survives across `open_shell` and the future
-    /// `shell_read` / `shell_write` calls.
-    #[allow(
-        dead_code,
-        reason = "channel is parked here until the shell-IO ports drive read/write/close"
-    )]
-    channel: Channel<Msg>,
+    /// Sink for input frames consumed by the dedicated writer task.
+    /// `write_shell` clones this and forwards `WriteRequest::Data`;
+    /// `close_shell` forwards `WriteRequest::Close`.
+    input_tx: mpsc::Sender<WriteRequest>,
+    /// Cancellation handle for the writer task. Firing it terminates
+    /// the loop so `close_shell` can guarantee teardown even if the
+    /// `WriteRequest::Close` frame never reaches the writer (e.g. the
+    /// mpsc queue was already torn down by an inactivity sweep).
+    cancel_token: CancellationToken,
 }
 
 impl fmt::Debug for ShellRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShellRecord")
             .field("session_id", &self.session_id)
-            .field("channel", &"<russh::Channel>")
+            .field("input_tx", &"<mpsc::Sender<WriteRequest>>")
+            .field("cancel_token", &self.cancel_token.is_cancelled())
             .finish()
     }
 }
@@ -488,6 +493,39 @@ impl SshClientPort for RusshAdapter {
         self.do_open_shell(session_id, terminal).await
     }
 
+    async fn write_shell(&self, shell_id: &ShellId, bytes: Bytes) -> Result<usize, DomainError> {
+        let input_tx = self.lookup_shell_input(shell_id)?;
+        let len = bytes.len();
+        input_tx
+            .send(WriteRequest::Data(bytes))
+            .await
+            .map_err(|e| {
+                DomainError::Transport(format!("shell write failed for {shell_id}: {e}"))
+            })?;
+        Ok(len)
+    }
+
+    async fn close_shell(&self, shell_id: &ShellId) -> Result<(), DomainError> {
+        // Remove first so a racing `write_shell` cannot enqueue more data
+        // after the close frame; we then fire the cancel + close pair
+        // outside the shard guard.
+        let removed = self.shells.remove(shell_id);
+        let Some((_, record)) = removed else {
+            return Err(DomainError::ShellNotFound(shell_id.clone()));
+        };
+        let ShellRecord {
+            input_tx,
+            cancel_token,
+            ..
+        } = record;
+        // Drain order matches v3: enqueue Close first so the writer
+        // closes the russh channel cleanly, then cancel the token to
+        // unblock the select arm if the queue was already drained.
+        let _ = input_tx.send(WriteRequest::Close).await;
+        cancel_token.cancel();
+        Ok(())
+    }
+
     async fn health_check(&self, session_id: &SessionId) -> Result<(), DomainError> {
         let handle = self.lookup_handle(session_id)?;
         let timeout = self.config.health_probe_timeout;
@@ -664,26 +702,54 @@ impl RusshAdapter {
         Ok(entity)
     }
 
-    /// Bind a freshly opened russh channel to a shell id, surfacing an
-    /// `Internal` error on the (extremely unlikely) id race.
+    /// Bind a freshly opened russh channel to a shell id by splitting it
+    /// into read/write halves, spawning the dedicated writer task, and
+    /// parking the read half on the cancel token until the H13 reader
+    /// driver lands. Surfaces an `Internal` error on the (extremely
+    /// unlikely) id race.
     fn bind_shell(
         &self,
         shell_id: &ShellId,
         session_id: &SessionId,
         channel: Channel<Msg>,
     ) -> Result<(), DomainError> {
+        let (read_half, write_half) = channel.split();
+        let (input_tx, input_rx) = mpsc::channel::<WriteRequest>(SHELL_INPUT_CHANNEL_CAP);
+        let cancel_token = CancellationToken::new();
+
+        spawn_shell_writer_task(write_half, input_rx, cancel_token.clone());
+        spawn_shell_reader_drain(read_half, cancel_token.clone());
+
         match self.shells.entry(shell_id.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(ShellRecord {
                     session_id: session_id.clone(),
-                    channel,
+                    input_tx,
+                    cancel_token,
                 });
                 Ok(())
             }
-            Entry::Occupied(_) => Err(DomainError::Internal(format!(
-                "shell id already bound: {shell_id}"
-            ))),
+            Entry::Occupied(_) => {
+                // Race: cancel the writer task we just spawned so it
+                // doesn't outlive the failed binding.
+                cancel_token.cancel();
+                Err(DomainError::Internal(format!(
+                    "shell id already bound: {shell_id}"
+                )))
+            }
         }
+    }
+
+    /// Internal: clone the input sink for a given shell id without
+    /// holding the shard guard across `.await`.
+    fn lookup_shell_input(
+        &self,
+        shell_id: &ShellId,
+    ) -> Result<mpsc::Sender<WriteRequest>, DomainError> {
+        self.shells.get(shell_id).map_or_else(
+            || Err(DomainError::ShellNotFound(shell_id.clone())),
+            |entry| Ok(entry.value().input_tx.clone()),
+        )
     }
 }
 
@@ -691,6 +757,73 @@ impl RusshAdapter {
 /// that want a non-default size will pass it through a dedicated
 /// shell-config port when shells migrate fully.
 const DEFAULT_SHELL_BUFFER_SIZE: u64 = 10_u64.saturating_mul(1024).saturating_mul(1024);
+
+/// Capacity for the per-shell input mpsc queue. Mirrors the v3
+/// `SHELL_INPUT_CHANNEL_CAP` so the writer task drains at the same rate
+/// as the legacy code path.
+const SHELL_INPUT_CHANNEL_CAP: usize = 64;
+
+/// Spawn the dedicated writer task that owns the russh write half
+/// exclusively. Drains [`WriteRequest`] frames from `input_rx` until
+/// either a [`WriteRequest::Close`] arrives, the senders are dropped,
+/// or `cancel_token` fires. Mirrors `mcp::tools::legacy_helpers::shell_writer`.
+fn spawn_shell_writer_task(
+    write_half: russh::ChannelWriteHalf<Msg>,
+    mut input_rx: mpsc::Receiver<WriteRequest>,
+    cancel_token: CancellationToken,
+) {
+    let writer = ChannelWriter::new(write_half);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => {
+                    let _ = writer.close().await;
+                    break;
+                }
+                req = input_rx.recv() => {
+                    match req {
+                        Some(WriteRequest::Data(bytes)) => {
+                            if let Err(e) = writer.write(&bytes).await {
+                                warn!("russh adapter shell writer task: {e}");
+                                break;
+                            }
+                        }
+                        Some(WriteRequest::Close) | None => {
+                            let _ = writer.close().await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a minimal reader-drain task so the read half does not block
+/// the russh channel state machine before the H13 reader driver lands.
+/// This task only consumes frames until the channel signals close or
+/// the cancel token fires; the actual byte forwarding belongs to the
+/// `ShellReaderPort` adapter introduced by H13.
+fn spawn_shell_reader_drain(
+    mut read_half: russh::ChannelReadHalf,
+    cancel_token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => break,
+                msg = read_half.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Translate a [`Credentials`] variant into the `(password, key_path)`
 /// pair the v3 helpers expect. Agent credentials map to `(None, None)`,

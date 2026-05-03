@@ -13,7 +13,7 @@ use bytes::Bytes;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
-use crate::domain::ids::{CommandId, SessionId};
+use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
 
@@ -106,6 +106,24 @@ pub trait LocalSshClientPort: Send + Sync {
         session_id: &SessionId,
         terminal: ShellTerminal,
     ) -> Result<ShellEntity, DomainError>;
+
+    /// Write raw bytes to an interactive shell (text input or escape sequences).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::ShellNotFound` if the shell is unknown to the
+    /// adapter, or `DomainError::WriteFailed` if the channel rejects the data.
+    async fn write_shell(&self, shell_id: &ShellId, bytes: Bytes) -> Result<usize, DomainError>;
+
+    /// Close an interactive shell (cancel reader task + drop channel).
+    ///
+    /// Idempotent — calling on an already-closed shell returns
+    /// `DomainError::ShellNotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::ShellNotFound` when the shell id is unknown.
+    async fn close_shell(&self, shell_id: &ShellId) -> Result<(), DomainError>;
 
     /// Probe the connection liveness with a minimal command (e.g. `echo 1`).
     ///

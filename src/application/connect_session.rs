@@ -560,6 +560,15 @@ mod tests {
                 FakeSshCall::Execute { .. } => "execute",
                 FakeSshCall::ExecuteAsync { .. } => "execute_async",
                 FakeSshCall::HealthCheck { .. } => "health",
+                FakeSshCall::OpenShell { .. } => {
+                    panic!("connect_session test path must not invoke open_shell")
+                }
+                FakeSshCall::WriteShell { .. } => {
+                    panic!("connect_session test path must not invoke write_shell")
+                }
+                FakeSshCall::CloseShell { .. } => {
+                    panic!("connect_session test path must not invoke close_shell")
+                }
             })
             .collect();
         assert_eq!(kinds, vec!["health", "disconnect", "connect"]);
