@@ -642,6 +642,102 @@ pub fn disconnect_agent_structured(outcome: &DisconnectAgentOutcome) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// v4.7-step3 — ssh_disconnect_many render helpers
+// ---------------------------------------------------------------------------
+
+/// One per-id outcome surfaced by `ssh_disconnect_many`.
+#[derive(Debug, Clone)]
+pub struct DisconnectManyEntry {
+    /// Echoed session id.
+    pub session_id: String,
+    /// `Ok(())` on a successful disconnect, `Err((code, reason))`
+    /// otherwise. `code` is the v4.5 wire error code already
+    /// classified by the inbound layer; `reason` is the human-readable
+    /// message rendered on the `REASON:` line.
+    pub result: Result<(), (String, String)>,
+}
+
+impl DisconnectManyEntry {
+    /// Build a successful entry.
+    #[must_use]
+    pub const fn ok(session_id: String) -> Self {
+        Self {
+            session_id,
+            result: Ok(()),
+        }
+    }
+
+    /// Build an error entry.
+    #[must_use]
+    pub const fn error(session_id: String, code: String, reason: String) -> Self {
+        Self {
+            session_id,
+            result: Err((code, reason)),
+        }
+    }
+}
+
+/// Render the Markdown body for `ssh_disconnect_many`. Each entry
+/// becomes one `- <session_id>: OK | ERROR [<code>] <reason>` line so
+/// the response mirrors the layout of `ssh_list_sessions` etc.
+#[must_use]
+pub fn disconnect_many_render(entries: &[DisconnectManyEntry]) -> String {
+    let total = entries.len();
+    let disconnected = entries.iter().filter(|e| e.result.is_ok()).count();
+    let failed = total.saturating_sub(disconnected);
+    let mut out = String::with_capacity(96 + entries.len() * 80);
+    out.push_str("SSH_DISCONNECT_MANY: OK\nDISCONNECTED: ");
+    out.push_str(&disconnected.to_string());
+    out.push_str("\nFAILED: ");
+    out.push_str(&failed.to_string());
+    for entry in entries {
+        out.push_str("\n- ");
+        out.push_str(&sanitize_value(&entry.session_id));
+        match &entry.result {
+            Ok(()) => out.push_str(": OK"),
+            Err((code, reason)) => {
+                out.push_str(": ERROR [");
+                out.push_str(code);
+                out.push_str("] ");
+                out.push_str(&sanitize_value(reason));
+            }
+        }
+    }
+    out
+}
+
+/// Build the structured payload for `ssh_disconnect_many`. Mirrors the
+/// per-id list rendered by [`disconnect_many_render`].
+#[must_use]
+pub fn disconnect_many_structured(entries: &[DisconnectManyEntry]) -> Value {
+    let total = entries.len();
+    let disconnected = entries.iter().filter(|e| e.result.is_ok()).count();
+    let failed = total.saturating_sub(disconnected);
+    let results: Vec<Value> = entries
+        .iter()
+        .map(|entry| match &entry.result {
+            Ok(()) => json!({
+                "session_id": entry.session_id,
+                "status":     "ok",
+            }),
+            Err((code, reason)) => json!({
+                "session_id": entry.session_id,
+                "status":     "error",
+                "code":       code,
+                "reason":     reason,
+            }),
+        })
+        .collect();
+    json!({
+        "tool":   "ssh_disconnect_many",
+        "status": "ok",
+        "results": results,
+        "disconnected": disconnected,
+        "failed":       failed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -833,5 +929,54 @@ mod tests {
         };
         let body = list_sessions_render(outcome);
         assert!(!body.contains("HINT:"), "body: {body}");
+    }
+
+    // ---------- v4.7-step3 ssh_disconnect_many render tests -----------
+
+    #[test]
+    fn disconnect_many_render_emits_per_id_block() {
+        use super::DisconnectManyEntry;
+        let entries = vec![
+            DisconnectManyEntry::ok("sess-a".to_string()),
+            DisconnectManyEntry::error(
+                "sess-b".to_string(),
+                "SESSION_NOT_FOUND".to_string(),
+                "no active SSH session with the given ID".to_string(),
+            ),
+            DisconnectManyEntry::ok("sess-c".to_string()),
+        ];
+        let body = super::disconnect_many_render(&entries);
+        assert!(body.starts_with("SSH_DISCONNECT_MANY: OK"));
+        assert!(body.contains("DISCONNECTED: 2"));
+        assert!(body.contains("FAILED: 1"));
+        assert!(body.contains("- sess-a: OK"));
+        assert!(body.contains("- sess-b: ERROR [SESSION_NOT_FOUND] no active SSH"));
+        assert!(body.contains("- sess-c: OK"));
+    }
+
+    #[test]
+    fn disconnect_many_structured_mirrors_render() {
+        use super::DisconnectManyEntry;
+        let entries = vec![
+            DisconnectManyEntry::ok("sess-a".to_string()),
+            DisconnectManyEntry::error(
+                "sess-b".to_string(),
+                "TRANSPORT_ERROR".to_string(),
+                "kaput".to_string(),
+            ),
+        ];
+        let json = super::disconnect_many_structured(&entries);
+        assert_eq!(json["tool"], "ssh_disconnect_many");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["disconnected"], 1);
+        assert_eq!(json["failed"], 1);
+        let arr = json["results"].as_array().expect("results array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["session_id"], "sess-a");
+        assert_eq!(arr[0]["status"], "ok");
+        assert_eq!(arr[1]["session_id"], "sess-b");
+        assert_eq!(arr[1]["status"], "error");
+        assert_eq!(arr[1]["code"], "TRANSPORT_ERROR");
+        assert_eq!(arr[1]["reason"], "kaput");
     }
 }

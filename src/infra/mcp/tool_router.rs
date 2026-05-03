@@ -20,9 +20,10 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Icon, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
+    CallToolResult, GetPromptRequestParams, GetPromptResult, Icon, Implementation,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -30,11 +31,11 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::application::cancel_command::CancelCommandRequest;
 use crate::application::close_shell::CloseShellRequest;
-use crate::application::connect_session::{ConnectRequest, ConnectSessionUseCase};
+use crate::application::connect_session::{ConnectOutcome, ConnectRequest, ConnectSessionUseCase};
 use crate::application::disconnect_agent::DisconnectAgentRequest;
-use crate::application::disconnect_session::DisconnectRequest;
+use crate::application::disconnect_session::{DisconnectRequest, DisconnectSessionUseCase};
 use crate::application::download_file::DownloadRequest;
-use crate::application::execute_command::ExecuteRequest;
+use crate::application::execute_command::{ExecuteCommandUseCase, ExecuteRequest};
 #[cfg(feature = "port_forward")]
 use crate::application::forward_port::ForwardPortRequest;
 use crate::application::get_command_output::{
@@ -54,6 +55,7 @@ use crate::application::wait_for_pattern::{
 };
 use crate::application::write_shell::WriteShellRequest;
 use crate::composition::UseCases;
+use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
@@ -62,11 +64,13 @@ use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
+use crate::infra::mcp::prompts;
 use crate::infra::mcp::render;
 use crate::infra::mcp::resource_templates;
 use crate::infra::mcp::results::{
-    SshConnectResult, SshExecuteResult, SshGetCommandOutputResult, SshGetTransferProgressResult,
-    SshShellOpenResult, SshShellReadResult,
+    SshConnectResult, SshDisconnectManyResult, SshExecuteBatchResult, SshExecuteResult,
+    SshGetCommandOutputResult, SshGetTransferProgressResult, SshRunResult, SshShellOpenResult,
+    SshShellReadResult,
 };
 use crate::ports::auth_strategy::AuthStrategyPort;
 use crate::ports::clock::ClockPort;
@@ -85,10 +89,12 @@ use crate::ports::subscriber_registry::{SubscriberRegistryAsync, SubscriberRegis
 use crate::ports::transfer_repo::TransferRepository;
 
 use super::args::connection::{
-    SshConnectArgs, SshDisconnectAgentArgs, SshDisconnectArgs, SshListSessionsArgs,
+    SshConnectArgs, SshDisconnectAgentArgs, SshDisconnectArgs, SshDisconnectManyArgs,
+    SshListSessionsArgs,
 };
 use super::args::execute::{
-    SshCancelCommandArgs, SshExecuteArgs, SshGetCommandOutputArgs, SshListCommandsArgs,
+    SshCancelCommandArgs, SshExecuteArgs, SshExecuteBatchArgs, SshGetCommandOutputArgs,
+    SshListCommandsArgs, SshRunArgs,
 };
 #[cfg(feature = "port_forward")]
 use super::args::forward::SshForwardArgs;
@@ -1009,6 +1015,71 @@ where
         }
     }
 
+    // ---------- v4.7-step3 convenience + batch tools -----------------
+
+    #[tool(
+        title = "Run remote command (one-shot)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Connect, execute a short command synchronously, and (by default) disconnect — all in one call.\n\nWhen to use:\n- Short atomic commands (uptime, hostname, cat /etc/release).\n- Smaller LLMs that prefer not to choreograph connect -> execute -> wait by hand.\n\nWorkflow:\n1. ssh_run mints (or reuses) a session via reuse=auto.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
+        output_schema = schema_for_type::<SshRunResult>()
+    )]
+    async fn ssh_run(
+        &self,
+        Parameters(args): Parameters<SshRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_one_shot(
+            self.use_cases.connect.as_ref(),
+            self.use_cases.execute.as_ref(),
+            self.use_cases.get_command_output.as_ref(),
+            self.use_cases.disconnect.as_ref(),
+            args,
+        )
+        .await
+    }
+
+    #[tool(
+        title = "Execute a batch of commands on one session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_execute per command dominates.\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
+        output_schema = schema_for_type::<SshExecuteBatchResult>()
+    )]
+    async fn ssh_execute_batch(
+        &self,
+        Parameters(args): Parameters<SshExecuteBatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_execute_batch(
+            self.use_cases.execute.as_ref(),
+            self.use_cases.get_command_output.as_ref(),
+            args,
+        )
+        .await
+    }
+
+    #[tool(
+        title = "Disconnect multiple SSH sessions",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Best-effort bulk disconnect of up to 64 sessions in a single call.\n\nWhen to use:\n- Cleaning up a fan-out of sessions when bulk-by-agent is not appropriate.\n- Per-id failures are reported in the response and do not abort the remaining disconnects.\n\nWorkflow:\n1. Pass the list of SESSION_IDs returned from prior ssh_connect calls.\n2. Inspect the per-id `results` array for any `error` entries.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (empty / >64 ids).\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
+        output_schema = schema_for_type::<SshDisconnectManyResult>()
+    )]
+    async fn ssh_disconnect_many(
+        &self,
+        Parameters(args): Parameters<SshDisconnectManyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await
+    }
+
     // ---------- Forward domain --------------------------------------
 
     #[tool(
@@ -1592,6 +1663,71 @@ where
             Err(err) => Ok(render_tool_error("SSH_GET_TRANSFER_PROGRESS", &err)),
         }
     }
+
+    // ---------- v4.7-step3 convenience + batch tools -----------------
+
+    #[tool(
+        title = "Run remote command (one-shot)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Connect, execute a short command synchronously, and (by default) disconnect.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
+        output_schema = schema_for_type::<SshRunResult>()
+    )]
+    async fn ssh_run(
+        &self,
+        Parameters(args): Parameters<SshRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_one_shot(
+            self.use_cases.connect.as_ref(),
+            self.use_cases.execute.as_ref(),
+            self.use_cases.get_command_output.as_ref(),
+            self.use_cases.disconnect.as_ref(),
+            args,
+        )
+        .await
+    }
+
+    #[tool(
+        title = "Execute a batch of commands on one session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Run up to 16 commands sequentially on a single session.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
+        output_schema = schema_for_type::<SshExecuteBatchResult>()
+    )]
+    async fn ssh_execute_batch(
+        &self,
+        Parameters(args): Parameters<SshExecuteBatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_execute_batch(
+            self.use_cases.execute.as_ref(),
+            self.use_cases.get_command_output.as_ref(),
+            args,
+        )
+        .await
+    }
+
+    #[tool(
+        title = "Disconnect multiple SSH sessions",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Best-effort bulk disconnect of up to 64 sessions.\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
+        output_schema = schema_for_type::<SshDisconnectManyResult>()
+    )]
+    async fn ssh_disconnect_many(
+        &self,
+        Parameters(args): Parameters<SshDisconnectManyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,6 +1826,610 @@ fn parse_human_bytes(input: Option<&str>) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// v4.7-step3 — ssh_run / ssh_execute_batch / ssh_disconnect_many helpers
+// ---------------------------------------------------------------------------
+
+/// Hard cap on `ssh_run` / `ssh_execute_batch` per-command wait
+/// timeout. Mirrors the documented "Cap: 300" line on the args
+/// schema; outside the rmcp wrapper the use case has no notion of
+/// caller intent so the budget is enforced here.
+const RUN_TIMEOUT_CAP_SECS: u64 = 300;
+/// Hard cap on the per-command output budget. Mirrors the documented
+/// `SSH_MCP_OUTPUT_MAX_BYTES_CAP` ceiling for a single response.
+const RUN_OUTPUT_BYTES_CAP: usize = 1_048_576;
+/// Maximum number of commands accepted in a single
+/// `ssh_execute_batch` call.
+const EXECUTE_BATCH_MAX_COMMANDS: usize = 16;
+/// Maximum number of session ids accepted in a single
+/// `ssh_disconnect_many` call.
+const DISCONNECT_MANY_MAX_IDS: usize = 64;
+
+/// Clamp the caller-supplied `timeout_secs` to [`RUN_TIMEOUT_CAP_SECS`]
+/// and return the resulting [`Duration`]. `None` defaults to 30s
+/// (mirrors the schema default) and is also clamped.
+fn clamp_run_timeout(secs: Option<u64>) -> Duration {
+    let raw = secs.unwrap_or(30);
+    Duration::from_secs(raw.min(RUN_TIMEOUT_CAP_SECS))
+}
+
+/// Clamp the caller-supplied `max_output_bytes` to
+/// [`RUN_OUTPUT_BYTES_CAP`]. `None` defaults to 16384.
+fn clamp_run_output_bytes(bytes: Option<usize>) -> usize {
+    bytes.unwrap_or(16_384).min(RUN_OUTPUT_BYTES_CAP)
+}
+
+/// Build the `ConnectRequest` driving the implicit connect step of
+/// `ssh_run`. Uses `reuse=Auto` so repeated calls converge on the
+/// same long-lived session per host/user/agent triple.
+fn build_run_connect_request(args: &SshRunArgs) -> Result<ConnectRequest, DomainError> {
+    let address = parse_address(&args.address)?;
+    let credentials = pick_credentials(
+        &args.username,
+        args.password.as_deref(),
+        args.key_path.as_deref(),
+    );
+    Ok(ConnectRequest {
+        explicit_session_id: None,
+        address,
+        username: args.username.clone(),
+        credentials,
+        timeout_secs: None,
+        max_retries: None,
+        retry_delay_ms: None,
+        compress: None,
+        name: None,
+        persistent: false,
+        agent_id: args.agent_id.clone().map(AgentId::new),
+        reuse: DomainReusePolicy::Auto,
+    })
+}
+
+/// Pull a usable `SessionId` out of the connect outcome. `Suggested`
+/// is unreachable (`reuse=Auto` returns `Reused` instead); kept as a
+/// defensive arm so a future use case change cannot silently break the
+/// orchestration.
+fn session_id_from_connect(outcome: ConnectOutcome) -> Result<SessionId, DomainError> {
+    match outcome {
+        ConnectOutcome::Connected { session, .. } | ConnectOutcome::Reused { session, .. } => {
+            Ok(session.id)
+        }
+        ConnectOutcome::Suggested { .. } => Err(DomainError::Internal(
+            "ssh_run: unexpected SUGGESTED outcome with reuse=Auto".to_string(),
+        )),
+    }
+}
+
+/// Drive the spawn -> wait pair backing both `ssh_run` and one
+/// iteration of `ssh_execute_batch`. Returns the terminal command
+/// snapshot the caller renders into the response body.
+async fn spawn_and_wait_for_command<S, SR, CR, OS, C, Idg, Cfg, Sub>(
+    execute: &ExecuteCommandUseCase<S, SR, CR, C, Idg, Cfg, Sub>,
+    output: &GetCommandOutputUseCase<CR, OS>,
+    session_id: &SessionId,
+    command: String,
+    pty: bool,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<GetCommandOutputResult, DomainError>
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+    Sub: SubscriberRegistryPort + Send + Sync,
+{
+    let exec_outcome = execute
+        .execute(ExecuteRequest {
+            session_id: session_id.clone(),
+            command,
+            timeout: Some(timeout),
+            use_pty: pty,
+        })
+        .await?;
+    output
+        .execute(GetCommandOutputRequest {
+            command_id: exec_outcome.command_id,
+            wait: true,
+            wait_timeout: Some(timeout),
+            max_output_bytes: Some(max_output_bytes),
+        })
+        .await
+}
+
+/// Resolve the `ssh_connect` step driven by `ssh_run`. Returns the
+/// freshly minted (or reused) session id, mapping every error class
+/// into the tool error body the orchestrator forwards to the caller.
+async fn connect_for_run<S, SR, C, Idg, Cfg>(
+    connect: &ConnectSessionUseCase<S, SR, C, Idg, Cfg>,
+    args: &SshRunArgs,
+) -> Result<SessionId, CallToolResult>
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+{
+    let req = build_run_connect_request(args).map_err(|e| render_tool_error("SSH_RUN", &e))?;
+    let outcome = connect
+        .execute(req)
+        .await
+        .map_err(|e| render_tool_error("SSH_RUN", &e))?;
+    session_id_from_connect(outcome).map_err(|e| render_tool_error("SSH_RUN", &e))
+}
+
+/// Drive the full `connect -> execute -> wait -> [disconnect]`
+/// orchestration backing `ssh_run`.
+async fn run_one_shot<S, SR, CR, ShR, TR, OS, C, Idg, Cfg, Sub>(
+    connect: &ConnectSessionUseCase<S, SR, C, Idg, Cfg>,
+    execute: &ExecuteCommandUseCase<S, SR, CR, C, Idg, Cfg, Sub>,
+    output: &GetCommandOutputUseCase<CR, OS>,
+    disconnect: &DisconnectSessionUseCase<S, SR, CR, ShR, TR>,
+    args: SshRunArgs,
+) -> Result<CallToolResult, McpError>
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    ShR: ShellRepository + Send + Sync,
+    TR: TransferRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+    Sub: SubscriberRegistryPort + Send + Sync,
+{
+    let timeout = clamp_run_timeout(args.timeout_secs);
+    let output_cap = clamp_run_output_bytes(args.max_output_bytes);
+    let pty = args.pty.unwrap_or(false);
+    let disconnect_after = args.disconnect_after.unwrap_or(true);
+    let session_id = match connect_for_run(connect, &args).await {
+        Ok(sid) => sid,
+        Err(body) => return Ok(body),
+    };
+    let result = match spawn_and_wait_for_command(
+        execute,
+        output,
+        &session_id,
+        args.command,
+        pty,
+        timeout,
+        output_cap,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(err) => return Ok(render_tool_error("SSH_RUN", &err)),
+    };
+    let disconnected = run_disconnect_after(disconnect, &session_id, disconnect_after).await;
+    Ok(build_run_response(
+        &result,
+        session_id.as_str(),
+        disconnected,
+    ))
+}
+
+/// Disconnect the session if `disconnect_after` is true, otherwise
+/// keep it open. Disconnect failures are tolerated — the command
+/// already ran and the user-visible signal (the rendered result) is
+/// the actionable signal.
+async fn run_disconnect_after<S, SR, CR, ShR, TR>(
+    disconnect: &DisconnectSessionUseCase<S, SR, CR, ShR, TR>,
+    session_id: &SessionId,
+    disconnect_after: bool,
+) -> bool
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    ShR: ShellRepository + Send + Sync,
+    TR: TransferRepository + Send + Sync,
+{
+    if !disconnect_after {
+        return false;
+    }
+    let _ = disconnect
+        .execute(DisconnectRequest {
+            session_id: session_id.clone(),
+        })
+        .await;
+    true
+}
+
+/// Compose the `ssh_run` success [`CallToolResult`] from the captured
+/// snapshot. Pulled out so the orchestrator stays under the 30-line
+/// cognitive threshold.
+fn build_run_response(
+    result: &GetCommandOutputResult,
+    session_id: &str,
+    disconnected: bool,
+) -> CallToolResult {
+    let body = render::execute::run_render(result, session_id, disconnected);
+    let structured = render::execute::run_structured(result, session_id, disconnected);
+    ok_text_and_structured(body, structured)
+}
+
+/// Validate the batch input. Returns the rendered error body when the
+/// caller passed an empty list or more than [`EXECUTE_BATCH_MAX_COMMANDS`]
+/// entries; otherwise `Ok(())` and the orchestrator continues.
+fn validate_batch_args(args: &SshExecuteBatchArgs) -> Result<(), CallToolResult> {
+    if args.commands.is_empty() {
+        return Err(render_tool_error(
+            "SSH_EXECUTE_BATCH",
+            &DomainError::InvalidArgument("commands must contain at least one entry".to_string()),
+        ));
+    }
+    if args.commands.len() > EXECUTE_BATCH_MAX_COMMANDS {
+        return Err(render_tool_error(
+            "SSH_EXECUTE_BATCH",
+            &DomainError::InvalidArgument(format!(
+                "commands accepts up to {EXECUTE_BATCH_MAX_COMMANDS} entries, got {}",
+                args.commands.len()
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Drive the sequential per-command loop backing `ssh_execute_batch`.
+async fn run_execute_batch<S, SR, CR, OS, C, Idg, Cfg, Sub>(
+    execute: &ExecuteCommandUseCase<S, SR, CR, C, Idg, Cfg, Sub>,
+    output: &GetCommandOutputUseCase<CR, OS>,
+    args: SshExecuteBatchArgs,
+) -> Result<CallToolResult, McpError>
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+    Sub: SubscriberRegistryPort + Send + Sync,
+{
+    if let Err(body) = validate_batch_args(&args) {
+        return Ok(body);
+    }
+    let session_id = SessionId::new(args.session_id.clone());
+    let outcome = drive_batch_loop(
+        execute,
+        output,
+        &session_id,
+        &args.commands,
+        BatchSettings {
+            stop_on_failure: args.stop_on_failure.unwrap_or(true),
+            pty: args.pty.unwrap_or(false),
+            timeout: clamp_run_timeout(args.timeout_secs_per_command),
+            output_cap: clamp_run_output_bytes(args.max_output_bytes_per_command),
+        },
+    )
+    .await;
+    let body = render_batch_body(&args.session_id, &args.commands, &outcome);
+    let structured = render_batch_structured(&args.session_id, &args.commands, &outcome);
+    Ok(ok_text_and_structured(body, structured))
+}
+
+/// Per-iteration outcome captured during the batch loop. The caller
+/// uses [`Self::failed`] to decide whether to halt and the renderer
+/// converts each entry into the matching Markdown / structured shape.
+struct BatchIteration {
+    /// Index into the input `commands` array.
+    index: usize,
+    /// The terminal snapshot returned by `get_command_output`.
+    result: GetCommandOutputResult,
+}
+
+impl BatchIteration {
+    /// `true` when the command's terminal state is anything other than
+    /// `Completed { exit_code: 0 }` — the canonical "failure" trigger
+    /// for `stop_on_failure`.
+    fn failed(&self) -> bool {
+        if self.result.timed_out {
+            return true;
+        }
+        match self.result.status {
+            CommandStatus::Completed => self.result.exit_code != Some(0),
+            CommandStatus::Cancelled | CommandStatus::Failed | CommandStatus::Running => true,
+        }
+    }
+}
+
+/// Aggregated loop result returned by [`drive_batch_loop`].
+struct BatchOutcome {
+    /// Successful per-command iterations, in order.
+    iterations: Vec<BatchIteration>,
+    /// `true` when the loop exited early because of a non-zero exit
+    /// code under `stop_on_failure=true`.
+    halted: bool,
+    /// Optional fatal use case error surfaced before the loop ran (or
+    /// before any iteration captured a snapshot).
+    fatal: Option<DomainError>,
+}
+
+/// Caller-tunable knobs for the batch loop. Keeping the four flags +
+/// caps grouped here lets [`drive_batch_loop`] respect the
+/// `too_many_arguments` lint without losing any control surface.
+#[derive(Debug, Clone, Copy)]
+struct BatchSettings {
+    /// Halt on the first non-zero exit code.
+    stop_on_failure: bool,
+    /// Allocate a PTY for each spawned command.
+    pty: bool,
+    /// Per-command wait budget.
+    timeout: Duration,
+    /// Per-command max output bytes.
+    output_cap: usize,
+}
+
+/// Outcome of one iteration of the batch loop. `Halt` short-circuits
+/// the loop under `stop_on_failure`; `Fatal` carries a use case error
+/// surfaced before the iteration captured a snapshot.
+enum BatchStep {
+    Continue(BatchIteration),
+    Halt(BatchIteration),
+    Fatal(DomainError),
+}
+
+async fn drive_batch_loop<S, SR, CR, OS, C, Idg, Cfg, Sub>(
+    execute: &ExecuteCommandUseCase<S, SR, CR, C, Idg, Cfg, Sub>,
+    output: &GetCommandOutputUseCase<CR, OS>,
+    session_id: &SessionId,
+    commands: &[String],
+    settings: BatchSettings,
+) -> BatchOutcome
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+    Sub: SubscriberRegistryPort + Send + Sync,
+{
+    let mut iterations: Vec<BatchIteration> = Vec::with_capacity(commands.len());
+    for (index, command) in commands.iter().enumerate() {
+        let step = run_batch_step(execute, output, session_id, &settings, index, command).await;
+        match step {
+            BatchStep::Continue(iter) => iterations.push(iter),
+            BatchStep::Halt(iter) => {
+                iterations.push(iter);
+                return BatchOutcome {
+                    iterations,
+                    halted: true,
+                    fatal: None,
+                };
+            }
+            BatchStep::Fatal(err) => {
+                return BatchOutcome {
+                    iterations,
+                    halted: false,
+                    fatal: Some(err),
+                };
+            }
+        }
+    }
+    BatchOutcome {
+        iterations,
+        halted: false,
+        fatal: None,
+    }
+}
+
+/// Drive one batch iteration: spawn + wait + classify the snapshot.
+async fn run_batch_step<S, SR, CR, OS, C, Idg, Cfg, Sub>(
+    execute: &ExecuteCommandUseCase<S, SR, CR, C, Idg, Cfg, Sub>,
+    output: &GetCommandOutputUseCase<CR, OS>,
+    session_id: &SessionId,
+    settings: &BatchSettings,
+    index: usize,
+    command: &str,
+) -> BatchStep
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Idg: IdGeneratorPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+    Sub: SubscriberRegistryPort + Send + Sync,
+{
+    let outcome = spawn_and_wait_for_command(
+        execute,
+        output,
+        session_id,
+        command.to_string(),
+        settings.pty,
+        settings.timeout,
+        settings.output_cap,
+    )
+    .await;
+    match outcome {
+        Ok(result) => {
+            let iteration = BatchIteration { index, result };
+            if settings.stop_on_failure && iteration.failed() {
+                BatchStep::Halt(iteration)
+            } else {
+                BatchStep::Continue(iteration)
+            }
+        }
+        Err(err) => BatchStep::Fatal(err),
+    }
+}
+
+fn render_batch_body(session_id: &str, commands: &[String], outcome: &BatchOutcome) -> String {
+    if let Some(err) = outcome.fatal.as_ref() {
+        return render_tool_error_body("SSH_EXECUTE_BATCH", err);
+    }
+    let entries = build_batch_views(commands, outcome);
+    render::execute::batch_render(
+        session_id,
+        outcome.halted,
+        outcome.iterations.len(),
+        commands.len(),
+        &entries,
+    )
+}
+
+fn render_batch_structured(
+    session_id: &str,
+    commands: &[String],
+    outcome: &BatchOutcome,
+) -> serde_json::Value {
+    if let Some(err) = outcome.fatal.as_ref() {
+        let (code, reason, detail) = classify_error(err);
+        return format_error_structured("SSH_EXECUTE_BATCH", code, &reason, detail.as_deref());
+    }
+    let results = build_batch_structured_entries(commands, outcome);
+    let status = if outcome.halted { "halted" } else { "ok" };
+    serde_json::json!({
+        "tool":     "ssh_execute_batch",
+        "status":   status,
+        "session_id": session_id,
+        "results":  results,
+        "executed": outcome.iterations.len(),
+        "total":    commands.len(),
+    })
+}
+
+fn build_batch_structured_entries(
+    commands: &[String],
+    outcome: &BatchOutcome,
+) -> Vec<serde_json::Value> {
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(commands.len());
+    let mut iter = outcome.iterations.iter();
+    let mut next = iter.next();
+    for (index, command) in commands.iter().enumerate() {
+        if let Some(iteration) = next.filter(|i| i.index == index) {
+            results.push(render::execute::batch_entry_structured(
+                index,
+                command,
+                &iteration.result,
+            ));
+            next = iter.next();
+        } else {
+            results.push(render::execute::batch_skipped_entry(index, command));
+        }
+    }
+    results
+}
+
+fn build_batch_views<'a>(
+    commands: &'a [String],
+    outcome: &'a BatchOutcome,
+) -> Vec<render::execute::BatchEntryView<'a>> {
+    let mut views: Vec<render::execute::BatchEntryView<'a>> = Vec::with_capacity(commands.len());
+    let mut iter = outcome.iterations.iter();
+    let mut next = iter.next();
+    for (index, command) in commands.iter().enumerate() {
+        if let Some(iteration) = next.filter(|i| i.index == index) {
+            views.push(render::execute::BatchEntryView::Executed {
+                index,
+                command: command.as_str(),
+                result: &iteration.result,
+            });
+            next = iter.next();
+        } else {
+            views.push(render::execute::BatchEntryView::Skipped {
+                index,
+                command: command.as_str(),
+            });
+        }
+    }
+    views
+}
+
+/// Render the canonical Markdown-only error body. Same shape as
+/// [`render_tool_error`] without the structured channel — used inline
+/// when the orchestrator hits a fatal use case error before producing
+/// any per-command output.
+fn render_tool_error_body(tool: &str, err: &DomainError) -> String {
+    let (code, reason, detail) = classify_error(err);
+    format_error(tool, code, &reason, detail.as_deref())
+}
+
+/// Validate the bulk disconnect input. Returns the rendered error
+/// body when the caller passed an empty list or more than
+/// [`DISCONNECT_MANY_MAX_IDS`] entries.
+fn validate_disconnect_many_args(args: &SshDisconnectManyArgs) -> Result<(), CallToolResult> {
+    if args.session_ids.is_empty() {
+        return Err(render_tool_error(
+            "SSH_DISCONNECT_MANY",
+            &DomainError::InvalidArgument(
+                "session_ids must contain at least one entry".to_string(),
+            ),
+        ));
+    }
+    if args.session_ids.len() > DISCONNECT_MANY_MAX_IDS {
+        return Err(render_tool_error(
+            "SSH_DISCONNECT_MANY",
+            &DomainError::InvalidArgument(format!(
+                "session_ids accepts up to {DISCONNECT_MANY_MAX_IDS} entries, got {}",
+                args.session_ids.len()
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Process one disconnect attempt and convert the use case outcome
+/// into the per-id entry surfaced by both wire channels.
+async fn disconnect_many_entry<S, SR, CR, ShR, TR>(
+    disconnect: &DisconnectSessionUseCase<S, SR, CR, ShR, TR>,
+    sid: String,
+) -> render::connection::DisconnectManyEntry
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    ShR: ShellRepository + Send + Sync,
+    TR: TransferRepository + Send + Sync,
+{
+    let result = disconnect
+        .execute(DisconnectRequest {
+            session_id: SessionId::new(sid.clone()),
+        })
+        .await;
+    match result {
+        Ok(_) => render::connection::DisconnectManyEntry::ok(sid),
+        Err(err) => {
+            let (code, reason, _) = classify_error(&err);
+            render::connection::DisconnectManyEntry::error(sid, code.to_string(), reason)
+        }
+    }
+}
+
+/// Drive the best-effort bulk-disconnect loop backing
+/// `ssh_disconnect_many`.
+async fn run_disconnect_many<S, SR, CR, ShR, TR>(
+    disconnect: &DisconnectSessionUseCase<S, SR, CR, ShR, TR>,
+    args: SshDisconnectManyArgs,
+) -> Result<CallToolResult, McpError>
+where
+    S: SshClientPort + Send + Sync,
+    SR: SessionRepository + Send + Sync,
+    CR: CommandRepository + Send + Sync,
+    ShR: ShellRepository + Send + Sync,
+    TR: TransferRepository + Send + Sync,
+{
+    if let Err(body) = validate_disconnect_many_args(&args) {
+        return Ok(body);
+    }
+    let mut entries: Vec<render::connection::DisconnectManyEntry> =
+        Vec::with_capacity(args.session_ids.len());
+    for sid in args.session_ids {
+        entries.push(disconnect_many_entry(disconnect, sid).await);
+    }
+    let body = render::connection::disconnect_many_render(&entries);
+    let structured = render::connection::disconnect_many_structured(&entries);
+    Ok(ok_text_and_structured(body, structured))
+}
+
+// ---------------------------------------------------------------------------
 // Server identity + LLM bootstrap
 // ---------------------------------------------------------------------------
 
@@ -1721,9 +2461,10 @@ fn build_implementation() -> Implementation {
 }
 
 /// Shared [`ServerCapabilities`] fingerprint advertised on the
-/// `initialize` handshake — tools + resources + subscribe channels.
-/// Both feature flavours of the server return the exact same capability
-/// set; only the tool catalogue and instructions differ.
+/// `initialize` handshake — tools + resources + subscribe channels +
+/// the v4.7-step3 prompts catalogue. Both feature flavours of the
+/// server return the exact same capability set; only the tool
+/// catalogue and instructions differ.
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities::builder()
         .enable_tools()
@@ -1731,6 +2472,7 @@ fn server_capabilities() -> ServerCapabilities {
         .enable_resources()
         .enable_resources_subscribe()
         .enable_resources_list_changed()
+        .enable_prompts()
         .build()
 }
 
@@ -1868,6 +2610,23 @@ where
         )
         .await
     }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(prompts::list_prompts()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let args = request.arguments.unwrap_or_default();
+        prompts::get_prompt(&request.name, &args)
+    }
 }
 
 #[cfg(not(feature = "port_forward"))]
@@ -1954,6 +2713,23 @@ where
             &self.peer_table,
         )
         .await
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(prompts::list_prompts()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let args = request.arguments.unwrap_or_default();
+        prompts::get_prompt(&request.name, &args)
     }
 }
 

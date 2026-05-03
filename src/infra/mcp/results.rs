@@ -196,3 +196,135 @@ pub struct SshGetTransferProgressResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<Vec<String>>,
 }
+
+/// `ssh_run` payload — surfaces the resolved session id, the captured
+/// exit code, and the truncated stdout/stderr blocks.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the four bool fields each describe a distinct observable: disconnected = lifecycle, stdout_truncated/stderr_truncated = output integrity, timed_out = wait budget; collapsing them hurts the wire schema"
+)]
+pub struct SshRunResult {
+    /// Discriminator: always `"ssh_run"`.
+    pub tool: String,
+    /// One of `"completed"`, `"timeout"`, `"failed"`, `"cancelled"`.
+    pub status: String,
+    /// Resolved session id (newly minted or reused).
+    pub session_id: String,
+    /// Newly minted command id.
+    pub command_id: String,
+    /// `true` when the session was disconnected after the command
+    /// finished (default), `false` when the caller opted to keep the
+    /// session alive for follow-up calls.
+    pub disconnected: bool,
+    /// Captured exit code; `None` for terminal states other than
+    /// `"completed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Stdout snapshot.
+    pub stdout: String,
+    /// Stderr snapshot.
+    pub stderr: String,
+    /// `true` when the snapshot dropped trailing stdout bytes.
+    pub stdout_truncated: bool,
+    /// `true` when the snapshot dropped trailing stderr bytes.
+    pub stderr_truncated: bool,
+    /// `true` when the wait budget fired before completion.
+    pub timed_out: bool,
+    /// Optional error description set when the command failed before
+    /// producing an exit status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One per-command entry surfaced by [`SshExecuteBatchResult`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "stdout_truncated/stderr_truncated/timed_out describe distinct observables on a single per-command snapshot; collapsing them hurts the wire schema"
+)]
+pub struct SshExecuteBatchEntry {
+    /// 0-based index into the input commands array.
+    pub index: usize,
+    /// Verbatim command line.
+    pub command: String,
+    /// One of `"completed"`, `"timeout"`, `"failed"`, `"cancelled"`,
+    /// `"skipped"`.
+    pub status: String,
+    /// Newly minted command id (absent on `"skipped"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Captured exit code (absent for non-`"completed"` entries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Stdout snapshot.
+    pub stdout: String,
+    /// Stderr snapshot.
+    pub stderr: String,
+    /// `true` when the stdout snapshot dropped trailing bytes.
+    pub stdout_truncated: bool,
+    /// `true` when the stderr snapshot dropped trailing bytes.
+    pub stderr_truncated: bool,
+    /// `true` when the per-command wait budget fired before
+    /// completion.
+    pub timed_out: bool,
+    /// Optional error description when the command failed before
+    /// producing an exit status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `ssh_execute_batch` payload — sequential execution of multiple
+/// commands against a single session.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshExecuteBatchResult {
+    /// Discriminator: always `"ssh_execute_batch"`.
+    pub tool: String,
+    /// `"ok"` when every command ran (regardless of exit code) or
+    /// `"halted"` when stop-on-failure short-circuited the loop.
+    pub status: String,
+    /// Owning session.
+    pub session_id: String,
+    /// Per-command outcome list, ordered by `index`.
+    pub results: Vec<SshExecuteBatchEntry>,
+    /// Total number of input commands.
+    pub total: usize,
+    /// Number of commands actually executed (may be less than
+    /// `total` when `status = "halted"`).
+    pub executed: usize,
+}
+
+/// One per-id entry surfaced by [`SshDisconnectManyResult`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshDisconnectManyEntry {
+    /// Echoed session id.
+    pub session_id: String,
+    /// `"ok"` on a successful disconnect, `"error"` otherwise.
+    pub status: String,
+    /// v4.5 wire error code when `status = "error"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Human-readable reason when `status = "error"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `ssh_disconnect_many` payload — best-effort bulk disconnect.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshDisconnectManyResult {
+    /// Discriminator: always `"ssh_disconnect_many"`.
+    pub tool: String,
+    /// Always `"ok"` — per-id failures surface inside `results`.
+    pub status: String,
+    /// Per-id outcome list.
+    pub results: Vec<SshDisconnectManyEntry>,
+    /// Number of successfully disconnected sessions.
+    pub disconnected: usize,
+    /// Number of sessions that returned an error.
+    pub failed: usize,
+}

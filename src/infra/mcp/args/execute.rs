@@ -84,6 +84,36 @@ const fn default_max_items() -> Option<usize> {
     Some(500)
 }
 
+// ssh_run / ssh_execute_batch defaults --------------------------------
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_run_timeout_secs() -> Option<u64> {
+    Some(30)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_run_max_output_bytes() -> Option<usize> {
+    Some(16384)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_disconnect_after_run() -> Option<bool> {
+    Some(true)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_stop_on_failure() -> Option<bool> {
+    Some(true)
+}
+
 /// Arguments for the `ssh_execute` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshExecuteArgs {
@@ -158,6 +188,84 @@ pub struct SshCancelCommandArgs {
     /// `SSH_MCP_OUTPUT_MAX_BYTES_CAP`.
     #[schemars(default = "default_max_output_bytes")]
     pub max_output_bytes: Option<usize>,
+}
+
+/// Arguments for the `ssh_run` MCP tool.
+///
+/// One-shot orchestration of `ssh_connect` + `ssh_execute` +
+/// (optional) `ssh_disconnect`. Avoids the three-round-trip
+/// `connect -> execute -> wait` choreography for short atomic
+/// commands like `uptime`, `hostname`, etc.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshRunArgs {
+    /// SSH server address in the form `host:port` (e.g.
+    /// `192.168.1.1:22`, `example.com:2222`). Port defaults to 22.
+    pub address: String,
+
+    /// SSH login username.
+    pub username: String,
+
+    /// Command to run on the remote host.
+    pub command: String,
+
+    /// Password for password-based authentication. Optional.
+    pub password: Option<String>,
+
+    /// Path to a private key file. Optional. Auth chain: key ->
+    /// password -> agent (`SSH_AUTH_SOCK`).
+    pub key_path: Option<String>,
+
+    /// Optional `AGENT_ID` for grouping the underlying session.
+    pub agent_id: Option<String>,
+
+    /// Allocate a pseudo-terminal for the command. Default: false.
+    #[schemars(default = "default_pty")]
+    pub pty: Option<bool>,
+
+    /// Maximum seconds to wait for the command to complete. Default:
+    /// 30. Capped at 300 by the inbound adapter.
+    #[schemars(default = "default_run_timeout_secs")]
+    pub timeout_secs: Option<u64>,
+
+    /// Maximum bytes shown in stdout/stderr. Default: 16384. Cap:
+    /// 1048576.
+    #[schemars(default = "default_run_max_output_bytes")]
+    pub max_output_bytes: Option<usize>,
+
+    /// Disconnect the session after the command finishes. Default:
+    /// true (one-shot mode). Set false to keep the session open and
+    /// reuse it for subsequent `ssh_execute` calls.
+    #[schemars(default = "default_disconnect_after_run")]
+    pub disconnect_after: Option<bool>,
+}
+
+/// Arguments for the `ssh_execute_batch` MCP tool — sequential
+/// execution of multiple commands on the same session, with optional
+/// stop-on-failure semantics.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshExecuteBatchArgs {
+    /// `SESSION_ID` returned from `ssh_connect`.
+    pub session_id: String,
+
+    /// Commands to execute, in order. 1..=16 entries.
+    pub commands: Vec<String>,
+
+    /// Halt the loop on the first non-zero exit code. Default: true.
+    #[schemars(default = "default_stop_on_failure")]
+    pub stop_on_failure: Option<bool>,
+
+    /// Per-command wait timeout in seconds. Default: 30. Cap: 300.
+    #[schemars(default = "default_run_timeout_secs")]
+    pub timeout_secs_per_command: Option<u64>,
+
+    /// Per-command max bytes shown in stdout/stderr. Default: 16384.
+    /// Cap: 1048576.
+    #[schemars(default = "default_run_max_output_bytes")]
+    pub max_output_bytes_per_command: Option<usize>,
+
+    /// Allocate a PTY for each command. Default: false.
+    #[schemars(default = "default_pty")]
+    pub pty: Option<bool>,
 }
 
 #[cfg(test)]
@@ -253,5 +361,83 @@ mod tests {
             property_default(&schema_json, "max_output_bytes"),
             Some(&Value::from(16384_usize))
         );
+    }
+
+    // ---------- v4.7-step3 ssh_run / ssh_execute_batch arg tests ------
+
+    #[test]
+    fn ssh_run_schema_emits_documented_defaults() {
+        use super::SshRunArgs;
+        let schema = schema_for!(SshRunArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "timeout_secs"),
+            Some(&Value::from(30_u64))
+        );
+        assert_eq!(
+            property_default(&schema_json, "max_output_bytes"),
+            Some(&Value::from(16384_usize))
+        );
+        assert_eq!(
+            property_default(&schema_json, "disconnect_after"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            property_default(&schema_json, "pty"),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn ssh_execute_batch_schema_emits_documented_defaults() {
+        use super::SshExecuteBatchArgs;
+        let schema = schema_for!(SshExecuteBatchArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "stop_on_failure"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            property_default(&schema_json, "timeout_secs_per_command"),
+            Some(&Value::from(30_u64))
+        );
+        assert_eq!(
+            property_default(&schema_json, "max_output_bytes_per_command"),
+            Some(&Value::from(16384_usize))
+        );
+    }
+
+    #[test]
+    fn ssh_run_args_round_trip() {
+        use super::SshRunArgs;
+        let raw = serde_json::json!({
+            "address": "h.example.com:22",
+            "username": "alice",
+            "command": "uptime",
+            "pty": true,
+            "timeout_secs": 5,
+            "disconnect_after": false,
+        });
+        let parsed: SshRunArgs = serde_json::from_value(raw).expect("parse");
+        assert_eq!(parsed.address, "h.example.com:22");
+        assert_eq!(parsed.username, "alice");
+        assert_eq!(parsed.command, "uptime");
+        assert_eq!(parsed.pty, Some(true));
+        assert_eq!(parsed.timeout_secs, Some(5));
+        assert_eq!(parsed.disconnect_after, Some(false));
+    }
+
+    #[test]
+    fn ssh_execute_batch_args_round_trip() {
+        use super::SshExecuteBatchArgs;
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "commands": ["uptime", "hostname"],
+            "stop_on_failure": false,
+        });
+        let parsed: SshExecuteBatchArgs = serde_json::from_value(raw).expect("parse");
+        assert_eq!(parsed.session_id, "sess-1");
+        assert_eq!(parsed.commands.len(), 2);
+        assert_eq!(parsed.stop_on_failure, Some(false));
     }
 }
