@@ -1,6 +1,6 @@
-# SSH MCP Configuration Guide (v4.0.0)
+# SSH MCP Configuration Guide (v4.1.0)
 
-Reference for every tunable exposed by the v4.0.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Reference for every tunable exposed by the v4.1.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
 
 [[_TOC_]]
 
@@ -51,7 +51,7 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 
 | Variable | Type | Default | Range | Description |
 |----------|------|---------|-------|-------------|
-| `SSH_COMMAND_CLEANUP_TTL` | `u64` (s) | `60` | `>= 0` | TTL before unread completed-command output is GC'd from `COMMAND_STORAGE`. Reading consumes the entry after a 1 s post-read grace window. |
+| `SSH_COMMAND_CLEANUP_TTL` | `u64` (s) | `60` | `>= 0` | TTL before unread completed-command output is GC'd from the command repository. Reading consumes the entry after a 1 s post-read grace window. |
 | `SSH_COMMAND_MAX_BUFFER_SIZE` | bytes (`b/k/m/g/t`) | `10m` | `>= 1` | Per-command stdout/stderr cap. Oldest bytes are head-drained when exceeded. |
 | `SSH_MCP_OUTPUT_DEFAULT_BYTES` | `usize` | `16384` | `>= 1` | Default `max_output_bytes` applied to output-returning tools. |
 | `SSH_MCP_OUTPUT_MAX_BYTES_CAP` | `usize` | `1048576` | `>= 1` | Hard cap on `max_output_bytes` regardless of caller request. |
@@ -69,7 +69,7 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 
 | Variable | Type | Default | Range | Description |
 |----------|------|---------|-------|-------------|
-| `SSH_TRANSFER_CLEANUP_TTL` | `u64` (s) | `300` | `>= 0` | TTL before terminated (completed/failed/cancelled) transfers are removed from `TRANSFER_STORAGE`. Gives clients a window to poll the final state. |
+| `SSH_TRANSFER_CLEANUP_TTL` | `u64` (s) | `300` | `>= 0` | TTL before terminated (completed/failed/cancelled) transfers are removed from the transfer repository. Gives clients a window to poll the final state. |
 
 ## Subscribe layer
 

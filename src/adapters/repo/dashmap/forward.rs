@@ -36,7 +36,7 @@
 //! ## Feature gate
 //!
 //! Compiled only when the `port_forward` Cargo feature is enabled,
-//! mirroring the v3 module gate at `mcp::forward`.
+//! mirroring the legacy module gate.
 
 #![cfg(feature = "port_forward")]
 

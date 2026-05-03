@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (v4.0.0).
+Accepted (v4.0.0). Deferred decouple closed in v4.1.0 (see [Consequences](#consequences)).
 
 ## Context
 
@@ -51,34 +51,37 @@ The drawback (compile time + binary size) is bounded because the composition roo
 - `trait-variant` generates two parallel trait surfaces — `LocalSshClientPort` (pure AFIT, used by tests with no `Send` bound) and `SshClientPort` (`Send`-bounded, used by use cases). Use cases stay generic over the `Send`-bounded variant; tests pick the local variant when convenient.
 - No allocation per call (`async-trait` boxes every future).
 
-### `async-trait` removal deferred to H17.6
+### `async-trait` removal (delivered in v4.1 H17.6 P2)
 
-The legacy `src/mcp/auth/*` chain stayed on `#[async_trait]` because the H8 refit landed under `src/adapters/auth/` while the v3 module remains runtime-active for the H17.6 cleanup window. The `async-trait` direct dependency disappears together with the foundational `mcp::*` modules in v4.1.
+The v4.0.0 release deferred `async-trait` removal to H17.6: the legacy `src/mcp/auth/*` chain stayed on `#[async_trait]` because the H8 refit landed under `src/adapters/auth/` while the v3 module remained runtime-active. **v4.1 H17.6 P2** (commit `00009e3`) closed this: the strategy chain was rewritten to native AFIT inside `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain.rs}` with an enum dispatcher replacing dyn dispatch, and the `async-trait` direct dependency was removed from `Cargo.toml`. Any `async-trait` copies that remain in the dependency tree are transitive (e.g. via rmcp).
 
-### Foundational `src/mcp/` deep decouple deferred to H17.6
+### Foundational `src/mcp/` deep decouple (delivered in v4.1 H17.6 P1+P3+P4)
 
 The H17.5a hard-delete (commit `95ddc5b`) removed ~14k LOC of orphaned v3 modules: `src/mcp/{tools,storage,server,message,resources,schema,keys,forward}` (with `keys.rs` re-homed under `src/domain/keys.rs`).
 
-The remaining `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` modules stay runtime-active in v4.0.0. The russh / SFTP / output / config adapters delegate into them rather than holding the lock-free state carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`) directly. Absorbing those modules into the hexagonal layout (move state carriers under `adapters/<domain>/state/`, replace the global `SUBSCRIPTION_REGISTRY` with the `MemoryRegistry` adapter exclusively, delete the `mcp::*` namespace) is tracked under H17.6 for the v4.1 release.
-
-The deferral was deliberate: H0 → H17 already constituted ~40 commits of refit; H17.6 would have added 10–15 more, blocking H18 verification (1021 lib tests pass) and the H19 documentation update. Shipping v4.0.0 with the foundational modules in place keeps the release cycle bounded while preserving every v3 lock-free invariant.
+The remaining `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` modules were deferred to H17.6 in v4.0.0 to keep the release cycle bounded. **v4.1 H17.6 P1** (commit `bf646f9`) and **P3+P4** (commit `72f1ccd`) finished the job: every former `mcp::*` module was relocated under the owning adapter (`adapters/{ssh,sftp,config}/internal/`) or, for the global subscription registry, into a transitional `adapters/subscription/legacy.rs`, and the `src/mcp/` directory was deleted. The `crate::mcp::*` namespace no longer exists; only `domain/`, `ports/`, `application/`, `adapters/`, `infra/`, `composition/` survive at the crate root.
 
 ## Consequences
 
+### v4.1 closure (H17.6 P1+P2+P3+P4)
+
+v4.1 H17.6 closed the deferred decouple — `async-trait` was dropped, `src/mcp/` was deleted, and every adapter is self-contained. The foundational `crate::mcp::*` namespace no longer exists; former modules now live under `crate::adapters::{ssh,sftp,config}::internal::*` and `crate::adapters::subscription::legacy` (transitional). Etapa trail: P1 `bf646f9` (relocate v3 internals to adapter-internal modules), P2 `00009e3` (decouple AuthChain via internal AuthStrategyPort + drop async-trait dep), P3+P4 `72f1ccd` (final src/mcp/ delete; relocate config / error / subscription).
+
+The remaining "two registries during the transition window" trade-off below is now scoped to a single legacy adapter (`adapters::subscription::legacy::SUBSCRIPTION_REGISTRY`) that the SSH/SFTP runtime adapters still poke; migrating those adapters to the `MemoryRegistry<N>` port handle is the only surviving v4.x backlog item.
+
 ### Positives
 
-- **Test isolation.** 1021 lib tests + 2 integration tests, the bulk of which run against in-memory fakes (`adapters::ssh::fake`, `adapters::sftp::fake`, `adapters::clock::fake`, `adapters::id_generator::deterministic`, `adapters::config::memory`). No live SSH, no real SFTP, deterministic IDs.
+- **Test isolation.** 1014 lib tests + 2 integration tests, the bulk of which run against in-memory fakes (`adapters::ssh::fake`, `adapters::sftp::fake`, `adapters::clock::fake`, `adapters::id_generator::deterministic`, `adapters::config::memory`). No live SSH, no real SFTP, deterministic IDs.
 - **Composition isolation.** The two binaries (`ssh-mcp`, `ssh-mcp-stdio`) are thin shells over `composition::prod::run_{http,stdio}`; the wiring lives in one place and is identical between transports.
 - **Layer boundary enforcement.** Every layer's allowed / forbidden imports are documented per module and policed by the strict lint baseline. The `domain` layer has zero runtime-crate imports.
 - **Static dispatch on the hot path.** `cargo expand` confirms zero virtual-call boundaries between use cases and adapters.
-- **Foundational cleanup runway.** H17.5a deleted ~14k LOC of orphaned v3 modules in a single commit. The remaining `mcp::*` modules have a clean H17.6 plan that does not block v4.0.0.
+- **Foundational cleanup completed.** H17.5a deleted ~14k LOC of orphaned v3 modules in a single commit; v4.1 H17.6 finished the job by removing the surviving ~6 500 LOC `src/mcp/` foundational tree, leaving only `domain/`, `ports/`, `application/`, `adapters/`, `infra/`, `composition/` at the crate root.
 
 ### Negatives
 
 - **Boilerplate.** Adding a tool now spans ~9 files (domain entity, port surface, adapter implementation, use case, args struct, render module, tool_router entry, composition `UseCases<…>` extension, composition `prod.rs` wiring). v3 fit the same change into 1–2 files.
 - **Compile time.** Generic monomorphisation across a large `UseCases<S, F, SR, CR, ShR, TR, [FR,] N, AS, OS, SubR, C, Cfg, Idg>` container increases `cargo build --release` from ~45s to ~70s on a warm cache.
-- **Two registries during the transition window.** v4 use cases consume `MemoryRegistry`; the foundational producers still poke the v3 `SUBSCRIPTION_REGISTRY` global. Both stay in sync because the rmcp notifier adapter wraps the `Peer<RoleServer>` from the same `PeerTable`. H17.6 collapses this.
-- **Mixed async-trait and trait-variant.** The legacy `mcp::auth` chain is the only surviving `#[async_trait]` site. Its replacement `src/adapters/auth/chain.rs` already uses AFIT; the direct dep deletion is gated on H17.6.
+- **One transitional global registry.** v4 use cases consume `MemoryRegistry`; the SSH/SFTP runtime adapters still poke the legacy `SUBSCRIPTION_REGISTRY` (now relocated to `adapters::subscription::legacy`). Both stay in sync because the rmcp notifier adapter wraps the `Peer<RoleServer>` from the same `PeerTable`. The legacy adapter goes away once the SSH/SFTP runtime adapters move to the port handle.
 
 ### Lock-free baseline preserved
 
@@ -117,7 +120,7 @@ Rejected. Two reasons: (a) virtual-call overhead on the PTY / command / transfer
 
 ### A4. Run H17.6 inside v4.0.0
 
-Rejected. H17.6 (foundational decoupling — absorb the surviving `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` modules) was estimated at 10–15 commits with significant test surface impact. Folding it into v4.0.0 would have pushed the release window by 2–4 weeks and risked regressing the 1021 lib tests during the move. Shipping v4.0.0 with the foundational modules runtime-active and tracking H17.6 for v4.1 keeps the release cycle bounded; the public API stays identical regardless.
+Rejected at the time. H17.6 (foundational decoupling — absorb the surviving `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` modules) was estimated at 10–15 commits with significant test surface impact. Folding it into v4.0.0 would have pushed the release window by 2–4 weeks and risked regressing the 1021 lib tests during the move. Shipping v4.0.0 with the foundational modules runtime-active kept the release cycle bounded. **H17.6 then shipped in v4.1.0** as four targeted commits (P1 `bf646f9`, P2 `00009e3`, P3+P4 `72f1ccd`) without any change to the public MCP API.
 
 ## References
 
@@ -158,6 +161,12 @@ Rejected. H17.6 (foundational decoupling — absorb the surviving `src/mcp/{asyn
 - **H17** — `c535992` `feat(v4): H17 infra MCP args + render migration + SFTP handle sharing`
 - **H17.5a** — `95ddc5b` `chore(v4): H17.5a minimal hard-delete (orphaned v3 modules) + move keys.rs to domain` — ~14k LOC cleanup
 - **H18** — `ddfbfeb` `test(v4): H18 verify v4 coverage + add smoke integration + fix axum 0.8 root-mount panic`
+
+### v4.1 deep decouple chain (H17.6)
+
+- **H17.6 P1** — `bf646f9` `refactor(v4.1): H17.6 P1 relocate mcp internals to adapters/{ssh,sftp}/internal`
+- **H17.6 P2** — `00009e3` `refactor(v4.1): H17.6 P2 decouple AuthChain via AuthStrategyPort + drop async-trait dep`
+- **H17.6 P3+P4** — `72f1ccd` `chore(v4.1): H17.6 P3+P4 final src/mcp delete (relocate config/error/subscription)`
 
 ### External
 

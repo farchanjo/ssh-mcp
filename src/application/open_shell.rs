@@ -57,7 +57,7 @@ use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
 
 /// Default `TERM` value used when the caller omits `term`. Matches the
-/// v3 [`crate::mcp::tools::shell::ssh_shell_open_impl`] default so
+/// legacy v3 `ssh_shell_open_impl` default so
 /// existing clients see the same negotiated terminal type.
 const DEFAULT_TERM: &str = "xterm";
 /// Default PTY width in columns when the caller omits `cols`.

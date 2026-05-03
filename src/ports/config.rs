@@ -1,6 +1,6 @@
 //! Configuration accessor port.
 //!
-//! Mirrors the resolver functions in [`crate::mcp::config`] so use cases can
+//! Mirrors the resolver functions in [`crate::adapters::config::internal`] so use cases can
 //! query tunables without touching environment variables directly. The port
 //! is sync and dyn-safe; the production adapter (etapa H6) wraps the v3
 //! resolvers, while tests inject a simple struct literal.

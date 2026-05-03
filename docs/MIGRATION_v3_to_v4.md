@@ -1,8 +1,10 @@
-# Migrating Contributors from v3.0 to v4.0 (Internal Architecture)
+# Migrating Contributors from v3.0 to v4.x (Internal Architecture)
 
-This document is for **codebase contributors** moving from v3.0.x to the v4.0.0 hexagonal layout. The **public MCP API is stable** — every external client / host / LLM continues to work without any change. v4 is an internal restructuring, not a wire-format break.
+This document is for **codebase contributors** moving from v3.0.x to the v4.x hexagonal layout (current: v4.1.0). The **public MCP API is stable** across the v4 line — every external client / host / LLM continues to work without any change. v4 is an internal restructuring, not a wire-format break.
 
 If you only consume the MCP server (HTTP or stdio), stop here — see [API.md](./API.md) for the unchanged tool catalogue.
+
+> **v4.1 update.** The H17.6 deep decouple shipped: the foundational `src/mcp/` tree is gone, the `async-trait` direct dependency is dropped, and every former `crate::mcp::*` reference now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` (or `adapters::subscription::legacy` for the transitional global registry). See the [v4.1 deep decouple addendum](#v41-deep-decouple-addendum) at the bottom of this document.
 
 Cross references:
 
@@ -27,7 +29,7 @@ Cross references:
 | Stdio transport behaviour | identical |
 | Strict Clippy lint baseline (forbid / deny + lock-free invariants) | identical (every v3 lint kept) |
 | Cargo features (`port_forward` default-on) | identical |
-| Test count and test contracts | grew from 820 → 1021 lib tests; every v3 test still passes |
+| Test count and test contracts | grew from 820 → 1014 lib tests (1021 in v4.0.0; small dip in v4.1 reflects removal of `mcp::*` internal-state regression tests now redundant against the relocated adapter-internal modules); every v3 public-surface test still passes |
 
 In short: a v3 host pointed at a v4 server sees no observable difference. Even error markdown bodies and the 8-hex nonce randomisation are byte-identical.
 
@@ -43,7 +45,6 @@ src/
   adapters/       # concrete implementations of every port
   infra/          # inbound MCP transport (#[tool_router], ServerHandler, render, args, helpers)
   composition/    # root wiring (concrete adapter pinning + binary entry points)
-  mcp/            # foundational v3 leftovers, runtime-active until H17.6
   bin/            # ssh-mcp-stdio thin shell
   main.rs         # ssh-mcp HTTP thin shell
   lib.rs
@@ -80,17 +81,17 @@ src/
 
 | v3 path | v4 path |
 |---------|---------|
-| `src/mcp/auth/{traits,password,key,agent,chain}.rs` (uses `#[async_trait]`) | port: `src/ports/auth_strategy.rs` (`AuthStrategyPort` via `trait-variant` AFIT) ; adapters: `src/adapters/auth/{password,key,agent,chain}.rs` |
+| `src/mcp/auth/{traits,password,key,agent,chain}.rs` (uses `#[async_trait]`) | port: `src/ports/auth_strategy.rs` (`AuthStrategyPort` via `trait-variant` AFIT) ; adapters: `src/adapters/auth/{password,key,agent,chain}.rs` ; runtime chain (post v4.1): `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain}.rs` (native AFIT + enum dispatcher; `async-trait` direct dep dropped) |
 
-The v3 module is **runtime-unreachable** in v4 (no use case calls into it) but stays in `Cargo.toml` because the foundational `src/mcp/` block still depends on it transitively. H17.6 will delete it together with the `async-trait` direct dep.
+The v3 module was deleted in v4.1 H17.6 P2 (commit `00009e3`) along with the `async-trait` direct dep. See the [v4.1 deep decouple addendum](#v41-deep-decouple-addendum).
 
 ### Subscription registry
 
 | v3 path | v4 path |
 |---------|---------|
-| `src/mcp/subscription.rs` (`SUBSCRIPTION_REGISTRY` global + per-resource debouncer + peer-GC) | port: `src/ports/subscriber_registry.rs` (`SubscriberRegistryPort` sync slice + `SubscriberRegistryAsync` async slice) ; adapter: `src/adapters/subscription/memory_registry.rs` (`MemoryRegistry<N>` generic over the notifier) |
+| `src/mcp/subscription.rs` (`SUBSCRIPTION_REGISTRY` global + per-resource debouncer + peer-GC) | port: `src/ports/subscriber_registry.rs` (`SubscriberRegistryPort` sync slice + `SubscriberRegistryAsync` async slice) ; hexagonal adapter: `src/adapters/subscription/memory_registry.rs` (`MemoryRegistry<N>` generic over the notifier) ; transitional global (post v4.1): `src/adapters/subscription/legacy.rs` (`SUBSCRIPTION_REGISTRY` + `spawn_peer_gc`) |
 
-The v3 global `SUBSCRIPTION_REGISTRY` and the `spawn_peer_gc` task are still **runtime-active** in v4.0.0 because the foundational producers (`mcp::async_command`, `mcp::shell`, `mcp::sftp`, `mcp::transfer`, `mcp::session`) poke the v3 global directly. v4 use cases consume the new `MemoryRegistry`. The two coexist during the v4.0.0 transition window; H17.6 collapses them.
+In v4.1, the global was relocated from `src/mcp/subscription.rs` to `src/adapters/subscription/legacy.rs` (commit `72f1ccd`). The SSH/SFTP runtime adapters still poke the global; use cases consume `MemoryRegistry<N>` via the port surface. Both stay in sync because the rmcp notifier adapter wraps the `Peer<RoleServer>` from the same `PeerTable`. The legacy adapter goes away once the SSH/SFTP runtime adapters are migrated to the port handle (tracked under v4.x backlog).
 
 ### Notifier
 
@@ -98,25 +99,9 @@ The v3 global `SUBSCRIPTION_REGISTRY` and the `spawn_peer_gc` task are still **r
 |---------|---------|
 | `rmcp::Peer<RoleServer>` plumbed by hand into every tool | port: `src/ports/notifier.rs` (`NotifierPort` async + `PeerHandle` sync) ; adapters: `src/adapters/notifier/{rmcp_adapter,rmcp_peer}.rs` ; `PeerTable` re-exposed under `src/infra/mcp/peer_handle.rs` |
 
-### Foundational `src/mcp/` modules (kept, runtime-active)
+### Foundational `src/mcp/` modules — relocated in v4.1
 
-These v3 modules survived H17.5a because the v4 adapters (`adapters::ssh::russh_adapter`, `adapters::sftp::russh_sftp_adapter`, `adapters::output_stream::russh_output`) still delegate into them. They are slated for absorption in H17.6 (v4.1 cleanup window):
-
-| v3 module | Why it stays |
-|-----------|--------------|
-| `src/mcp/async_command.rs` | `RunningCommand` lock-free state consumed by the russh adapter. |
-| `src/mcp/auth/` | Strategy chain still on `#[async_trait]`. v4 surface is `src/adapters/auth/*`; v3 module is unreachable but pinned by the transitional `async-trait` dep. |
-| `src/mcp/client.rs` | Low-level russh helpers (`connect_to_ssh_with_retry`, `execute_ssh_command`, `open_pty_shell`) reused by the adapter. |
-| `src/mcp/config.rs` | Env-var resolvers; `adapters::config::env::EnvConfig` delegates here. |
-| `src/mcp/error.rs` | Retry-classification helper consumed by `mcp::client`. |
-| `src/mcp/session.rs` | `SshClientHandler` russh callback type. |
-| `src/mcp/sftp.rs` | Streaming SFTP transfer state used by the SFTP adapter. |
-| `src/mcp/shell.rs` | `RunningShell` + `RingBuffer` consumed by the russh adapter. |
-| `src/mcp/subscription.rs` | `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc` task. The `MemoryRegistry` adapter (H9) is the v4 surface; the v3 global is still poked by the foundational producers. |
-| `src/mcp/transfer.rs` | `RunningTransfer` lock-free state. |
-| `src/mcp/types.rs` | Shared payload structs (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, `TransferInfo`). |
-
-H17.5a (commit `95ddc5b`) hard-deleted ~14k LOC of orphaned v3 code: `tools/`, `storage/`, `server.rs`, `message/`, `resources.rs`, `schema.rs`, `keys.rs` (moved to `domain/`), `forward.rs`. The remaining `mcp::*` surface is the runtime-load-bearing minimum.
+The v4.0.0 release deferred the foundational decouple to H17.6. **v4.1.0** shipped that cleanup: every former `src/mcp/<module>.rs` was relocated under the owning adapter (or, for the global subscription registry, into a transitional `adapters/subscription/legacy.rs`), and the `src/mcp/` directory was deleted entirely. See the [v4.1 deep decouple addendum](#v41-deep-decouple-addendum) below for the path mapping. The historical context: H17.5a (commit `95ddc5b`) first hard-deleted ~14k LOC of orphaned v3 code (`tools/`, `storage/`, `server.rs`, `message/`, `resources.rs`, `schema.rs`, `keys.rs` moved to `domain/`, `forward.rs`); v4.1 H17.6 P1+P3+P4 then relocated the remaining ~6 500 LOC `mcp::*` runtime-load-bearing surface.
 
 ## What changed for contributors
 
@@ -153,7 +138,7 @@ type ConcreteSessionRepo = DashMapSessionRepo;
 pub type ProdUseCases = UseCases<ConcreteSsh, ConcreteSftp, /* ... */>;
 ```
 
-Wiring errors surface at the composition root, not at runtime. The exception is the legacy `mcp::auth` module (`#[async_trait]`) which stays for the H17.6 deferral window.
+Wiring errors surface at the composition root, not at runtime. The legacy `mcp::auth` module that pinned `#[async_trait]` was deleted in v4.1 H17.6 P2; the runtime chain now lives at `adapters/ssh/internal/auth/` with native AFIT + enum dispatch.
 
 ### Layer import rules
 
@@ -207,11 +192,11 @@ async fn connect_session_returns_reused_when_session_alive() {
 }
 ```
 
-Composition isolation makes these tests fast (no russh, no real SFTP, deterministic IDs). 1021 of the 1023 tests are unit tests at this layer.
+Composition isolation makes these tests fast (no russh, no real SFTP, deterministic IDs). 1014 of the 1016 tests are unit tests at this layer.
 
 ### Lints (unchanged baseline)
 
-Every v3 lint stays. The lock-free invariants (`await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_in_scrutinee`, `significant_drop_tightening`) now apply to `src/adapters/repo/dashmap/*` and `src/adapters/subscription/memory_registry.rs` instead of `src/mcp/storage/*` and `src/mcp/subscription.rs`. See [LOCKS.md](./LOCKS.md) for the v4 acquisition order and the channel-capacity table.
+Every v3 lint stays. The lock-free invariants (`await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_in_scrutinee`, `significant_drop_tightening`) now apply to `src/adapters/repo/dashmap/*`, `src/adapters/subscription/{memory_registry,legacy}.rs`, and the adapter-internal carriers under `src/adapters/{ssh,sftp}/internal/*`. See [LOCKS.md](./LOCKS.md) for the v4.1 acquisition order and the channel-capacity table.
 
 ## Recommended workflow for an in-flight v3 patch
 
@@ -233,7 +218,7 @@ cargo build --release --bin ssh-mcp                # HTTP only
 cargo build --release --bin ssh-mcp-stdio          # stdio only
 cargo build --release --no-default-features        # without port forwarding
 
-cargo test --lib --quiet                           # 1021 lib tests
+cargo test --lib --quiet                           # 1014 lib tests
 cargo test --tests --quiet                         # integration tests
 cargo test --all-features                          # combined run
 
@@ -243,13 +228,30 @@ cargo clippy --all-features --all-targets --workspace -- -D warnings
 
 `MSRV` is now `1.85` (Rust 2024 edition + AFIT stable). `axum` was upgraded from `0.7` to `0.8`.
 
-## Future cleanup (H17.6 / v4.1)
+## v4.1 deep decouple addendum
 
-The v4.0.0 release deliberately ships with `src/mcp/{async_command,client,config,error,session,sftp,shell,subscription,transfer,types,auth}` runtime-active. Their absorption into the hexagonal layout is tracked under H17.6 / v4.1:
+H17.6 P1+P2+P3+P4 (commits `bf646f9`, `00009e3`, `72f1ccd`) shipped in v4.1.0. The foundational `mcp::*` paths are gone:
 
-- Move `RunningCommand`, `RunningShell`, `RunningTransfer` into `src/adapters/{ssh,sftp}/state/` and inline the lock-free carriers there.
-- Replace `SUBSCRIPTION_REGISTRY` global with the `MemoryRegistry` adapter exclusively (the foundational producers will get an injected handle instead of a static).
-- Delete `src/mcp/auth/` and the `async-trait` direct dep.
-- Delete the entire `mcp::*` namespace; only `domain/`, `ports/`, `application/`, `adapters/`, `infra/`, `composition/` survive.
+| Former v4.0 path | v4.1 path |
+|------------------|-----------|
+| `src/mcp/client.rs`, `mcp::client::*` | `src/adapters/ssh/internal/client.rs`, `adapters::ssh::internal::client::*` |
+| `src/mcp/session.rs`, `mcp::session::*` | `src/adapters/ssh/internal/session.rs`, `adapters::ssh::internal::session::*` |
+| `src/mcp/async_command.rs`, `mcp::async_command::*` | `src/adapters/ssh/internal/async_command.rs`, `adapters::ssh::internal::async_command::*` |
+| `src/mcp/shell.rs`, `mcp::shell::*` | `src/adapters/ssh/internal/shell.rs`, `adapters::ssh::internal::shell::*` |
+| `src/mcp/types.rs` (SSH-side payloads), `mcp::types::*` | `src/adapters/ssh/internal/types.rs`, `adapters::ssh::internal::types::*` |
+| `src/mcp/error.rs`, `mcp::error::*` | `src/adapters/ssh/internal/error.rs`, `adapters::ssh::internal::error::*` |
+| `src/mcp/auth/{traits,password,key,agent,chain}.rs` (`#[async_trait]`) | `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain}.rs` (native AFIT + enum dispatcher; `async-trait` direct dep dropped) |
+| `src/mcp/sftp.rs`, `mcp::sftp::*` | `src/adapters/sftp/internal/sftp.rs`, `adapters::sftp::internal::sftp::*` |
+| `src/mcp/transfer.rs`, `mcp::transfer::*` | `src/adapters/sftp/internal/transfer.rs`, `adapters::sftp::internal::transfer::*` |
+| `src/mcp/types.rs` (SFTP-side payloads) | `src/adapters/sftp/internal/types.rs` |
+| `src/mcp/config.rs`, `mcp::config::*` | `src/adapters/config/internal/mod.rs`, `adapters::config::internal::*` |
+| `src/mcp/subscription.rs`, `mcp::subscription::SUBSCRIPTION_REGISTRY` + `mcp::subscription::spawn_peer_gc` | `src/adapters/subscription/legacy.rs`, `adapters::subscription::legacy::SUBSCRIPTION_REGISTRY` + `adapters::subscription::legacy::spawn_peer_gc` (transitional, alongside `adapters::subscription::memory_registry::MemoryRegistry<N>`) |
 
-See [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) for the deferral rationale and the H0 → H18 commit chain.
+For in-flight v4.0 patches: `git grep crate::mcp::` will surface every callsite that needs a path rewrite. Adapter-internal modules are private to their owning adapter; use cases never reach in.
+
+The remaining v4.x backlog:
+
+- Migrate the SSH/SFTP runtime adapters off `adapters::subscription::legacy::SUBSCRIPTION_REGISTRY` and onto the `MemoryRegistry<N>` port handle, then delete the legacy adapter.
+- Cross-adapter SFTP refinements (shared transfer scheduler, per-session SFTP semaphore tuning).
+
+See [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) for the original deferral rationale and the H0 → H18 commit chain (the H17.6 closure is appended to that ADR's Consequences section).

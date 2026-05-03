@@ -1,22 +1,67 @@
 //! Authentication chain for trying multiple strategies.
+//!
+//! Each variant of [`Strategy`] wraps one concrete russh-handshake
+//! strategy. Since AFIT (async `fn` in trait) is not dyn-safe, we
+//! cannot store `Box<dyn AuthStrategy>` — the chain holds an enum and
+//! dispatches statically through a single `match`. The trade-off is
+//! one `match` per strategy attempt in exchange for dropping the
+//! `async-trait` direct dependency from the crate.
 
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use russh::client;
 use tracing::debug;
 
-use crate::mcp::session::SshClientHandler;
+use crate::adapters::ssh::internal::session::SshClientHandler;
 
 use super::agent::AgentAuth;
 use super::key::KeyAuth;
 use super::password::PasswordAuth;
 use super::traits::AuthStrategy;
 
+/// Statically dispatched russh-handshake strategy variant.
+///
+/// AFIT is not dyn-safe, so heterogeneous strategies cannot be stored
+/// behind `Box<dyn AuthStrategy>`. This enum keeps the chain free of
+/// dynamic dispatch (and therefore free of `async-trait`) while still
+/// supporting every authentication method the v3 chain offered.
+pub(crate) enum Strategy {
+    /// Password handshake.
+    Password(PasswordAuth),
+    /// Private key file handshake.
+    Key(KeyAuth),
+    /// SSH agent handshake.
+    Agent(AgentAuth),
+}
+
+impl Strategy {
+    /// Forward the authentication call to the inner strategy.
+    async fn authenticate(
+        &self,
+        handle: &mut client::Handle<SshClientHandler>,
+        username: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Password(inner) => inner.authenticate(handle, username).await,
+            Self::Key(inner) => inner.authenticate(handle, username).await,
+            Self::Agent(inner) => inner.authenticate(handle, username).await,
+        }
+    }
+
+    /// Forward the strategy name (used for logging).
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Password(_) => "password",
+            Self::Key(_) => "key",
+            Self::Agent(_) => "agent",
+        }
+    }
+}
+
 /// Authentication chain that tries multiple strategies in order.
 ///
-/// Strategies are tried in the order they were added. The first successful
-/// authentication stops the chain and returns success.
+/// Strategies are tried in the order they were added. The first
+/// successful authentication stops the chain and returns success.
 ///
 /// # Example
 ///
@@ -28,14 +73,13 @@ use super::traits::AuthStrategy;
 ///
 /// let result = chain.authenticate(&mut handle, "username").await?;
 /// ```
-pub struct AuthChain {
-    strategies: Vec<Box<dyn AuthStrategy>>,
+pub(crate) struct AuthChain {
+    strategies: Vec<Strategy>,
 }
 
 impl AuthChain {
     /// Create a new empty authentication chain.
-    #[must_use]
-    pub fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             strategies: Vec::new(),
         }
@@ -43,34 +87,34 @@ impl AuthChain {
 
     /// Add password authentication to the chain.
     #[must_use]
-    pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.strategies.push(Box::new(PasswordAuth::new(password)));
+    pub(crate) fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.strategies
+            .push(Strategy::Password(PasswordAuth::new(password)));
         self
     }
 
     /// Add key-based authentication to the chain.
     #[must_use]
-    pub fn with_key(mut self, key_path: impl Into<PathBuf>) -> Self {
-        self.strategies.push(Box::new(KeyAuth::new(key_path)));
+    pub(crate) fn with_key(mut self, key_path: impl Into<PathBuf>) -> Self {
+        self.strategies.push(Strategy::Key(KeyAuth::new(key_path)));
         self
     }
 
     /// Add SSH agent authentication to the chain.
     #[must_use]
-    pub fn with_agent(mut self) -> Self {
-        self.strategies.push(Box::new(AgentAuth::new()));
+    pub(crate) fn with_agent(mut self) -> Self {
+        self.strategies.push(Strategy::Agent(AgentAuth::new()));
         self
     }
 
     /// Check if the chain has any authentication strategies.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.strategies.is_empty()
     }
 
     /// Get the number of strategies in the chain.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.strategies.len()
     }
 }
@@ -81,7 +125,6 @@ impl Default for AuthChain {
     }
 }
 
-#[async_trait]
 impl AuthStrategy for AuthChain {
     async fn authenticate(
         &self,
@@ -130,36 +173,36 @@ impl AuthStrategy for AuthChain {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AuthChain, AuthStrategy, PathBuf};
 
     #[test]
-    fn test_auth_chain_empty() {
+    fn empty_chain_has_zero_strategies() {
         let chain = AuthChain::new();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
     }
 
     #[test]
-    fn test_auth_chain_with_password() {
+    fn with_password_appends_strategy() {
         let chain = AuthChain::new().with_password("secret");
         assert!(!chain.is_empty());
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_with_key() {
+    fn with_key_appends_strategy() {
         let chain = AuthChain::new().with_key("/path/to/key");
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_with_agent() {
+    fn with_agent_appends_strategy() {
         let chain = AuthChain::new().with_agent();
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_multiple() {
+    fn fluent_api_appends_in_order() {
         let chain = AuthChain::new()
             .with_password("secret")
             .with_key("/path/to/key")
@@ -168,19 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_chain_name() {
+    fn name_is_chain() {
         let chain = AuthChain::new();
         assert_eq!(chain.name(), "chain");
     }
 
     #[test]
-    fn test_auth_chain_default() {
+    fn default_constructs_empty_chain() {
         let chain = AuthChain::default();
         assert!(chain.is_empty());
     }
 
     #[test]
-    fn test_auth_chain_fluent_api_preserves_order() {
+    fn fluent_api_preserves_order() {
         let chain = AuthChain::new()
             .with_password("pass1")
             .with_key("/key1")
@@ -188,16 +231,14 @@ mod tests {
             .with_agent()
             .with_key("/key2");
 
-        // Check we have 5 strategies
         assert_eq!(chain.len(), 5);
 
-        // Verify order by checking strategy names
-        let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
+        let names: Vec<_> = chain.strategies.iter().map(super::Strategy::name).collect();
         assert_eq!(names, vec!["password", "key", "password", "agent", "key"]);
     }
 
     #[test]
-    fn test_auth_chain_multiple_same_type() {
+    fn supports_multiple_password_strategies() {
         let chain = AuthChain::new()
             .with_password("secret1")
             .with_password("secret2")
@@ -205,79 +246,69 @@ mod tests {
 
         assert_eq!(chain.len(), 3);
 
-        let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
+        let names: Vec<_> = chain.strategies.iter().map(super::Strategy::name).collect();
         assert_eq!(names, vec!["password", "password", "password"]);
     }
 
     #[test]
-    fn test_auth_chain_single_strategy_not_empty() {
+    fn single_strategy_makes_chain_non_empty() {
         let chain = AuthChain::new().with_agent();
         assert!(!chain.is_empty());
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_with_pathbuf_key() {
+    fn accepts_owned_pathbuf_for_key() {
         let path = PathBuf::from("/custom/path/to/key");
         let chain = AuthChain::new().with_key(path);
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_with_string_password() {
+    fn accepts_owned_string_for_password() {
         let password = String::from("my_password");
         let chain = AuthChain::new().with_password(password);
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_chaining_after_empty() {
+    fn supports_chaining_after_empty_check() {
         let chain = AuthChain::new();
         assert!(chain.is_empty());
 
-        // Can still chain after checking
         let chain = chain.with_password("secret");
         assert!(!chain.is_empty());
     }
 
     #[test]
-    fn test_auth_chain_implements_auth_strategy() {
-        let chain = AuthChain::new().with_password("secret");
-
-        // Verify it can be used as an AuthStrategy (compile-time check)
-        fn requires_auth_strategy(_: &dyn AuthStrategy) {}
-        requires_auth_strategy(&chain);
-    }
-
-    #[test]
-    fn test_auth_chain_is_send_sync() {
+    fn chain_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AuthChain>();
     }
 
     #[test]
-    fn test_auth_chain_empty_password() {
+    fn empty_password_is_allowed() {
         let chain = AuthChain::new().with_password("");
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_empty_key_path() {
+    fn empty_key_path_is_allowed() {
         let chain = AuthChain::new().with_key("");
         assert_eq!(chain.len(), 1);
     }
 
     #[test]
-    fn test_auth_chain_many_strategies() {
+    fn supports_many_strategies() {
         let mut chain = AuthChain::new();
-        for i in 0..100 {
-            chain = chain.with_password(format!("pass{}", i));
+        for i in 0..100_u32 {
+            chain = chain.with_password(format!("pass{i}"));
         }
         assert_eq!(chain.len(), 100);
     }
 
     #[test]
-    fn test_auth_chain_mixed_types_preserves_count() {
+    fn mixed_types_preserve_count() {
         let chain = AuthChain::new()
             .with_password("p1")
             .with_key("/k1")
@@ -290,86 +321,72 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_chain_all_agents() {
+    fn supports_only_agent_strategies() {
         let chain = AuthChain::new().with_agent().with_agent().with_agent();
 
         assert_eq!(chain.len(), 3);
-        let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
+        let names: Vec<_> = chain.strategies.iter().map(super::Strategy::name).collect();
         assert!(names.iter().all(|n| *n == "agent"));
     }
 
     #[test]
-    fn test_auth_chain_all_keys() {
+    fn supports_only_key_strategies() {
         let chain = AuthChain::new()
             .with_key("/path/to/key1")
             .with_key("/path/to/key2")
             .with_key("/path/to/key3");
 
         assert_eq!(chain.len(), 3);
-        let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
+        let names: Vec<_> = chain.strategies.iter().map(super::Strategy::name).collect();
         assert!(names.iter().all(|n| *n == "key"));
     }
 
     #[test]
-    fn test_auth_chain_is_empty_after_clear_by_recreating() {
+    fn rebuilding_chain_resets_state() {
         let chain = AuthChain::new().with_password("secret");
         assert!(!chain.is_empty());
 
-        // "Clear" by creating new chain
         let chain = AuthChain::new();
         assert!(chain.is_empty());
     }
 
     #[test]
-    fn test_auth_chain_default_is_empty() {
+    fn default_is_empty_with_chain_name() {
         let chain = AuthChain::default();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
         assert_eq!(chain.name(), "chain");
     }
 
-    mod e15_extra {
-        use super::*;
+    #[test]
+    fn chain_name_returns_static_str() {
+        let chain = AuthChain::new();
+        let n: &'static str = chain.name();
+        assert_eq!(n, "chain");
+    }
 
-        #[test]
-        fn chain_is_send_sync_for_dyn_box() {
-            fn assert_send_sync<T: Send + Sync>() {}
-            assert_send_sync::<Box<dyn AuthStrategy>>();
-        }
+    #[test]
+    fn explicit_strategies_keep_order() {
+        let chain = AuthChain::new()
+            .with_agent()
+            .with_password("p")
+            .with_key("/k");
+        let names: Vec<_> = chain.strategies.iter().map(super::Strategy::name).collect();
+        assert_eq!(names, vec!["agent", "password", "key"]);
+    }
 
-        #[test]
-        fn chain_name_static_str() {
-            let chain = AuthChain::new();
-            let n: &'static str = chain.name();
-            assert_eq!(n, "chain");
+    #[test]
+    fn len_grows_monotonically() {
+        let mut chain = AuthChain::new();
+        for i in 1..=10_usize {
+            chain = chain.with_password(format!("p{i}"));
+            assert_eq!(chain.len(), i);
         }
+    }
 
-        #[test]
-        fn empty_chain_with_explicit_strategies_keeps_order() {
-            let chain = AuthChain::new()
-                .with_agent()
-                .with_password("p")
-                .with_key("/k");
-            let names: Vec<_> = chain.strategies.iter().map(|s| s.name()).collect();
-            assert_eq!(names, vec!["agent", "password", "key"]);
-        }
-
-        #[test]
-        fn chain_len_grows_monotonically() {
-            let mut chain = AuthChain::new();
-            for i in 1..=10_usize {
-                chain = chain.with_password(format!("p{i}"));
-                assert_eq!(chain.len(), i);
-            }
-        }
-
-        #[test]
-        fn empty_chain_authenticates_with_explicit_error() {
-            // Drive the empty-chain branch via the trait method's logic
-            // without needing a real SSH handle: we observe via len() and
-            // the public is_empty() contract.
-            let chain = AuthChain::new();
-            assert!(chain.is_empty());
-        }
+    #[test]
+    fn empty_chain_reports_is_empty() {
+        let chain = AuthChain::new();
+        assert!(chain.is_empty());
     }
 }

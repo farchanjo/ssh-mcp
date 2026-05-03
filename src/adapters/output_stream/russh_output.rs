@@ -156,12 +156,12 @@ impl OutputStreamPort for RusshOutputAdapter {
 #[cfg(test)]
 mod tests {
     use super::{Bytes, RusshOutputAdapter};
+    use crate::adapters::ssh::internal::async_command::{OutputBuffer, RunningCommand};
+    use crate::adapters::ssh::internal::shell::{RingBuffer, RunningShell, WriteRequest};
+    use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
     use crate::adapters::ssh::russh_adapter::{CommandRecord, ShellRecord};
     use crate::domain::error::DomainError;
     use crate::domain::ids::{CommandId, SessionId, ShellId};
-    use crate::mcp::async_command::{OutputBuffer, RunningCommand};
-    use crate::mcp::shell::{RingBuffer, RunningShell, WriteRequest};
-    use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
     use crate::ports::output_stream::OutputStreamPort;
     use dashmap::DashMap;
     use std::sync::Arc;

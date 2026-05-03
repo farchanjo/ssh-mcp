@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1023%20passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-4.1.0-blue.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
 
@@ -18,20 +18,24 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 **realtime resource subscriptions**, and stream files via SFTP — all over the
 **rmcp 1.6** Streamable HTTP transport (axum-hosted) or stdio.
 
-> **Codebase contributors upgrading from v3.x?** See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md). The public MCP API is unchanged — v4 is an internal restructuring to a full hexagonal architecture, not a wire-format break.
+> **Codebase contributors upgrading from v3.x or v4.0?** See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) (includes the v4.1 deep-decouple addendum). The public MCP API is unchanged — v4.x is an internal restructuring to a full hexagonal architecture, not a wire-format break.
 > For LLM-side token-efficient usage patterns, see [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
 
 [[_TOC_]]
 
-## What's New in v4.0.0
+## What's New in v4.1.0
+
+- **Deep decouple complete** — H17.6 removed the entire `src/mcp/` foundational tree (~6 500 LOC). Every former `crate::mcp::*` reference now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` (or `adapters::subscription::legacy` for the transitional global registry). Each adapter is self-contained.
+- **`async-trait` direct dep dropped** — the surviving v3 strategy chain was rewritten to native AFIT inside `src/adapters/ssh/internal/auth/` with an enum dispatcher replacing dyn. Any `async-trait` copies left in the dependency tree are transitive (rmcp, etc.) and outside our control.
+- **Public MCP API unchanged** — same 18 tools, same 5 resource schemes, same markdown response shape, same env vars. v3 / v4.0 hosts work against v4.1 servers without any change.
+- **1016 tests** (1014 lib + 2 integration) — every public-surface guarantee preserved.
+
+### Carried forward from v4.0.0
 
 - **Hexagonal (Ports and Adapters) architecture** — `src/{domain, ports, application, adapters, infra, composition}/`. Use cases live under `src/application/` (one struct per business operation), take their ports as generic parameters (static dispatch via `trait-variant` AFIT — **no `Box<dyn Trait>` in hot paths**), and are unit-tested against in-memory fakes with **zero rmcp / russh / SFTP machinery in the test path**.
-- **Public MCP API unchanged** — same 18 tools, same 5 resource schemes, same markdown response shape, same env vars. v3 hosts and LLM clients work against v4 servers without any change. v4 is a codebase migration, not a protocol break.
 - **Compile-time wiring root** — `src/composition/{prod, fixtures}.rs` pins concrete adapters at compile time so wiring errors surface at `cargo build` rather than runtime.
 - **PeerHandle abstraction** — use cases interact with rmcp peers through a sync handle (`subscribe`, `unsubscribe`, `notify`) instead of holding `Peer<RoleServer>` inside hot DashMap values.
 - **Shared SSH handle registry** — `SshHandleRegistry` lets the SFTP adapter reuse the russh handle from `RusshClient` instead of opening a second connection per session.
-- **~14k LOC of v3 monolith removed** in H17.5a after every consumer migrated to the new layers (`tools/`, `storage/`, `server.rs`, `message/`, `resources.rs`, `schema.rs`, `keys.rs`, `forward.rs`).
-- **1023 tests** (1021 lib + 2 integration) — up from 832 in v3 — exercising every layer in isolation plus a composition-root smoke test.
 - **HTTP root-mount fix** under `axum` 0.8 — `composition::prod` switches to `Router::fallback_service` when `MCP_HTTP_PATH = "/"`.
 
 ## Features
@@ -74,7 +78,7 @@ LLMs to connect to SSH servers, execute commands, drive interactive shells with
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
 cargo build --release
-cargo test --lib --quiet      # 1021 tests
+cargo test --lib --quiet      # 1014 tests
 cargo test --tests --quiet    # 2 integration tests (incl. v4 composition smoke)
 ```
 
@@ -425,7 +429,7 @@ Priority: **Parameter > Environment Variable > Default**. The full table (25+ va
 
 ## Architecture
 
-v4.0.0 adopts a full Hexagonal (Ports and Adapters) layout:
+v4.1.0 ships the deep-decoupled hexagonal layout (no surviving `src/mcp/` tree):
 
 ```
 src/
@@ -434,31 +438,28 @@ src/
 ├── domain/                — pure entities + value objects + errors + live event variants (no I/O, no async)
 ├── ports/                 — trait skeletons (sync via plain trait, async via trait-variant AFIT)
 ├── application/           — 22 use cases (one struct per business operation; generic over ports)
-├── adapters/              — concrete adapters (russh, russh-sftp, DashMap, in-memory, env-config, …)
-│   ├── ssh/               — RusshClient + SshHandleRegistry (shared with sftp adapter)
-│   ├── sftp/              — RusshSftpClient + InMemorySftp test fixture
+├── adapters/              — concrete adapters; each one self-contained (own internal/ subtree where needed)
+│   ├── ssh/               — RusshClient + SshHandleRegistry; internal/{client,session,async_command,shell,types,error}.rs + internal/auth/ (AFIT chain)
+│   ├── sftp/              — RusshSftpClient + InMemorySftp; internal/{sftp,transfer,types}.rs
 │   ├── repo/dashmap/      — lock-free in-memory repos for every domain entity
-│   ├── auth/              — trait-variant AFIT rewrite of the v3 strategy chain
+│   ├── auth/              — port-side AuthChainAdapter (delegates to ssh/internal/auth)
 │   ├── clock/             — system + fake
-│   ├── config/            — env-var resolver
+│   ├── config/            — EnvConfig + internal/ env-var resolvers
 │   ├── id_generator/      — uuid + deterministic
 │   ├── notifier/          — RmcpAdapter + RmcpPeer (PeerHandle abstraction)
 │   ├── output_stream/     — RusshOutput + InMemory PTY broadcast
-│   └── subscription/      — MemoryRegistry<N> (generic over notifier)
+│   └── subscription/      — MemoryRegistry<N> + legacy.rs (transitional SUBSCRIPTION_REGISTRY + spawn_peer_gc)
 ├── infra/mcp/             — inbound rmcp surface
 │   ├── server.rs          — McpSshServer<UC> (generic over the use-case set)
 │   ├── tool_router.rs     — the 18 #[tool] entry points
 │   ├── resource_handlers.rs — resources/list, read, subscribe, unsubscribe
 │   ├── peer_handle.rs     — PeerTable re-export for binaries
-│   ├── args/              — per-tool Deserialize + JsonSchema structs (replaces v3 schema.rs)
-│   ├── render/            — per-domain markdown builders (replaces v3 message::builder)
-│   └── helpers/           — error / nonce / output rendering primitives (replaces v3 message::helpers)
-├── composition/           — wiring root
-│   ├── prod.rs            — production adapter set (russh + russh-sftp + DashMap + env-config + UUID v4)
-│   └── fixtures.rs        — deterministic test adapter set (gated by `test-fixtures` feature)
-└── mcp/                   — foundational v3 leftovers (runtime-active; absorbed in v4.1 / etapa H17.6)
-    ├── client.rs, session.rs, sftp.rs, shell.rs, async_command.rs, transfer.rs
-    ├── subscription.rs, auth/, config.rs, error.rs, types.rs
+│   ├── args/              — per-tool Deserialize + JsonSchema structs
+│   ├── render/            — per-domain markdown builders
+│   └── helpers/           — error / nonce / output rendering primitives
+└── composition/           — wiring root
+    ├── prod.rs            — production adapter set (russh + russh-sftp + DashMap + env-config + UUID v4)
+    └── fixtures.rs        — deterministic test adapter set (gated by `test-fixtures` feature)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layer-by-layer module map, dependency graph, and sequence diagrams.
@@ -466,7 +467,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layer-by-layer mod
 ## Testing
 
 ```bash
-# Rust unit tests (1021)
+# Rust unit tests (1014)
 cargo test --lib --quiet
 
 # Rust integration tests (2 — incl. v4 composition smoke)
@@ -497,7 +498,7 @@ RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants
 
 | Suite | Count |
 |-------|-------|
-| Lib unit tests | **1021** |
+| Lib unit tests | **1014** |
 | Integration tests | **2** (incl. `tests/v4_smoke.rs`) |
 | Python integration scripts | 5 |
 | Python stress scripts | 4 |

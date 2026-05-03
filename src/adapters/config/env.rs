@@ -1,11 +1,11 @@
 //! Production [`ConfigPort`] adapter — reads from environment variables.
 //!
 //! Every accessor delegates to the matching helper in
-//! [`crate::mcp::config`] so v3 and v4 share a single source of truth for
-//! env-var parsing. Parameter overrides are not exposed through the port
-//! surface: use cases that need to override an effective value pass an
-//! explicit argument to the relevant SSH operation, while the port only
-//! carries the resolved configuration.
+//! [`crate::adapters::config::internal`] so the workspace shares a single
+//! source of truth for env-var parsing. Parameter overrides are not
+//! exposed through the port surface: use cases that need to override an
+//! effective value pass an explicit argument to the relevant SSH
+//! operation, while the port only carries the resolved configuration.
 //!
 //! `EnvConfig` is a zero-sized type that implements [`Copy`], so it can be
 //! shared across threads via `Arc<EnvConfig>` (or simply by value) without
@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 #[cfg(feature = "port_forward")]
-use crate::mcp::config::resolve_forward_broadcast_cap;
-use crate::mcp::config::{
+use crate::adapters::config::internal::resolve_forward_broadcast_cap;
+use crate::adapters::config::internal::{
     resolve_command_broadcast_cap, resolve_command_cleanup_ttl, resolve_command_max_buffer_size,
     resolve_command_timeout, resolve_compression, resolve_connect_timeout,
     resolve_inactivity_timeout, resolve_list_max_items_cap, resolve_list_max_items_default,
@@ -25,8 +25,8 @@ use crate::mcp::config::{
     resolve_shell_broadcast_cap, resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size,
     resolve_transfer_broadcast_cap, resolve_transfer_cleanup_ttl,
 };
-use crate::mcp::shell::MAX_SHELLS_PER_SESSION;
-use crate::mcp::transfer::MAX_TRANSFERS_PER_SESSION;
+use crate::adapters::sftp::internal::transfer::MAX_TRANSFERS_PER_SESSION;
+use crate::adapters::ssh::internal::shell::MAX_SHELLS_PER_SESSION;
 use crate::ports::config::ConfigPort;
 
 /// Production environment-variable backed configuration adapter.
@@ -36,7 +36,8 @@ use crate::ports::config::ConfigPort;
 pub struct EnvConfig;
 
 /// Default broadcast capacity surfaced when the `port_forward` feature is
-/// disabled. Mirrors `crate::mcp::config::DEFAULT_FORWARD_BROADCAST_CAP`,
+/// disabled. Mirrors
+/// `crate::adapters::config::internal::DEFAULT_FORWARD_BROADCAST_CAP`,
 /// which is itself feature-gated and therefore unreachable from this
 /// always-compiled accessor.
 #[cfg(not(feature = "port_forward"))]
@@ -184,7 +185,7 @@ mod tests {
         // When no env vars are set the EnvConfig must surface the same
         // defaults the v3 resolvers expose. We assert a representative
         // subset rather than every accessor; the resolver tests in
-        // `mcp::config` cover the full value surface.
+        // `adapters::config::internal` cover the full value surface.
         let cfg = EnvConfig;
 
         assert_eq!(cfg.connect_timeout(), Duration::from_secs(30));

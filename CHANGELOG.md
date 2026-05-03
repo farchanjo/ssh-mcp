@@ -5,6 +5,42 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] — 2026-05-03
+
+### Highlights
+
+- H17.6 deep decouple closes the v4.0.0 deferral window. Every foundational `crate::mcp::*` reference is gone; `src/mcp/` is deleted (~6 500 LOC removed from the runtime tree). The `async-trait` direct dependency is dropped — every adapter uses native AFIT (statically dispatched through enums where dyn-safety was previously required).
+- Public MCP API stays byte-compatible with v4.0.0 (and v3.0.0). Same 18 tools, same 5 resource schemes, same markdown shape, same env vars, same defaults.
+- Test count grew from **1023 (1021 lib + 2 integration)** in v4.0.0 to **1016 (1014 lib + 2 integration)** in v4.1 — a small reduction reflects the removal of `mcp::*` internal-state regression tests now redundant against the relocated adapter-internal modules; every public-surface test still passes.
+
+### Removed
+
+- `src/mcp/` tree (~6 500 LOC): `client.rs`, `session.rs`, `sftp.rs`, `shell.rs`, `async_command.rs`, `transfer.rs`, `subscription.rs`, `auth/`, `config.rs`, `error.rs`, `types.rs`. The `crate::mcp::*` namespace no longer exists in `src/lib.rs` — only `domain/`, `ports/`, `application/`, `adapters/`, `infra/`, `composition/` remain at the crate root.
+- `async-trait` direct dependency dropped from `Cargo.toml`. The v3 strategy chain that pinned it has been rewritten to native AFIT inside the SSH adapter (`src/adapters/ssh/internal/auth/`); dyn dispatch is replaced by an enum exhaustively dispatching to the three concrete strategies. Any `async-trait` copies that remain in the dependency tree are transitive (e.g. via rmcp) and outside our control.
+
+### Changed
+
+- Foundational types relocated to adapter-internal paths so each adapter is self-contained:
+  - `src/adapters/ssh/internal/{client,session,async_command,shell,types,error}.rs` — russh wiring helpers (`connect_to_ssh_with_retry`, `execute_ssh_command`, `open_pty_shell`, `SshClientHandler`), `RunningCommand`, `RunningShell` + `RingBuffer`, `SessionInfo` / `AsyncCommandInfo` / `ShellInfo` / `TransferInfo`, retry classification.
+  - `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain}.rs` — internal `AuthStrategyPort` + AFIT chain (no async-trait, statically dispatched).
+  - `src/adapters/sftp/internal/{sftp,transfer,types}.rs` — streaming SFTP transfer state, `RunningTransfer`, shared payload structs.
+  - `src/adapters/config/internal/mod.rs` — env-var resolvers feeding `EnvConfig`.
+  - `src/adapters/subscription/legacy.rs` — transitional home for `SubscriptionRegistry` + `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc`. The hexagonal `MemoryRegistry<N>` adapter is the forward-looking replacement consumed by use cases; the legacy adapter coexists until the SSH/SFTP runtime adapters get wired through the port surface end to end.
+
+### Internal
+
+- H17.6 P1 `bf646f9` — relocate v3 internals to adapter-internal modules under `src/adapters/{ssh,sftp,config}/internal/`.
+- H17.6 P2 `00009e3` — decouple `AuthChain` via internal `AuthStrategyPort`; drop `async-trait` direct dep.
+- H17.6 P3+P4 `72f1ccd` — final `src/mcp/` delete; relocate `config`, `error`, and `subscription` (legacy) under their owning adapters.
+
+### Migration
+
+See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) for the v4.1 contributor note (foundational `mcp::*` paths gone — code now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` and `crate::adapters::subscription::legacy`). **No client-side migration is required** — v3 / v4.0 hosts work against v4.1 servers without any change.
+
+### Etapa trail (v4.1 commits)
+
+H17.6 P1 `bf646f9`, P2 `00009e3`, P3+P4 `72f1ccd`.
+
 ## [4.0.0] — 2026-05-03
 
 ### Highlights
@@ -82,10 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deferred to v4.1 (etapa H17.6)
 
-- Relocate the runtime-active foundational `src/mcp/{client, session, sftp, shell, async_command, transfer, subscription, auth, config, error, types}` modules into the corresponding adapter layers and delete the `src/mcp/` directory.
-- Drop the transitional `async-trait` direct dep once the v3 `src/mcp/auth/` chain is gone (every v4 port already uses `trait-variant` AFIT).
-- Decouple `AuthChain` adapter from the v3 strategy module (consume the `AuthStrategyPort` graph end to end).
-- Cross-adapter SFTP refinements (shared transfer scheduler, per-session SFTP semaphore tuning).
+Shipped — see the [4.1.0] entry above for the H17.6 P1+P2+P3+P4 outcome (src/mcp/ deleted, async-trait dropped, AuthChain decoupled). Cross-adapter SFTP refinements (shared transfer scheduler, per-session SFTP semaphore tuning) remain on the v4.2 backlog.
 
 ### Migration
 
@@ -175,6 +208,7 @@ See `docs/MIGRATION_v2_to_v3.md` for client upgrade instructions.
 
 See `git log` for the v2.x changes; this CHANGELOG was introduced in v3.0.0.
 
+[4.1.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.1.0
 [4.0.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.0.0
 [3.0.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v3.0.0
 [2.0.1]: https://github.com/farchanjo/ssh-mcp/releases/tag/v2.0.1

@@ -1,5 +1,5 @@
 //! Production [`SshClientPort`] adapter backed by `russh` and the v3
-//! helpers in [`crate::mcp::client`].
+//! helpers in [`crate::adapters::ssh::internal::client`].
 //!
 //! ## Responsibility
 //!
@@ -62,6 +62,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::adapters::sftp::russh_sftp_adapter::SshHandleRegistry;
+use crate::adapters::ssh::internal::async_command::RunningCommand;
+use crate::adapters::ssh::internal::client::{
+    connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async,
+    execute_ssh_command_async_pty, open_pty_shell,
+};
+use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::adapters::ssh::internal::shell::{
+    ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms,
+};
+use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
@@ -69,14 +79,6 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
-use crate::mcp::async_command::RunningCommand;
-use crate::mcp::client::{
-    connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async,
-    execute_ssh_command_async_pty, open_pty_shell,
-};
-use crate::mcp::session::SshClientHandler;
-use crate::mcp::shell::{ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms};
-use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
 
 /// Type alias for the v3 SSH handle the adapter wraps.
@@ -92,7 +94,7 @@ pub struct RusshAdapterConfig {
     /// is `None`.
     pub default_command_timeout: Duration,
     /// Maximum SSH connect retry attempts (see `MAX_RETRY_DELAY` in
-    /// [`crate::mcp::config`] for the wall-clock cap).
+    /// [`crate::adapters::config::internal`] for the wall-clock cap).
     pub max_retries: u32,
     /// Initial retry delay; doubled with jitter on each attempt.
     pub retry_delay: Duration,
@@ -844,7 +846,7 @@ const DEFAULT_SHELL_BUFFER_SIZE: u64 = 10_u64.saturating_mul(1024).saturating_mu
 const SHELL_INPUT_CHANNEL_CAP: usize = 64;
 
 /// Local staging capacity for the shell reader before the first
-/// flush. Mirrors `mcp::tools::legacy_helpers::shell_reader`.
+/// flush. Mirrors the legacy `legacy_helpers::shell_reader`.
 const SHELL_READER_LOCAL_CAP: usize = 4096;
 
 /// Local-buffer high-water mark that triggers an early flush into
@@ -854,7 +856,7 @@ const SHELL_FLUSH_THRESHOLD: usize = 4096;
 /// Spawn the dedicated writer task that owns the russh write half
 /// exclusively. Drains [`WriteRequest`] frames from `input_rx` until
 /// either a [`WriteRequest::Close`] arrives, the senders are dropped,
-/// or `cancel_token` fires. Mirrors `mcp::tools::legacy_helpers::shell_writer`.
+/// or `cancel_token` fires. Mirrors the legacy `legacy_helpers::shell_writer`.
 fn spawn_shell_writer_task(
     write_half: russh::ChannelWriteHalf<Msg>,
     mut input_rx: mpsc::Receiver<WriteRequest>,
@@ -919,7 +921,7 @@ impl ShellReaderHandles {
 
 /// Spawn the dedicated reader task that drains the russh read half and
 /// publishes incoming PTY bytes into [`RunningShell::history`] via
-/// [`ArcSwap::rcu`]. Mirrors `mcp::tools::legacy_helpers::shell_reader`
+/// [`ArcSwap::rcu`]. Mirrors the legacy `legacy_helpers::shell_reader`
 /// without the registry-side debouncing — the
 /// [`crate::ports::subscription::SubscriberRegistry`] adapter (H9) will
 /// observe the per-shell broadcast channel directly.

@@ -22,7 +22,7 @@
 //!
 //! The actual TCP listener and the russh `tcpip-forward` request are owned
 //! by the SSH client adapter. The v3 implementation called
-//! [`crate::mcp::forward::setup_port_forwarder`] directly from the rmcp
+//! the legacy v3 `setup_port_forwarder` directly from the rmcp
 //! tool; the v4 split keeps the use case ignorant of russh internals — the
 //! adapter's listener spawning happens behind a yet-to-be-wired
 //! `SshClientPort::open_forward` call (H15.x). For the H15 milestone the
@@ -40,7 +40,7 @@
 //! # Feature gate
 //!
 //! Compiled only when the `port_forward` Cargo feature is enabled, mirroring
-//! the v3 module gate at `crate::mcp::forward`.
+//! the legacy v3 forward module gate.
 
 #![cfg(feature = "port_forward")]
 
