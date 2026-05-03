@@ -15,6 +15,7 @@ from helpers.fixtures import (  # noqa: E402,F401
     http_server,
     stdio_client,
     ssh_target,
+    local_sshd,
 )
 
 

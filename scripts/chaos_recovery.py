@@ -336,9 +336,23 @@ def _scenario_subscribe_after_close(target: ChaosSshTarget) -> dict:
 
 def main() -> int:
     target = ChaosSshTarget.from_env()
+    fixture_owner = None
+    if target is None:
+        try:
+            from helpers.local_sshd import LocalSshdFixture  # type: ignore
+            fixture_owner = LocalSshdFixture()
+            fixture_owner.__enter__()
+            target = ChaosSshTarget(
+                address=fixture_owner.address,
+                username=fixture_owner.username,
+                key_path=None,
+                password=fixture_owner.password,
+            )
+        except Exception:
+            target = None
     if target is None:
         write_event(
-            {"scenario": "_all_", "ok": True, "skipped": "SSH_MCP_TEST_TARGET unset"}
+            {"scenario": "_all_", "ok": True, "skipped": "no SSH target available"}
         )
         return write_summary(
             {
@@ -388,6 +402,11 @@ def main() -> int:
         "duration_s": round(time.monotonic() - started, 3),
         "status": "ok" if failed == 0 and panics == 0 else "fail",
     }
+    if fixture_owner is not None:
+        try:
+            fixture_owner.__exit__(None, None, None)
+        except Exception:
+            pass
     return write_summary(summary)
 
 

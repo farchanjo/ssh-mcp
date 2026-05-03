@@ -175,7 +175,7 @@ def _scenario_send_key_invalid_repeat_zero(client: McpClient, stats: dict) -> No
             {"shell_id": str(uuid.uuid4()), "key": "arrow_up", "repeat": 0},
         )
     )
-    _expect_error(stats, "send_key_repeat_zero", parsed, "INVALID_ARGUMENT")
+    _expect_error(stats, "send_key_repeat_zero", parsed, "INVALID_ARGUMENT", "INVALID_REPEAT")
 
 
 def _scenario_send_key_invalid_repeat_high(client: McpClient, stats: dict) -> None:
@@ -187,7 +187,7 @@ def _scenario_send_key_invalid_repeat_high(client: McpClient, stats: dict) -> No
             {"shell_id": str(uuid.uuid4()), "key": "arrow_up", "repeat": 65},
         )
     )
-    _expect_error(stats, "send_key_repeat_too_high", parsed, "INVALID_ARGUMENT")
+    _expect_error(stats, "send_key_repeat_too_high", parsed, "INVALID_ARGUMENT", "INVALID_REPEAT")
 
 
 def _scenario_wait_for_empty_patterns(client: McpClient, stats: dict) -> None:
@@ -513,9 +513,14 @@ def _scenario_upload_local_missing(client: McpClient, stats: dict, target: Chaos
         ok = terminal.get("__status") == "FAILED"
         _assert(stats, "upload_local_missing", ok, got=terminal.get("__status"))
     else:
-        # Direct error path is also acceptable.
-        ok = parsed.get("__status") == "ERROR" and "SFTP_ERROR" in (parsed.get("reason") or "")
-        _assert(stats, "upload_local_missing", ok, got=parsed.get("reason"))
+        # Direct error path is also acceptable. v4.6+ uses more granular
+        # codes: LOCAL_FILE_ERROR (fs::metadata failed) is preferred,
+        # SFTP_ERROR remains as the untagged fallback.
+        reason = parsed.get("reason") or ""
+        ok = parsed.get("__status") == "ERROR" and (
+            "SFTP_ERROR" in reason or "LOCAL_FILE_ERROR" in reason
+        )
+        _assert(stats, "upload_local_missing", ok, got=reason)
     call_tool_text(client, "ssh_disconnect", {"session_id": sid}, timeout=15)
 
 
@@ -556,8 +561,12 @@ def _scenario_upload_directory(client: McpClient, stats: dict, target: ChaosSshT
             ok = terminal.get("__status") == "FAILED"
             _assert(stats, "upload_directory_not_file", ok, got=terminal.get("__status"))
         else:
-            ok = parsed.get("__status") == "ERROR" and "SFTP_ERROR" in (parsed.get("reason") or "")
-            _assert(stats, "upload_directory_not_file", ok, got=parsed.get("reason"))
+            # v4.6+ live: LOCAL_NOT_FILE for the directory case.
+            reason = parsed.get("reason") or ""
+            ok = parsed.get("__status") == "ERROR" and (
+                "SFTP_ERROR" in reason or "LOCAL_NOT_FILE" in reason
+            )
+            _assert(stats, "upload_directory_not_file", ok, got=reason)
     call_tool_text(client, "ssh_disconnect", {"session_id": sid}, timeout=15)
 
 
@@ -598,8 +607,12 @@ def _scenario_download_remote_missing(client: McpClient, stats: dict, target: Ch
             ok = terminal.get("__status") == "FAILED"
             _assert(stats, "download_remote_missing", ok, got=terminal.get("__status"))
         else:
-            ok = parsed.get("__status") == "ERROR" and "SFTP_ERROR" in (parsed.get("reason") or "")
-            _assert(stats, "download_remote_missing", ok, got=parsed.get("reason"))
+            # v4.6+ live: REMOTE_METADATA_ERROR for the missing-remote case.
+            reason = parsed.get("reason") or ""
+            ok = parsed.get("__status") == "ERROR" and (
+                "SFTP_ERROR" in reason or "REMOTE_METADATA_ERROR" in reason
+            )
+            _assert(stats, "download_remote_missing", ok, got=reason)
     call_tool_text(client, "ssh_disconnect", {"session_id": sid}, timeout=15)
 
 
@@ -664,12 +677,32 @@ def main() -> int:
                 )
 
     target = ChaosSshTarget.from_env()
+    fixture_owner = None
     if target is None:
-        for scenario in _SCENARIOS_WITH_SSHD:
-            stats["skipped"] += 1
-            write_event(
-                {"test": scenario.__name__, "ok": True, "skipped": "SSH_MCP_TEST_TARGET unset"}
+        # Auto-fallback: spin up the in-process paramiko sshd so the
+        # SSHD-touching scenarios run end-to-end without requiring
+        # SSH_MCP_TEST_TARGET. The fixture owns its own port and lifetime.
+        try:
+            from helpers.local_sshd import LocalSshdFixture  # type: ignore
+            fixture_owner = LocalSshdFixture()
+            fixture_owner.__enter__()
+            target = ChaosSshTarget(
+                address=fixture_owner.address,
+                username=fixture_owner.username,
+                key_path=None,
+                password=fixture_owner.password,
             )
+        except Exception as exc:
+            for scenario in _SCENARIOS_WITH_SSHD:
+                stats["skipped"] += 1
+                write_event({
+                    "test": scenario.__name__,
+                    "ok": True,
+                    "skipped": f"local fixture failed: {exc}",
+                })
+            target = None
+    if target is None:
+        pass  # fallback failed; scenarios already marked skipped above
     else:
         for scenario in _SCENARIOS_WITH_SSHD:
             with chaos_session() as (client, transport):
@@ -699,6 +732,11 @@ def main() -> int:
         "duration_s": round(time.monotonic() - started, 3),
         "status": "ok" if stats["failed"] == 0 and stats["panics"] == 0 else "fail",
     }
+    if fixture_owner is not None:
+        try:
+            fixture_owner.__exit__(None, None, None)
+        except Exception:
+            pass
     return write_summary(summary)
 
 
