@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use russh::{client, keys};
 use tracing::debug;
 
-use crate::mcp::session::SshClientHandler;
-use crate::mcp::sftp::expand_tilde;
+use crate::adapters::sftp::internal::sftp::expand_tilde;
+use crate::adapters::ssh::internal::session::SshClientHandler;
 
 use super::traits::AuthStrategy;
 

@@ -1,7 +1,9 @@
 //! Interactive shell aggregate value objects.
 //!
-//! Mirrors the v3 [`crate::mcp::types::ShellInfo`] payload and the lifecycle
-//! enum [`crate::mcp::types::ShellStatus`] without any tokio coupling.
+//! Mirrors the v3 `crate::adapters::ssh::internal::types::ShellInfo` payload
+//! and the lifecycle enum
+//! `crate::adapters::ssh::internal::types::ShellStatus` without any tokio
+//! coupling.
 
 use std::fmt;
 use std::time::Duration;

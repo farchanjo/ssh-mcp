@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use russh::client;
 
-use crate::mcp::session::SshClientHandler;
+use crate::adapters::ssh::internal::session::SshClientHandler;
 
 use super::traits::AuthStrategy;
 

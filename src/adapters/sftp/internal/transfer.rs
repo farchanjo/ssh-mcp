@@ -112,7 +112,7 @@ pub struct RunningTransfer {
     /// Live broadcast of progress / terminal events. New subscribers join via
     /// `progress_tx.subscribe()`. Capacity is resolved from
     /// `SSH_TRANSFER_BROADCAST_CAP` via
-    /// `super::config::resolve_transfer_broadcast_cap`.
+    /// `crate::mcp::config::resolve_transfer_broadcast_cap`.
     pub progress_tx: broadcast::Sender<ProgressEvent>,
     /// Wake source for intra-server long-poll progress readers. Notified
     /// after every successful chunk plus on terminal events.
@@ -123,7 +123,7 @@ impl RunningTransfer {
     /// Build a `RunningTransfer` with fresh lock-free primitives.
     ///
     /// The `broadcast_cap` argument is the resolved capacity; callers should
-    /// pass `super::config::resolve_transfer_broadcast_cap()` so the
+    /// pass `crate::mcp::config::resolve_transfer_broadcast_cap()` so the
     /// `SSH_TRANSFER_BROADCAST_CAP` env var is honoured (default 256, floor
     /// 8, hard cap 4096). Status starts as `Running` and `error` starts
     /// empty.

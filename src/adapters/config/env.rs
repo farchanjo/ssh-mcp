@@ -13,6 +13,8 @@
 
 use std::time::Duration;
 
+use crate::adapters::sftp::internal::transfer::MAX_TRANSFERS_PER_SESSION;
+use crate::adapters::ssh::internal::shell::MAX_SHELLS_PER_SESSION;
 #[cfg(feature = "port_forward")]
 use crate::mcp::config::resolve_forward_broadcast_cap;
 use crate::mcp::config::{
@@ -25,8 +27,6 @@ use crate::mcp::config::{
     resolve_shell_broadcast_cap, resolve_shell_inactivity_ttl, resolve_shell_max_buffer_size,
     resolve_transfer_broadcast_cap, resolve_transfer_cleanup_ttl,
 };
-use crate::mcp::shell::MAX_SHELLS_PER_SESSION;
-use crate::mcp::transfer::MAX_TRANSFERS_PER_SESSION;
 use crate::ports::config::ConfigPort;
 
 /// Production environment-variable backed configuration adapter.

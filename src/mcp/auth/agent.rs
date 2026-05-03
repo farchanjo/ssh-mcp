@@ -5,7 +5,7 @@ use russh::{client, keys};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 
-use crate::mcp::session::SshClientHandler;
+use crate::adapters::ssh::internal::session::SshClientHandler;
 
 use super::traits::AuthStrategy;
 
