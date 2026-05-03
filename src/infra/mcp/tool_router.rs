@@ -1096,7 +1096,7 @@ where
         resource_handlers::read_resource_impl(
             &self.use_cases.read_resource,
             request,
-            &context.peer,
+            &context,
             &self.peer_table,
         )
         .await
@@ -1110,7 +1110,7 @@ where
         resource_handlers::subscribe_impl(
             &self.use_cases.subscribe_resource,
             request,
-            context.peer,
+            &context,
             &self.peer_table,
         )
         .await
@@ -1124,7 +1124,7 @@ where
         resource_handlers::unsubscribe_impl(
             &self.use_cases.unsubscribe_resource,
             request,
-            &context.peer,
+            &context,
             &self.peer_table,
         )
         .await
@@ -1188,7 +1188,7 @@ where
         resource_handlers::read_resource_impl(
             &self.use_cases.read_resource,
             request,
-            &context.peer,
+            &context,
             &self.peer_table,
         )
         .await
@@ -1202,7 +1202,7 @@ where
         resource_handlers::subscribe_impl(
             &self.use_cases.subscribe_resource,
             request,
-            context.peer,
+            &context,
             &self.peer_table,
         )
         .await
@@ -1216,7 +1216,7 @@ where
         resource_handlers::unsubscribe_impl(
             &self.use_cases.unsubscribe_resource,
             request,
-            &context.peer,
+            &context,
             &self.peer_table,
         )
         .await
