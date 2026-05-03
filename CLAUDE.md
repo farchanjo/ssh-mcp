@@ -7,7 +7,7 @@ cargo build --release                              # Build all binaries (default
 cargo build --release --bin ssh-mcp                # HTTP server only (axum 0.8 + rmcp 1.6)
 cargo build --release --bin ssh-mcp-stdio          # Stdio transport only (rmcp 1.6 stdio)
 cargo build --release --no-default-features        # Without port forwarding
-cargo test --lib --quiet                           # 1091 lib tests
+cargo test --lib --quiet                           # 1156 lib tests
 cargo test --tests --quiet                         # 2 integration tests (incl. v4 smoke)
 cargo test --all-features                          # Combined run
 cargo test --features test-fixtures                # Use cases with deterministic in-memory adapters
@@ -15,9 +15,9 @@ cargo fmt --all -- --check                         # Check formatting
 cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
 ```
 
-## Architecture (v4.6.0 — Hexagonal / Ports and Adapters, deep-decoupled)
+## Architecture (v4.7.0 — Hexagonal / Ports and Adapters, deep-decoupled)
 
-The public MCP API is structurally unchanged from v3 / v4.0 / v4.1 / v4.5 (same 18 tools, 5 resource schemes, block markdown shape, env vars). v4.6 ships one narrow wire renaming — the agent_id field key changed from `AGENT:` to `AGENT_ID:` for ID-suffix consistency — plus a steering surface for smaller LLMs: `NEXT:` advisory line on every response with a clear successor (pre-filled tool calls), four new subscribe-first `HINT:` sites (shell open / execute / upload / download / forward), JSON Schema `default` keywords on optional args, a one-line `Cost:` hint at the end of every tool description, and a wired `Implementation.icons` URL pointing at `assets/icon.svg`. v4.5 layered the v4.5 LLM UX on top: stable `PeerId` derived from `Mcp-Session-Id` (HTTP) or stdio singleton, live `_meta` envelope on `resources/read`, granular wire error codes (14 dispatched tags — all live as of v4.6), `Implementation` identity with few-shot `instructions`, and `ToolAnnotations` on every tool. v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
+The public MCP API is structurally compatible with v3 / v4.0 / v4.1 / v4.5 / v4.6 — every legacy tool keeps its block-markdown wire shape and env vars. v4.7 adds three new tools (`ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`) so the catalogue grows from 18 to 21 (or 17 to 20 without `port_forward`), introduces a parallel `structured_content` JSON channel on every tool response (Markdown body unchanged), and ships an MCP inter-tool conversation surface: `resources/templates/list` advertisement (4 templates without `port_forward`, 5 with), `notifications/progress` emissions during long async waits, an MCP `prompts/list` + `prompts/get` catalog with 5 canonical workflows, idempotent retries via `_meta.idempotency_key` (15 mutating tools), `NOT_FOUND` closest-match `DETAIL` suggestions for typo'd ids, and an optional `INITIAL_BUFFER` line on `ssh_shell_open` when the PTY emits stdout in the first ~100ms. v4.6 carried over: `NEXT:` advisory line on every response with a clear successor, subscribe-first `HINT:` sites, JSON Schema `default` keywords on optional args, one-line `Cost:` hints on every tool description, the `AGENT:` -> `AGENT_ID:` rename, and a wired `Implementation.icons` URL. v4.5 layered the LLM UX foundation: stable `PeerId` derived from `Mcp-Session-Id` (HTTP) or stdio singleton, live `_meta` envelope on `resources/read`, granular wire error codes (14 dispatched tags — all live), `Implementation` identity with few-shot `instructions`, and `ToolAnnotations` on every tool. v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
 
 ### Binary Targets
 
@@ -34,7 +34,7 @@ Both binaries are thin shells over `composition::prod` — only the transport di
 | **ports** | `src/ports/` | Trait skeletons. Sync via plain trait, async via `trait-variant` AFIT. No `Box<dyn Future>` for v4 ports. |
 | **application** | `src/application/` | 22 use cases (one struct per business operation). Generic over the ports they depend on — static dispatch, no virtual calls in hot paths. Unit-testable against in-memory fakes with zero rmcp / russh / SFTP machinery. |
 | **adapters** | `src/adapters/` | Concrete implementations of every port. Production: russh, russh-sftp, DashMap, env-config, UUID v4. Test: in-memory + `FakeClock` + `DeterministicIdGen` (gated by the `test-fixtures` feature). |
-| **infra** | `src/infra/mcp/` | Inbound rmcp surface: `McpSshServer<UC>`, the 18 `#[tool]` entry points (`tool_router.rs`), `resources/*` handlers, `PeerHandle` plumbing, per-tool args (`Deserialize + JsonSchema`), per-domain markdown render, helpers (error / nonce / output). |
+| **infra** | `src/infra/mcp/` | Inbound rmcp surface: `McpSshServer<UC>`, the 21 `#[tool]` entry points (`tool_router.rs`), `resources/*` + `resources/templates/list` handlers, `prompts/*` catalog (`prompts.rs`), idempotency cache (`idempotency.rs`), closest-match suggestions (`suggestions.rs`), best-effort `notifications/progress` pump (`progress.rs`), typed result schemas (`results.rs`), `PeerHandle` plumbing, per-tool args (`Deserialize + JsonSchema`), per-domain markdown + structured render, helpers (error / nonce / output). |
 | **composition** | `src/composition/` | Wiring root. `prod.rs` pins concrete adapters at compile time so wiring errors surface at `cargo build` rather than runtime. `fixtures.rs` wires deterministic adapters for tests. |
 
 ### Adapters quick map
@@ -62,25 +62,27 @@ Each runtime adapter owns its private internals under `internal/` (or, for the s
 - `src/adapters/config/internal/mod.rs` — env-var resolvers backing `EnvConfig`.
 - `src/adapters/subscription/legacy.rs` — transitional `SubscriptionRegistry` + `SUBSCRIPTION_REGISTRY` global + `spawn_peer_gc`. The hexagonal `MemoryRegistry<N>` adapter at `memory_registry.rs` is the forward-looking replacement consumed by use cases; the legacy adapter coexists until the SSH/SFTP runtime adapters are wired through the port surface end to end.
 
-### Response Format (block-only, byte-compatible with v3)
+### Response Format (block-only Markdown + structured JSON, byte-compatible with v3 on the text channel)
 
-All 18 MCP tools return a single markdown `Text<String>`:
+All 21 (or 20 without `port_forward`) MCP tools return a single markdown `Text<String>` plus a parallel `structured_content` JSON object (v4.7):
 
 - First line: `TOOL_NAME: STATUS` (e.g. `SSH_CONNECT: OK`).
 - One `KEY: value` per line.
 - All IDs suffixed with `_ID` (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`).
 - Output blocks use an 8-hex-char nonce per response: `--- stdout [a3f2b1d7] ---\n<content>\n--- stderr [a3f2b1d7] (empty) ---`.
-- Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: optional detail`.
+- Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: optional detail` (and a parallel structured `{ tool, status: "error", code, reason, detail }`).
+- v4.7 `structured_content` mirrors the Markdown body as a typed JSON object (e.g. `{ "tool": "ssh_connect", "status": "ok", "session_id": "...", "host": "...", ... }`). 6 tools (`ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress`) advertise an `output_schema` so smaller LLMs can validate against the schema. The other 15 tools emit a free-form structured payload.
 
-The v4 markdown shape is byte-identical to v3 (verified by snapshot tests in `tests/v4_smoke.rs`). v3 hosts work against v4 servers without any change.
+The v4 / v4.7 markdown shape is byte-identical to v3 on the text channel (verified by snapshot tests in `tests/v4_smoke.rs`). v3 hosts work against v4.7 servers without any change.
 
-### MCP Tools (18 total — unchanged from v3)
+### MCP Tools (21 total in v4.7 — `ssh_run` + `ssh_execute_batch` + `ssh_disconnect_many` added)
 
-- **Connection**: `ssh_connect` (typed `ReusePolicy { Suggest, Auto, ForceNew }`), `ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`.
-- **Commands**: `ssh_execute` (optional `pty=true`), `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command`.
-- **Shell** (subscribe-first via `shell://<id>/output`): `ssh_shell_open` (tunable `inactivity_ttl`, `max_buffer_size`), `ssh_shell_write`, `ssh_shell_send_key` (semantic keystrokes + modifiers + repeat), `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`; head-paginated with `clear=true`), `ssh_shell_wait_for` (multi-pattern gate), `ssh_shell_close`.
+- **Connection**: `ssh_connect` (typed `ReusePolicy { Suggest, Auto, ForceNew }`), `ssh_disconnect`, `ssh_disconnect_many` (v4.7 — best-effort batch, 1..=64 ids), `ssh_list_sessions`, `ssh_disconnect_agent`.
+- **Commands**: `ssh_execute` (optional `pty=true`), `ssh_execute_batch` (v4.7 — sequential 1..=16 commands per session, stop-on-failure), `ssh_run` (v4.7 — one-shot connect + execute + optional disconnect), `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command`.
+- **Shell** (subscribe-first via `shell://<id>/output`): `ssh_shell_open` (tunable `inactivity_ttl`, `max_buffer_size`; v4.7 surfaces an optional `INITIAL_BUFFER:` line when the PTY emits within `SSH_SHELL_OPEN_INITIAL_PEEK_MS` of open), `ssh_shell_write`, `ssh_shell_send_key` (semantic keystrokes + modifiers + repeat), `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`; head-paginated with `clear=true`), `ssh_shell_wait_for` (multi-pattern gate), `ssh_shell_close`.
 - **SFTP**: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`.
 - **Network**: `ssh_forward` (feature-gated: `port_forward`).
+- **MCP surface (v4.7)**: `prompts/list` + `prompts/get` (5 canonical workflows: `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`). `resources/templates/list` advertises 4 / 5 RFC 6570 URI templates depending on `port_forward`. `notifications/progress` fires during long async waits when the request supplies `_meta.progressToken`. Mutating tools dedup via `_meta.idempotency_key` (15 tools, default 5-min TTL, env `SSH_IDEMPOTENCY_TTL_SECS` / `SSH_IDEMPOTENCY_MAX_ENTRIES`).
 
 Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
 
@@ -132,7 +134,7 @@ See `docs/LOCKS.md` for the lock-free invariants enforced by these lints (rewrit
 - v4 use cases generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT.
 - Match exhaustively (no `_ =>` for closed enums; use `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 1091 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
+- 1156 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - 8 loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`; full loom mode currently blocked by upstream tokio/loom incompatibility in russh + axum — documented in the test file and `Cargo.toml`).
 

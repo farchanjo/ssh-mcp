@@ -193,6 +193,16 @@ pub struct SshDisconnectAgentArgs {
     pub agent_id: String,
 }
 
+/// Arguments for the `ssh_disconnect_many` MCP tool — best-effort
+/// bulk disconnect of multiple sessions in a single call.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SshDisconnectManyArgs {
+    /// 1..=64 `SESSION_ID`s to disconnect. Per-id failures are
+    /// reported in the response and do not abort the remaining
+    /// disconnects.
+    pub session_ids: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ReusePolicy, SshConnectArgs, SshListSessionsArgs};
@@ -285,5 +295,16 @@ mod tests {
             Some(&Value::from(500_usize))
         );
         assert!(property_default(&schema_json, "agent_id").is_none());
+    }
+
+    #[test]
+    fn ssh_disconnect_many_args_round_trip() {
+        use super::SshDisconnectManyArgs;
+        let raw = serde_json::json!({
+            "session_ids": ["sess-1", "sess-2", "sess-3"],
+        });
+        let parsed: SshDisconnectManyArgs = serde_json::from_value(raw).expect("parse");
+        assert_eq!(parsed.session_ids.len(), 3);
+        assert_eq!(parsed.session_ids[0], "sess-1");
     }
 }

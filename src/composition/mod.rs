@@ -22,6 +22,7 @@
 //! variant in [`prod`].
 
 pub mod fixtures;
+pub mod id_lister;
 pub mod prod;
 pub mod status_sinks;
 

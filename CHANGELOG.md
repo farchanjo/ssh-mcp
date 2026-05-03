@@ -5,6 +5,38 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.0] — 2026-05-03
+
+### Highlights
+
+- **MCP Inter-Tool Conversation 100%** — every tool-to-tool optimization the audit identified is now wired. Smaller LLMs (27B-30B class) get a typed JSON channel parallel to Markdown, server-advertised URI templates, mid-flight progress notifications, a one-shot `ssh_run` tool, batch tools, a 5-prompt catalog of canonical workflows, server-side idempotency dedup, NOT_FOUND closest-match suggestions, and an INITIAL_BUFFER snapshot on shell open. Tool count goes 18 → 21 (with `port_forward`) or 17 → 20 (without).
+- Public MCP API stays byte-compatible with v4.6.0 on the **text channel** — every existing markdown response is identical to the byte. The `structured_content` channel is purely additive.
+
+### Added
+
+- **`structured_content` JSON parallel to Markdown on every tool** — `CallToolResult` now carries both the existing block-style Markdown text and a typed JSON object. Smaller LLMs index by key without parsing Markdown. Mirrors the KEY: value pairs 1:1 with snake_case field names; surfaces the `NEXT:` hint as a `next: [...]` array; surfaces error responses as `{ tool, status: "error", code, reason, detail }`. Six tools advertise typed `output_schema` (`SshConnectResult`, `SshExecuteResult`, `SshGetCommandOutputResult`, `SshShellOpenResult`, `SshShellReadResult`, `SshGetTransferProgressResult`); the remaining 12 emit free-form structured payloads.
+- **`resources/templates/list`** — server now advertises 4-5 RFC 6570 URI templates (`shell://{shell_id}/output{?cursor}`, `command://{command_id}/output{?cursor}`, `transfer://{transfer_id}/progress`, `session://{session_id}/health`, and `forward://{forward_id}/events{?cursor}` with `port_forward`). Smaller LLMs construct subscribe URIs without first calling `resources/list`.
+- **Progress notifications during long async** — `notifications/progress` fire mid-flight on `ssh_get_command_output(wait=true)` (5s cadence), `ssh_get_transfer_progress(wait=true)` (5s cadence), and `ssh_shell_wait_for` (1s cadence) when the request carries `_meta.progressToken`. Best-effort: notify errors are swallowed so the user-visible response is unchanged.
+- **`ssh_run` convenience tool** — one-shot connect + execute + (optional) disconnect. Three round-trips collapsed into one. Args mirror `ssh_connect` + `ssh_execute` with `disconnect_after=true` default. Cost: 1 SSH handshake + 1 channel + (optional) disconnect.
+- **`ssh_execute_batch` tool** — chains 1..=16 commands through one session with stop-on-failure semantics (default true). Returns aggregate Markdown plus structured `results[]` array.
+- **`ssh_disconnect_many` tool** — best-effort batch disconnect of 1..=64 SESSION_IDs. Per-id failures don't abort the batch.
+- **MCP prompts catalog** — `prompts/list` + `prompts/get` with 5 canonical workflows: `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`. `prompts` capability advertised on the `initialize` handshake.
+- **Idempotency `_meta.idempotency_key`** — DashMap-backed LRU dedup cache (default 300s TTL, 1024 entries; configurable via `SSH_IDEMPOTENCY_TTL_SECS` / `SSH_IDEMPOTENCY_MAX_ENTRIES`). 15 mutating tools wrapped: `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_execute`, `ssh_cancel_command`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`, `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. New error code `IDEMPOTENCY_KEY_TOO_LONG` for keys over 256 bytes. Read-only tools (`ssh_list_*`, `ssh_get_*` with read semantics, `ssh_shell_read`, `ssh_shell_wait_for`) ignore the key.
+- **NOT_FOUND closest-match suggestions** — when `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires and the relevant repo has live entries, the DETAIL line now appends `closest matches: <id1>, <id2>, <id3>` (top 3 byte-level Levenshtein neighbors). Smaller LLMs recover from typos without round-tripping `ssh_list_*`. Pure-Rust implementation, no `strsim` dependency.
+- **INITIAL_BUFFER on `ssh_shell_open`** — when the PTY emits stdout within ~100ms, the response carries an `INITIAL_BUFFER:` line (head-truncated to 4 KiB) plus `structured_content.initial_buffer`. Smaller LLMs that follow the `subscribe → read` pattern can sometimes skip the first round-trip. Tunable via `SSH_SHELL_OPEN_INITIAL_PEEK_MS` (default 100), `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS` (default 5), `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES` (default 4096).
+- **`Implementation.instructions` updated** — both `port_forward` and `not(port_forward)` few-shot blocks bumped to 21 / 20 tool count and call out `ssh_run`, INITIAL_BUFFER, and the idempotency convention.
+
+### Tests
+
+- Lib tests: **1091 → 1156** (+65: 12 from structured_content, 8 from templates + progress, 22 from new tools + prompts, 23 from idempotency / closest-match / initial-buffer). Wire-shape regressions: zero on the text channel.
+
+### Behaviour notes
+
+- Wire byte-compat with v4.6 on the text channel. The structured_content channel is purely additive — clients that ignore it get the same v4.6 Markdown response.
+- `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` are pure orchestration over existing use cases — no new domain entities.
+- Idempotency cache is per-process (not persisted). Server restart clears it. The cache is **lock-free** on the hot path (DashMap); GC runs lazy on insert plus an explicit `evict_expired()` accessor for opt-in periodic sweep.
+- Progress notifications obey the MCP spec — when the request omits `_meta.progressToken`, no notifications fire (matches v4.6 behaviour exactly).
+
 ## [4.6.0] — 2026-05-03
 
 ### Highlights

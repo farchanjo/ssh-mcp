@@ -121,6 +121,18 @@ where
         Self { commands, streams }
     }
 
+    /// Borrow the shared output-stream port handle.
+    ///
+    /// The inbound rmcp layer uses this to interleave snapshot reads
+    /// with the use case future when emitting bounded
+    /// `notifications/progress` notifications during a `wait=true`
+    /// poll. The use case body itself does not need it (it already owns
+    /// the same `Arc`); the accessor is purely an inbound-side helper.
+    #[must_use]
+    pub const fn streams(&self) -> &Arc<OS> {
+        &self.streams
+    }
+
     /// Drive the orchestration. See module-level docs for the step-by-step
     /// semantics.
     ///

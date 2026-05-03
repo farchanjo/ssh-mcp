@@ -11,3 +11,4 @@
 pub mod error;
 pub mod nonce;
 pub mod output;
+pub mod structured;

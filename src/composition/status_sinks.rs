@@ -473,9 +473,7 @@ impl TransferRegistrationSink for RepoTransferRegistrationSink {
                     let cap = self.config.max_transfers_per_session();
                     match self.repo.insert_if_under_cap(entity, cap).await {
                         Ok(()) => {}
-                        Err(crate::domain::error::DomainError::MaxTransfersExceeded {
-                            limit,
-                        }) => {
+                        Err(crate::domain::error::DomainError::MaxTransfersExceeded { limit }) => {
                             // Use case will surface the user-visible
                             // error; the sink merely steps aside.
                             debug!(
@@ -842,7 +840,12 @@ mod tests {
         // use-case-side insert never panics.
         sink.register(entity).await;
         sink.register(twin).await;
-        assert!(repo.get(&CommandId::new("c-dup".to_string())).await.expect("get").is_some());
+        assert!(
+            repo.get(&CommandId::new("c-dup".to_string()))
+                .await
+                .expect("get")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -873,7 +876,12 @@ mod tests {
         let twin = entity.clone();
         sink.register(entity).await;
         sink.register(twin).await;
-        assert!(repo.get(&ShellId::new("sh-dup".to_string())).await.expect("get").is_some());
+        assert!(
+            repo.get(&ShellId::new("sh-dup".to_string()))
+                .await
+                .expect("get")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -898,7 +906,12 @@ mod tests {
         let twin = entity.clone();
         sink.register(entity).await;
         sink.register(twin).await;
-        assert!(repo.get(&TransferId::new("t-dup".to_string())).await.expect("get").is_some());
+        assert!(
+            repo.get(&TransferId::new("t-dup".to_string()))
+                .await
+                .expect("get")
+                .is_some()
+        );
     }
 
     #[tokio::test]
