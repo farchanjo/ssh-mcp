@@ -5,6 +5,38 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.1] — 2026-05-03
+
+### Highlights
+
+- **Stability patch driven by exhaustive Python integration + chaos battery (231 scenarios across 11 v4.7 test suites + 3 chaos suites + W1-W15 LLM cross-tool workflows + S1-S20 subscribe contract + CS1-CS12 subscribe chaos).** The user reported MCP resets under workload; the battery surfaced the root cause. Public MCP API stays byte-compatible with v4.7.0 — every contract preserved.
+
+### Fixed
+
+- **`max_buffer_size` tool argument on `ssh_shell_open` is now actually honoured** (v4.7.1 BUG #1, found by `chaos_v47_subscribe.py::cs2_lagged_recovery` and `cs6_buffer_overflow_compensation`). Prior to this patch the override reached the persisted `ShellEntity` but never flowed into the runtime `RunningShell.max_buffer_size: Arc<AtomicU64>` that the reader-task `flush_shell_buffer` helper consults. Result: the buffer cap was silently the adapter default (10 MiB) regardless of caller override, and slow-consumer workloads grew the buffer unbounded toward OOM territory — the most likely cause of the "MCP resetando em workload pesado" symptom. Fix: `SshClientPort::open_shell` gains a `max_buffer_size: Option<u64>` parameter; `OpenShellUseCase` threads it through; `RusshAdapter::do_open_shell` uses the override (or env-driven default) for both the entity AND the runtime atomic backing the reader-task flush threshold. Regression test `flush_shell_buffer_honours_supplied_cap_with_head_truncation` writes 2x the cap and asserts head truncation lands at the cap.
+- **`ssh_get_command_output` no longer returns `COMMAND_NOT_FOUND` after a successful `ssh_cancel_command`** (v4.7.1 BUG #2, found by `test_v47_llm_workflows.py::test_w11_cancel_mid_flight`). Prior behaviour: `RusshAdapter::cancel` removes the adapter-internal command record immediately; `RusshOutputAdapter::snapshot_command` then returns `CommandNotFound` even though the repo entity is alive in `Cancelled` status (and `ssh_list_commands` correctly reports it). `GetCommandOutputUseCase::execute` propagated that error verbatim, breaking the canonical LLM cancel-mid-flight workflow. Fix: when the entity is in a terminal state (`Cancelled` / `Completed` / `Failed`) and `snapshot_command` returns `CommandNotFound`, treat it as a benign "snapshot evicted; entity has the saved status" — return the entity's saved status with empty stdout/stderr. Added `CommandStatus::is_terminal()` helper. Four regression tests cover the three terminal states plus a negative case asserting that `Running` + missing snapshot still surfaces `CommandNotFound` (genuine inconsistencies stay visible).
+- **`with_idempotency` purity invariant locked in CI** (v4.7.1 BUG #3 turned out to be a non-bug; flagged by `chaos_v47_subscribe.py::cs12_idempotency_with_subscribe` reporting `post_replay_count_strict_zero=false`). Trace confirmed the wrapper at `tool_router.rs:322-324` already runs the use case only on cache miss; on cache hit it returns the cached body verbatim with no side effects. The 2 post-replay notifications observed in the chaos script come from the subscription debouncer's force-flush ticker (`adapters/subscription/legacy.rs:432-434`, default 1000ms cadence) firing during the chaos script's 1-second observation window. Three regression tests now lock the invariant in case future refactors add a side-call to the replay path: `idempotency_replay_does_not_invoke_callback`, `idempotency_absent_key_runs_callback_every_time`, `idempotency_failed_response_is_not_cached`.
+
+### Test infrastructure
+
+- **231 new Python integration / chaos scenarios** under `scripts/`:
+  - `pytest.ini` with global `timeout=60s` (avoids the 1-hour ghost runs the user observed when many test files were aggregated)
+  - 11 new v47 pytest files covering every v4.7 surface (structured_content / templates / progress / ssh_run / batches / prompts / idempotency / closest_match / initial_buffer / subscriptions / llm_workflows)
+  - 2 new chaos suites: `chaos_v47.py` and `chaos_v47_subscribe.py` (CS1-CS12)
+  - Upgraded paramiko fixture (`scripts/helpers/local_sshd.py`): SFTP subsystem now actually starts (was no-op); shell handler now allocates real PTY via `pty.openpty()` so `Ctrl+C` propagates as SIGINT; `send_exit_status` clamps signal exit codes (was crashing paramiko's `struct.pack`)
+  - 16 existing test files updated for the v4.7 catalogue (21 tools, AGENT_ID rename, structured_content side-channel, _meta envelope on resources/read)
+- **Test results in isolation: 123 PASS, 0 FAIL** on the v47 suites after this patch (was 122 PASS, 1 FAIL on v4.7.0 — the W11 failure is now green).
+
+### Tests
+
+- Lib tests: **1156 → 1168** (+12: 4 from BUG #1 RingBuffer cap regression + 4 from BUG #2 terminal-state + 1 from `is_terminal()` + 3 from BUG #3 idempotency invariant).
+
+### Behaviour notes
+
+- All three fixes are byte-compat preserving — the wire shapes match v4.7.0; only the bug behaviours change.
+- BUG #1 changes the trait surface of `SshClientPort::open_shell` (added `max_buffer_size: Option<u64>` parameter). External crates implementing the port must update; in-repo adapters and tests are all updated.
+- The pytest fixture-leak issue (zombie `ssh-mcp-stdio` processes when many test files are aggregated in one pytest invocation) is documented but not source-fixed in this patch — the operational mitigation is the new `pytest.ini` timeout plus running each file in isolation. A follow-up (v4.7.2 or v4.8.0) can close the rmcp HTTP child-process cleanup loop.
+
 ## [4.7.0] — 2026-05-03
 
 ### Highlights
