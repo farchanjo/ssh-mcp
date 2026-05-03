@@ -64,7 +64,8 @@ use crate::adapters::sftp::internal::transfer::TransferStatus as McpStatus;
 use crate::adapters::sftp::internal::types::ProgressEvent;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::ssh::internal::status_sink::{
-    NoopTransferStatusSink, SharedTransferStatusSink,
+    NoopTransferRegistrationSink, NoopTransferStatusSink, SharedTransferRegistrationSink,
+    SharedTransferStatusSink,
 };
 use crate::domain::error::DomainError;
 use crate::domain::ids::{SessionId, TransferId};
@@ -221,6 +222,10 @@ pub struct RusshSftpAdapter {
     /// [`Self::with_status_sink`] so `ssh_get_transfer_progress`
     /// observes terminal state.
     status_sink: SharedTransferStatusSink,
+    /// Bridge that mirrors the in-memory `InflightTransfers` lifecycle
+    /// into the domain `TransferRepository` (v4.3 fix). Defaults to a
+    /// no-op for tests / fixtures.
+    registration_sink: SharedTransferRegistrationSink,
 }
 
 impl fmt::Debug for RusshSftpAdapter {
@@ -231,6 +236,7 @@ impl fmt::Debug for RusshSftpAdapter {
             .field("broadcast_cap", &self.broadcast_cap)
             .field("max_per_session", &self.max_per_session)
             .field("status_sink", &"<dyn TransferStatusSink>")
+            .field("registration_sink", &"<dyn TransferRegistrationSink>")
             .finish()
     }
 }
@@ -250,6 +256,7 @@ impl RusshSftpAdapter {
             broadcast_cap,
             max_per_session,
             status_sink: Arc::new(NoopTransferStatusSink),
+            registration_sink: Arc::new(NoopTransferRegistrationSink),
         }
     }
 
@@ -262,6 +269,15 @@ impl RusshSftpAdapter {
     #[must_use]
     pub fn with_status_sink(mut self, sink: SharedTransferStatusSink) -> Self {
         self.status_sink = sink;
+        self
+    }
+
+    /// Wire a bridge that registers / unregisters transfers in the
+    /// domain `TransferRepository` as the adapter binds them in / removes
+    /// them from `InflightTransfers`. v4.3 fix.
+    #[must_use]
+    pub fn with_registration_sink(mut self, sink: SharedTransferRegistrationSink) -> Self {
+        self.registration_sink = sink;
         self
     }
 
@@ -382,6 +398,13 @@ impl RusshSftpAdapter {
                     "upload task completed but inflight entry was already cleared"
                 );
             }
+            // The repository row deliberately survives the streaming
+            // task. `ssh_get_transfer_progress` (in `wait` mode) and
+            // `transfer://X/progress` resource readers must observe the
+            // terminal `Completed` snapshot — the status sink already
+            // marked it for them. The use case is the canonical path
+            // that purges the row. Adapter-side `unregister` here would
+            // race the very wait poll the user is making.
         });
     }
 
@@ -422,6 +445,8 @@ impl RusshSftpAdapter {
                     "download task completed but inflight entry was already cleared"
                 );
             }
+            // See `spawn_upload_task` for the rationale on why the
+            // domain repo row is left alive past the streaming task.
         });
     }
 
@@ -566,14 +591,24 @@ impl SftpClientPort for RusshSftpAdapter {
             total_bytes,
         );
 
-        Ok(fresh_entity(
+        let entity = fresh_entity(
             transfer_id,
             session_id,
             TransferDirection::Upload,
             resolved_local.to_string_lossy().into_owned(),
             remote_path,
             total_bytes,
-        ))
+        );
+        // v4.3 fix: defensive registration spawned so the adapter return
+        // path is not blocked by a redundant repo write. The use case
+        // (`upload_file`) is the canonical writer; the sink only fills
+        // adapter-driven paths.
+        let sink = Arc::clone(&self.registration_sink);
+        let entity_for_sink = entity.clone();
+        tokio::spawn(async move {
+            sink.register(entity_for_sink).await;
+        });
+        Ok(entity)
     }
 
     async fn download(
@@ -603,14 +638,21 @@ impl SftpClientPort for RusshSftpAdapter {
             total_bytes,
         );
 
-        Ok(fresh_entity(
+        let entity = fresh_entity(
             transfer_id,
             session_id,
             TransferDirection::Download,
             resolved_local.to_string_lossy().into_owned(),
             remote_path,
             total_bytes,
-        ))
+        );
+        // See `upload` for the rationale.
+        let sink = Arc::clone(&self.registration_sink);
+        let entity_for_sink = entity.clone();
+        tokio::spawn(async move {
+            sink.register(entity_for_sink).await;
+        });
+        Ok(entity)
     }
 
     async fn cancel(&self, transfer_id: &TransferId) -> Result<(), DomainError> {

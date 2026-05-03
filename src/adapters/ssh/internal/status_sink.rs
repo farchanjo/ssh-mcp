@@ -37,7 +37,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::domain::command::CommandEntity;
+#[cfg(feature = "port_forward")]
+use crate::domain::forward::ForwardEntity;
+#[cfg(feature = "port_forward")]
+use crate::domain::ids::ForwardId;
 use crate::domain::ids::{CommandId, ShellId, TransferId};
+use crate::domain::shell::ShellEntity;
+use crate::domain::transfer::TransferEntity;
 
 /// Future returned by every sink method. Boxed so the trait stays
 /// object-safe.
@@ -114,6 +121,73 @@ pub trait TransferStatusSink: Send + Sync {
         transfer_id: &'a TransferId,
         bytes_transferred: u64,
     ) -> SinkFuture<'a>;
+}
+
+// ---------------------------------------------------------------------------
+// Registration sinks (v4.3)
+// ---------------------------------------------------------------------------
+//
+// The status sinks above only flip an *existing* repository row to a
+// terminal state. They do **not** create or destroy rows. Until v4.3 the
+// only writers were the use cases (`open_shell`, `execute_command`,
+// `upload_file`, `download_file`, `forward_port`), which inserted **after**
+// the SSH/SFTP adapter had already bound the entity into its private
+// DashMap. That created two problems:
+//
+// 1. **Race window.** Subscribers calling `resources/subscribe shell://X`
+//    immediately after `ssh_shell_open` could observe the adapter row
+//    but no repo row, surfacing `ShellNotFound` even though the shell
+//    was alive on the wire.
+// 2. **Adapter-driven teardown is invisible to the repo.** When the
+//    adapter removes an entity (cancel, close, transfer task end, etc.)
+//    the repository keeps the stale row until a use case eventually runs
+//    `remove`.
+//
+// The registration sinks close that gap: the adapter calls `register`
+// the moment it inserts into its own table and `unregister` on every
+// removal path. The composition root binds these sinks to the same
+// repository handles that downstream use cases query. Like the status
+// sinks, every method is best-effort and logs (rather than panics) on
+// repository faults so a transient storage hiccup never tears the
+// runtime down.
+
+/// Bridge between adapter-side `RunningCommand` lifecycle and the
+/// domain `CommandRepository`.
+pub trait CommandRegistrationSink: Send + Sync {
+    /// Persist a fresh `CommandEntity` matching the live adapter row.
+    /// Idempotent — the production sink swallows duplicate-id errors so
+    /// a use-case-side insert that lands first is harmless.
+    fn register(&self, entity: CommandEntity) -> SinkFuture<'_>;
+    /// Remove the row when the adapter destroys its in-memory record.
+    fn unregister<'a>(&'a self, command_id: &'a CommandId) -> SinkFuture<'a>;
+}
+
+/// Bridge between adapter-side `RunningShell` lifecycle and the domain
+/// `ShellRepository`. See [`CommandRegistrationSink`].
+pub trait ShellRegistrationSink: Send + Sync {
+    /// Persist a fresh `ShellEntity` matching the live adapter row.
+    fn register(&self, entity: ShellEntity) -> SinkFuture<'_>;
+    /// Remove the row when the adapter destroys its in-memory record.
+    fn unregister<'a>(&'a self, shell_id: &'a ShellId) -> SinkFuture<'a>;
+}
+
+/// Bridge between adapter-side `TransferShared` lifecycle and the domain
+/// `TransferRepository`. See [`CommandRegistrationSink`].
+pub trait TransferRegistrationSink: Send + Sync {
+    /// Persist a fresh `TransferEntity` matching the live adapter row.
+    fn register(&self, entity: TransferEntity) -> SinkFuture<'_>;
+    /// Remove the row when the adapter destroys its in-memory record.
+    fn unregister<'a>(&'a self, transfer_id: &'a TransferId) -> SinkFuture<'a>;
+}
+
+/// Bridge between adapter-side `ForwardHandle` lifecycle and the domain
+/// `ForwardRepository`. Feature-gated alongside the forward repo port.
+#[cfg(feature = "port_forward")]
+pub trait ForwardRegistrationSink: Send + Sync {
+    /// Persist a fresh `ForwardEntity` matching the live adapter row.
+    fn register(&self, entity: ForwardEntity) -> SinkFuture<'_>;
+    /// Remove the row when the adapter destroys its in-memory record.
+    fn unregister<'a>(&'a self, forward_id: &'a ForwardId) -> SinkFuture<'a>;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +272,65 @@ impl TransferStatusSink for NoopTransferStatusSink {
     }
 }
 
+/// No-op [`CommandRegistrationSink`] used as the adapter default until
+/// the composition root wires a real bridge.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopCommandRegistrationSink;
+
+impl CommandRegistrationSink for NoopCommandRegistrationSink {
+    fn register(&self, _entity: CommandEntity) -> SinkFuture<'_> {
+        Box::pin(async {})
+    }
+
+    fn unregister<'a>(&'a self, _command_id: &'a CommandId) -> SinkFuture<'a> {
+        Box::pin(async {})
+    }
+}
+
+/// No-op [`ShellRegistrationSink`] mirroring [`NoopCommandRegistrationSink`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopShellRegistrationSink;
+
+impl ShellRegistrationSink for NoopShellRegistrationSink {
+    fn register(&self, _entity: ShellEntity) -> SinkFuture<'_> {
+        Box::pin(async {})
+    }
+
+    fn unregister<'a>(&'a self, _shell_id: &'a ShellId) -> SinkFuture<'a> {
+        Box::pin(async {})
+    }
+}
+
+/// No-op [`TransferRegistrationSink`] mirroring [`NoopCommandRegistrationSink`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopTransferRegistrationSink;
+
+impl TransferRegistrationSink for NoopTransferRegistrationSink {
+    fn register(&self, _entity: TransferEntity) -> SinkFuture<'_> {
+        Box::pin(async {})
+    }
+
+    fn unregister<'a>(&'a self, _transfer_id: &'a TransferId) -> SinkFuture<'a> {
+        Box::pin(async {})
+    }
+}
+
+/// No-op [`ForwardRegistrationSink`] mirroring [`NoopCommandRegistrationSink`].
+#[cfg(feature = "port_forward")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopForwardRegistrationSink;
+
+#[cfg(feature = "port_forward")]
+impl ForwardRegistrationSink for NoopForwardRegistrationSink {
+    fn register(&self, _entity: ForwardEntity) -> SinkFuture<'_> {
+        Box::pin(async {})
+    }
+
+    fn unregister<'a>(&'a self, _forward_id: &'a ForwardId) -> SinkFuture<'a> {
+        Box::pin(async {})
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Convenience aliases
 // ---------------------------------------------------------------------------
@@ -212,13 +345,34 @@ pub type SharedShellStatusSink = Arc<dyn ShellStatusSink>;
 /// Shared handle to the transfer sink. See [`SharedCommandStatusSink`].
 pub type SharedTransferStatusSink = Arc<dyn TransferStatusSink>;
 
+/// Shared handle to the command registration sink (v4.3). See
+/// [`SharedCommandStatusSink`] for the rationale.
+pub type SharedCommandRegistrationSink = Arc<dyn CommandRegistrationSink>;
+
+/// Shared handle to the shell registration sink (v4.3).
+pub type SharedShellRegistrationSink = Arc<dyn ShellRegistrationSink>;
+
+/// Shared handle to the transfer registration sink (v4.3).
+pub type SharedTransferRegistrationSink = Arc<dyn TransferRegistrationSink>;
+
+/// Shared handle to the forward registration sink (v4.3, feature-gated).
+#[cfg(feature = "port_forward")]
+pub type SharedForwardRegistrationSink = Arc<dyn ForwardRegistrationSink>;
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandStatusSink, NoopCommandStatusSink, NoopShellStatusSink, NoopTransferStatusSink,
-        ShellStatusSink, TransferStatusSink,
+        CommandRegistrationSink, CommandStatusSink, NoopCommandRegistrationSink,
+        NoopCommandStatusSink, NoopShellRegistrationSink, NoopShellStatusSink,
+        NoopTransferRegistrationSink, NoopTransferStatusSink, ShellRegistrationSink,
+        ShellStatusSink, TransferRegistrationSink, TransferStatusSink,
     };
-    use crate::domain::ids::{CommandId, ShellId, TransferId};
+    use crate::domain::command::CommandEntity;
+    use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
+    use crate::domain::shell::{ShellEntity, ShellTerminal};
+    use crate::domain::transfer::{TransferDirection, TransferEntity};
+    use chrono::Utc;
+    use std::time::Duration;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -269,5 +423,94 @@ mod tests {
         let _cmd: super::SharedCommandStatusSink = std::sync::Arc::new(NoopCommandStatusSink);
         let _shell: super::SharedShellStatusSink = std::sync::Arc::new(NoopShellStatusSink);
         let _xfer: super::SharedTransferStatusSink = std::sync::Arc::new(NoopTransferStatusSink);
+        let _cmd_reg: super::SharedCommandRegistrationSink =
+            std::sync::Arc::new(NoopCommandRegistrationSink);
+        let _shell_reg: super::SharedShellRegistrationSink =
+            std::sync::Arc::new(NoopShellRegistrationSink);
+        let _xfer_reg: super::SharedTransferRegistrationSink =
+            std::sync::Arc::new(NoopTransferRegistrationSink);
+    }
+
+    #[test]
+    fn noop_registration_sinks_are_send_sync() {
+        assert_send_sync::<NoopCommandRegistrationSink>();
+        assert_send_sync::<NoopShellRegistrationSink>();
+        assert_send_sync::<NoopTransferRegistrationSink>();
+    }
+
+    fn sample_command_entity() -> CommandEntity {
+        CommandEntity::new(
+            CommandId::new("c-1".to_string()),
+            SessionId::new("s-1".to_string()),
+            "echo hi".to_string(),
+            Utc::now(),
+        )
+    }
+
+    fn sample_shell_entity() -> ShellEntity {
+        ShellEntity::new(
+            ShellId::new("sh-1".to_string()),
+            SessionId::new("s-1".to_string()),
+            ShellTerminal::new("xterm".to_string(), 80, 24),
+            Utc::now(),
+            Duration::from_secs(60),
+            1024,
+        )
+    }
+
+    fn sample_transfer_entity() -> TransferEntity {
+        TransferEntity::new(
+            TransferId::new("t-1".to_string()),
+            SessionId::new("s-1".to_string()),
+            TransferDirection::Upload,
+            "/tmp/local".to_string(),
+            "/srv/remote".to_string(),
+            Utc::now(),
+            1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn noop_command_registration_sink_returns_immediately() {
+        let sink = NoopCommandRegistrationSink;
+        let id = CommandId::new("c-1".to_string());
+        sink.register(sample_command_entity()).await;
+        sink.unregister(&id).await;
+    }
+
+    #[tokio::test]
+    async fn noop_shell_registration_sink_returns_immediately() {
+        let sink = NoopShellRegistrationSink;
+        let id = ShellId::new("sh-1".to_string());
+        sink.register(sample_shell_entity()).await;
+        sink.unregister(&id).await;
+    }
+
+    #[tokio::test]
+    async fn noop_transfer_registration_sink_returns_immediately() {
+        let sink = NoopTransferRegistrationSink;
+        let id = TransferId::new("t-1".to_string());
+        sink.register(sample_transfer_entity()).await;
+        sink.unregister(&id).await;
+    }
+
+    #[cfg(feature = "port_forward")]
+    #[tokio::test]
+    async fn noop_forward_registration_sink_returns_immediately() {
+        use super::{ForwardRegistrationSink, NoopForwardRegistrationSink};
+        use crate::domain::forward::ForwardEntity;
+        use crate::domain::ids::ForwardId;
+        let sink = NoopForwardRegistrationSink;
+        let entity = ForwardEntity::new(
+            ForwardId::new("fwd-1".to_string()),
+            SessionId::new("s-1".to_string()),
+            8080,
+            "internal".to_string(),
+            80,
+            Utc::now(),
+        );
+        let id = entity.id.clone();
+        sink.register(entity).await;
+        sink.unregister(&id).await;
     }
 }

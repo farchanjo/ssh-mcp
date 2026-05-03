@@ -72,7 +72,8 @@ use crate::application::wait_for_pattern::WaitForPatternUseCase;
 use crate::application::write_shell::WriteShellUseCase;
 use crate::composition::UseCases;
 use crate::composition::status_sinks::{
-    RepoCommandStatusSink, RepoShellStatusSink, RepoTransferStatusSink,
+    RepoCommandRegistrationSink, RepoCommandStatusSink, RepoShellRegistrationSink,
+    RepoShellStatusSink, RepoTransferRegistrationSink, RepoTransferStatusSink,
 };
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
@@ -191,14 +192,36 @@ pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
     let command_sink = Arc::new(RepoCommandStatusSink::new(Arc::clone(&commands)));
     let shell_sink = Arc::new(RepoShellStatusSink::new(Arc::clone(&shells)));
     let transfer_sink = Arc::new(RepoTransferStatusSink::new(Arc::clone(&transfers)));
+    // v4.3 fix: registration sinks bridge the adapter-internal DashMaps
+    // into the matching domain repositories so subscribers / readers see
+    // the entity the moment it exists. Same handles flow into the use
+    // cases (which still insert/remove explicitly), so the sinks
+    // intentionally tolerate duplicate-id inserts.
+    let command_registration_sink =
+        Arc::new(RepoCommandRegistrationSink::new(Arc::clone(&commands)));
+    let shell_registration_sink = Arc::new(RepoShellRegistrationSink::new(Arc::clone(&shells)));
+    // The transfer registration sink needs a config handle so its
+    // adapter-side `register` call honours the per-session transfer cap.
+    // Build the config Arc up here (slightly out of order vs the rest of
+    // the wiring) so the sink and the use cases share the same handle.
+    let config = Arc::new(EnvConfig);
+    let transfer_registration_sink = Arc::new(RepoTransferRegistrationSink::new(
+        Arc::clone(&transfers),
+        Arc::clone(&config),
+    ));
     let ssh = Arc::new(
         RusshAdapter::new()
             .with_sftp_registry(sftp_registry.clone())
             .with_command_status_sink(command_sink)
-            .with_shell_status_sink(shell_sink),
+            .with_shell_status_sink(shell_sink)
+            .with_command_registration_sink(command_registration_sink)
+            .with_shell_registration_sink(shell_registration_sink),
     );
-    let sftp =
-        Arc::new(RusshSftpAdapter::new(sftp_registry, 256, 10).with_status_sink(transfer_sink));
+    let sftp = Arc::new(
+        RusshSftpAdapter::new(sftp_registry, 256, 10)
+            .with_status_sink(transfer_sink)
+            .with_registration_sink(transfer_registration_sink),
+    );
     #[cfg(feature = "port_forward")]
     let forwards = Arc::new(DashMapForwardRepo::new());
 
@@ -210,7 +233,8 @@ pub fn build_use_cases() -> (Arc<ProdUseCases>, Arc<PeerTable>) {
     let output = Arc::new(RusshOutputAdapter::new(&ssh));
 
     let clock = Arc::new(SystemClock);
-    let config = Arc::new(EnvConfig);
+    // `config` was bound earlier (alongside the transfer registration sink)
+    // so the sink shares the same handle as every downstream use case.
     let ids = Arc::new(UuidIds);
 
     let connect = Arc::new(ConnectSessionUseCase::new(
