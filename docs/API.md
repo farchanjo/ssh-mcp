@@ -1,6 +1,6 @@
-# SSH MCP API Reference (v3.0.0)
+# SSH MCP API Reference (v4.0.0)
 
-Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes exposed by the v3.0.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`).
+Complete API reference for the 18 MCP tools and the 5 resource subscribe schemes exposed by the v4.0.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). The wire contract is unchanged from v3.0.0; only the internal layout moved (see [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)).
 
 [[_TOC_]]
 
@@ -761,7 +761,7 @@ Returned by `get_info()`:
 }
 ```
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md#subscription-pipeline) for the producer → debouncer → notification pipeline and [FLOWS.md](./FLOWS.md) for end-to-end sequence diagrams.
+See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer → debouncer → notification pipeline and [FLOWS.md](./FLOWS.md) for end-to-end sequence diagrams.
 
 ---
 

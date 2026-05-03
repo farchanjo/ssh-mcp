@@ -1,6 +1,6 @@
-# SSH MCP Flow Diagrams (v3.0.0)
+# SSH MCP Flow Diagrams (v4.0.0)
 
-Sequence diagrams for the most common workflows on top of the v3.0.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum or stdio).
+Sequence diagrams for the most common workflows on top of the v4.0.0 ssh-mcp server. All diagrams are Mermaid and assume the rmcp 1.6 transport (HTTP via axum 0.8 or stdio). The v4 hexagonal layout puts the entry-point `ServerHandler` under `src/infra/mcp/server.rs`, the per-resource debouncer + per-peer cursor under `src/adapters/subscription/memory_registry.rs`, and the lock-free PTY / command / transfer carriers under `src/adapters/{ssh,sftp}/*` (which delegate into the foundational `src/mcp/{shell,async_command,sftp,transfer}` modules pending the H17.6 cleanup — see [ARCHITECTURE.md Future work](./ARCHITECTURE.md#future-work)).
 
 [[_TOC_]]
 
@@ -20,7 +20,7 @@ sequenceDiagram
     SSH->>Remote: TCP + SSH handshake
     Remote-->>SSH: authenticated
     SSH-->>Server: handle
-    Server->>Server: SESSION_STORAGE.insert(SessionRef)
+    Server->>Server: SessionRepository.insert(SessionEntity)
     Server-->>Client: SSH_CONNECT: OK\nSESSION_ID: a3f2b1d7-...
 
     Client->>Server: ssh_execute(session_id, command="uname -a")
@@ -61,8 +61,8 @@ sequenceDiagram
     Server-->>Client: SESSION_ID
 
     Client->>Server: ssh_shell_open(session_id, term=xterm)
-    Server->>Reader: spawn (ArcSwap&lt;RingBuffer&gt; + broadcast + Notify)
-    Server->>Writer: spawn (mpsc::Receiver&lt;WriteRequest&gt;)
+    Server->>Reader: spawn (ArcSwap of RingBuffer + broadcast + Notify)
+    Server->>Writer: spawn (mpsc::Receiver of WriteRequest)
     Server-->>Client: SSH_SHELL_OPEN: OK\nSHELL_ID: 4b9c8e2a-...\nTERM: xterm 80x24
 
     Client->>Server: resources/subscribe shell://4b9c8e2a-.../output
@@ -158,17 +158,18 @@ sequenceDiagram
     participant Shell as RunningShell
     participant Remote as Remote PTY
 
-    Client->>Server: ssh_shell_open(...) -> SHELL_ID
-    Client->>Server: ssh_shell_write(shell_id, "while true; do date; sleep 1; done\n")
+    Client->>Server: ssh_shell_open(...) returns SHELL_ID
+    Client->>Server: ssh_shell_write(shell_id, INFINITE_LOOP_CMD)
+    Note over Client,Remote: INFINITE_LOOP_CMD is a busy loop such as `while true do date && sleep 1 done`.
 
     Note over Remote: shell prints date every second
 
     Client->>Server: ssh_shell_send_key(shell_id, key=ctrl_c)
-    Server->>Server: ShellKey::CtrlC.encode(empty_mods) -> b"\x03"
+    Server->>Server: ShellKey::CtrlC.encode(empty_mods) returns b"\x03"
     Server->>Shell: input_tx.send(WriteRequest::Data(b"\x03"))
     Shell->>Remote: \x03
-    Remote-->>Shell: ^C\n$
-    Server-->>Client: SSH_SHELL_SEND_KEY: OK\nSHELL_ID: ...\nKEY: ctrl_c\nBYTES_SENT: 1
+    Remote-->>Shell: ^C $
+    Server-->>Client: SSH_SHELL_SEND_KEY OK<br/>SHELL_ID: ...<br/>KEY: ctrl_c<br/>BYTES_SENT: 1
 
     Note over Client: Shell remains open and ready for next command.
 ```
@@ -185,7 +186,7 @@ sequenceDiagram
     participant Cmd as RunningCommand
 
     Client->>Server: ssh_execute(session_id, command="cargo build --release")
-    Server->>Cmd: spawn (ArcSwap&lt;OutputBuffer&gt; + broadcast + OnceCell)
+    Server->>Cmd: spawn (ArcSwap of OutputBuffer + broadcast + OnceCell)
     Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
     Client->>Server: resources/subscribe command://7d4c8e2a-.../output
@@ -201,7 +202,7 @@ sequenceDiagram
         Server-->>Client: text + _meta{cursor, last_seq, command_status=running}
     end
 
-    Cmd->>Cmd: OnceCell::set(exit_code=0); status_rx -> Completed
+    Cmd->>Cmd: OnceCell::set(exit_code=0) and status_rx becomes Completed
     Cmd->>Reg: poke(Command, "7d4c8e2a-...")
     Reg-->>Client: notifications/resources/updated (final)
     Client->>Server: resources/read ...?cursor=auto
@@ -223,7 +224,7 @@ sequenceDiagram
     participant SFTP as russh-sftp
 
     Client->>Server: ssh_upload(session_id, local_path, remote_path)
-    Server->>Tr: spawn (AtomicU64 + broadcast::Sender&lt;ProgressEvent&gt; + OnceCell)
+    Server->>Tr: spawn (AtomicU64 + broadcast::Sender of ProgressEvent + OnceCell)
     Server-->>Client: SSH_UPLOAD: STARTED\nTRANSFER_ID: 8f7e6d5c-...
 
     Client->>Server: resources/subscribe transfer://8f7e6d5c-.../progress
@@ -259,7 +260,7 @@ sequenceDiagram
     participant Client as MCP client
     participant Server as McpSshServer
     participant Reg as SubscriptionRegistry
-    participant SS as SESSION_STORAGE
+    participant SS as SessionRepository
 
     Client->>Server: ssh_connect(host=db1, ...)
     Server-->>Client: SESSION_ID: s1
@@ -270,7 +271,7 @@ sequenceDiagram
     Server->>Reg: subscribe(Session, "s1", uri, peer_id, peer)
     Client->>Server: resources/subscribe session://s2/health
 
-    Note over Server,Reg: ssh_list_sessions probes echo 1 every call;<br/>each probe fires HealthEvent::Healthy.
+    Note over Server,Reg: ssh_list_sessions probes echo 1 every call. Each probe fires HealthEvent::Healthy.
 
     par s1 stays healthy
         Client->>Server: ssh_list_sessions
@@ -280,7 +281,7 @@ sequenceDiagram
         Client->>Server: resources/read session://s1/health
         Server-->>Client: JSON {healthy:true, last_health_check, last_seq}
     and s2 dies
-        Server->>SS: probe s2 -> error -> SESSION_STORAGE.remove(s2)
+        Server->>SS: probe s2 -> error -> SessionRepository.remove(s2)
         SS->>SS: health_tx.send(HealthEvent::Disconnected{seq})
         SS->>Reg: poke(Session, "s2")
         Reg-->>Client: notifications/resources/updated session://s2/health
@@ -309,15 +310,15 @@ sequenceDiagram
     par via notifications/cancelled
         Client->>Rmcp: notifications/cancelled {requestId}
         Rmcp->>Server: native cancellation routing
-        Server->>Server: tool task aborted; status_rx -> Cancelled
+        Server->>Server: tool task aborted and status_rx becomes Cancelled
     and via ssh_cancel_command tool
         Client->>Server: ssh_cancel_command(command_id="7d4c8e2a-...")
         Server->>Cmd: cancel_token.cancel()
-        Cmd->>Cmd: status_rx -> Cancelled
-        Server-->>Client: SSH_CANCEL_COMMAND: CANCELLED\n--- stdout (partial) ---
+        Cmd->>Cmd: status_rx becomes Cancelled
+        Server-->>Client: SSH_CANCEL_COMMAND CANCELLED<br/>--- stdout (partial) ---
     end
 
-    Note over Cmd: status persists as Cancelled until the<br/>SSH_COMMAND_CLEANUP_TTL post-read GC removes it.
+    Note over Cmd: status persists as Cancelled until the SSH_COMMAND_CLEANUP_TTL post-read GC removes it.
 ```
 
 ## 10. Subscriber lagged + auto-recovery
@@ -359,23 +360,23 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Bin as ssh-mcp / ssh-mcp-stdio
-    participant GC as spawn_peer_gc task
+    participant Bin as "ssh-mcp / ssh-mcp-stdio"
+    participant GC as "spawn_peer_gc task"
     participant Reg as SubscriptionRegistry
-    participant Peer as rmcp::Peer (closed)
+    participant Peer as "rmcp::Peer (closed)"
 
     Bin->>GC: spawn_peer_gc(interval_s, cancel_token)
 
     loop every SSH_MCP_PEER_GC_INTERVAL_S (default 30 s)
         GC->>Reg: gc_closed_peers()
-        Reg->>Reg: snapshot subscribers; for each unique peer_id check peer.is_transport_closed()
-        Reg->>Peer: is_transport_closed() -> true
-        Reg->>Reg: drop_peer(peer_id) -> for each URI: unsubscribe(peer_id, uri)
-        Note over Reg: Last unsubscribe per URI<br/>aborts the debouncer task.
+        Reg->>Reg: snapshot subscribers and for each unique peer_id probe peer.is_transport_closed
+        Reg->>Peer: is_transport_closed() returns true
+        Reg->>Reg: drop_peer(peer_id) then for each URI unsubscribe(peer_id, uri)
+        Note over Reg: Last unsubscribe per URI aborts the debouncer task.
     end
 
     Bin->>GC: cancel_token.cancel() (Ctrl-C / stdin close)
-    GC->>GC: tokio::select! cancellation branch -> exit
+    GC->>GC: tokio::select! cancellation branch then exit
 ```
 
 ---
