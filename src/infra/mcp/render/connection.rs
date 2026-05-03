@@ -5,12 +5,22 @@
 //! `render_disconnect_agent` — but takes the v4 use case Outcomes as
 //! input.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
 use crate::application::connect_session::ConnectOutcome;
 use crate::application::disconnect_agent::DisconnectAgentOutcome;
 use crate::application::disconnect_session::DisconnectOutcome;
 use crate::application::list_sessions::ListSessionsOutcome;
 use crate::domain::session::SessionEntity;
 use crate::infra::mcp::helpers::output::sanitize_value;
+
+/// Threshold (per-agent session count) above which the list-sessions
+/// renderer appends an anti-leak HINT line nudging the LLM toward
+/// `ssh_disconnect_agent`. Improvement D — see `feat/v4.4-llm-steering`.
+const ANTI_LEAK_HINT_THRESHOLD: usize = 5;
 
 /// Render a [`ConnectOutcome`] as the v3 `SSH_CONNECT` block.
 #[must_use]
@@ -20,15 +30,27 @@ pub fn connect_render(outcome: ConnectOutcome) -> String {
             session,
             replaced,
             retries,
-        } => render_connected(&session, replaced, retries),
-        ConnectOutcome::Reused { session } => render_reused(&session),
+            persistent,
+            inactivity_timeout,
+        } => render_connected(&session, replaced, retries, persistent, inactivity_timeout),
+        ConnectOutcome::Reused {
+            session,
+            persistent,
+            inactivity_timeout,
+        } => render_reused(&session, persistent, inactivity_timeout),
         ConnectOutcome::Suggested { matches } => render_suggested(&matches),
     }
 }
 
-fn render_connected(session: &SessionEntity, replaced: usize, retries: u32) -> String {
+fn render_connected(
+    session: &SessionEntity,
+    replaced: usize,
+    retries: u32,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> String {
     let host = format_host(session);
-    let mut out = String::with_capacity(192);
+    let mut out = String::with_capacity(224);
     out.push_str("SSH_CONNECT: OK\n");
     out.push_str("SESSION_ID: ");
     out.push_str(session.id.as_str());
@@ -42,8 +64,12 @@ fn render_connected(session: &SessionEntity, replaced: usize, retries: u32) -> S
     }
     out.push_str("\nRETRY: ");
     out.push_str(&retries.to_string());
-    out.push_str("\nPERSISTENT: ");
-    out.push_str("false");
+    append_persistent_or_expiry(
+        &mut out,
+        session.connected_at,
+        persistent,
+        inactivity_timeout,
+    );
     if replaced > 0 {
         out.push_str("\nREPLACED: ");
         out.push_str(&replaced.to_string());
@@ -51,9 +77,13 @@ fn render_connected(session: &SessionEntity, replaced: usize, retries: u32) -> S
     out
 }
 
-fn render_reused(session: &SessionEntity) -> String {
+fn render_reused(
+    session: &SessionEntity,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) -> String {
     let host = format_host(session);
-    let mut out = String::with_capacity(160);
+    let mut out = String::with_capacity(192);
     out.push_str("SSH_CONNECT: REUSED\n");
     out.push_str("SESSION_ID: ");
     out.push_str(session.id.as_str());
@@ -65,7 +95,49 @@ fn render_reused(session: &SessionEntity) -> String {
         out.push_str("\nAGENT: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
+    append_persistent_or_expiry(
+        &mut out,
+        session.connected_at,
+        persistent,
+        inactivity_timeout,
+    );
     out
+}
+
+/// Append either `PERSISTENT: true` (when the session opts out of the
+/// inactivity sweeper) or `EXPIRES_AT: <rfc3339>` (deadline = `connected_at`
+/// plus the configured inactivity timeout). LLM steering: clients can ping
+/// before the TTL fires. Improvement B — see `feat/v4.4-llm-steering`.
+fn append_persistent_or_expiry(
+    out: &mut String,
+    connected_at: DateTime<Utc>,
+    persistent: bool,
+    inactivity_timeout: Duration,
+) {
+    if persistent {
+        out.push_str("\nPERSISTENT: true");
+        return;
+    }
+    out.push_str("\nPERSISTENT: false");
+    if let Some(expires_at) = compute_expires_at(connected_at, inactivity_timeout) {
+        out.push_str("\nEXPIRES_AT: ");
+        out.push_str(&expires_at.to_rfc3339());
+    }
+}
+
+/// Saturating add `inactivity_timeout` to `connected_at`. Returns `None`
+/// when the timeout is zero (treat zero as "never expires" — the
+/// inactivity sweeper is disabled).
+fn compute_expires_at(
+    connected_at: DateTime<Utc>,
+    inactivity_timeout: Duration,
+) -> Option<DateTime<Utc>> {
+    if inactivity_timeout.is_zero() {
+        return None;
+    }
+    let secs = i64::try_from(inactivity_timeout.as_secs()).ok()?;
+    let dur = chrono::TimeDelta::try_seconds(secs)?;
+    connected_at.checked_add_signed(dur)
 }
 
 fn render_suggested(matches: &[SessionEntity]) -> String {
@@ -212,7 +284,31 @@ pub fn list_sessions_render(outcome: ListSessionsOutcome) -> String {
         out.push_str("\n- ");
         append_session_item(&mut out, s);
     }
+    append_anti_leak_hint(&mut out, &healthy);
     out
+}
+
+/// When any agent owns more than [`ANTI_LEAK_HINT_THRESHOLD`] healthy
+/// sessions, append a `HINT` line nudging the LLM toward
+/// `ssh_disconnect_agent`. Improvement D — see `feat/v4.4-llm-steering`.
+fn append_anti_leak_hint(out: &mut String, healthy: &[SessionEntity]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for s in healthy {
+        if let Some(agent) = s.agent_id.as_ref() {
+            *counts.entry(agent.as_str()).or_insert(0) += 1;
+        }
+    }
+    let leak: Option<(&str, usize)> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > ANTI_LEAK_HINT_THRESHOLD)
+        .max_by_key(|(_, n)| *n);
+    if let Some((agent, n)) = leak {
+        out.push_str("\nHINT: agent '");
+        out.push_str(&sanitize_value(agent));
+        out.push_str("' owns ");
+        out.push_str(&n.to_string());
+        out.push_str(" sessions; consider ssh_disconnect_agent to bulk-cleanup");
+    }
 }
 
 fn append_session_item(out: &mut String, s: &SessionEntity) {
@@ -286,11 +382,35 @@ pub fn disconnect_agent_render(outcome: &DisconnectAgentOutcome) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{disconnect_agent_render, disconnect_render, list_sessions_render};
+    use super::{
+        ANTI_LEAK_HINT_THRESHOLD, connect_render, disconnect_agent_render, disconnect_render,
+        list_sessions_render,
+    };
+    use crate::application::connect_session::ConnectOutcome;
     use crate::application::disconnect_agent::DisconnectAgentOutcome;
     use crate::application::disconnect_session::DisconnectOutcome;
     use crate::application::list_sessions::ListSessionsOutcome;
+    use crate::domain::identity::Address;
     use crate::domain::ids::{AgentId, SessionId};
+    use crate::domain::session::SessionEntity;
+    use chrono::{TimeZone, Utc};
+    use std::time::Duration;
+
+    fn sample_session(id: &str, agent: Option<&str>) -> SessionEntity {
+        SessionEntity {
+            id: SessionId::new(id.to_string()),
+            name: None,
+            agent_id: agent.map(|a| AgentId::new(a.to_string())),
+            address: Address::new("h.example.com".to_string(), 22).expect("address"),
+            username: "alice".to_string(),
+            connected_at: Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap(),
+            default_timeout: Duration::from_secs(30),
+            retry_attempts: 0,
+            compression_enabled: true,
+            last_health_check: None,
+            healthy: Some(true),
+        }
+    }
 
     #[test]
     fn disconnect_render_emits_block() {
@@ -329,5 +449,127 @@ mod tests {
             disconnect_agent_render(&outcome),
             "SSH_DISCONNECT_AGENT: OK\nAGENT: alpha\nSESSIONS: 3\nCOMMANDS: 5"
         );
+    }
+
+    // --- v4.4 LLM steering: EXPIRES_AT line ----------------------------
+
+    #[test]
+    fn connect_render_includes_expires_at_when_not_persistent() {
+        let session = sample_session("sess-1", None);
+        let body = connect_render(ConnectOutcome::Connected {
+            session,
+            replaced: 0,
+            retries: 0,
+            persistent: false,
+            inactivity_timeout: Duration::from_secs(300),
+        });
+        assert!(body.contains("PERSISTENT: false"));
+        // 12:00 + 300s = 12:05
+        assert!(
+            body.contains("EXPIRES_AT: 2026-05-03T12:05:00+00:00"),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn connect_render_skips_expires_at_when_persistent() {
+        let session = sample_session("sess-1", None);
+        let body = connect_render(ConnectOutcome::Connected {
+            session,
+            replaced: 0,
+            retries: 0,
+            persistent: true,
+            inactivity_timeout: Duration::from_secs(300),
+        });
+        assert!(body.contains("PERSISTENT: true"));
+        assert!(
+            !body.contains("EXPIRES_AT"),
+            "persistent sessions must omit the EXPIRES_AT line, body: {body}"
+        );
+    }
+
+    #[test]
+    fn reused_render_includes_expires_at() {
+        let session = sample_session("sess-2", Some("agent-X"));
+        let body = connect_render(ConnectOutcome::Reused {
+            session,
+            persistent: false,
+            inactivity_timeout: Duration::from_secs(120),
+        });
+        assert!(body.starts_with("SSH_CONNECT: REUSED"));
+        assert!(body.contains("AGENT: agent-X"));
+        // 12:00 + 120s = 12:02
+        assert!(
+            body.contains("EXPIRES_AT: 2026-05-03T12:02:00+00:00"),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn connect_render_omits_expires_at_when_inactivity_zero() {
+        let session = sample_session("sess-1", None);
+        let body = connect_render(ConnectOutcome::Connected {
+            session,
+            replaced: 0,
+            retries: 0,
+            persistent: false,
+            inactivity_timeout: Duration::ZERO,
+        });
+        assert!(body.contains("PERSISTENT: false"));
+        assert!(!body.contains("EXPIRES_AT"));
+    }
+
+    // --- v4.4 LLM steering: anti-leak HINT -----------------------------
+
+    #[test]
+    fn list_sessions_emits_anti_leak_hint_above_threshold() {
+        let healthy: Vec<SessionEntity> = (0..=ANTI_LEAK_HINT_THRESHOLD)
+            .map(|i| sample_session(&format!("s-{i}"), Some("agent-spammer")))
+            .collect();
+        let total = healthy.len();
+        let outcome = ListSessionsOutcome {
+            healthy,
+            removed_dead: vec![],
+            total,
+        };
+        let body = list_sessions_render(outcome);
+        assert!(
+            body.contains("HINT: agent 'agent-spammer' owns 6 sessions"),
+            "body: {body}"
+        );
+        assert!(body.contains("ssh_disconnect_agent"), "body: {body}");
+    }
+
+    #[test]
+    fn list_sessions_omits_hint_at_or_below_threshold() {
+        let healthy: Vec<SessionEntity> = (0..ANTI_LEAK_HINT_THRESHOLD)
+            .map(|i| sample_session(&format!("s-{i}"), Some("agent-okay")))
+            .collect();
+        let total = healthy.len();
+        let outcome = ListSessionsOutcome {
+            healthy,
+            removed_dead: vec![],
+            total,
+        };
+        let body = list_sessions_render(outcome);
+        assert!(
+            !body.contains("HINT:"),
+            "agents at or below threshold must not trigger the leak hint, body: {body}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_omits_hint_when_sessions_have_no_agent() {
+        let healthy: Vec<SessionEntity> = (0..=ANTI_LEAK_HINT_THRESHOLD)
+            .map(|i| sample_session(&format!("s-{i}"), None))
+            .collect();
+        let total = healthy.len();
+        let outcome = ListSessionsOutcome {
+            healthy,
+            removed_dead: vec![],
+            total,
+        };
+        let body = list_sessions_render(outcome);
+        assert!(!body.contains("HINT:"), "body: {body}");
     }
 }

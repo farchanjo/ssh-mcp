@@ -5,6 +5,31 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] — 2026-05-03
+
+### Highlights
+
+- LLM-steering minor release. Public MCP API stays byte-compatible with v4.3.0 / v4.2.0 / v4.1.0 / v4.0.0 / v3.0.0 — same 18 tools, same 5 resource schemes, same env vars, same defaults; the markdown shape is extended **additively** (new `EXPIRES_AT` line, new `HINT` line) so existing v3 / v4 hosts continue to parse the response without any change.
+
+### Added
+
+- **agent_id-aware ranking** — `connect_session` use case now ranks identity matches owned by the requesting `agent_id` ahead of foreign matches under both `reuse=auto` and `reuse=suggest`. Tiebreaker is the existing `connected_at desc` ordering. When the caller does not pass `agent_id`, ranking is a no-op (newest-first stays). Implemented in `src/application/connect_session.rs::rank_by_agent_affinity`.
+- **EXPIRES_AT line** — `SSH_CONNECT: OK` and `SSH_CONNECT: REUSED` blocks now emit `EXPIRES_AT: <rfc3339>` (computed as `connected_at + ConfigPort::inactivity_timeout`) so an LLM can ping (any cheap call) before the inactivity sweeper closes the session. When `persistent=true`, the renderer emits `PERSISTENT: true` and skips `EXPIRES_AT`. When the configured inactivity timeout is zero, `EXPIRES_AT` is also omitted (sweeper disabled). Renderer change in `src/infra/mcp/render/connection.rs::append_persistent_or_expiry` + `compute_expires_at`.
+- **anti-leak HINT** — `SSH_LIST_SESSIONS` now appends `HINT: agent '<id>' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` when any agent owns more than 5 healthy sessions in the rendered list. Threshold lives in `ANTI_LEAK_HINT_THRESHOLD` (`src/infra/mcp/render/connection.rs`).
+- **`ssh_connect` description Tip bullets** — the tool description (both feature flavours of the `#[tool_router]` impl) now includes:
+  - `Tip: pass reuse=auto to let the server pick the most recent healthy match in a single round-trip. Use reuse=suggest (default) when you want to inspect matches before reusing. Use reuse=force_new to bypass identity matching entirely.`
+  - `Tip: pass agent_id so subsequent sessions are grouped and you can bulk-cleanup with ssh_disconnect_agent. When agent_id is set, reuse=auto/reuse=suggest rank sessions owned by the same agent first.`
+
+### Changed
+
+- `ConnectOutcome::Connected` and `ConnectOutcome::Reused` carry two new fields (`persistent: bool`, `inactivity_timeout: Duration`) so the renderer can compute `EXPIRES_AT` without round-tripping through the SSH adapter or the entity. Internal change — use cases consumed by external code stay generic over the same ports.
+
+### Tests
+
+- Lib tests: **1048 → 1060** (+ 5 connect_session tests covering ranking owned-first / fallback-to-newest / Suggest ordering / `rank_by_agent_affinity` stability + no-op no-agent-id; + 7 render tests covering `EXPIRES_AT` present/absent / persistent skips it / zero-timeout omits it / Reused includes it / anti-leak HINT above threshold / no HINT at threshold / no HINT without agent ids).
+- Python integration: stdio **13/13** PASS (no wire-format change in the suite's expected keys).
+- HTTP suite: untouched (no test-file changes in `scripts/test_http.py`).
+
 ## [4.3.0] — 2026-05-03
 
 ### Highlights
