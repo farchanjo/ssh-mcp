@@ -11,6 +11,9 @@
 //! - **Health outcomes**: pushed via [`FakeSshClient::queue_health_ok`] /
 //!   [`FakeSshClient::queue_health_fail`] in FIFO order. Each `health_check`
 //!   call pops the head; an empty queue defaults to success.
+//! - **Disconnect outcomes**: pushed via [`FakeSshClient::queue_disconnect_ok`] /
+//!   [`FakeSshClient::queue_disconnect_error`] in FIFO order. Each
+//!   `disconnect` call pops the head; an empty queue defaults to success.
 //!
 //! Other port methods (`execute`, `execute_async`, `cancel`, `open_shell`)
 //! are not exercised by the H10 use case but the trait surface is satisfied
@@ -85,6 +88,15 @@ enum HealthOutcome {
     Err(DomainError),
 }
 
+/// Scripted outcome for a `disconnect` call.
+#[derive(Debug, Clone)]
+enum DisconnectOutcome {
+    /// Disconnect succeeds.
+    Ok,
+    /// Disconnect fails with the supplied domain error.
+    Err(DomainError),
+}
+
 /// Test [`SshClientPort`] adapter. Cloneable; clones share the same
 /// scripted state and the same call log via [`Arc`].
 #[derive(Debug, Clone, Default)]
@@ -98,6 +110,8 @@ struct FakeSshClientInner {
     connect_queue: Mutex<Vec<ConnectOutcome>>,
     /// Scripted `health_check` outcomes, popped FIFO.
     health_queue: Mutex<Vec<HealthOutcome>>,
+    /// Scripted `disconnect` outcomes, popped FIFO.
+    disconnect_queue: Mutex<Vec<DisconnectOutcome>>,
     /// Append-only log of every recorded call.
     calls: Mutex<Vec<FakeSshCall>>,
 }
@@ -133,13 +147,23 @@ impl FakeSshClient {
         Self::push(&self.inner.health_queue, HealthOutcome::Err(error));
     }
 
+    /// Queue a successful `disconnect` outcome.
+    pub fn queue_disconnect_ok(&self) {
+        Self::push(&self.inner.disconnect_queue, DisconnectOutcome::Ok);
+    }
+
+    /// Queue a failed `disconnect` outcome with the supplied domain error.
+    pub fn queue_disconnect_error(&self, error: DomainError) {
+        Self::push(&self.inner.disconnect_queue, DisconnectOutcome::Err(error));
+    }
+
     /// Snapshot of every recorded call in invocation order.
     #[must_use]
     pub fn calls(&self) -> Vec<FakeSshCall> {
-        self.inner.calls.lock().map_or_else(
-            |poison| poison.into_inner().clone(),
-            |guard| guard.clone(),
-        )
+        self.inner
+            .calls
+            .lock()
+            .map_or_else(|poison| poison.into_inner().clone(), |guard| guard.clone())
     }
 
     /// Number of recorded calls.
@@ -188,6 +212,19 @@ impl FakeSshClient {
             },
         )
     }
+
+    fn pop_disconnect_outcome(&self) -> DisconnectOutcome {
+        self.inner.disconnect_queue.lock().map_or_else(
+            |_| DisconnectOutcome::Ok,
+            |mut guard| {
+                if guard.is_empty() {
+                    DisconnectOutcome::Ok
+                } else {
+                    guard.remove(0)
+                }
+            },
+        )
+    }
 }
 
 impl SshClientPort for FakeSshClient {
@@ -226,7 +263,10 @@ impl SshClientPort for FakeSshClient {
         self.record(FakeSshCall::Disconnect {
             session_id: session_id.clone(),
         });
-        Ok(())
+        match self.pop_disconnect_outcome() {
+            DisconnectOutcome::Ok => Ok(()),
+            DisconnectOutcome::Err(err) => Err(err),
+        }
     }
 
     async fn execute(&self, request: CommandRequest) -> Result<CommandOutcome, DomainError> {
