@@ -1,6 +1,5 @@
 //! SSH agent authentication.
 
-use async_trait::async_trait;
 use russh::{client, keys};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
@@ -11,14 +10,13 @@ use super::traits::AuthStrategy;
 
 /// SSH agent authentication strategy.
 ///
-/// Connects to the SSH agent (via `SSH_AUTH_SOCK`) and tries each available
-/// identity until one succeeds.
-pub struct AgentAuth;
+/// Connects to the SSH agent (via `SSH_AUTH_SOCK`) and tries each
+/// available identity until one succeeds.
+pub(crate) struct AgentAuth;
 
 impl AgentAuth {
     /// Create a new SSH agent authentication strategy.
-    #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self
     }
 }
@@ -29,7 +27,6 @@ impl Default for AgentAuth {
     }
 }
 
-#[async_trait]
 impl AuthStrategy for AgentAuth {
     async fn authenticate(
         &self,
@@ -97,39 +94,38 @@ async fn try_identities(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AgentAuth, AuthStrategy};
 
     #[test]
-    fn test_agent_auth_name() {
+    fn name_is_agent() {
         let auth = AgentAuth::new();
         assert_eq!(auth.name(), "agent");
     }
 
     #[test]
-    fn test_agent_auth_default() {
-        let auth = AgentAuth::default();
+    fn default_name_is_agent() {
+        let auth = AgentAuth;
         assert_eq!(auth.name(), "agent");
     }
 
     #[test]
-    fn test_agent_auth_new_equals_default() {
+    fn new_equals_default() {
         let auth_new = AgentAuth::new();
-        let auth_default = AgentAuth::default();
+        let auth_default = AgentAuth;
         assert_eq!(auth_new.name(), auth_default.name());
     }
 
     #[test]
-    fn test_agent_auth_is_send_sync() {
+    fn auth_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AgentAuth>();
     }
 
     #[test]
-    fn test_agent_auth_multiple_instances() {
-        // Verify we can create multiple independent instances
+    fn multiple_instances_share_name() {
         let auth1 = AgentAuth::new();
         let auth2 = AgentAuth::new();
-        let auth3 = AgentAuth::default();
+        let auth3 = AgentAuth;
 
         assert_eq!(auth1.name(), "agent");
         assert_eq!(auth2.name(), "agent");
@@ -137,38 +133,21 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_auth_implements_auth_strategy_trait() {
-        fn requires_auth_strategy(_: &dyn AuthStrategy) {}
-        let auth = AgentAuth::new();
-        requires_auth_strategy(&auth);
+    fn auth_is_const_constructible() {
+        // `new` is `const fn` — the result can be assigned to a const.
+        const _AGENT: AgentAuth = AgentAuth::new();
     }
 
-    mod e15_extra {
-        use super::*;
+    #[test]
+    fn auth_unit_struct_size_is_zero() {
+        // Unit-like struct: zero-sized.
+        assert_eq!(std::mem::size_of::<AgentAuth>(), 0);
+    }
 
-        #[test]
-        fn agent_auth_is_const_constructible() {
-            // `new` is `const fn` — the result can be assigned to a const.
-            const _AGENT: AgentAuth = AgentAuth::new();
-        }
-
-        #[test]
-        fn agent_auth_unit_struct_size_is_zero() {
-            // Unit-like struct: zero-sized.
-            assert_eq!(std::mem::size_of::<AgentAuth>(), 0);
-        }
-
-        #[test]
-        fn agent_auth_in_box_dyn_strategy() {
-            let boxed: Box<dyn AuthStrategy> = Box::new(AgentAuth::new());
-            assert_eq!(boxed.name(), "agent");
-        }
-
-        #[test]
-        fn agent_auth_name_is_static_str() {
-            let auth = AgentAuth::new();
-            let n: &'static str = auth.name();
-            assert_eq!(n, "agent");
-        }
+    #[test]
+    fn name_is_static_str() {
+        let auth = AgentAuth::new();
+        let n: &'static str = auth.name();
+        assert_eq!(n, "agent");
     }
 }
