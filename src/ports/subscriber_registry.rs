@@ -66,6 +66,20 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
 
     /// Snapshot all subscribers currently bound to `uri`.
     fn snapshot_subscribers(&self, uri: &str) -> Vec<SubscriberSnapshot>;
+
+    /// Read the current per-peer byte cursor for `(peer_id, uri)`.
+    /// Returns `0` when no cursor has ever been allocated.
+    fn peer_byte_cursor(&self, peer_id: &PeerId, uri: &str) -> u64;
+
+    /// Advance the per-peer byte cursor for `(peer_id, uri)` to at least
+    /// `target` (atomic max). Returns the cursor value AFTER the bump.
+    fn advance_peer_byte_cursor(&self, peer_id: &PeerId, uri: &str, target: u64) -> u64;
+
+    /// Walk every subscriber and drop the ones whose transport has
+    /// closed. Returns the number of peers dropped. Used by the
+    /// [`crate::application::peer_gc`] use case as a periodic GC pass
+    /// (rmcp 1.6 does not raise a peer-disconnect callback).
+    fn gc_closed_peers(&self) -> usize;
 }
 
 /// Async slice of the subscription registry. `subscribe` may spawn a
