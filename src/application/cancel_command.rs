@@ -401,6 +401,7 @@ mod tests {
             &self,
             _session_id: &SessionId,
             _terminal: crate::domain::shell::ShellTerminal,
+            _max_buffer_size: Option<u64>,
         ) -> Result<crate::domain::shell::ShellEntity, DomainError> {
             Err(DomainError::Internal(
                 "CancellingSsh::open_shell unused".to_string(),

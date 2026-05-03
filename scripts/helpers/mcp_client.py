@@ -434,6 +434,51 @@ class McpClient:
             return {"_rpc_error": resp["error"]}
         return resp.get("result", {})
 
+    def call_tool_with_meta(
+        self,
+        name: str,
+        arguments: dict,
+        *,
+        meta: dict | None = None,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Like ``call_tool`` but accepts an explicit ``_meta`` envelope.
+
+        v4.7 adds two `_meta` keys: ``progressToken`` (drives
+        ``notifications/progress`` cadence) and ``idempotency_key``
+        (15 mutating tools de-dup on the key tuple).
+        """
+        params: dict = {"name": name, "arguments": arguments}
+        if meta:
+            params["_meta"] = meta
+        resp = self.transport.send_request("tools/call", params, timeout=timeout)
+        if "error" in resp:
+            return {"_rpc_error": resp["error"]}
+        return resp.get("result", {})
+
+    # -- prompts ------------------------------------------------------------
+
+    def list_prompts(self) -> list[dict]:
+        resp = self.transport.send_request("prompts/list", {}, timeout=10)
+        return resp.get("result", {}).get("prompts", []) or []
+
+    def get_prompt(self, name: str, arguments: dict | None = None) -> dict:
+        params: dict = {"name": name}
+        if arguments:
+            params["arguments"] = arguments
+        resp = self.transport.send_request("prompts/get", params, timeout=10)
+        if "error" in resp:
+            return {"_rpc_error": resp["error"]}
+        return resp.get("result", {})
+
+    # -- resource templates ------------------------------------------------
+
+    def list_resource_templates(self) -> list[dict]:
+        resp = self.transport.send_request(
+            "resources/templates/list", {}, timeout=10
+        )
+        return resp.get("result", {}).get("resourceTemplates", []) or []
+
     # -- resources ----------------------------------------------------------
 
     def list_resources(self) -> list[dict]:
@@ -493,6 +538,78 @@ def call_tool_text(client: McpClient, name: str, arguments: dict, *, timeout: fl
     if isinstance(first, dict) and first.get("type") == "text":
         return first.get("text", "") or ""
     return ""
+
+
+def extract_structured(result: dict) -> dict | None:
+    """Return the ``structured_content`` JSON payload from a tool result.
+
+    The rmcp wire shape uses camelCase ``structuredContent``; this helper
+    accepts both forms so older transports keep working.
+    """
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent")
+    if structured is None:
+        structured = result.get("structured_content")
+    if isinstance(structured, dict):
+        return structured
+    return None
+
+
+def call_tool_pair(
+    client: McpClient,
+    name: str,
+    arguments: dict,
+    *,
+    timeout: float = 30.0,
+    meta: dict | None = None,
+) -> tuple[str, dict | None, dict]:
+    """Run a tool and return (text, structured_content, raw_result).
+
+    Single helper for v4.7 dual-channel assertions: tests want both the
+    Markdown body AND the JSON twin in one round-trip.
+    """
+    if meta is not None:
+        result = client.call_tool_with_meta(name, arguments, meta=meta, timeout=timeout)
+    else:
+        result = client.call_tool(name, arguments, timeout=timeout)
+    if "_rpc_error" in result:
+        return "", None, result
+    content = result.get("content") or []
+    text = ""
+    if content:
+        first = content[0]
+        if isinstance(first, dict) and first.get("type") == "text":
+            text = first.get("text", "") or ""
+    return text, extract_structured(result), result
+
+
+def collect_progress_notifications(
+    client: McpClient,
+    progress_token: str,
+    *,
+    deadline_secs: float,
+) -> list[dict]:
+    """Drain ``notifications/progress`` for ``progress_token`` until the
+    deadline elapses. Other notifications are ignored (returned to caller's
+    queue would require a re-queue path the rmcp transport does not offer
+    cleanly; for v4.7 progress tests this is sufficient).
+    """
+    out: list[dict] = []
+    deadline = time.monotonic() + deadline_secs
+    while time.monotonic() < deadline:
+        remaining = max(0.05, deadline - time.monotonic())
+        n = client.receive_notification(timeout=min(0.5, remaining))
+        if n is None:
+            continue
+        if n.get("method") != "notifications/progress":
+            continue
+        params = n.get("params") or {}
+        if str(params.get("progressToken")) == str(progress_token) or str(
+            params.get("progress_token")
+        ) == str(progress_token):
+            out.append(n)
+    return out
 
 
 def make_session_id() -> str:

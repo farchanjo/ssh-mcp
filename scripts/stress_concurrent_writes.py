@@ -64,11 +64,23 @@ def _run(transport: str) -> int:
         print(json.dumps({"status": "fail", "reason": f"coordinator init failed: {exc}"}))
         return 1
 
+    fixture_owner = None
     try:
         target = SshTarget.from_env()
         if target is None:
-            print(json.dumps({"status": "skip", "reason": "SSH_MCP_TEST_TARGET unset"}))
-            return 0
+            try:
+                from helpers.local_sshd import LocalSshdFixture  # type: ignore
+                fixture_owner = LocalSshdFixture()
+                fixture_owner.__enter__()
+                target = SshTarget(
+                    address=fixture_owner.address,
+                    username=fixture_owner.username,
+                    key_path=None,
+                    password=fixture_owner.password,
+                )
+            except Exception:
+                print(json.dumps({"status": "skip", "reason": "no SSH target available"}))
+                return 0
 
         sid = parse_block(
             call_tool_text(coordinator, "ssh_connect", target.connect_args(agent_id="stress-cw"))
@@ -172,6 +184,11 @@ def _run(transport: str) -> int:
                 server_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 server_proc.kill()
+        if fixture_owner is not None:
+            try:
+                fixture_owner.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def main() -> int:

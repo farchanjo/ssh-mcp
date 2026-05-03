@@ -30,10 +30,21 @@ def test_initialize_handshake(http_client: McpClient) -> None:
     assert getattr(transport, "session_id", None), "Mcp-Session-Id header missing"
 
 
-def test_tools_list_returns_eighteen_tools(http_client: McpClient) -> None:
+def test_tools_list_returns_v47_catalogue(http_client: McpClient) -> None:
+    """v4.7 advertises 21 tools (20 without the `port_forward` Cargo feature).
+
+    Renamed from ``test_tools_list_returns_eighteen_tools`` to reflect the
+    v4.7 catalogue growth (added: ``ssh_run``, ``ssh_execute_batch``,
+    ``ssh_disconnect_many``). Mirrors the stdio assertion in
+    ``test_stdio.py::test_stdio_tools_list_returns_v47_catalogue``.
+    """
     tools = http_client.list_tools()
     names = sorted(t["name"] for t in tools)
-    assert len(names) == 18, f"expected 18 tools, got {len(names)}: {names}"
+    assert len(names) in {20, 21}, f"expected 20 or 21 tools, got {len(names)}: {names}"
+    # v4.7 additions
+    for new in ("ssh_run", "ssh_execute_batch", "ssh_disconnect_many"):
+        assert new in names, f"missing v4.7 tool {new}: {names}"
+    # v4.6 carry-overs
     expected_subset = {
         "ssh_connect",
         "ssh_disconnect",
@@ -52,7 +63,6 @@ def test_tools_list_returns_eighteen_tools(http_client: McpClient) -> None:
         "ssh_upload",
         "ssh_download",
         "ssh_get_transfer_progress",
-        "ssh_forward",
     }
     assert expected_subset.issubset(set(names)), names
 
@@ -237,6 +247,12 @@ def test_shell_open_write_read_close(http_client: McpClient, ssh_target) -> None
 
 @pytest.mark.requires_sshd
 def test_shell_send_key_ctrl_c_breaks_yes(http_client: McpClient, ssh_target) -> None:
+    """Send Ctrl+C to a shell running ``yes`` and verify the shell stays alive.
+
+    Requires a real PTY at the SSH server side (the local paramiko fixture
+    in ``helpers.local_sshd`` wires ``/bin/sh -i`` through ``pty.openpty()``
+    so signal-bearing keystrokes propagate as SIGINT).
+    """
     text = call_tool_text(
         http_client, "ssh_connect", ssh_target.connect_args(agent_id="http-key")
     )

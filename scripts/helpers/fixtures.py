@@ -188,10 +188,56 @@ def stdio_client() -> Iterator[McpClient]:
 
 @pytest.fixture
 def ssh_target(request) -> SshTarget:
+    """Return an SSH endpoint for `requires_sshd` tests.
+
+    Resolution order (first match wins):
+
+    1. ``SSH_MCP_TEST_TARGET`` env var → use the operator-supplied endpoint.
+    2. Local in-process paramiko fixture → `helpers.local_sshd.LocalSshdFixture`
+       (auto-bootstraps a 127.0.0.1 sshd for the duration of the test).
+
+    The local fixture path lets the v4.7 integration suite run end-to-end on
+    a developer laptop without the operator first standing up a real sshd.
+    Both paths surface the same `SshTarget` shape.
+    """
     target = SshTarget.from_env()
-    if target is None:
-        pytest.skip("SSH_MCP_TEST_TARGET not set; requires_sshd test skipped")
-    return target
+    if target is not None:
+        yield target
+        return
+    # Fall back to the in-process paramiko fixture.
+    try:
+        from helpers.local_sshd import LocalSshdFixture
+    except ImportError:  # pragma: no cover - paramiko optional
+        pytest.skip("paramiko not installed and SSH_MCP_TEST_TARGET unset")
+    fixture = LocalSshdFixture()
+    fixture.__enter__()
+    try:
+        local_target = SshTarget(
+            address=fixture.address,
+            username=fixture.username,
+            key_path=None,
+            password=fixture.password,
+        )
+        yield local_target
+    finally:
+        fixture.__exit__(None, None, None)
+
+
+@pytest.fixture
+def local_sshd():
+    """Module-scoped factory fixture for tests that need direct access to
+    the in-process paramiko fixture (banner control, INITIAL_BUFFER tests).
+    """
+    try:
+        from helpers.local_sshd import LocalSshdFixture
+    except ImportError:  # pragma: no cover
+        pytest.skip("paramiko not installed")
+    fixture = LocalSshdFixture()
+    fixture.__enter__()
+    try:
+        yield fixture
+    finally:
+        fixture.__exit__(None, None, None)
 
 
 def requires_sshd(func):
@@ -210,6 +256,7 @@ __all__ = [
     "http_client",
     "stdio_client",
     "ssh_target",
+    "local_sshd",
     "requires_sshd",
     "stress_transport_mode",
     "make_stress_client",
