@@ -57,8 +57,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::adapters::sftp::internal::sftp::{
-    TransferShared, classify_transfer_error, resolve_local_path, sftp_download_streaming,
-    sftp_upload_streaming,
+    TransferShared, classify_transfer_error, open_sftp_session, resolve_local_path,
+    sftp_download_streaming, sftp_upload_streaming,
 };
 use crate::adapters::sftp::internal::transfer::TransferStatus as McpStatus;
 use crate::adapters::sftp::internal::types::ProgressEvent;
@@ -559,6 +559,9 @@ fn sftp_error_tag(operation: &str) -> Option<&'static str> {
     {
         return Some("SFTP_OPEN_FAILED");
     }
+    if operation.contains("remote metadata") || operation.contains("stat remote") {
+        return Some("REMOTE_METADATA_ERROR");
+    }
     None
 }
 
@@ -650,10 +653,14 @@ impl SftpClientPort for RusshSftpAdapter {
         } = request;
 
         let handle = self.preflight(&session_id)?;
-        // Remote size is unknown before the SFTP channel is open;
-        // streaming helper updates the broadcast snapshot as bytes flow.
-        // Future H10 wiring may upgrade with a `metadata` call.
-        let total_bytes = 0_u64;
+        // Stat the remote path synchronously before spawning the
+        // streaming task so genuine metadata failures surface as
+        // `REMOTE_METADATA_ERROR:` (the v4.5 wire tag) instead of
+        // letting the streaming task observe a `total_bytes = 0`
+        // snapshot for an unreachable file. The streaming task still
+        // opens its own session for the actual transfer so this stat
+        // is a one-RTT pre-flight only.
+        let total_bytes = stat_remote_size(&handle, &remote_path).await?;
         let resolved_local = resolve_local_path(&local_path);
 
         self.spawn_download_task(
@@ -700,6 +707,26 @@ async fn stat_local_size(path: &Path) -> Result<u64, DomainError> {
             &e.to_string(),
         )
     })
+}
+
+/// Stat the remote source file via SFTP and return its size. Opens a
+/// short-lived SFTP session over the supplied russh handle, requests
+/// metadata for `remote_path`, and tags every failure path with the
+/// v4.5 `REMOTE_METADATA_ERROR:` wire code. The session is dropped
+/// before returning — the caller's streaming task opens its own
+/// session for the actual transfer.
+async fn stat_remote_size(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    remote_path: &str,
+) -> Result<u64, DomainError> {
+    let sftp = open_sftp_session(handle)
+        .await
+        .map_err(|err| map_sftp_error("open SFTP session for remote metadata", &err))?;
+    let metadata = sftp
+        .metadata(remote_path.to_string())
+        .await
+        .map_err(|err| map_sftp_error(&format!("stat remote '{remote_path}'"), &err.to_string()))?;
+    Ok(metadata.size.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -854,5 +881,31 @@ mod tests {
         // the original handle is observable through the adapter's
         // accessor.
         assert_eq!(adapter.handle_registry().len(), reg.len());
+    }
+
+    /// `REMOTE_METADATA_ERROR` is the v4.5 wire tag for SFTP `stat`
+    /// failures during pre-flight on the download path. The classifier
+    /// must recognise the operation labels emitted by
+    /// [`super::stat_remote_size`] (`stat remote 'x'`) so the use case
+    /// surfaces the tag verbatim.
+    #[test]
+    fn sftp_error_tag_recognises_remote_metadata_operations() {
+        assert_eq!(
+            super::sftp_error_tag("stat remote '/srv/payload.bin'"),
+            Some("REMOTE_METADATA_ERROR")
+        );
+        assert_eq!(
+            super::sftp_error_tag("get remote metadata for '/srv/x'"),
+            Some("REMOTE_METADATA_ERROR")
+        );
+        // Session-open paths still win even though the same operation
+        // label can mention `remote metadata` — the SFTP_OPEN_FAILED
+        // rule is checked before the REMOTE_METADATA_ERROR rule.
+        assert_eq!(
+            super::sftp_error_tag("open SFTP session for remote metadata"),
+            Some("SFTP_OPEN_FAILED")
+        );
+        // Unrelated operations keep the legacy untagged shape.
+        assert_eq!(super::sftp_error_tag("read chunk"), None);
     }
 }

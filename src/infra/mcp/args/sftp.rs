@@ -5,6 +5,22 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+// Schemars 1.2 default-fn helpers — see `connection.rs` for rationale.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_wait() -> Option<bool> {
+    Some(false)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_wait_timeout_secs() -> Option<u64> {
+    Some(30)
+}
+
 /// Arguments for the `ssh_upload` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshUploadArgs {
@@ -41,8 +57,37 @@ pub struct SshGetTransferProgressArgs {
 
     /// Block until completion or `wait_timeout_secs` expires. Default:
     /// false.
+    #[schemars(default = "default_wait")]
     pub wait: Option<bool>,
 
     /// Maximum seconds to block when `wait=true`. Default: 30. Cap: 300.
+    #[schemars(default = "default_wait_timeout_secs")]
     pub wait_timeout_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SshGetTransferProgressArgs;
+    use schemars::schema_for;
+    use serde_json::Value;
+
+    /// See `connection::tests::property_default` for the helper rationale.
+    fn property_default<'a>(schema_json: &'a Value, field: &str) -> Option<&'a Value> {
+        let property = schema_json.get("properties")?.get(field)?;
+        property.get("default")
+    }
+
+    #[test]
+    fn ssh_get_transfer_progress_schema_emits_documented_defaults() {
+        let schema = schema_for!(SshGetTransferProgressArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "wait"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            property_default(&schema_json, "wait_timeout_secs"),
+            Some(&Value::from(30_u64))
+        );
+    }
 }

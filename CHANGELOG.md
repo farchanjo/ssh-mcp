@@ -5,6 +5,51 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] — 2026-05-03
+
+### Highlights
+
+- LLM UX **100%** — every dimension audited at v4.5 reaches its theoretical maximum for a 27B-30B class model. Self-bootstrap from `Implementation.instructions` + tool list with no external docs. Successor tools advertised in-band via a new `NEXT:` line. Subscribe-first nudges via inline `HINT:` lines on every async-spawn response. JSON Schema `default` keyword visible on every optional field. All 14 documented wire error codes now reach the wire (3 reserved tags promoted to live). Server icon wired. Cost / timing hints inlined in tool descriptions.
+- Public MCP API stays byte-compatible with v4.5.0 except for one narrow rename: the wire key for `agent_id` changed from `AGENT:` to `AGENT_ID:` for consistency with every other `_ID` field. Hosts that walk key-value lines generically are unaffected; hosts that grep `^AGENT:` literally must update.
+
+### Added
+
+- **`NEXT:` advisory line** — every response with a clear successor tool now ends with a `NEXT:` line listing pipe-separated concrete tool calls (e.g. `NEXT: ssh_get_command_output(command_id=c-X, wait=true) | ssh_cancel_command(command_id=c-X)`). 12 emission sites:
+  - `SSH_CONNECT: OK / REUSED / SUGGESTED`
+  - `SSH_LIST_SESSIONS: OK` (only when non-empty)
+  - `SSH_EXECUTE: STARTED`
+  - `SSH_GET_COMMAND_OUTPUT: RUNNING`
+  - `SSH_SHELL_OPEN: OK`
+  - `SSH_SHELL_WRITE: OK` / `SSH_SHELL_SEND_KEY: OK`
+  - `SSH_SHELL_WAIT_FOR: MATCHED / TIMEOUT`
+  - `SSH_UPLOAD: STARTED` / `SSH_DOWNLOAD: STARTED`
+  - `SSH_GET_TRANSFER_PROGRESS: RUNNING`
+  - `SSH_FORWARD: OK`
+- **Subscribe-first `HINT:` lines (4 new sites)** — `ssh_shell_open`, `ssh_execute` (async), `ssh_upload` / `ssh_download`, and `ssh_forward` now emit a one-line `HINT:` steering callers to the matching `resources/subscribe` URI ("subscribe to <scheme>://<id>/... for realtime ..."). Anti-leak `HINT:` on `ssh_list_sessions` (>5 sessions/agent, v4.4) is unchanged.
+- **JSON Schema `default` keyword visible on 27 optional fields** — `connection.rs` (7), `execute.rs` (8), `shell.rs` (10), `sftp.rs` (2). Smaller LLMs that read the schema mechanically now see the default value without parsing English from the description. Implemented via `#[schemars(default = "fn_name")]`.
+- **Cost / timing hints in tool descriptions** — every `#[tool(description = "...")]` ends with a `Cost: ...` line covering O() complexity, expected latency, blocking-vs-async, and pointer to subscribe paths where applicable. 35 description sites updated (18 with `port_forward` + 17 without).
+- **3 reserved error tags now emit live**:
+  - `FORWARD_FAILED:` — `application/forward_port.rs::ForwardPortUseCase::preflight_bind` (pre-flight `TcpListener::bind` failures other than `AddrInUse`).
+  - `LOCAL_NOT_FILE:` — `application/upload_file.rs::UploadFileUseCase::guard_local_path_is_file` (pre-flight `metadata` check rejects directories / non-regular files).
+  - `REMOTE_METADATA_ERROR:` — `adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` (download remote `stat` failures).
+  All 14 documented codes in `ERRORS.md` now reach the wire.
+- **Server icon wired** — `Implementation.icons` points to `https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg` (image/svg+xml, sizes "any"). New `assets/icon.svg` (128x128 terminal-themed mark with `$ ssh` prompt). URL resolves after the v4.6 master push; clients gracefully fall back to title + description before then.
+
+### Changed
+
+- **Wire key rename: `AGENT:` → `AGENT_ID:` (narrow breaking change)** — 7 render sites: `ssh_connect`, `ssh_list_sessions` (per-row), `ssh_execute` (async), `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. CLAUDE.md required all IDs to end with `_ID` — this closes the last drift. Hosts walking key-value lines generically: no change. Hosts grepping `^AGENT:` literally: update to `^AGENT_ID:`.
+- `ssh_connect` description trimmed for token efficiency where redundant; cost line preserves the existing tip bullets.
+
+### Tests
+
+- Lib tests: **1074 → 1091** (+12 from JSON Schema default snapshot tests; +6 from new error-code emission tests; -1 redundant test consolidated). Clippy / build / fmt all clean on touched files.
+
+### Behaviour notes
+
+- The narrow `AGENT:` → `AGENT_ID:` rename is the only wire-shape change in v4.6. Every other addition is purely additive (new lines appended; existing keys preserved).
+- `NEXT:` lines are advisory only — they never carry side effects and never affect MCP wire validity. Hosts that ignore them are still fully functional.
+- Cost hints in tool descriptions are conventional English text, not machine-readable. They steer models that rank tools by description similarity; they do not constrain behaviour.
+
 ## [4.5.0] — 2026-05-03
 
 ### Highlights

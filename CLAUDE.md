@@ -7,7 +7,7 @@ cargo build --release                              # Build all binaries (default
 cargo build --release --bin ssh-mcp                # HTTP server only (axum 0.8 + rmcp 1.6)
 cargo build --release --bin ssh-mcp-stdio          # Stdio transport only (rmcp 1.6 stdio)
 cargo build --release --no-default-features        # Without port forwarding
-cargo test --lib --quiet                           # 1014 lib tests
+cargo test --lib --quiet                           # 1091 lib tests
 cargo test --tests --quiet                         # 2 integration tests (incl. v4 smoke)
 cargo test --all-features                          # Combined run
 cargo test --features test-fixtures                # Use cases with deterministic in-memory adapters
@@ -15,9 +15,9 @@ cargo fmt --all -- --check                         # Check formatting
 cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
 ```
 
-## Architecture (v4.5.0 — Hexagonal / Ports and Adapters, deep-decoupled)
+## Architecture (v4.6.0 — Hexagonal / Ports and Adapters, deep-decoupled)
 
-The public MCP API is unchanged from v3 / v4.0 / v4.1 (same 18 tools, 5 resource schemes, markdown shape, env vars). v4.5 layers a richer LLM UX on top: stable `PeerId` derived from `Mcp-Session-Id` (HTTP) or stdio singleton, live `_meta` envelope on `resources/read`, granular wire error codes (14 dispatched tags), `Implementation` identity (title/description/website_url) with few-shot `instructions`, and `ToolAnnotations` on every tool. v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
+The public MCP API is structurally unchanged from v3 / v4.0 / v4.1 / v4.5 (same 18 tools, 5 resource schemes, block markdown shape, env vars). v4.6 ships one narrow wire renaming — the agent_id field key changed from `AGENT:` to `AGENT_ID:` for ID-suffix consistency — plus a steering surface for smaller LLMs: `NEXT:` advisory line on every response with a clear successor (pre-filled tool calls), four new subscribe-first `HINT:` sites (shell open / execute / upload / download / forward), JSON Schema `default` keywords on optional args, a one-line `Cost:` hint at the end of every tool description, and a wired `Implementation.icons` URL pointing at `assets/icon.svg`. v4.5 layered the v4.5 LLM UX on top: stable `PeerId` derived from `Mcp-Session-Id` (HTTP) or stdio singleton, live `_meta` envelope on `resources/read`, granular wire error codes (14 dispatched tags — all live as of v4.6), `Implementation` identity with few-shot `instructions`, and `ToolAnnotations` on every tool. v4 is an internal restructuring; v4.1 closed the H17.6 deferred decouple — `src/mcp/` is gone, `async-trait` is no longer a direct dep. See `docs/MIGRATION_v3_to_v4.md` for the contributor guide and `docs/ARCHITECTURE.md` for the full layer-by-layer module map.
 
 ### Binary Targets
 
@@ -132,7 +132,7 @@ See `docs/LOCKS.md` for the lock-free invariants enforced by these lints (rewrit
 - v4 use cases generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT.
 - Match exhaustively (no `_ =>` for closed enums; use `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 1014 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
+- 1091 lib tests + 2 integration tests + Python integration suites (`scripts/test_*.py`) + 4 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - 8 loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`; full loom mode currently blocked by upstream tokio/loom incompatibility in russh + axum — documented in the test file and `Cargo.toml`).
 

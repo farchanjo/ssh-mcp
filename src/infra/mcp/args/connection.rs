@@ -46,6 +46,60 @@ impl ReusePolicy {
     }
 }
 
+// Schemars 1.2 default-fn helpers. The `#[schemars(default = "fn")]`
+// attribute is parsed by serde-derive-internals (see
+// `schemars_derive::attr::schemars_to_serde::SERDE_KEYWORDS`), so the
+// fn signature must match the field type — i.e. `() -> Option<T>`.
+// Schemars then serializes the returned value into the JSON Schema
+// `default` keyword via `_schemars_maybe_to_value!` (see
+// `schemars_derive/src/schema_exprs.rs:709`).
+//
+// `clippy::unnecessary_wraps` is allowed here because the `Option<T>`
+// return is not stylistic — it's required by serde's contract for
+// `default = "fn"` on an `Option<T>` field.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_timeout_secs() -> Option<u64> {
+    Some(30)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_max_retries() -> Option<u32> {
+    Some(3)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_retry_delay_ms() -> Option<u64> {
+    Some(1000)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_compress() -> Option<bool> {
+    Some(true)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_persistent() -> Option<bool> {
+    Some(false)
+}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_max_items() -> Option<usize> {
+    Some(500)
+}
+
 /// Arguments for the `ssh_connect` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshConnectArgs {
@@ -71,18 +125,22 @@ pub struct SshConnectArgs {
 
     /// Connection timeout in seconds. Default: 30. Env:
     /// `SSH_CONNECT_TIMEOUT`.
+    #[schemars(default = "default_timeout_secs")]
     pub timeout_secs: Option<u64>,
 
     /// Maximum retry attempts for transient connection failures.
     /// Default: 3. Env: `SSH_MAX_RETRIES`.
+    #[schemars(default = "default_max_retries")]
     pub max_retries: Option<u32>,
 
     /// Initial delay between retries in milliseconds (exponential
     /// backoff, capped at 10s). Default: 1000. Env: `SSH_RETRY_DELAY_MS`.
+    #[schemars(default = "default_retry_delay_ms")]
     pub retry_delay_ms: Option<u64>,
 
     /// Enable zlib compression for the SSH transport. Default: true.
     /// Env: `SSH_COMPRESSION`.
+    #[schemars(default = "default_compress")]
     pub compress: Option<bool>,
 
     /// Optional human-readable name for the session (e.g. `production-db`,
@@ -92,6 +150,7 @@ pub struct SshConnectArgs {
 
     /// Keep the session open indefinitely (disables inactivity timeout).
     /// Default: false. Set true for long-lived backends or daemons.
+    #[schemars(default = "default_persistent")]
     pub persistent: Option<bool>,
 
     /// Optional `AGENT_ID` for grouping sessions
@@ -121,6 +180,7 @@ pub struct SshListSessionsArgs {
 
     /// Maximum entries returned. Default: 500. Cap: 10000. Env:
     /// `SSH_MCP_LIST_MAX_ITEMS` / `SSH_MCP_LIST_MAX_ITEMS_CAP`.
+    #[schemars(default = "default_max_items")]
     pub max_items: Option<usize>,
 }
 
@@ -135,8 +195,10 @@ pub struct SshDisconnectAgentArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::ReusePolicy;
+    use super::{ReusePolicy, SshConnectArgs, SshListSessionsArgs};
     use crate::domain::policy::ReusePolicy as DomainReusePolicy;
+    use schemars::schema_for;
+    use serde_json::Value;
 
     #[test]
     fn reuse_policy_serde_round_trip() {
@@ -161,5 +223,67 @@ mod tests {
     #[test]
     fn reuse_policy_default_is_suggest() {
         assert_eq!(ReusePolicy::default(), ReusePolicy::Suggest);
+    }
+
+    /// Pull the `default` keyword from a generated property schema.
+    ///
+    /// Walks the JSON Schema 2020-12 shape produced by `schemars 1.2`:
+    /// `{ "properties": { "<field>": { "default": <value>, ... } } }`.
+    /// Returns `None` when any step misses so the test asserts on the
+    /// presence/absence path explicitly instead of unwrapping mid-walk.
+    fn property_default<'a>(schema_json: &'a Value, field: &str) -> Option<&'a Value> {
+        let property = schema_json.get("properties")?.get(field)?;
+        property.get("default")
+    }
+
+    #[test]
+    fn ssh_connect_schema_emits_documented_defaults() {
+        let schema = schema_for!(SshConnectArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+
+        // Defaults documented on the doc-comment must reach the
+        // JSON Schema `default` keyword so smaller LLMs that read
+        // the schema mechanically (rather than the description) can
+        // see them.
+        assert_eq!(
+            property_default(&schema_json, "timeout_secs"),
+            Some(&Value::from(30_u64)),
+            "timeout_secs default missing in schema; full schema = {schema_json}"
+        );
+        assert_eq!(
+            property_default(&schema_json, "max_retries"),
+            Some(&Value::from(3_u32))
+        );
+        assert_eq!(
+            property_default(&schema_json, "retry_delay_ms"),
+            Some(&Value::from(1000_u64))
+        );
+        assert_eq!(
+            property_default(&schema_json, "compress"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            property_default(&schema_json, "persistent"),
+            Some(&Value::Bool(false))
+        );
+
+        // Fields without a documented default must NOT carry one.
+        assert!(
+            property_default(&schema_json, "session_id").is_none(),
+            "session_id has no documented default but schema emitted one"
+        );
+        assert!(property_default(&schema_json, "name").is_none());
+        assert!(property_default(&schema_json, "agent_id").is_none());
+    }
+
+    #[test]
+    fn ssh_list_sessions_schema_emits_max_items_default() {
+        let schema = schema_for!(SshListSessionsArgs);
+        let schema_json = serde_json::to_value(&schema).expect("schema -> json");
+        assert_eq!(
+            property_default(&schema_json, "max_items"),
+            Some(&Value::from(500_usize))
+        );
+        assert!(property_default(&schema_json, "agent_id").is_none());
     }
 }

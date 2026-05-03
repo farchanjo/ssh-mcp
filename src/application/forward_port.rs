@@ -44,7 +44,10 @@
 
 #![cfg(feature = "port_forward")]
 
+use std::io::ErrorKind;
 use std::sync::Arc;
+
+use tokio::net::TcpListener;
 
 use crate::domain::error::DomainError;
 use crate::domain::forward::ForwardEntity;
@@ -143,6 +146,11 @@ where
     ///
     /// - [`DomainError::SessionNotFound`] when the parent session is
     ///   unknown to the repository.
+    /// - [`DomainError::PortInUse`] when the local port is already bound.
+    /// - [`DomainError::Transport`] tagged `FORWARD_FAILED:` when the
+    ///   pre-flight bind fails for any other I/O reason (permission denied,
+    ///   network unreachable, etc.) so smaller LLMs see the specific wire
+    ///   code instead of the collapsed `TRANSPORT_ERROR`.
     /// - [`DomainError::Storage`] when the forward repository rejects the
     ///   insert.
     pub async fn execute(
@@ -161,6 +169,15 @@ where
         if session.is_none() {
             return Err(DomainError::SessionNotFound(req.session_id));
         }
+
+        // Best-effort pre-flight bind. Catches obvious failures (port
+        // already bound, permission denied) before the entity is persisted
+        // so a smaller LLM does not get a `forward://` resource for a
+        // listener that never came up. The probe is dropped immediately;
+        // a full TOCTOU race against the real SSH-side bind is out of
+        // scope (the production listener will fail again with the same
+        // error class and be reported through the `forward://` events).
+        Self::preflight_bind(req.local_port).await?;
 
         let forward_id = self.ids.new_forward_id();
         let started_at = self.clock.utc_now();
@@ -181,6 +198,27 @@ where
             remote_port: req.remote_port,
             started_at: started_at.to_rfc3339(),
         })
+    }
+
+    /// Best-effort pre-flight bind on the requested local port. Maps
+    /// [`ErrorKind::AddrInUse`] to [`DomainError::PortInUse`] (already a
+    /// dedicated wire code) and every other I/O failure to
+    /// [`DomainError::Transport`] tagged `FORWARD_FAILED:` so the wire
+    /// classifier promotes it to the specific code instead of collapsing
+    /// onto `TRANSPORT_ERROR`.
+    async fn preflight_bind(local_port: u16) -> Result<(), DomainError> {
+        match TcpListener::bind(("0.0.0.0", local_port)).await {
+            Ok(listener) => {
+                drop(listener);
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::AddrInUse => {
+                Err(DomainError::PortInUse(local_port))
+            }
+            Err(err) => Err(DomainError::Transport(format!(
+                "FORWARD_FAILED: bind 0.0.0.0:{local_port} failed: {err}"
+            ))),
+        }
     }
 }
 
@@ -203,6 +241,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::net::TcpListener;
 
     type UseCaseUnderTest = ForwardPortUseCase<
         FakeSshClient,
@@ -266,16 +305,22 @@ mod tests {
         }
     }
 
+    /// Tests target port 0 so the OS picks a free ephemeral port for the
+    /// pre-flight bind. The use case still echoes the requested port back
+    /// (the probe is dropped, the input value is what propagates into the
+    /// persisted entity), so assertions read the input value verbatim.
+    const FREE_PORT: u16 = 0;
+
     #[tokio::test(flavor = "multi_thread")]
     async fn happy_path_persists_forward_and_returns_outcome() {
         let (uc, _ssh, sessions, forwards) = build_use_case();
         seed_session(&sessions, "s-1").await;
         let outcome = uc
-            .execute(req("s-1", 8080, "internal", 80))
+            .execute(req("s-1", FREE_PORT, "internal", 80))
             .await
             .expect("execute");
         assert_eq!(outcome.session_id.as_str(), "s-1");
-        assert_eq!(outcome.local_port, 8080);
+        assert_eq!(outcome.local_port, FREE_PORT);
         assert_eq!(outcome.remote_address, "internal");
         assert_eq!(outcome.remote_port, 80);
         // forward_id matches the deterministic adapter shape.
@@ -286,7 +331,7 @@ mod tests {
             .expect("get")
             .expect("forward must be persisted");
         assert_eq!(stored.status, ForwardStatus::Running);
-        assert_eq!(stored.local_port, 8080);
+        assert_eq!(stored.local_port, FREE_PORT);
         assert_eq!(stored.remote_host, "internal");
     }
 
@@ -294,7 +339,7 @@ mod tests {
     async fn unknown_session_returns_session_not_found() {
         let (uc, _ssh, _sessions, forwards) = build_use_case();
         let err = uc
-            .execute(req("ghost", 8080, "internal", 80))
+            .execute(req("ghost", FREE_PORT, "internal", 80))
             .await
             .expect_err("unknown session must fail");
         match err {
@@ -310,7 +355,7 @@ mod tests {
         let (uc, _ssh, sessions, _forwards) = build_use_case();
         seed_session(&sessions, "s-1").await;
         let outcome = uc
-            .execute(req("s-1", 5432, "db.internal", 5432))
+            .execute(req("s-1", FREE_PORT, "db.internal", 5432))
             .await
             .expect("execute");
         // The clock is fixed via FakeClock(1_777_982_400_000) -> 2026-05-05T11:20:00Z.
@@ -322,8 +367,8 @@ mod tests {
     async fn three_calls_mint_distinct_ids() {
         let (uc, _ssh, sessions, forwards) = build_use_case();
         seed_session(&sessions, "s-1").await;
-        for port in [8001_u16, 8002, 8003] {
-            uc.execute(req("s-1", port, "internal", 80))
+        for _ in 0..3 {
+            uc.execute(req("s-1", FREE_PORT, "internal", 80))
                 .await
                 .expect("execute");
         }
@@ -339,10 +384,10 @@ mod tests {
         let (uc, _ssh, sessions, forwards) = build_use_case();
         seed_session(&sessions, "s-1").await;
         seed_session(&sessions, "s-2").await;
-        uc.execute(req("s-1", 8080, "a", 80))
+        uc.execute(req("s-1", FREE_PORT, "a", 80))
             .await
             .expect("execute s-1");
-        uc.execute(req("s-2", 9090, "b", 90))
+        uc.execute(req("s-2", FREE_PORT, "b", 90))
             .await
             .expect("execute s-2");
         let owned = forwards
@@ -350,7 +395,7 @@ mod tests {
             .await
             .expect("list_filtered");
         assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].local_port, 8080);
+        assert_eq!(owned[0].local_port, FREE_PORT);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -359,15 +404,42 @@ mod tests {
         // First call fails (no session) so the id generator must not have
         // advanced — the next happy path must still get fwd-0.
         let _ = uc
-            .execute(req("ghost", 1, "x", 1))
+            .execute(req("ghost", FREE_PORT, "x", 1))
             .await
             .expect_err("unknown");
         seed_session(&sessions, "s-1").await;
         let outcome = uc
-            .execute(req("s-1", 8080, "internal", 80))
+            .execute(req("s-1", FREE_PORT, "internal", 80))
             .await
             .expect("execute");
         assert_eq!(outcome.forward_id.as_str(), "fwd-0");
         assert_eq!(forwards.list_filtered(None).await.expect("list").len(), 1);
+    }
+
+    /// The pre-flight bind in [`ForwardPortUseCase::execute`] must
+    /// promote `AddrInUse` to [`DomainError::PortInUse`] (the dedicated
+    /// `PORT_IN_USE` wire code) so the LLM can branch on a precise
+    /// failure class instead of the generic `TRANSPORT_ERROR`. The probe
+    /// binds on `0.0.0.0:<port>` so this test holds a listener on the
+    /// same `0.0.0.0:<port>` (`SO_REUSEADDR` is OFF by default in tokio)
+    /// to guarantee a deterministic collision regardless of the host
+    /// loopback / wildcard binding conventions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_port_already_bound_returns_port_in_use() {
+        let (uc, _ssh, sessions, _forwards) = build_use_case();
+        seed_session(&sessions, "s-1").await;
+        let held = TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .expect("seed listener");
+        let local_port = held.local_addr().expect("local_addr").port();
+        let err = uc
+            .execute(req("s-1", local_port, "internal", 80))
+            .await
+            .expect_err("bind collision must fail");
+        match err {
+            DomainError::PortInUse(p) => assert_eq!(p, local_port),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        drop(held);
     }
 }
