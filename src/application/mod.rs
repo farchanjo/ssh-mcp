@@ -30,30 +30,30 @@
 //!   inline.
 
 pub mod connect_session;
+pub mod disconnect_agent;
 pub mod disconnect_session;
 pub mod list_sessions;
-pub mod disconnect_agent;
 
+pub mod cancel_command;
 pub mod execute_command;
 pub mod get_command_output;
 pub mod list_commands;
-pub mod cancel_command;
 
-pub mod open_shell;
-pub mod write_shell;
-pub mod send_key;
-pub mod read_shell;
-pub mod wait_for_pattern;
 pub mod close_shell;
+pub mod open_shell;
+pub mod read_shell;
+pub mod send_key;
+pub mod wait_for_pattern;
+pub mod write_shell;
 
-pub mod upload_file;
 pub mod download_file;
 pub mod get_transfer_progress;
+pub mod upload_file;
 
 #[cfg(feature = "port_forward")]
 pub mod forward_port;
 pub mod list_resources;
+pub mod peer_gc;
 pub mod read_resource;
 pub mod subscribe_resource;
 pub mod unsubscribe_resource;
-pub mod peer_gc;
