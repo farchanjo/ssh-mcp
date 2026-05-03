@@ -268,7 +268,10 @@ impl fmt::Debug for RusshAdapter {
             .field("sftp_handle_registry", &self.sftp_handle_registry)
             .field("command_status_sink", &"<dyn CommandStatusSink>")
             .field("shell_status_sink", &"<dyn ShellStatusSink>")
-            .field("command_registration_sink", &"<dyn CommandRegistrationSink>")
+            .field(
+                "command_registration_sink",
+                &"<dyn CommandRegistrationSink>",
+            )
             .field("shell_registration_sink", &"<dyn ShellRegistrationSink>")
             .finish()
     }
@@ -338,10 +341,7 @@ impl RusshAdapter {
     /// where `resources/subscribe command://X/output` could observe an
     /// adapter row but no repo row.
     #[must_use]
-    pub fn with_command_registration_sink(
-        mut self,
-        sink: SharedCommandRegistrationSink,
-    ) -> Self {
+    pub fn with_command_registration_sink(mut self, sink: SharedCommandRegistrationSink) -> Self {
         self.command_registration_sink = sink;
         self
     }
@@ -350,10 +350,7 @@ impl RusshAdapter {
     /// domain `ShellRepository`. Mirrors
     /// [`Self::with_command_registration_sink`].
     #[must_use]
-    pub fn with_shell_registration_sink(
-        mut self,
-        sink: SharedShellRegistrationSink,
-    ) -> Self {
+    pub fn with_shell_registration_sink(mut self, sink: SharedShellRegistrationSink) -> Self {
         self.shell_registration_sink = sink;
         self
     }
@@ -948,7 +945,13 @@ impl RusshAdapter {
         running: &Arc<RunningCommand>,
         pty: bool,
     ) {
-        Self::spawn_async_driver(handle, command.to_string(), timeout, Arc::clone(running), pty);
+        Self::spawn_async_driver(
+            handle,
+            command.to_string(),
+            timeout,
+            Arc::clone(running),
+            pty,
+        );
         Self::spawn_status_watcher(
             Arc::clone(&self.command_status_sink),
             command_id.clone(),

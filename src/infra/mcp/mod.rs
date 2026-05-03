@@ -27,6 +27,7 @@
 
 pub mod args;
 pub mod helpers;
+pub mod idempotency;
 pub mod peer_handle;
 pub mod progress;
 pub mod prompts;
@@ -35,4 +36,5 @@ pub mod resource_handlers;
 pub mod resource_templates;
 pub mod results;
 pub mod server;
+pub mod suggestions;
 pub mod tool_router;
