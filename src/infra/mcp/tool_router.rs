@@ -20,12 +20,13 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Icon, Implementation, ListResourcesResult, PaginatedRequestParams,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    CallToolResult, Icon, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::application::cancel_command::CancelCommandRequest;
 use crate::application::close_shell::CloseShellRequest;
@@ -36,15 +37,21 @@ use crate::application::download_file::DownloadRequest;
 use crate::application::execute_command::ExecuteRequest;
 #[cfg(feature = "port_forward")]
 use crate::application::forward_port::ForwardPortRequest;
-use crate::application::get_command_output::GetCommandOutputRequest;
-use crate::application::get_transfer_progress::GetTransferProgressRequest;
+use crate::application::get_command_output::{
+    GetCommandOutputRequest, GetCommandOutputResult, GetCommandOutputUseCase,
+};
+use crate::application::get_transfer_progress::{
+    GetTransferProgressRequest, GetTransferProgressResult, GetTransferProgressUseCase,
+};
 use crate::application::list_commands::ListCommandsRequest;
 use crate::application::list_sessions::ListSessionsRequest;
 use crate::application::open_shell::OpenShellRequest;
 use crate::application::read_shell::ReadShellRequest;
 use crate::application::send_key::SendKeyRequest;
 use crate::application::upload_file::UploadRequest;
-use crate::application::wait_for_pattern::WaitForPatternRequest;
+use crate::application::wait_for_pattern::{
+    WaitForPatternOutcome, WaitForPatternRequest, WaitForPatternUseCase,
+};
 use crate::application::write_shell::WriteShellRequest;
 use crate::composition::UseCases;
 use crate::domain::error::DomainError;
@@ -54,7 +61,9 @@ use crate::domain::keys::KeyModifiers;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
+use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
 use crate::infra::mcp::render;
+use crate::infra::mcp::resource_templates;
 use crate::infra::mcp::results::{
     SshConnectResult, SshExecuteResult, SshGetCommandOutputResult, SshGetTransferProgressResult,
     SshShellOpenResult, SshShellReadResult,
@@ -248,6 +257,162 @@ fn parse_address(input: &str) -> Result<Address, DomainError> {
         Address::with_default_port(input.to_string())
             .map_err(|e| DomainError::InvalidArgument(e.to_string()))
     }
+}
+
+/// Drive a long-running command-output use case under a bounded
+/// progress-emission interval.
+///
+/// Best-effort: the emitter swallows transport errors and the use case
+/// future is the source of the user-visible outcome.
+///
+/// The pump only ticks while `req.wait` is `true` and the emitter is
+/// enabled; when either is false the use case is awaited directly so the
+/// fast path stays a single `.await`.
+async fn drive_with_command_progress<CR, OS>(
+    use_case: &GetCommandOutputUseCase<CR, OS>,
+    streams: &Arc<OS>,
+    req: GetCommandOutputRequest,
+    emitter: ProgressEmitter,
+) -> Result<GetCommandOutputResult, DomainError>
+where
+    CR: CommandRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+{
+    if !req.wait || !emitter.is_enabled() {
+        return use_case.execute(req).await;
+    }
+    let cmd_id = req.command_id.clone();
+    let exec_fut = use_case.execute(req);
+    tokio::pin!(exec_fut);
+    let mut tick = interval(COMMAND_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            biased;
+            outcome = &mut exec_fut => return outcome,
+            _ = tick.tick() => emit_command_snapshot(streams, &cmd_id, &emitter).await,
+        }
+    }
+}
+
+/// Pull a fresh command output snapshot and emit it through the progress
+/// emitter.
+///
+/// Errors during the snapshot pull are silently ignored so the pump never
+/// blows up on a transient port hiccup.
+async fn emit_command_snapshot<OS>(
+    streams: &Arc<OS>,
+    command_id: &CommandId,
+    emitter: &ProgressEmitter,
+) where
+    OS: OutputStreamPort + Send + Sync,
+{
+    let Ok(snap) = streams.snapshot_command(command_id).await else {
+        return;
+    };
+    let bytes = super::progress::usize_to_progress(snap.stdout.len());
+    emitter
+        .emit(bytes, None, Some("command running".to_string()))
+        .await;
+}
+
+/// Drive a long-running transfer-progress use case under a bounded
+/// progress-emission interval.
+///
+/// Same shape as [`drive_with_command_progress`] but pulls a fresh
+/// `TransferEntity` for each tick so the emission carries
+/// `(bytes_transferred, total_bytes)`.
+async fn drive_with_transfer_progress<TR>(
+    use_case: &GetTransferProgressUseCase<TR>,
+    transfers: &Arc<TR>,
+    req: GetTransferProgressRequest,
+    emitter: ProgressEmitter,
+) -> Result<GetTransferProgressResult, DomainError>
+where
+    TR: TransferRepository + Send + Sync,
+{
+    if !req.wait || !emitter.is_enabled() {
+        return use_case.execute(req).await;
+    }
+    let xfer_id = req.transfer_id.clone();
+    let exec_fut = use_case.execute(req);
+    tokio::pin!(exec_fut);
+    let mut tick = interval(COMMAND_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            biased;
+            outcome = &mut exec_fut => return outcome,
+            _ = tick.tick() => emit_transfer_snapshot(transfers, &xfer_id, &emitter).await,
+        }
+    }
+}
+
+/// Pull a fresh transfer entity and emit
+/// `(bytes_transferred, total_bytes)` through the progress emitter.
+///
+/// Errors during the lookup are silently ignored.
+async fn emit_transfer_snapshot<TR>(
+    transfers: &Arc<TR>,
+    transfer_id: &TransferId,
+    emitter: &ProgressEmitter,
+) where
+    TR: TransferRepository + Send + Sync,
+{
+    let Ok(Some(entity)) = transfers.get(transfer_id).await else {
+        return;
+    };
+    let progress = super::progress::u64_to_progress(entity.bytes_transferred);
+    let total = super::progress::u64_to_progress(entity.total_bytes);
+    emitter
+        .emit(progress, Some(total), Some("transfer running".to_string()))
+        .await;
+}
+
+/// Drive a long-running shell `wait_for_pattern` use case under a 1 s
+/// progress-emission interval, reporting `(elapsed_secs, timeout_secs)`
+/// so the LLM sees forward motion while it polls.
+async fn drive_with_wait_for_progress<ShR, OS, C, Cfg>(
+    use_case: &WaitForPatternUseCase<ShR, OS, C, Cfg>,
+    req: WaitForPatternRequest,
+    emitter: ProgressEmitter,
+) -> Result<WaitForPatternOutcome, DomainError>
+where
+    ShR: ShellRepository + Send + Sync,
+    OS: OutputStreamPort + Send + Sync,
+    C: ClockPort + Send + Sync,
+    Cfg: ConfigPort + Send + Sync,
+{
+    if !emitter.is_enabled() {
+        return use_case.execute(req).await;
+    }
+    let total = req.timeout.map(|t| t.as_secs_f64());
+    let started = Instant::now();
+    let exec_fut = use_case.execute(req);
+    tokio::pin!(exec_fut);
+    let mut tick = interval(WAIT_FOR_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            outcome = &mut exec_fut => return outcome,
+            _ = tick.tick() => emit_wait_progress(started, total, &emitter).await,
+        }
+    }
+}
+
+/// Emit one elapsed-seconds tick toward the configured timeout.
+///
+/// Pure helper extracted from [`drive_with_wait_for_progress`] so the
+/// pump body stays under the 30-line ceiling.
+async fn emit_wait_progress(started: Instant, total: Option<f64>, emitter: &ProgressEmitter) {
+    let elapsed = started.elapsed().as_secs_f64();
+    emitter
+        .emit(elapsed, total, Some("waiting for pattern".to_string()))
+        .await;
 }
 
 /// Build the [`Credentials`] DTO from the rmcp connect args following the
@@ -479,12 +644,13 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
         output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
         &self,
         Parameters(args): Parameters<SshGetCommandOutputArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = GetCommandOutputRequest {
             command_id: CommandId::new(args.command_id),
@@ -492,7 +658,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
             max_output_bytes: args.max_output_bytes,
         };
-        match self.use_cases.get_command_output.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let use_case = self.use_cases.get_command_output.as_ref();
+        let streams = use_case.streams();
+        let outcome = drive_with_command_progress(use_case, streams, req, emitter).await;
+        match outcome {
             Ok(result) => {
                 let structured = render::execute::get_command_output_structured(&result);
                 let body = render::execute::get_command_output_render(result);
@@ -689,11 +859,12 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating."
+        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort)."
     )]
     async fn ssh_shell_wait_for(
         &self,
         Parameters(args): Parameters<SshShellWaitForArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = WaitForPatternRequest {
             shell_id: ShellId::new(args.shell_id),
@@ -702,7 +873,11 @@ where
             max_output_bytes: args.max_output_bytes,
             clear: args.clear.unwrap_or(true),
         };
-        match self.use_cases.wait_for_pattern.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let outcome =
+            drive_with_wait_for_progress(self.use_cases.wait_for_pattern.as_ref(), req, emitter)
+                .await;
+        match outcome {
             Ok(outcome) => {
                 let structured = render::shell::shell_wait_for_structured(&outcome);
                 let body = render::shell::shell_wait_for_render(&outcome);
@@ -807,19 +982,24 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.",
+        description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
         output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
         &self,
         Parameters(args): Parameters<SshGetTransferProgressArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = GetTransferProgressRequest {
             transfer_id: TransferId::new(args.transfer_id),
             wait: args.wait.unwrap_or(false),
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
-        match self.use_cases.get_transfer_progress.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let use_case = self.use_cases.get_transfer_progress.as_ref();
+        let transfers = use_case.transfers();
+        let outcome = drive_with_transfer_progress(use_case, transfers, req, emitter).await;
+        match outcome {
             Ok(result) => {
                 let structured = render::sftp::transfer_progress_structured(&result);
                 let body = render::sftp::transfer_progress_render(&result);
@@ -1048,12 +1228,13 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        description = "Fetch the current output of an asynchronous command.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
         output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
         &self,
         Parameters(args): Parameters<SshGetCommandOutputArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = GetCommandOutputRequest {
             command_id: CommandId::new(args.command_id),
@@ -1061,7 +1242,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
             max_output_bytes: args.max_output_bytes,
         };
-        match self.use_cases.get_command_output.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let use_case = self.use_cases.get_command_output.as_ref();
+        let streams = use_case.streams();
+        let outcome = drive_with_command_progress(use_case, streams, req, emitter).await;
+        match outcome {
             Ok(result) => {
                 let structured = render::execute::get_command_output_structured(&result);
                 let body = render::execute::get_command_output_render(result);
@@ -1258,11 +1443,12 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating."
+        description = "Block until a substring pattern appears in the shell output.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort)."
     )]
     async fn ssh_shell_wait_for(
         &self,
         Parameters(args): Parameters<SshShellWaitForArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = WaitForPatternRequest {
             shell_id: ShellId::new(args.shell_id),
@@ -1271,7 +1457,11 @@ where
             max_output_bytes: args.max_output_bytes,
             clear: args.clear.unwrap_or(true),
         };
-        match self.use_cases.wait_for_pattern.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let outcome =
+            drive_with_wait_for_progress(self.use_cases.wait_for_pattern.as_ref(), req, emitter)
+                .await;
+        match outcome {
             Ok(outcome) => {
                 let structured = render::shell::shell_wait_for_structured(&outcome);
                 let body = render::shell::shell_wait_for_render(&outcome);
@@ -1376,19 +1566,24 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.",
+        description = "Snapshot the progress of an SFTP transfer.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
         output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
         &self,
         Parameters(args): Parameters<SshGetTransferProgressArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let req = GetTransferProgressRequest {
             transfer_id: TransferId::new(args.transfer_id),
             wait: args.wait.unwrap_or(false),
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
-        match self.use_cases.get_transfer_progress.execute(req).await {
+        let emitter = ProgressEmitter::new(&ctx);
+        let use_case = self.use_cases.get_transfer_progress.as_ref();
+        let transfers = use_case.transfers();
+        let outcome = drive_with_transfer_progress(use_case, transfers, req, emitter).await;
+        match outcome {
             Ok(result) => {
                 let structured = render::sftp::transfer_progress_structured(&result);
                 let body = render::sftp::transfer_progress_render(&result);
@@ -1622,6 +1817,16 @@ where
         resource_handlers::list_resources_impl(&self.use_cases.list_resources).await
     }
 
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resource_templates::build_list(),
+        ))
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -1697,6 +1902,16 @@ where
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         resource_handlers::list_resources_impl(&self.use_cases.list_resources).await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resource_templates::build_list(),
+        ))
     }
 
     async fn read_resource(
