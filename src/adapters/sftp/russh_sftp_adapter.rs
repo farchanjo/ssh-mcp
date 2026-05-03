@@ -17,17 +17,17 @@
 //!   TransferControl` so [`RusshSftpAdapter::cancel`] can flip the
 //!   `CancellationToken` of a running upload/download without bringing
 //!   down its tokio task.
-//! - The streaming chunk loop is delegated to `crate::mcp::sftp::*`
+//! - The streaming chunk loop is delegated to `crate::adapters::sftp::internal::sftp::*`
 //!   (the v3 helpers) — the adapter wires up the lock-free
 //!   primitives ([`Notify`], [`broadcast::Sender`], [`watch::Sender`])
-//!   declared on [`crate::mcp::sftp::TransferShared`] so the
+//!   declared on [`crate::adapters::sftp::internal::sftp::TransferShared`] so the
 //!   future `transfer://<id>/progress` MCP resource keeps working.
 //!
 //! # Progress callback design
 //!
 //! The port surface intentionally **does not** expose a per-chunk
 //! callback parameter. Progress publishes through the broadcast and
-//! `Notify` primitives owned by [`crate::mcp::sftp::TransferShared`]:
+//! `Notify` primitives owned by [`crate::adapters::sftp::internal::sftp::TransferShared`]:
 //! the H10 use case attaches a subscriber via the future
 //! `OutputStreamPort` and converts ticks into MCP notifications. This
 //! keeps the port narrow (`upload`/`download` return a snapshot only)
@@ -56,16 +56,16 @@ use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::domain::error::DomainError;
-use crate::domain::ids::{SessionId, TransferId};
-use crate::domain::transfer::{TransferDirection, TransferEntity, TransferStatus as DomainStatus};
-use crate::mcp::session::SshClientHandler;
-use crate::mcp::sftp::{
+use crate::adapters::sftp::internal::sftp::{
     TransferShared, classify_transfer_error, resolve_local_path, sftp_download_streaming,
     sftp_upload_streaming,
 };
-use crate::mcp::transfer::TransferStatus as McpStatus;
-use crate::mcp::types::ProgressEvent;
+use crate::adapters::sftp::internal::transfer::TransferStatus as McpStatus;
+use crate::adapters::sftp::internal::types::ProgressEvent;
+use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::domain::error::DomainError;
+use crate::domain::ids::{SessionId, TransferId};
+use crate::domain::transfer::{TransferDirection, TransferEntity, TransferStatus as DomainStatus};
 use crate::ports::sftp_client::{DownloadRequest, SftpClientPort, UploadRequest};
 
 /// Internal registry that maps a [`SessionId`] to the russh client handle

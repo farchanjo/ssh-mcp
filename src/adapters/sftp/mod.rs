@@ -4,6 +4,8 @@
 //!   wrapping [`russh_sftp::client::SftpSession`] streams behind opaque
 //!   in-flight transfer state. Hides every russh / russh-sftp type from
 //!   the use case layer.
+//! - `internal` — adapter-private streaming + transfer-state runtime
+//!   relocated from the v3 `crate::mcp::*` namespace in H17.6 P1.
 //!
 //! ## SSH handle bridging
 //!
@@ -14,6 +16,7 @@
 //! adapter. The H10 wiring step reconciles the registry into the
 //! composition root so both adapters reference the same instance.
 
+pub mod internal;
 pub mod russh_sftp_adapter;
 
 #[cfg(any(test, feature = "test-fixtures"))]

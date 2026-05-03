@@ -1,5 +1,5 @@
 //! Production [`SshClientPort`] adapter backed by `russh` and the v3
-//! helpers in [`crate::mcp::client`].
+//! helpers in [`crate::adapters::ssh::internal::client`].
 //!
 //! ## Responsibility
 //!
@@ -62,6 +62,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::adapters::sftp::russh_sftp_adapter::SshHandleRegistry;
+use crate::adapters::ssh::internal::async_command::RunningCommand;
+use crate::adapters::ssh::internal::client::{
+    connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async,
+    execute_ssh_command_async_pty, open_pty_shell,
+};
+use crate::adapters::ssh::internal::session::SshClientHandler;
+use crate::adapters::ssh::internal::shell::{
+    ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms,
+};
+use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
@@ -69,14 +79,6 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
-use crate::mcp::async_command::RunningCommand;
-use crate::mcp::client::{
-    connect_to_ssh_with_retry, execute_ssh_command, execute_ssh_command_async,
-    execute_ssh_command_async_pty, open_pty_shell,
-};
-use crate::mcp::session::SshClientHandler;
-use crate::mcp::shell::{ChannelWriter, RingBuffer, RunningShell, WriteRequest, now_ms};
-use crate::mcp::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
 use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
 
 /// Type alias for the v3 SSH handle the adapter wraps.

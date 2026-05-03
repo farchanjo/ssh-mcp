@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use russh::client;
 use tracing::debug;
 
-use crate::mcp::session::SshClientHandler;
+use crate::adapters::ssh::internal::session::SshClientHandler;
 
 use super::agent::AgentAuth;
 use super::key::KeyAuth;

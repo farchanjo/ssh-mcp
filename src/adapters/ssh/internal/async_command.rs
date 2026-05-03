@@ -29,6 +29,7 @@ use tokio::sync::{OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{AsyncCommandInfo, AsyncCommandStatus};
+use crate::mcp::config::resolve_command_broadcast_cap;
 
 /// Output buffer for collecting command output
 #[derive(Debug, Default, Clone)]
@@ -167,12 +168,12 @@ impl RunningCommand {
     /// Construct a `RunningCommand` with fresh lock-free primitives.
     ///
     /// The broadcast channel capacity is resolved from `SSH_COMMAND_BROADCAST_CAP`
-    /// via [`super::config::resolve_command_broadcast_cap`], with a default of
+    /// via [`crate::mcp::config::resolve_command_broadcast_cap`], with a default of
     /// 1024 frames, a floor of 16, and a hard cap of 65536.
     #[must_use]
     pub fn new(info: AsyncCommandInfo) -> Self {
         let (status_tx, status_rx) = watch::channel(AsyncCommandStatus::Running);
-        let cap = super::config::resolve_command_broadcast_cap();
+        let cap = resolve_command_broadcast_cap();
         let (output_tx, _output_rx) = broadcast::channel(cap);
         Self {
             info,

@@ -2,19 +2,20 @@
 //! "no tokio in their public API" rule.
 //!
 //! The aggregates that *carry* tokio types (`RunningCommand`, `RunningShell`,
-//! `RunningTransfer`) intentionally stay in `src/mcp/` for now — they are
-//! adapter-side runtime state, not domain values.
+//! `RunningTransfer`) intentionally live under
+//! `crate::adapters::{ssh,sftp}::internal::*` (relocated in H17.6 P1) — they
+//! are adapter-side runtime state, not domain values.
 
 #[allow(
     clippy::pub_use,
-    reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the v3 boundary"
+    reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the adapter boundary"
 )]
-pub use crate::mcp::async_command::OutputBuffer;
+pub use crate::adapters::ssh::internal::async_command::OutputBuffer;
 #[allow(
     clippy::pub_use,
-    reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the v3 boundary"
+    reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the adapter boundary"
 )]
-pub use crate::mcp::shell::RingBuffer;
+pub use crate::adapters::ssh::internal::shell::RingBuffer;
 
 #[cfg(test)]
 mod tests {

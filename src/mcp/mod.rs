@@ -1,43 +1,20 @@
-//! Foundational SSH/PTY/SFTP runtime carriers (v3 leftovers consumed by v4 adapters).
+//! Cross-adapter v3 leftovers (auth, config, error, subscription).
 //!
-//! After the H17.5a hard-delete, this module no longer hosts the v3 MCP server,
-//! tools, resources, storage, message builders, port forwarder, or runtime.
-//! Those concerns now live under:
+//! After H17.5a (hard-delete of the v3 MCP server) and H17.6 P1 (relocation
+//! of the SSH/SFTP runtime carriers into `adapters::ssh::internal` and
+//! `adapters::sftp::internal`), this module only hosts cross-cutting
+//! concerns shared between adapters and the composition root:
 //!
-//! - `infra::mcp::server` / `infra::mcp::tool_router` / `infra::mcp::resource_handlers`
-//!   — the rmcp `ServerHandler` and tool/resource wiring.
-//! - `application::*` — use cases.
-//! - `adapters::repo::dashmap::*` — `DashMap`-backed repositories.
-//! - `adapters::repo::dashmap::forward` + `application::forward_port` — port forwarding.
-//! - `infra::mcp::render` / `infra::mcp::helpers` — markdown rendering.
-//! - `domain::keys` — semantic keystroke encoder.
-//!
-//! What remains here is foundational state used by the russh / sftp adapters
-//! and by composition::prod (peer GC + config resolvers). H17.6 will absorb
-//! these into the hexagonal layout and retire the `mcp::` namespace entirely.
-//!
-//! Surviving modules:
-//!
-//! - [`async_command`] — `RunningCommand` + `OutputBuffer` consumed by the russh adapter.
-//! - [`auth`] — `AuthChain` strategies (still uses `async-trait`).
-//! - [`client`] — low-level SSH connect / exec / PTY helpers reused by adapters.
+//! - [`auth`] — `AuthChain` strategies (still uses `async-trait`; left in
+//!   place per Phase 1 scope).
 //! - [`config`] — env-var resolvers; `adapters::config::env` delegates here.
-//! - [`error`] — retry classification consumed by `mcp::client`.
-//! - [`session`] — `SshClientHandler` russh callback handler.
-//! - [`sftp`] — streaming SFTP transfer state used by the sftp adapter.
-//! - [`shell`] — `RunningShell` + `RingBuffer` consumed by the russh adapter.
+//! - [`error`] — retry classification consumed by `adapters::ssh::internal::client`.
 //! - [`subscription`] — `SUBSCRIPTION_REGISTRY` + peer GC task spawned by composition.
-//! - [`transfer`] — `RunningTransfer` lock-free state.
-//! - [`types`] — shared payload structs (`SessionInfo`, `AsyncCommandInfo`, `ShellInfo`, …).
+//!
+//! Subsequent H17.6 phases will absorb these into the hexagonal layout and
+//! retire the `mcp::` namespace entirely.
 
-pub(crate) mod async_command;
 pub mod auth;
-pub(crate) mod client;
 pub mod config;
 pub(crate) mod error;
-pub mod session;
-pub(crate) mod sftp;
-pub(crate) mod shell;
 pub mod subscription;
-pub(crate) mod transfer;
-pub mod types;
