@@ -115,6 +115,7 @@ regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
 
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
+proptest = "1"              # v5 Phase 5 — property-based tests for state machine, cursor, lag policy invariants
 
 [features]
 default = ["port_forward"]
