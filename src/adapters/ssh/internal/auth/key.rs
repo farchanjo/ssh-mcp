@@ -67,21 +67,11 @@ impl AuthStrategy for KeyAuth {
 
         Ok(result.success())
     }
-
-    fn name(&self) -> &'static str {
-        "key"
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthStrategy, KeyAuth, PathBuf};
-
-    #[test]
-    fn name_is_key() {
-        let auth = KeyAuth::new("/path/to/key");
-        assert_eq!(auth.name(), "key");
-    }
+    use super::{KeyAuth, PathBuf};
 
     #[test]
     fn stores_path() {
@@ -113,7 +103,6 @@ mod tests {
     fn supports_different_key_types() {
         // RSA key
         let rsa = KeyAuth::new("/home/user/.ssh/id_rsa");
-        assert_eq!(rsa.name(), "key");
         assert_eq!(
             rsa.key_path.file_name().and_then(|n| n.to_str()),
             Some("id_rsa")
@@ -121,7 +110,6 @@ mod tests {
 
         // Ed25519 key
         let ed25519 = KeyAuth::new("/home/user/.ssh/id_ed25519");
-        assert_eq!(ed25519.name(), "key");
         assert_eq!(
             ed25519.key_path.file_name().and_then(|n| n.to_str()),
             Some("id_ed25519")
@@ -129,7 +117,6 @@ mod tests {
 
         // ECDSA key
         let ecdsa = KeyAuth::new("/home/user/.ssh/id_ecdsa");
-        assert_eq!(ecdsa.name(), "key");
         assert_eq!(
             ecdsa.key_path.file_name().and_then(|n| n.to_str()),
             Some("id_ecdsa")
@@ -204,13 +191,6 @@ mod tests {
         let long_path = format!("/home/user/{}/id_rsa", "subdir/".repeat(100));
         let auth = KeyAuth::new(&long_path);
         assert!(auth.key_path.to_string_lossy().len() > 700);
-    }
-
-    #[test]
-    fn name_is_static_str() {
-        let auth = KeyAuth::new("/x");
-        let n: &'static str = auth.name();
-        assert_eq!(n, "key");
     }
 
     #[test]

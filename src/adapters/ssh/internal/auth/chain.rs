@@ -108,6 +108,7 @@ impl AuthChain {
     }
 
     /// Check if the chain has any authentication strategies.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.strategies.is_empty()
     }
@@ -165,15 +166,11 @@ impl AuthStrategy for AuthChain {
 
         Err(last_error.unwrap_or_else(|| "All authentication methods failed".to_string()))
     }
-
-    fn name(&self) -> &'static str {
-        "chain"
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthChain, AuthStrategy, PathBuf};
+    use super::{AuthChain, PathBuf};
 
     #[test]
     fn empty_chain_has_zero_strategies() {
@@ -208,12 +205,6 @@ mod tests {
             .with_key("/path/to/key")
             .with_agent();
         assert_eq!(chain.len(), 3);
-    }
-
-    #[test]
-    fn name_is_chain() {
-        let chain = AuthChain::new();
-        assert_eq!(chain.name(), "chain");
     }
 
     #[test]
@@ -355,14 +346,6 @@ mod tests {
         let chain = AuthChain::default();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
-        assert_eq!(chain.name(), "chain");
-    }
-
-    #[test]
-    fn chain_name_returns_static_str() {
-        let chain = AuthChain::new();
-        let n: &'static str = chain.name();
-        assert_eq!(n, "chain");
     }
 
     #[test]

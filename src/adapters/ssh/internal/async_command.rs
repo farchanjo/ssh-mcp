@@ -104,6 +104,10 @@ fn drain_head_if_over(buf: &mut Vec<u8>, max_size: usize) {
 /// Each chunk carries a `seq` allocated by
 /// [`crate::adapters::subscription::legacy::SubscriptionRegistry::next_seq`] so a
 /// subscriber that recovers from `Lagged` can detect gaps.
+#[expect(
+    dead_code,
+    reason = "broadcast event-bus payload — fields read by v5.0 subscription channel mux subscribers; remove this expect when v5.0 lifecycle binding ships"
+)]
 #[derive(Debug, Clone)]
 pub enum OutputChunk {
     /// Stdout bytes appended since the previous frame.
@@ -160,8 +164,6 @@ pub struct RunningCommand {
     pub error: Arc<OnceCell<String>>,
     /// Whether the command timed out.
     pub timed_out: Arc<AtomicBool>,
-    /// Whether the output has been read by `ssh_get_command_output`.
-    pub output_read: Arc<AtomicBool>,
 }
 
 impl RunningCommand {
@@ -187,13 +189,9 @@ impl RunningCommand {
             exit_code: Arc::new(OnceCell::new()),
             error: Arc::new(OnceCell::new()),
             timed_out: Arc::new(AtomicBool::new(false)),
-            output_read: Arc::new(AtomicBool::new(false)),
         }
     }
 }
-
-/// Maximum number of concurrent async commands (multiplexed channels) per session
-pub const MAX_ASYNC_COMMANDS_PER_SESSION: usize = 100;
 
 #[cfg(test)]
 mod tests {
@@ -327,23 +325,6 @@ mod tests {
                 buffer.append_stdout_bounded(&[b'x'], cap);
             }
             assert_eq!(buffer.stdout.len(), cap);
-        }
-    }
-
-    mod constants {
-        use super::*;
-
-        #[test]
-        fn test_max_async_commands_per_session() {
-            assert_eq!(MAX_ASYNC_COMMANDS_PER_SESSION, 100);
-        }
-
-        #[test]
-        fn test_max_commands_is_reasonable() {
-            // Should support at least 10 concurrent commands
-            assert!(MAX_ASYNC_COMMANDS_PER_SESSION >= 10);
-            // Should not exceed SSH multiplexing practical limits
-            assert!(MAX_ASYNC_COMMANDS_PER_SESSION <= 256);
         }
     }
 

@@ -23,17 +23,16 @@
 //! - Persistent shell sessions for multi-step workflows
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use russh::ChannelWriteHalf;
 use russh::client;
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use super::types::{ShellInfo, ShellStatus};
 use crate::adapters::config::internal::resolve_shell_broadcast_cap;
 
 /// Write handle for sending input to a shell channel.
@@ -93,12 +92,12 @@ pub enum WriteRequest {
 
 /// State for a running interactive shell session.
 ///
-/// All fields are lock-free: snapshots use `ArcSwap`, the writer queue
-/// uses `mpsc::Sender`, activity tracking is an `AtomicU64` (epoch ms),
-/// and live fan-out uses a broadcast channel + `Notify`.
+/// All fields are lock-free: snapshots use `ArcSwap`, activity tracking is
+/// an `AtomicU64` (epoch ms), and live fan-out uses a broadcast channel +
+/// `Notify`. Input routing and per-shell metadata are owned by the parent
+/// adapter (see [`crate::adapters::ssh::russh_adapter::ShellRecord`]) so
+/// this struct stays minimal and lock-free.
 pub struct RunningShell {
-    /// Shell metadata.
-    pub info: ShellInfo,
     /// Token to cancel the background reader and writer tasks.
     pub cancel_token: CancellationToken,
     /// Lock-free snapshot of the rolling output buffer.
@@ -113,17 +112,6 @@ pub struct RunningShell {
     /// Wake source for intra-server long-poll readers (`ssh_shell_read.wait`,
     /// `ssh_shell_wait_for`). Notified after every successful append.
     pub data_notify: Arc<Notify>,
-    /// Sink for input. The dedicated writer task owns the underlying
-    /// `ChannelWriter` exclusively — no `Mutex`.
-    pub input_tx: mpsc::Sender<WriteRequest>,
-    /// Sender for status updates (kept alive to prevent channel closure).
-    #[allow(
-        dead_code,
-        reason = "kept alive to prevent watch channel closure for status_rx"
-    )]
-    pub status_tx: watch::Sender<ShellStatus>,
-    /// Receiver for status updates.
-    pub status_rx: watch::Receiver<ShellStatus>,
     /// Last read/write activity in epoch millis. Tracked atomically so
     /// the inactivity monitor can read it without taking a lock.
     pub last_activity_ms: Arc<AtomicU64>,
@@ -137,35 +125,24 @@ impl RunningShell {
     /// Build a `RunningShell` with fresh lock-free primitives.
     ///
     /// The broadcast channel capacity is resolved via
-    /// [`crate::adapters::config::internal::resolve_shell_broadcast_cap`] (default 1024,
-    /// floor 16, hard cap 65536). The mpsc input queue is sized to the
-    /// same value so a single noisy producer cannot swamp the writer.
+    /// [`crate::adapters::config::internal::resolve_shell_broadcast_cap`]
+    /// (default 1024, floor 16, hard cap 65536).
     #[must_use]
-    pub fn new(
-        info: ShellInfo,
-        cancel_token: CancellationToken,
-        input_tx: mpsc::Sender<WriteRequest>,
-        max_buffer_size: u64,
-    ) -> Self {
-        let (status_tx, status_rx) = watch::channel(ShellStatus::Open);
+    pub fn new(cancel_token: CancellationToken, max_buffer_size: u64) -> Self {
         let cap = resolve_shell_broadcast_cap();
         let (output_tx, _output_rx) = broadcast::channel(cap);
         Self {
-            info,
             cancel_token,
             history: Arc::new(ArcSwap::from_pointee(RingBuffer::default())),
             output_tx,
             data_notify: Arc::new(Notify::new()),
-            input_tx,
-            status_tx,
-            status_rx,
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             max_buffer_size: Arc::new(AtomicU64::new(max_buffer_size)),
         }
     }
 }
 
-/// Maximum number of concurrent shells per session
+/// Maximum number of concurrent shells per session.
 pub const MAX_SHELLS_PER_SESSION: usize = 10;
 
 /// Current wall-clock time as milliseconds since the Unix epoch.
@@ -178,11 +155,6 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-/// Update `last_activity_ms` atomically to "now".
-pub fn touch_activity(activity: &AtomicU64) {
-    activity.store(now_ms(), Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -210,18 +182,8 @@ mod tests {
 
     mod running_shell {
         use super::*;
-        use crate::adapters::ssh::internal::types::ShellInfo;
-
-        fn sample_info() -> ShellInfo {
-            ShellInfo {
-                shell_id: "shell-1".to_string(),
-                session_id: "sess-1".to_string(),
-                term_type: "xterm".to_string(),
-                cols: 80,
-                rows: 24,
-                opened_at: "2024-01-15T10:30:00Z".to_string(),
-            }
-        }
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
 
         #[tokio::test]
         async fn test_cancellation_token() {
@@ -230,17 +192,6 @@ mod tests {
 
             token.cancel();
             assert!(token.is_cancelled());
-        }
-
-        #[tokio::test]
-        async fn test_status_watch_channel() {
-            let (tx, mut rx) = watch::channel(ShellStatus::Open);
-
-            assert_eq!(*rx.borrow(), ShellStatus::Open);
-
-            tx.send(ShellStatus::Closed).unwrap();
-            rx.changed().await.unwrap();
-            assert_eq!(*rx.borrow(), ShellStatus::Closed);
         }
 
         #[tokio::test]
@@ -264,13 +215,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_running_shell_new_has_lock_free_state() {
-            let (input_tx, _input_rx) = mpsc::channel::<WriteRequest>(16);
-            let shell = RunningShell::new(
-                sample_info(),
-                CancellationToken::new(),
-                input_tx,
-                10 * 1024 * 1024,
-            );
+            let shell = RunningShell::new(CancellationToken::new(), 10 * 1024 * 1024);
 
             // History snapshot is reachable without locks.
             let snap = shell.history.load_full();
@@ -353,13 +298,6 @@ mod tests {
             let a = now_ms();
             let b = now_ms();
             assert!(b >= a);
-        }
-
-        #[test]
-        fn test_touch_activity_updates_atomic() {
-            let activity = AtomicU64::new(0);
-            touch_activity(&activity);
-            assert!(activity.load(Ordering::Relaxed) > 0);
         }
     }
 

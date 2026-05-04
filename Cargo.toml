@@ -176,6 +176,10 @@ unused_assignments         = "deny"
 unreachable_code           = "deny"
 unreachable_patterns       = "deny"
 unused_lifetimes           = "deny"
+# Register the `loom` cfg flag so `tests/lockfree_invariants.rs#![cfg(loom)]`
+# does not trip `unexpected_cfgs`. Loom mode is opt-in via
+# `RUSTFLAGS="--cfg loom"`.
+unexpected_cfgs            = { level = "warn", check-cfg = ['cfg(loom)'] }
 # Re-enabled in E2 (post-tools-migration) once commands.rs is rebuilt against rmcp:
 #   dead_code, unused_variables, unused_qualifications,
 #   trivial_numeric_casts, trivial_casts, let_underscore_drop
