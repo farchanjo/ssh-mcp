@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation tracked under Phase 4 of the v5 roadmap. Depends on ADR 0003 (Lifecycle Binding), ADR 0004 (Channel Mux), and ADR 0005 (LLM UX).
+Accepted. Implemented in v5.x (Phase 4 of the v5 roadmap) and shipped as the `ssh-mcp-tail` binary; carried forward unchanged into v6.0. Depends on ADR 0003 (Lifecycle Binding), ADR 0004 (Channel Mux), and ADR 0005 (LLM UX).
 
 ## Context
 
@@ -95,13 +95,15 @@ One JSON object per line, terminated by `\n`. The schema is `serde`-tagged on `o
 {"op":"exec","sid":"<session-uuid>","cmd":"top -b -n 5","pty":false,"id":"corr-2"}
 {"op":"subscribe","uri":"command://<cmd-uuid>/output","lifetime":"auto-close","grace_ms":2000,"lag_policy":"snapshot","id":"corr-3"}
 {"op":"unsubscribe","sub_id":"<sub-uuid>","id":"corr-4"}
-{"op":"shell_open","sid":"<session-uuid>","cols":80,"rows":24,"id":"corr-5"}
-{"op":"shell_write","shid":"<shell-uuid>","bytes":"ls -la\n","id":"corr-6"}
-{"op":"shell_key","shid":"<shell-uuid>","key":"ctrl_c","id":"corr-7"}
-{"op":"upload","sid":"<session-uuid>","local":"/tmp/file","remote":"/srv/file","id":"corr-8"}
-{"op":"cancel","cid":"<cmd-uuid>","id":"corr-9"}
-{"op":"disconnect","sid":"<session-uuid>","id":"corr-10"}
-{"op":"shutdown","id":"corr-11"}
+{"op":"read","uri":"command://<cmd-uuid>/output","cursor":102400,"id":"corr-5"}
+{"op":"shell_open","sid":"<session-uuid>","cols":80,"rows":24,"id":"corr-6"}
+{"op":"shell_write","shid":"<shell-uuid>","bytes":"ls -la\n","id":"corr-7"}
+{"op":"shell_key","shid":"<shell-uuid>","key":"ctrl_c","id":"corr-8"}
+{"op":"upload","sid":"<session-uuid>","local":"/tmp/file","remote":"/srv/file","id":"corr-9"}
+{"op":"download","sid":"<session-uuid>","remote":"/srv/file","local":"/tmp/file","id":"corr-10"}
+{"op":"cancel","cid":"<cmd-uuid>","id":"corr-11"}
+{"op":"disconnect","sid":"<session-uuid>","id":"corr-12"}
+{"op":"shutdown","id":"corr-13"}
 ```
 
 `id` is an optional correlation identifier; the daemon echoes it on every event tied to the op.
@@ -192,7 +194,7 @@ RUST_LOG=ssh_mcp=info,ssh_mcp_tail=debug ssh-mcp-tail daemon
 ### Negative
 
 - **Two binaries to maintain (`ssh-mcp-stdio` + `ssh-mcp-tail`).** Code reuse minimises this — both share `composition::prod` adapters, the bin entries are thin shells. Phase 4 commits ~250 LOC of new bin + ~150 LOC of formatter / parser / mux.
-- **NDJSON protocol versioning.** Each new op or event variant grows the protocol surface. `docs/INSTRUCTIONS_DAEMON.md` and a JSON schema (`docs/api/ssh-mcp-ndjson.schema.json`) lock the contract.
+- **NDJSON protocol versioning.** Each new op or event variant grows the protocol surface. `docs/DAEMON.md` and a JSON schema (`docs/api/ssh-mcp-ndjson.schema.json`) lock the contract.
 - **No multi-tenant story in Phase 4.** A daemon is single-tenant by default. Multi-tenant scoping (per-API-key) lands in a later release.
 
 ### Neutral
@@ -207,5 +209,5 @@ RUST_LOG=ssh_mcp=info,ssh_mcp_tail=debug ssh-mcp-tail daemon
 - [ADR 0005 — LLM UX Priorities](./0005-llm-ux-priorities.md) — daemon emits the same HINT / NEXT / WARN markers.
 - [ADR 0006 — Backpressure Policies](./0006-backpressure-policies.md) — daemon lag handling.
 - [ADR 0007 — Error Taxonomy](./0007-error-taxonomy.md) — daemon NDJSON error envelope.
-- [docs/INSTRUCTIONS_DAEMON.md](../INSTRUCTIONS_DAEMON.md) (forthcoming).
+- [docs/DAEMON.md](../DAEMON.md).
 - [docs/api/ssh-mcp-ndjson.schema.json](../api/ssh-mcp-ndjson.schema.json) (forthcoming).

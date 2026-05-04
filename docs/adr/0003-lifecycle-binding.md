@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation tracked under Phase 1 of the v5 roadmap.
+Accepted. Implemented in v5.0 (Phase 1 of the v5 roadmap, commit `525b795`); carried forward unchanged into v6.0.
 
 ## Context
 
@@ -202,8 +202,7 @@ These map onto MCP wire codes `RESOURCE_GONE`, `INTERNAL_ERROR`, `INTERNAL_ERROR
 
 ## References
 
-- [Phase 1 Lifecycle Binding implementation plan](../arch/v5-phase1.md) (forthcoming)
 - [ADR 0004 — Channel Mux Fairness](./0004-channel-mux-fairness.md) — depends on lifecycle binding
 - [ADR 0005 — LLM UX Priorities](./0005-llm-ux-priorities.md) — surfaces the `release_when_no_subs` flag
-- [docs/LOCKS.md](../LOCKS.md) — lock-free invariants this ADR preserves
+- [docs/DEVELOPMENT.md → Lock-free invariants](../DEVELOPMENT.md#lock-free-invariants) — lock-free invariants this ADR preserves
 - [docs/RESOURCES.md](../RESOURCES.md) — resource scheme contract

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation spans Phases 1, 2, 3 of the v5 roadmap.
+Accepted. Implemented in v5.0 (across Phases 1, 2, 3 of the v5 roadmap); carried forward unchanged into v6.0.
 
 ## Context
 
@@ -29,7 +29,7 @@ Two approaches were on the table:
 
 ## Decision
 
-Group every code into one of seven categories with explicit retry semantics. Each code carries a structured DETAIL that is one sentence, ≤120 characters, action-oriented, and aligned with the ADR 0005 LLM UX phrasing. Maintain a canonical handbook at `docs/llm-ux/ERROR_HANDBOOK.md` that lists every code, its category, retry policy, cause, cure, prevention, and an NDJSON exchange example.
+Group every code into one of seven categories with explicit retry semantics. Each code carries a structured DETAIL that is one sentence, ≤120 characters, action-oriented, and aligned with the ADR 0005 LLM UX phrasing. Maintain a canonical handbook at [docs/LLM_GUIDE.md → Error handbook](../LLM_GUIDE.md#error-handbook) that lists every code, its category, retry policy, cause, cure, prevention, and an NDJSON exchange example.
 
 ### Categories
 
@@ -83,9 +83,9 @@ flowchart TD
     class CAT,REM active
 ```
 
-### Code list (38 codes total)
+### Code list (38 v5.0 baseline; current shipped surface ≥ 43)
 
-For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 codes carry over with their existing semantics. The full list is in `docs/llm-ux/ERROR_HANDBOOK.md`.
+For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 codes carry over with their existing semantics. The full list is in [docs/LLM_GUIDE.md → Error handbook](../LLM_GUIDE.md#error-handbook). v5.x added a handful of operational codes on top of the 38-code baseline (`PORT_IN_USE`, `TIMEOUT`, `EMPTY_PATTERNS`, `PATTERN_TOO_LONG`, `TOO_MANY_PATTERNS`, `MODIFIER_NOT_ALLOWED`); the full DETAIL lookup at `src/infra/mcp/error_detail.rs` is authoritative.
 
 #### Lifecycle (ADR 0003)
 
@@ -162,7 +162,7 @@ Already implemented in v4.7 for `NOT_FOUND` codes. Extended in v5.0 to cover `SU
 
 - **Predictable retry decisions.** A 27B model can switch on the category alone (`AUTH` → never retry; `TRANSPORT` → retry with backoff; `RESOURCE` → never retry). Source code mostly does not need code-by-code branches.
 - **Self-explanatory wire surface.** Every error response carries a one-sentence cure; no host-side mapping table is required.
-- **Single source of truth.** The handbook at `docs/llm-ux/ERROR_HANDBOOK.md` is the canonical reference for operators, contributors, and LLMs alike.
+- **Single source of truth.** The handbook at [docs/LLM_GUIDE.md → Error handbook](../LLM_GUIDE.md#error-handbook) is the canonical reference for operators, contributors, and LLMs alike.
 - **Closest-match suggestions reduce typos.** Existing v4.7 mechanism extended to subscription-related codes.
 
 ### Negative
@@ -182,4 +182,4 @@ Already implemented in v4.7 for `NOT_FOUND` codes. Extended in v5.0 to cover `SU
 - [ADR 0005 — LLM UX Priorities](./0005-llm-ux-priorities.md)
 - [ADR 0006 — Backpressure Policies](./0006-backpressure-policies.md)
 - [ADR 0008 — NDJSON Daemon Protocol](./0008-ndjson-daemon-protocol.md)
-- [docs/llm-ux/ERROR_HANDBOOK.md](../llm-ux/ERROR_HANDBOOK.md) (forthcoming).
+- [docs/LLM_GUIDE.md → Error handbook](../LLM_GUIDE.md#error-handbook) — canonical 38-code handbook.

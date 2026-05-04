@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation tracked under Phase 2 of the v5 roadmap. Depends on ADR 0004 (Channel Mux).
+Accepted. Implemented in v5.0 (Phase 2 of the v5 roadmap); carried forward unchanged into v6.0. Depends on ADR 0004 (Channel Mux).
 
-**Amendment 1 (v5.1.0 — proposed):** Adds byte-threshold flush trigger to the debouncer fronteira plus per-call `flush_bytes` / `debounce` overrides on `sub_open`. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold** and switches env-var interface from raw `*_MS`/`*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy `*_MS` aliases remain accepted for one minor with a `DEPRECATED:` log nudge. See [Byte-threshold flush trigger](#byte-threshold-flush-trigger) and [Per-call overrides on `sub_open`](#per-call-overrides-on-sub_open).
+**Amendment 1 (v5.1.0 — accepted, implemented):** Adds byte-threshold flush trigger to the debouncer fronteira plus per-call `flush_bytes` / `debounce` overrides on `sub_open`. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold** and switches env-var interface from raw `*_MS`/`*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy `*_MS` aliases remain accepted for one minor with a `DEPRECATED:` log nudge. See [Byte-threshold flush trigger](#byte-threshold-flush-trigger) and [Per-call overrides on `sub_open`](#per-call-overrides-on-sub_open).
 
 ## Context
 
@@ -192,34 +192,20 @@ flowchart LR
 - **Duration** — uses `humantime::parse_duration` semantics: bare integer with unit suffix `ms`/`s`/`m`/`h`. Bare integer (no unit) is rejected on the new env vars to avoid the "is this ms or s?" ambiguity that bit operators on `SSH_NOTIFY_KEEPALIVE_S` (seconds) vs. `SSH_NOTIFY_DEBOUNCE_MS` (ms).
 - **Bytesize** — uses `bytesize::ByteSize::from_str` semantics: bare integer = bytes; suffixes `k`/`m`/`g` = decimal (1k = 1000); `kib`/`mib`/`gib` = binary (1kib = 1024); `kb`/`mb` accepted as decimal aliases. Default and clamps quoted in **kib/mib** for predictability (`64k` parses as 65 000 bytes, `64kib` as 65 536; the canonical default is `64kib`, but the docs and CLI examples use `64k` because LLM-host configs are forgiving).
 
-### Per-call overrides on `sub_open`
+### Per-call overrides on `sub_open` (deferred)
 
-Both knobs are also exposed as optional fields on the `sub_open` tool. Accept either typed primitives or the same human-readable strings as the env vars — the LLM picks whichever its prompt happens to surface:
+> **Status: deferred — not shipped in v5.x or v6.0.** The byte-threshold flush trigger ships globally via `SSH_NOTIFY_FLUSH_BYTES` (env-var only). Per-call `flush_bytes` / `debounce` overrides on `sub_open` were design intent in this amendment but were dropped to keep the v5.x release surface tight; current `SubOpenArgs` exposes only `uri`, `lifetime`, `grace_ms`, `ttl_secs`, `lag_policy`, `filter`. A future ADR (or v6.x amendment) may layer them in.
 
-```jsonc
-{
-  "name": "sub_open",
-  "arguments": {
-    "uri": "shell://<id>/output",
-    // Either form is valid:
-    "flush_bytes": "16k",         // string → bytesize parser → 16 000 bytes
-    // "flush_bytes": 16384,      // integer → raw bytes
-    "debounce":   "25ms"          // string → humantime parser → Duration
-    // "debounce":   { "ms": 25 } // structured form also accepted
-    // "debounce_ms": 25          // legacy alias kept for one minor
-  }
-}
-```
+**Today's tuning surface.** Operators tune the debouncer process-wide via:
 
-**Precedence (highest wins):** tool argument → env var → compile-time default.
+- `SSH_NOTIFY_DEBOUNCE_MS` (default `200`, floor `5`, cap `5000`).
+- `SSH_NOTIFY_FORCE_FLUSH_MS` (default `1000`).
+- `SSH_NOTIFY_KEEPALIVE_S` (default `30`).
+- `SSH_NOTIFY_FLUSH_BYTES` (default `64k`, floor `1024`, cap `1MiB`; `0` disables byte-threshold).
 
-**Schema contract.** JSON Schema declares `flush_bytes: oneOf[integer, string-pattern]` and `debounce: oneOf[string-pattern, {ms: integer}]` so structured-output models do not need free-form regex. Server-side, both branches funnel through the same `parse_bytesize` / `parse_duration` helpers used by the env-var loaders — single canonical source of validation.
+See [CONFIGURATION.md → Debouncer timing](../CONFIGURATION.md#debouncer-timing) for the full env-var table.
 
-**Scope.** A per-call override is recorded on the **resource debouncer**, not on the lane. Because the debouncer is shared across all subscribers of `(kind, resource_id)`, the **first subscriber's override wins for the lifetime of the debouncer**. Subsequent subscribers may pass different values, but they are stored as a hint only and surface a wire-level `HINT: NOTIFY_OVERRIDE_IGNORED` informational line — the debouncer is not reconfigured mid-flight to avoid races on the byte counter and the `tokio::time::interval` ticks.
-
-When the last subscriber detaches and the debouncer task exits (Phase 1 lifecycle policy `release_when_no_subs = true`) or the resource closes, the next `sub_open` resets the values from the new caller's override. This matches the existing "first subscriber owns the resource debouncer" invariant from v4.
-
-**Validation.** Tool arguments are clamped to the same `[min, max]` range as the env vars; out-of-range values return `[CFG_INVALID]` with `DETAIL` pointing at the violated field and the parsed canonical form (e.g. `DETAIL: debounce "10000ms" exceeds max 5s; clamp or pass <=5s`). `flush_bytes: 0` (or `"0"`) is accepted — disables byte-threshold for this resource. `debounce` below 5 ms is rejected. Parser failures (`"24x"`, `"fast"`, `"-1k"`) return `[CFG_PARSE]` with the offending substring quoted.
+**Why deferred.** The "first subscriber owns the debouncer" invariant from v4 made per-call overrides ambiguous (subsequent subscribers' values would be silently ignored, creating a `HINT: NOTIFY_OVERRIDE_IGNORED` surface that smaller LLMs misread). Resolving cleanly requires either a per-`(kind, resource_id)` reservation step at resource-create time, or a debouncer-per-lane refactor — both larger than the v5.1 amendment scope.
 
 **Stats.** `sub_stats` returns the *effective* values (`effective_flush_bytes`, `effective_debounce_ms`) for the resource the lane attaches to, so the LLM can verify its override took effect or reason about why it was overridden by a prior subscriber.
 
