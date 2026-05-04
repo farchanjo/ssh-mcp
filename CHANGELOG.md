@@ -5,6 +5,51 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0-rc1] — pending
+
+v5.0 is in flight on the `feat/v5-foundation` branch. Phase 1 (lifecycle binding) and Phase 2 (channel mux + sub_id) are merged; Phase 3 (LLM UX overhaul) and Phase 4 (NDJSON daemon) are running in parallel by other agents and will land before the rc1 tag. Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. See [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) for the host migration guide and the eight ADRs at [docs/adr/0001..0008.md](docs/adr/) for the design narrative.
+
+### Highlights
+
+- **Subscribe-first architecture.** `ResourceLifecycle` CAS state machine (`Owned -> Observed -> Releasing -> Closed`) plus per-session cascade refcount on `SessionLifecycle.active_refs`; grace timer arms when last subscriber detaches; new subscribes within the window cancel the timer; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` opts a resource into auto-cleanup. Default preserves v4 semantics. See [ADR 0003](docs/adr/0003-lifecycle-binding.md).
+- **Channel mux + sub_id.** Cursor key shifts from `(PeerId, Uri)` to `(SubId, Uri)` (UUIDv7); each `resources/subscribe` (legacy) or `ssh_subscribe` (new tool) call gets its own bounded `mpsc::channel(N)`, `LagPolicy` (`BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot` (default)), filter pipeline, replay window, and `SubscriberStats` (8 atomics). A `ChannelMux` round-robin drainer guarantees fair scheduling across lanes — a slow consumer cannot starve a fast one. Legacy hosts get a synthesised `sub_id` for backwards compat. See [ADR 0004](docs/adr/0004-channel-mux-fairness.md).
+- **LLM UX overhaul (Phase 3 — in flight).** 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` line severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 v4 carry-overs + 5 push-first); `SUB_LEAK_RISK` auto-warning watcher (background scan over every `Owned` resource older than `SSH_SUB_LEAK_RISK_WARN_S`, default 2 s). See [ADR 0005](docs/adr/0005-llm-ux-priorities.md) and [docs/llm-ux/](docs/llm-ux/).
+- **NDJSON daemon binary (Phase 4 — in flight).** New `ssh-mcp-tail` binary with three subcommands (`run`, `shell`, `daemon`). Embeds an in-process rmcp client + server pair across `tokio::io::duplex`; reads NDJSON ops on stdin, emits NDJSON events on stdout. Single binary, no IPC, Unix-pipeline composable. Reuses `composition::prod` adapters via the new `composition::embed::wire()` entry point. For tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. See [ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md) and [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md).
+- **38-code error taxonomy.** 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics; centralised one-sentence DETAIL phrasing aligned with the LLM consumer surface. See [ADR 0007](docs/adr/0007-error-taxonomy.md) and [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md).
+- **Lock-free invariants extended.** New atomics for lifecycle (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker) and lane / mux (per-lane mpsc, `AtomicUsize` cursor, `AtomicBool` pause flag, 8 stats atomics, `Notify` waker). Loom coverage extends from 8 invariants to 16 (Phase 1 + Phase 2 each add 4). Production clippy gate stays exit-0. See [docs/LOCKS.md](docs/LOCKS.md).
+- **MSRV bumped to Rust 1.95.** Rust 2024 edition baseline + AFIT + APIs stabilised through 1.95.
+
+### Added
+
+- **Domain layer**: `src/domain/lifecycle.rs` (`LifecycleState`, `LifecyclePolicy`, `LifecycleSnapshot`, `SessionPolicy`, `DEFAULT_GRACE_MS`); `src/domain/subscription.rs` (`SubId` UUIDv7 wrapper, `LagPolicy`, `LogLevel`, `FilterRule`, `SubscriptionLifetime`, `SubscriberStats`).
+- **Ports**: `src/ports/lifecycle_policy.rs` (`LifecyclePolicyPort` + async slice); `src/ports/channel_mux.rs` (`ChannelMuxPort`); `src/ports/subscriber_lane.rs` (`SubscriberLanePort` + async slice + `LaneAdmin` dyn-safe shim).
+- **Adapters**: `src/adapters/lifecycle/{mod,refcount,grace_timer,cascade}.rs` (Phase 1); `src/adapters/subscription/{subscriber_lane,channel_mux,filter,replay}.rs` (Phase 2).
+- **Domain errors**: `ResourceGone`, `LifecycleStateConflict`, `SessionRefcountUnderflow`, `SubNotFound`, `SubMaxPerUriExceeded`, `SubMaxTotalExceeded`, `LaneBufferFull`, `LagBackpressure`, `RingBufferOverflow`, `MuxBackpressure`, `GraceTimerExpired`.
+- **Env vars** (defaults preserve v4 behaviour):
+  - Lifecycle: `SSH_LIFECYCLE_GRACE_MS` (2000), `SSH_LIFECYCLE_OWN_GRACE_MS`, `SSH_SESSION_IDLE_GRACE_MS` (5000).
+  - Lane / mux: `SSH_LAG_POLICY_DEFAULT` (`snapshot`), `SSH_LANE_BUFFER` (1024), `SSH_MUX_BUFFER` (8192), `SSH_BP_BLOCK_TIMEOUT_MS` (5000), `SSH_REPLAY_WINDOW_BYTES` (1 MB), `SSH_FILTER_REGEX_MAX` (1024), `SSH_MAX_SUBS_PER_URI` (16), `SSH_MAX_SUBS_TOTAL` (1024).
+  - LLM hygiene: `SSH_SUB_LEAK_RISK_WARN_S` (2), `SSH_SUB_LEAK_RISK_KILL_S` (0 = off).
+  - NDJSON daemon: `SSH_NDJSON_LINE_MAX` (1 MB), `SSH_HEARTBEAT_INTERVAL_S` (30), `SSH_DAEMON_STATS_INTERVAL_S` (60), `SSH_GRACE_HARD_TIMEOUT_S` (30).
+- **ADRs**: 0003 (lifecycle binding), 0004 (channel mux fairness), 0005 (LLM UX priorities), 0006 (backpressure policies), 0007 (error taxonomy), 0008 (NDJSON daemon protocol).
+- **Docs**: `docs/MIGRATION_v4_to_v5.md`, `docs/INSTRUCTIONS_DAEMON.md`, `docs/TROUBLESHOOTING.md`, `docs/llm-ux/{README,GOLDEN_RULES,PROMPTS_CATALOG,ANTIPATTERNS,ERROR_HANDBOOK,INSTRUCTIONS_27B,INSTRUCTIONS_70B}.md`.
+- **Loom invariants**: 8 new interleavings in `tests/lockfree_invariants.rs` covering Phase 1 (4) and Phase 2 (4). Total: 16.
+
+### Changed
+
+- **Cursor key**: `(PeerId, Uri)` -> `(SubId, Uri)` internally. Legacy hosts get a synthesised `sub_id` per `(PeerId, Uri)` pair for backwards compat. Cursor advance, gap detection, and replay are all keyed on `SubId` going forward.
+- **Default lane LagPolicy**: implicit broadcast `RecvError::Lagged` recovery (v4) -> per-lane `Snapshot` (drop backlog + ring-buffer rebuild). Behaviour matches v4 semantics for slow subscribers; the policy is now explicit per-`SubId` and tunable via `SSH_LAG_POLICY_DEFAULT`.
+- **Session reaper**: now consults `SessionLifecycle.active_refs > 0` before honouring the inactivity TTL. Refcount supersedes TTL — a session with active resources is never reaped by TTL alone.
+- **MSRV**: 1.85 -> 1.95.
+- **Subscription registry**: adds `(SubId, Uri)` cursor index alongside the existing `(PeerId, Uri)` index (commit `4ccbca3`); both coexist while the lane fan-out runs against the SubId index.
+
+### Migrated
+
+See [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) for the full v4.x to v5.0 host migration guide. There are zero breaking changes on the wire; every delta is a new optional argument or a new env var with a v4-preserving default. v3 / v4 hosts pointed at v5 servers see no behavioural change unless they opt into the new flags / tools / env vars.
+
+### Pre-existing flake noted
+
+The `env_config_returns_v3_defaults_with_unset_env` lib test occasionally trips when running `cargo test` in parallel due to env-var contention with sibling tests; single-process runs are stable. Tracked for resolution before rc1 tags.
+
 ## [4.8.1] — 2026-05-04
 
 ### Highlights
