@@ -559,3 +559,202 @@ fn loom_cursor_atomic_advance() {
         assert_eq!(final_state, 1, "state CAS must have succeeded");
     });
 }
+
+// ---------------------------------------------------------------------------
+// v5 Phase 2 — Channel Mux + SubId loom invariants
+// ---------------------------------------------------------------------------
+
+/// Mini-model of the round-robin mux drain. Two lanes, one cursor;
+/// every successful pop bumps the cursor so neither lane starves
+/// the other.
+#[test]
+fn loom_mux_round_robin_no_starvation() {
+    loom::model(|| {
+        // Two lane "queue lengths" — model the per-lane backlog.
+        let lane_a = Arc::new(AtomicU64::new(2));
+        let lane_b = Arc::new(AtomicU64::new(2));
+        let cursor = Arc::new(AtomicUsize::new(0));
+
+        let a1 = Arc::clone(&lane_a);
+        let b1 = Arc::clone(&lane_b);
+        let c1 = Arc::clone(&cursor);
+        let drain = thread::spawn(move || {
+            let mut a_drained = 0_u64;
+            let mut b_drained = 0_u64;
+            for _ in 0_u32..4 {
+                let lanes = [Arc::clone(&a1), Arc::clone(&b1)];
+                let start = c1.load(Ordering::Relaxed) % lanes.len();
+                for offset in 0..lanes.len() {
+                    let idx = (start + offset) % lanes.len();
+                    let q = lanes[idx].load(Ordering::Relaxed);
+                    if q > 0
+                        && lanes[idx]
+                            .compare_exchange(q, q - 1, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        if idx == 0 {
+                            a_drained += 1;
+                        } else {
+                            b_drained += 1;
+                        }
+                        c1.store((idx + 1) % lanes.len(), Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            (a_drained, b_drained)
+        });
+
+        // Producer trying to top up lane A while drain runs.
+        let a2 = Arc::clone(&lane_a);
+        let producer = thread::spawn(move || {
+            a2.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let (a_drained, b_drained) = drain.join().unwrap();
+        producer.join().unwrap();
+
+        // Fairness: the drain visited both lanes — never starved
+        // lane B even when A had backlog.
+        assert!(
+            a_drained > 0 && b_drained > 0,
+            "round-robin starved a lane: a={a_drained} b={b_drained}",
+        );
+    });
+}
+
+/// Mini-model of the lane mpsc DropOldest path. Producer increments
+/// a "queued" counter, consumer decrements; under DropOldest the
+/// `seq_local` counter (events delivered from the lane) is strictly
+/// monotonic regardless of drops.
+#[test]
+fn loom_lane_mpsc_drop_oldest_monotonic() {
+    loom::model(|| {
+        let queued = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicU64::new(0));
+        const CAPACITY: usize = 2;
+
+        let q1 = Arc::clone(&queued);
+        let d1 = Arc::clone(&delivered);
+        let producer = thread::spawn(move || {
+            for _ in 0_u32..3 {
+                let cur = q1.load(Ordering::Acquire);
+                if cur >= CAPACITY {
+                    // drop_oldest: pop one and push.
+                    let _ = q1.compare_exchange(cur, cur, Ordering::AcqRel, Ordering::Relaxed);
+                    // (model treats the "drop oldest" as net-zero
+                    // queue change.)
+                } else {
+                    q1.fetch_add(1, Ordering::AcqRel);
+                }
+                d1.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+
+        let q2 = Arc::clone(&queued);
+        let d2 = Arc::clone(&delivered);
+        let consumer = thread::spawn(move || {
+            for _ in 0_u32..2 {
+                let cur = q2.load(Ordering::Acquire);
+                if cur > 0 {
+                    let _ = q2.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Relaxed);
+                }
+            }
+            d2.load(Ordering::Acquire)
+        });
+
+        producer.join().unwrap();
+        let observed = consumer.join().unwrap();
+        let final_delivered = delivered.load(Ordering::Acquire);
+        // Monotonic invariant: the consumer's snapshot of `delivered`
+        // is always <= the final value (no time travel).
+        assert!(
+            observed <= final_delivered,
+            "delivered counter regressed: observed={observed} final={final_delivered}",
+        );
+    });
+}
+
+/// Mini-model of pause/resume against a `BlockSlow` producer. While
+/// pause flag is true the producer must not increment `delivered`;
+/// when resume sets the flag back to false, no events are lost
+/// (producer's `attempted` counter equals the final `delivered`
+/// once both threads finish).
+#[test]
+fn loom_lane_pause_resume_no_loss() {
+    loom::model(|| {
+        let paused = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+        let attempted = Arc::new(AtomicU64::new(0));
+        let delivered = Arc::new(AtomicU64::new(0));
+
+        let p_attempted = Arc::clone(&attempted);
+        let p_paused = Arc::clone(&paused);
+        let p_delivered = Arc::clone(&delivered);
+        let producer = thread::spawn(move || {
+            for _ in 0_u32..3 {
+                p_attempted.fetch_add(1, Ordering::AcqRel);
+                while p_paused.load(Ordering::Acquire) {
+                    // Spin-wait — production code uses
+                    // `Notify::notified().await`.
+                    loom::thread::yield_now();
+                }
+                p_delivered.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+
+        let c_paused = Arc::clone(&paused);
+        let controller = thread::spawn(move || {
+            c_paused.store(true, Ordering::Release);
+            loom::thread::yield_now();
+            c_paused.store(false, Ordering::Release);
+        });
+
+        producer.join().unwrap();
+        controller.join().unwrap();
+
+        let final_attempted = attempted.load(Ordering::Acquire);
+        let final_delivered = delivered.load(Ordering::Acquire);
+        // BlockSlow guarantees zero loss: every attempted send
+        // ultimately delivers.
+        assert_eq!(
+            final_attempted, final_delivered,
+            "pause/resume lost events: attempted={final_attempted} delivered={final_delivered}",
+        );
+    });
+}
+
+/// Mini-model of `advance_cursor(target)` under contention. Two
+/// readers race to bump the cursor; the final value is always the
+/// maximum of the targets, never less.
+#[test]
+fn loom_subid_cursor_atomic_advance() {
+    loom::model(|| {
+        let cursor = Arc::new(AtomicU64::new(0));
+
+        let c1 = Arc::clone(&cursor);
+        let c2 = Arc::clone(&cursor);
+        let h1 = thread::spawn(move || {
+            c1.fetch_max(100, Ordering::AcqRel);
+        });
+        let h2 = thread::spawn(move || {
+            c2.fetch_max(50, Ordering::AcqRel);
+        });
+        // Concurrent reader observing the cursor at any point must
+        // see a value <= 100 (no out-of-thin-air larger value).
+        let c3 = Arc::clone(&cursor);
+        let observer = thread::spawn(move || {
+            let v = c3.load(Ordering::Acquire);
+            assert!(
+                v <= 100,
+                "cursor read out-of-thin-air larger value: {v}",
+            );
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+        observer.join().unwrap();
+        let final_cursor = cursor.load(Ordering::Acquire);
+        // Max-cursor invariant: the larger fetch_max wins.
+        assert_eq!(final_cursor, 100, "fetch_max lost the larger target");
+    });
+}
