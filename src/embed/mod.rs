@@ -20,7 +20,7 @@
 //! - [`cli`] — `clap` subcommand definitions (`run` / `shell` / `daemon`).
 //!
 //! Design rationale: [ADR 0008](../docs/adr/0008-ndjson-daemon-protocol.md).
-//! Wire reference: `docs/INSTRUCTIONS_DAEMON.md`.
+//! Wire reference: `docs/DAEMON.md`.
 
 pub mod cli;
 pub mod dispatcher;

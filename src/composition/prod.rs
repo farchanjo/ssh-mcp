@@ -45,7 +45,6 @@ use crate::adapters::lifecycle::leak_watcher::{
 };
 use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
-use crate::ports::notifier::{DebouncerActivator, ProducerForwarder};
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
 #[cfg(feature = "port_forward")]
@@ -99,6 +98,7 @@ use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 use crate::infra::mcp::tool_router::IdLister;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+use crate::ports::notifier::{DebouncerActivator, ProducerForwarder};
 use crate::ports::subscriber_lane::LaneAdmin;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
@@ -302,9 +302,10 @@ pub fn build_use_cases() -> ProdWiring {
     // v5 Phase 2: SubscriberLane + ChannelMux. The lane adapter
     // mints per-`SubId` UUIDv7 ids through the same id generator
     // used elsewhere in the wiring. The mux installs an outbound
-    // sink (Phase 4 wires the NDJSON daemon writer); Phase 2 keeps
-    // the sink open so receivers stay drainable but no consumer is
-    // attached yet.
+    // sink that the `ssh-mcp-tail` daemon drains via
+    // `composition::embed`; HTTP / stdio binaries keep the receiver
+    // alive on this composition root so the mpsc never reports
+    // `Closed`.
     let subscriber_lane_adapter = SubscriberLaneAdapter::new(
         Arc::clone(&ids),
         resolve_lane_buffer(),
@@ -319,20 +320,18 @@ pub fn build_use_cases() -> ProdWiring {
     let (mux_outbound_tx, _mux_outbound_rx) = mpsc::channel(resolve_mux_buffer());
     channel_mux.install_outbound(mux_outbound_tx);
     let lane_admin: Arc<dyn LaneAdmin> = lane_admin_from(&subscriber_lane_adapter);
-    // Phase 4 will wire the drain task to the NDJSON daemon stdout
-    // writer. Phase 2 keeps the receiver alive on the composition
-    // root so the mpsc never reports `Closed` and the outbound sink
-    // never blocks.
+    // The `ssh-mcp-tail` daemon (`composition::embed`) drains this
+    // receiver into NDJSON stdout. HTTP / stdio binaries keep the
+    // receiver alive on this composition root so the mpsc never
+    // reports `Closed` and the outbound sink never blocks.
     //
     // v5.3 — install the lane-fanout bridge so the legacy
     // [`MemoryRegistry::broadcast`] pipeline also delivers
     // `notifications/resources/updated` to every `sub_open`
     // lane bound to the broadcast URI. Lane stats (events_sent /
     // bytes_sent) increment on each successful peer notify.
-    let lane_bridge = LaneFanoutBridge::new(
-        Arc::clone(&subscriber_lane_adapter),
-        Arc::clone(&notifier),
-    );
+    let lane_bridge =
+        LaneFanoutBridge::new(Arc::clone(&subscriber_lane_adapter), Arc::clone(&notifier));
     subscribers.install_lane_bridge(lane_bridge);
 
     let connect = Arc::new(ConnectSessionUseCase::new(

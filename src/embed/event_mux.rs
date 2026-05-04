@@ -129,11 +129,12 @@ async fn heartbeat_loop(tx: EventTx, interval: Duration, shutdown: CancellationT
 
 /// Spawn the daemon-stats task.
 ///
-/// The mux does not currently track counters of its own — Phase 3
-/// owns the lifecycle/leak counters and Phase 5 will plug them in.
-/// For the v5.0 wire surface we emit the stable shape with zero
-/// baselines so consumers can wire dashboards before the real
-/// numbers are ready.
+/// The mux does not currently track counters of its own — the
+/// lifecycle / leak counters live on the Phase 3 `LeakWatcher` and
+/// per-lane `SubscriberStats` (`adapters::subscription`). The daemon
+/// emits the stable shape with zero baselines for fields the embed
+/// layer does not currently observe so consumers can wire dashboards
+/// against a forward-compatible schema.
 #[must_use]
 pub fn spawn_daemon_stats(
     tx: EventTx,
@@ -228,7 +229,7 @@ impl ClientHandler for EmbedClient {
     ) {
         // Surface the notification as an advisory `Warn` envelope so
         // downstream consumers see byte-ordered notifications without
-        // waiting for the Phase 5 read-and-format pipeline.
+        // waiting for a dedicated read-and-format pipeline.
         let event = Event::Warn {
             code: "RESOURCE_UPDATED".to_string(),
             resource: Some(params.uri.clone()),

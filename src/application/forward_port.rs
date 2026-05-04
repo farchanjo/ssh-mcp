@@ -204,7 +204,6 @@ where
             started_at: started_at.to_rfc3339(),
         })
     }
-
 }
 
 #[cfg(test)]

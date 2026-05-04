@@ -430,12 +430,7 @@ mod tests {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 3);
         for i in 0..5_u32 {
             // Stagger insertions slightly so `inserted_at` orderings are deterministic.
-            cache.put(
-                "ssh_exec",
-                &format!("k{i}"),
-                format!("B{i}"),
-                Value::Null,
-            );
+            cache.put("ssh_exec", &format!("k{i}"), format!("B{i}"), Value::Null);
             std::thread::sleep(Duration::from_millis(2));
         }
         // The oldest two entries (k0, k1) should have been pruned.

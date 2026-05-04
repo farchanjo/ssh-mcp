@@ -48,10 +48,13 @@ pub struct ChannelMuxAdapter {
     /// Aggregate counters (lock-free, sampled).
     events_sent: AtomicU64,
     bytes_sent: AtomicU64,
-    /// Outbound sink — Phase 2 writes to a bounded mpsc that the
-    /// composition root drains (Phase 4 wires this to the NDJSON
-    /// daemon stdout writer). The sink is optional so unit tests can
-    /// instantiate the mux without an outbound writer.
+    /// Outbound sink — writes to a bounded mpsc that the composition
+    /// root drains. The `ssh-mcp-tail` daemon (`composition::embed`)
+    /// is the canonical drain target for the NDJSON stdout writer;
+    /// HTTP / stdio binaries keep the receiver alive on the
+    /// composition root so the mpsc never reports `Closed`. The sink
+    /// is optional so unit tests can instantiate the mux without an
+    /// outbound writer.
     outbound: ArcSwap<Option<mpsc::Sender<(SubId, LaneMsg)>>>,
     /// Cooperative shutdown token. Cancelling stops the drain loop.
     shutdown: CancellationToken,

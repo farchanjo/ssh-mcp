@@ -297,8 +297,7 @@ pub struct SshExecBatchArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandStatus, SshExecCancelArgs, SshExecArgs, SshExecOutputArgs,
-        SshCommandsArgs,
+        CommandStatus, SshCommandsArgs, SshExecArgs, SshExecCancelArgs, SshExecOutputArgs,
     };
     use crate::domain::policy::CommandStatusFilter;
     use schemars::schema_for;

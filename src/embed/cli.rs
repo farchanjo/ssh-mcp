@@ -45,7 +45,7 @@ pub enum Subcmd {
 }
 
 /// Parameters for the `daemon` subcommand. Every field is optional;
-/// each maps to an env-var override (see `docs/INSTRUCTIONS_DAEMON.md`).
+/// each maps to an env-var override (see `docs/DAEMON.md`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonArgs {
     /// Optional explicit `SSH_NDJSON_LINE_MAX` override.
@@ -329,7 +329,7 @@ pub const HELP_TEXT: &str = concat!(
     "  ssh-mcp-tail daemon [--line-max N] [--heartbeat-secs N] [--stats-secs N]\n",
     "  ssh-mcp-tail run --host H --user U [--key K] [--port P] [--no-auto-disconnect] -- <cmd>...\n",
     "  ssh-mcp-tail shell --host H --user U [--key K] [--port P] [--cols 80] [--rows 24]\n",
-    "\nDocumentation: docs/INSTRUCTIONS_DAEMON.md (ADR 0008).\n",
+    "\nDocumentation: docs/DAEMON.md (ADR 0008).\n",
 );
 
 /// Dispatch the parsed CLI tree onto the matching composition root
