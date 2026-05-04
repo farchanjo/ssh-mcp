@@ -29,6 +29,74 @@ The public MCP API is structurally compatible with v3 / v4.0 / v4.1 / v4.5 / v4.
 
 The text channel stays byte-identical to v4.7.1 / v4.8 on the 21 carry-over tools. The 9 new tools follow the same `KEY: value` + 8-hex nonce + `--- name [nonce] ---` envelope. v3 / v4 hosts pointed at v5 servers see no behavioural change unless they opt into the new flags / tools / env vars.
 
+### Hexagonal layers
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph BIN["bin — entry points"]
+        HTTP["src/main.rs<br/>HTTP"]
+        STDIO["src/bin/ssh_mcp_stdio.rs<br/>stdio"]
+        TAIL["src/bin/ssh_mcp_tail.rs<br/>NDJSON daemon"]
+    end
+    subgraph COMP["composition — wiring root"]
+        PROD["prod.rs"]
+        EMBED["embed.rs<br/>(Phase 4)"]
+        FIX["fixtures.rs"]
+    end
+    subgraph EMBEDLAYER["embed — daemon transport"]
+        DUPLEX["duplex_transport.rs"]
+        DISP["dispatcher.rs"]
+        EVMUX["event_mux.rs"]
+    end
+    subgraph INFRA["infra/mcp — inbound MCP"]
+        TR["tool_router.rs<br/>30 #[tool] fns"]
+        RES["resource_handlers.rs"]
+        PROMPTS["prompts.rs"]
+    end
+    subgraph APP["application — use cases"]
+        UC["~22 *UseCase generic<br/>over ports"]
+    end
+    subgraph PORTS["ports — trait skeletons"]
+        VPORTS["v4 ports + v5:<br/>lifecycle_policy<br/>channel_mux<br/>subscriber_lane"]
+    end
+    subgraph ADAPT["adapters — concrete impls"]
+        RUSSH["ssh / sftp"]
+        REPO["repo/dashmap"]
+        LIFE["lifecycle/<br/>(Phase 1)"]
+        SUBLANE["subscription/<br/>lane + mux<br/>(Phase 2)"]
+    end
+    subgraph DOMAIN["domain — pure"]
+        ENT["entities + ids +<br/>lifecycle.rs +<br/>subscription.rs"]
+    end
+
+    BIN --> COMP
+    COMP --> EMBEDLAYER
+    COMP --> INFRA
+    INFRA --> APP
+    APP --> PORTS
+    PORTS -.-> ADAPT
+    ADAPT --> DOMAIN
+    APP --> DOMAIN
+    PORTS --> DOMAIN
+
+    style BIN fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style COMP fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style INFRA fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style APP fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style PORTS fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style ADAPT fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style DOMAIN fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style EMBEDLAYER fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style HTTP fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style STDIO fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TAIL fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LIFE fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style SUBLANE fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+```
+
+Detailed module-by-module breakdown: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#hexagonal-layer-map).
+
 ### Lifecycle binding & cascade refcount
 
 CAS state machine driven from `src/adapters/lifecycle/refcount.rs` with all hot-path fields atomic:
@@ -43,6 +111,32 @@ CAS state machine driven from `src/adapters/lifecycle/refcount.rs` with all hot-
 | `session_id` | `SessionId` | parent ref for cascade |
 
 The grace timer task lives in `src/adapters/lifecycle/grace_timer.rs`; cascade through `SessionLifecycle.active_refs: AtomicUsize` lives in `src/adapters/lifecycle/cascade.rs`. The session reaper consults `active_refs > 0` before honouring the inactivity TTL — refcount supersedes TTL. Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` call (Phase 3 surfaces it on the schema). Loom invariants: `tests/lockfree_invariants.rs` covers four interleavings (subscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity).
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+stateDiagram-v2
+    [*] --> Owned: open / execute / upload
+    Owned --> Observed: first on_subscribe<br/>sub_count 0 -> 1
+    Observed --> Observed: on_subscribe / on_unsubscribe<br/>(sub_count > 0)
+    Observed --> Releasing: last on_unsubscribe<br/>policy.release_when_no_subs
+    Releasing --> Observed: on_subscribe within grace<br/>(cancel timer)
+    Releasing --> Closed: grace_until_ms expired<br/>(timer fires)
+    Owned --> Closed: explicit close
+    Observed --> Closed: explicit close
+    Closed --> [*]: cascade refcount--<br/>(SessionLifecycle)
+
+    classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef releasing fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef closed fill:#cf222e,color:#f0f6fc,stroke:#f85149
+
+    class Owned owned
+    class Observed observed
+    class Releasing releasing
+    class Closed closed
+```
+
+Full CAS state-transition diagram with memory ordering annotations: [docs/LOCKS.md](docs/LOCKS.md#cas-state-transition-diagram).
 
 ### Channel mux & sub_id isolation
 
@@ -59,6 +153,37 @@ Each `resources/subscribe` (legacy) or `ssh_subscribe` (new tool) call mints a `
 | `pause_flag` | `AtomicBool` | suspend drain without disconnecting |
 
 The `ChannelMux` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin draining (Acquire load + Release store). Drain wakes on `Arc<Notify>`; no spinning. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain. Tested under loom in `tests/lockfree_invariants.rs` (4 new interleavings: mux fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, cursor advance under contention).
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    Producer["Producer<br/>(russh / SFTP / health)"]
+    Debouncer["per-resource debouncer<br/>50 ms / 1 s flush"]
+    LaneA["MultiplexLane<br/>SubId A<br/>policy + filter + stats"]
+    LaneB["MultiplexLane<br/>SubId B<br/>policy + filter + stats"]
+    LaneN["MultiplexLane<br/>SubId N<br/>..."]
+    Mux["ChannelMux<br/>cursor_lane: AtomicUsize<br/>round-robin"]
+    Out["outbound writer<br/>rmcp Peer or NDJSON"]
+
+    Producer --> Debouncer
+    Debouncer --> LaneA
+    Debouncer --> LaneB
+    Debouncer --> LaneN
+    LaneA --> Mux
+    LaneB --> Mux
+    LaneN --> Mux
+    Mux --> Out
+
+    style Producer fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Debouncer fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style LaneA fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LaneB fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LaneN fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Mux fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Out fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
+
+Full subscribe pipeline (producer -> debouncer -> lane fan-out -> mux drain -> outbound writer): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#subscribe-pipeline-v5-layered-view).
 
 ### LLM UX priorities
 
