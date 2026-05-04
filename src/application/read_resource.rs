@@ -102,7 +102,7 @@ impl fmt::Display for ParseError {
         match self {
             Self::BadScheme(scheme) => write!(
                 f,
-                "unsupported scheme {scheme:?}: expected one of shell, command, transfer, session, forward"
+                "unsupported scheme {scheme:?}: expected one of shell, command, transfer, session, forward, serial"
             ),
             Self::MissingId => write!(f, "resource URI is missing the resource id segment"),
             Self::BadSubPath { expected, got } => {
@@ -186,6 +186,7 @@ fn parse_scheme(scheme: &str) -> Result<ResourceKind, ParseError> {
         "transfer" => Ok(ResourceKind::Transfer),
         "session" => Ok(ResourceKind::Session),
         "forward" => Ok(ResourceKind::Forward),
+        "serial" => Ok(ResourceKind::Serial),
         other => Err(ParseError::BadScheme(other.to_string())),
     }
 }
