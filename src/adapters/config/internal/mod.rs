@@ -27,16 +27,16 @@ use std::time::Duration;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default SSH command execution timeout
-pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Default maximum retry attempts for SSH connection
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// Default retry delay
-pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1000);
+pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Default session inactivity timeout (separate from connect timeout)
-pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Maximum retry delay cap (10 seconds)
 pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -60,13 +60,13 @@ pub const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
 pub const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
 
 /// Default TTL for completed command cleanup (seconds)
-pub const DEFAULT_COMMAND_CLEANUP_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_COMMAND_CLEANUP_TTL: Duration = Duration::from_mins(1);
 
 /// Environment variable name for command cleanup TTL
 pub const COMMAND_CLEANUP_TTL_ENV_VAR: &str = "SSH_COMMAND_CLEANUP_TTL";
 
 /// Default shell inactivity timeout (seconds) — auto-close after no read/write
-pub const DEFAULT_SHELL_INACTIVITY_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_SHELL_INACTIVITY_TTL: Duration = Duration::from_mins(10);
 
 /// Environment variable name for shell inactivity TTL
 pub const SHELL_INACTIVITY_TTL_ENV_VAR: &str = "SSH_SHELL_INACTIVITY_TTL";
@@ -326,6 +326,7 @@ pub fn resolve_command_cleanup_ttl() -> Duration {
 /// - `t` / `tb`: terabytes (×1024⁴)
 ///
 /// Examples: `"512k"`, `"10m"`, `"1g"`, `"1024"`, `"500mb"`, `"2tb"`
+#[must_use]
 pub fn parse_byte_size(input: &str) -> Option<u64> {
     let input = input.trim().to_ascii_lowercase();
     if input.is_empty() {

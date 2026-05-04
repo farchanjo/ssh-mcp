@@ -54,7 +54,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard cap on the wait budget. Mirrors the v3 `min(300)` clamp.
-const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Inbound DTO. Built by the rmcp tool wrapper (etapa H16).
 #[derive(Debug, Clone)]
