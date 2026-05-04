@@ -97,7 +97,8 @@ dotenvy = "0.15"                                                        # Env va
 futures = "0.3"                                                         # Async utilities
 tracing = "0.1"                                                         # Tracing
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.16", features = ["v4", "serde"] }
+uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
+regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
 
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants

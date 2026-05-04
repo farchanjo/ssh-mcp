@@ -18,4 +18,5 @@ pub mod policy;
 pub mod ringbuffer;
 pub mod session;
 pub mod shell;
+pub mod subscription;
 pub mod transfer;
