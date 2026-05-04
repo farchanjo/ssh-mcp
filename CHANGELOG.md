@@ -5,7 +5,7 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [5.0.0-rc1] — pending
+## [5.0.0-rc1] — 2026-05-04
 
 In flight on `feat/v5-foundation`. Phase 1 (lifecycle binding) and Phase 2 (channel mux + sub_id) merged; Phase 3 (LLM UX overhaul) and Phase 4 (NDJSON daemon) running in parallel by other agents, will land before the rc1 tag. Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). Design narrative: ADRs at [docs/adr/0001..0008.md](docs/adr/).
 
