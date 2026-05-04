@@ -19,27 +19,34 @@ For full-spec MCP hosts (mcp-inspector, custom rmcp clients, Goose CLI, Cline) t
 
 The daemon embeds the rmcp `ServerHandler` inside the same process as an rmcp client; the two halves talk to each other via an in-memory `tokio::io::duplex(64 KB)` byte pair, which carries real JSON-RPC framing. The dispatcher reads NDJSON ops from stdin, translates them into `tools/call` and `resources/subscribe` requests on the embedded client, and forwards rmcp notifications to the stdout writer as NDJSON events.
 
-```
-+---------------------------------------------+
-|  ssh-mcp-tail (single process, single bin)  |
-|                                             |
-|  +---------+   tokio::io::duplex   +-----+  |
-|  | rmcp    |   (JSON-RPC bytes)    | rmcp|  |
-|  | client  |<--------------------->| svr |  |
-|  +----+----+                       +--+--+  |
-|       |                               |     |
-|       |  notifications/               | use |
-|       |  resources/updated            | cas |
-|       |                               | es  |
-|       v                               v     |
-|   EventMux                       composition|
-|   (formats stdout)               ::embed    |
-|                                             |
-+---------------------------------------------+
-        ^ stdin (NDJSON ops)
-        |
-        v stdout (NDJSON events)
-        v stderr (RUST_LOG output)
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    autonumber
+    participant Caller as Caller<br/>(stdin)
+    participant LR as LineReader
+    participant DSP as Dispatcher
+    participant CLI as embed client
+    participant SVR as embed server<br/>+ adapters
+    participant MUX as EventMux
+    participant Out as stdout
+
+    Caller->>LR: {"op":"connect",...,"id":"corr-1"}
+    LR->>DSP: parsed Op
+    DSP->>CLI: tools/call ssh_connect
+    CLI->>SVR: JSON-RPC over duplex
+    SVR-->>CLI: ssh_connect result
+    CLI-->>DSP: typed result
+    DSP->>MUX: ack event { id: corr-1, sid: ... }
+    MUX->>Out: {"ev":"ack","id":"corr-1","sid":"..."}
+
+    Note over Caller,Out: subscribe path then drains push events
+    Caller->>LR: {"op":"subscribe",...,"id":"corr-2"}
+    LR->>DSP: parsed Op
+    DSP->>CLI: resources/subscribe
+    SVR-->>CLI: notifications/resources/updated
+    CLI-->>MUX: push event { sub_id, cursor, delta }
+    MUX->>Out: {"ev":"push","sub_id":"...","delta":"..."}
 ```
 
 The `composition::embed::wire()` factory pins concrete `composition::prod` adapters (russh client, russh-sftp, DashMap repos, AuthChain, MemoryRegistry, RmcpAdapter, ...) and exposes both halves of the duplex so the binary main loop can spawn them as cooperating tasks. No IPC syscall is involved; both sides share the same async runtime.
@@ -224,6 +231,32 @@ Graceful drain. Daemon exits with code 0 after the drain completes (`SSH_GRACE_H
 
 ```json
 {"op":"shutdown","id":"corr-11"}
+```
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    autonumber
+    participant Trigger as stdin EOF /<br/>shutdown op /<br/>SIGTERM / SIGINT
+    participant LR as LineReader
+    participant DSP as Dispatcher
+    participant SUB as Subscriptions
+    participant SESS as Sessions
+    participant SRV as embed server
+    participant MUX as EventMux
+    participant Out as stdout
+
+    Trigger->>LR: stop reading
+    LR->>DSP: exit signal
+    DSP->>SUB: broadcast cancel
+    SUB-->>DSP: drained
+    DSP->>SESS: ssh_disconnect (per session)
+    SESS-->>DSP: closed
+    DSP->>SRV: abort task
+    SRV->>MUX: flush remaining events
+    MUX->>Out: write final NDJSON lines
+    Out-->>Trigger: process exit 0
+    Note over Trigger,Out: bounded by SSH_GRACE_HARD_TIMEOUT_S<br/>(default 30s)
 ```
 
 The shutdown sequence is detailed in [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).

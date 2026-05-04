@@ -111,6 +111,29 @@ The defaults preserve v4 behaviour. The new env vars are listed exhaustively in 
 
 The following defaults change between v4.8 and v5.0. None affect a host that does not opt into the new flag or env var; v4 idioms are preserved.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    subgraph On["Always-on (transparent)"]
+        T1["(SubId, Uri) cursor key<br/>(legacy hosts get<br/>synthesised sub_id)"]
+        T2["per-lane mpsc<br/>(Snapshot default)"]
+        T3["refcount-aware<br/>session reaper"]
+        T4["WARN: SUB_LEAK_RISK<br/>once Phase 3 lands"]
+    end
+
+    subgraph Opt["Opt-in (per-call)"]
+        O1["release_when_no_subs<br/>= true<br/>(default false)"]
+        O2["lifetime=auto-close<br/>or =lease<br/>(default manual)"]
+        O3["lag_policy=block_slow<br/>(default snapshot)"]
+        O4["ssh-mcp-tail daemon<br/>(separate binary)"]
+    end
+
+    classDef on fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef opt fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    class T1,T2,T3,T4 on
+    class O1,O2,O3,O4 opt
+```
+
 | Behaviour | v4.8 | v5.0 default | Opt-in flag |
 |---|---|---|---|
 | Resource auto-cleanup when no subscriber | n/a (manual close required) | unchanged for v4 idioms (`release_when_no_subs = false`) | `release_when_no_subs: true` per call |
