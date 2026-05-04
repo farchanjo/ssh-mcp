@@ -663,3 +663,124 @@ pub struct SshDisconnectManyResult {
     /// Number of sessions that returned an error.
     pub failed: usize,
 }
+
+// ---------------------------------------------------------------------------
+// v5.2 — Serial transport (ADR 0009)
+// ---------------------------------------------------------------------------
+
+/// `ssh_serial_open` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialOpenResult {
+    /// Discriminator: always `"ssh_serial_open"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// `SERIAL_ID` minted for this open port. Pass to
+    /// `ssh_serial_close`, `ssh_serial_write`, `ssh_serial_send_key`.
+    pub serial_id: String,
+    /// Echoed device path.
+    pub path: String,
+    /// Echoed baud rate.
+    pub baud_rate: u32,
+    /// Resolved data bits.
+    pub data_bits: u8,
+    /// Resolved stop bits (`"1"` / `"2"`).
+    pub stop_bits: String,
+    /// Resolved parity (`"none"` / `"odd"` / `"even"`).
+    pub parity: String,
+    /// Resolved flow control (`"none"` / `"software"` / `"hardware"`).
+    pub flow_control: String,
+    /// Subscribe URI.
+    pub uri: String,
+}
+
+/// `ssh_serial_close` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialCloseResult {
+    /// Discriminator: always `"ssh_serial_close"`.
+    pub tool: String,
+    /// `"ok"` when a port matched and was closed; `"noop"` when no port
+    /// matched the given id.
+    pub status: String,
+    /// Echoed `SERIAL_ID`.
+    pub serial_id: String,
+}
+
+/// `ssh_serial_write` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialWriteResult {
+    /// Discriminator: always `"ssh_serial_write"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed `SERIAL_ID`.
+    pub serial_id: String,
+    /// Bytes enqueued for transmission.
+    pub bytes_sent: usize,
+}
+
+/// `ssh_serial_send_key` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialSendKeyResult {
+    /// Discriminator: always `"ssh_serial_send_key"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed `SERIAL_ID`.
+    pub serial_id: String,
+    /// Echoed key label.
+    pub key: String,
+    /// Echoed repeat count.
+    pub repeat: u32,
+    /// Bytes enqueued.
+    pub bytes_sent: usize,
+}
+
+/// Per-port entry on `ssh_serial_list_open`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialOpenEntry {
+    /// `SERIAL_ID`.
+    pub serial_id: String,
+    /// Device path.
+    pub path: String,
+    /// Baud rate.
+    pub baud_rate: u32,
+    /// Optional human label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Subscribe URI.
+    pub uri: String,
+}
+
+/// `ssh_serial_list_open` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialListOpenResult {
+    /// Discriminator: always `"ssh_serial_list_open"`.
+    pub tool: String,
+    /// Always `"ok"`.
+    pub status: String,
+    /// Open ports.
+    pub ports: Vec<SshSerialOpenEntry>,
+    /// Total open count.
+    pub total: usize,
+}
+
+/// `ssh_serial_list_ports` payload — OS-visible serial devices.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshSerialListPortsResult {
+    /// Discriminator: always `"ssh_serial_list_ports"`.
+    pub tool: String,
+    /// Always `"ok"`.
+    pub status: String,
+    /// Device paths visible to the OS.
+    pub paths: Vec<String>,
+    /// Total visible count.
+    pub total: usize,
+}
