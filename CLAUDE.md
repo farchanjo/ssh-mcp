@@ -127,7 +127,7 @@ Each `resources/subscribe` (legacy) or `ssh_subscribe` (new tool) call mints a `
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
     Producer["Producer<br/>(russh / SFTP / health)"]
-    Debouncer["per-resource debouncer<br/>50 ms / 1 s flush"]
+    Debouncer["per-resource debouncer<br/>200 ms / 1 s flush"]
     LaneA["MultiplexLane<br/>SubId A<br/>policy + filter + stats"]
     LaneB["MultiplexLane<br/>SubId B<br/>policy + filter + stats"]
     LaneN["MultiplexLane<br/>SubId N<br/>..."]
@@ -183,7 +183,7 @@ Each session serializes one russh channel at a time through a per-session semaph
 
 ### MCP resources
 
-5 push-capable schemes (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events` (feature-gated)). Cursor support on `shell` / `command` / `forward`. Subscriptions go through `MemoryRegistry<N>` (generic over the notifier port — no `Box<dyn>`). Debouncer coalesces on `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms), force-flushes after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1 s), keepalives every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). v5 lagged subscribers auto-recover via the per-lane `Snapshot` policy ([ADR 0006](docs/adr/0006-backpressure-policies.md)). Full contract: [docs/RESOURCES.md](docs/RESOURCES.md).
+5 push-capable schemes (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events` (feature-gated)). Cursor support on `shell` / `command` / `forward`. Subscriptions go through `MemoryRegistry<N>` (generic over the notifier port — no `Box<dyn>`). Debouncer coalesces on `SSH_NOTIFY_DEBOUNCE_MS` (default 200 ms), force-flushes after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1 s), keepalives every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). v5 lagged subscribers auto-recover via the per-lane `Snapshot` policy ([ADR 0006](docs/adr/0006-backpressure-policies.md)). Full contract: [docs/RESOURCES.md](docs/RESOURCES.md).
 
 ### Response format
 

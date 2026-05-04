@@ -276,7 +276,7 @@ Fires once per debounce window per subscribed URI.
 When it fires:
 
 - The producer (shell reader, command reader, transfer task, health probe, forward task) called `SubscriberRegistryPort::poke(kind, id)`.
-- The debouncer slept `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms) to coalesce multiple pokes into one notification.
+- The debouncer slept `SSH_NOTIFY_DEBOUNCE_MS` (default 200 ms) to coalesce multiple pokes into one notification.
 - The debouncer also fires on every `SSH_NOTIFY_FORCE_FLUSH_MS` tick (default 1000 ms) and every `SSH_NOTIFY_KEEPALIVE_S` tick (default 30 s) regardless of producer activity.
 
 The notification carries no payload bytes — call `resources/read?cursor=auto` to fetch the delta.
@@ -297,7 +297,7 @@ Per resource, the debouncer task fires a `notifications/resources/updated` every
 
 ### D. Cumulative chunks
 
-The debouncer collapses N producer pokes inside a single debounce window into one outbound notification. The chunks themselves accumulate in the producer's `ArcSwap<RingBuffer>` / `ArcSwap<OutputBuffer>`; the `resources/read` step does the actual coalescing of bytes through the per-peer cursor. Result: subscribers see one notification per ~50 ms regardless of how chatty the producer is.
+The debouncer collapses N producer pokes inside a single debounce window into one outbound notification. The chunks themselves accumulate in the producer's `ArcSwap<RingBuffer>` / `ArcSwap<OutputBuffer>`; the `resources/read` step does the actual coalescing of bytes through the per-peer cursor. Result: subscribers see one notification per ~200 ms regardless of how chatty the producer is.
 
 ## Per-peer cursor behaviour
 
@@ -331,7 +331,7 @@ All knobs live under `SSH_NOTIFY_*` and `SSH_*_BROADCAST_CAP`. Defaults are sane
 
 | Env var                          | Default | Range / cap     | Effect                                                                      |
 | -------------------------------- | ------- | --------------- | --------------------------------------------------------------------------- |
-| `SSH_NOTIFY_DEBOUNCE_MS`         | 50      | clamped         | Delay between first poke and outbound notification.                         |
+| `SSH_NOTIFY_DEBOUNCE_MS`         | 200     | clamped         | Delay between first poke and outbound notification.                         |
 | `SSH_NOTIFY_FORCE_FLUSH_MS`      | 1000    | clamped         | Maximum gap between notifications when pokes keep arriving.                 |
 | `SSH_NOTIFY_KEEPALIVE_S`         | 30      | clamped         | Idle keepalive interval per resource.                                       |
 | `SSH_MCP_PEER_GC_INTERVAL_S`     | 30      | min 1           | Period of the peer-GC scan that drops disconnected peers' subscriptions.    |

@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(cfg.transfer_broadcast_cap(), 256);
         assert_eq!(cfg.session_broadcast_cap(), 256);
         assert_eq!(cfg.forward_broadcast_cap(), 256);
-        assert_eq!(cfg.notify_debounce(), Duration::from_millis(50));
+        assert_eq!(cfg.notify_debounce(), Duration::from_millis(200));
         assert_eq!(cfg.notify_force_flush(), Duration::from_secs(1));
         assert_eq!(cfg.notify_keepalive(), Duration::from_secs(30));
         assert_eq!(cfg.peer_gc_interval(), Duration::from_secs(30));

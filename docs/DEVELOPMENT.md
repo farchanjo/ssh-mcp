@@ -462,7 +462,7 @@ Six fronteiras between the russh receiver and the host stdout / socket. Each car
 flowchart LR
     F0["russh recv<br/>tcp / pty"]
     F1["F1<br/>broadcast Sender<br/>SSH_SHELL_BROADCAST_CAP=1024<br/>lag = snapshot via ArcSwap"]
-    F2["F2<br/>per-resource debouncer<br/>50 ms / 1 s flush"]
+    F2["F2<br/>per-resource debouncer<br/>200 ms / 1 s flush"]
     F3["F3<br/>per-(SubId, Uri) lane<br/>SSH_LANE_BUFFER=1024<br/>LagPolicy: BlockSlow / DropOldest /<br/>DropNewest / Snapshot"]
     F4["F4<br/>ChannelMux mux_tx<br/>SSH_MUX_BUFFER=8192<br/>round-robin try_recv"]
     F5["F5<br/>rmcp Peer / NDJSON writer<br/>tokio io"]

@@ -176,7 +176,7 @@ See [CONFIGURATION.md](./CONFIGURATION.md) for the full list. Highlights:
 
 | New in v3                          | Default | Purpose                                                                          |
 | ---------------------------------- | ------- | -------------------------------------------------------------------------------- |
-| `SSH_NOTIFY_DEBOUNCE_MS`           | 50      | Debounce window for `notifications/resources/updated`.                           |
+| `SSH_NOTIFY_DEBOUNCE_MS`           | 200     | Debounce window for `notifications/resources/updated`.                           |
 | `SSH_NOTIFY_FORCE_FLUSH_MS`        | 1000    | Maximum gap between notifications under continuous activity.                     |
 | `SSH_NOTIFY_KEEPALIVE_S`           | 30      | Idle keepalive interval per resource.                                            |
 | `SSH_MCP_PEER_GC_INTERVAL_S`       | 30      | Period of the peer-GC scan (drops subscriptions for closed transports).          |
@@ -495,7 +495,7 @@ If you only consume the v4 MCP surface and never opt into the new tools, env var
 | Tool response markdown shape (`KEY: value`, 8-hex nonce, `--- name [nonce] ---`) | block-only | identical | yes |
 | Structured `_meta` channel on every tool response | typed JSON | identical (extended for new tools) | yes |
 | Resources schemes | 5 | identical (no new schemes in v5.0) | yes |
-| `notifications/resources/updated` debounce semantics (`SSH_NOTIFY_*`) | 50 ms / 1 s / 30 s | identical defaults | yes |
+| `notifications/resources/updated` debounce semantics (`SSH_NOTIFY_*`) | 200 ms / 1 s / 30 s | bumped debounce default from 50 → 200 ms (other timers identical) | partial — debounce default changed |
 | `notifications/cancelled` (rmcp 1.6 native) | yes | yes | yes |
 | `prompts/list` + `prompts/get` | 5 prompts | 10 prompts (5 new) | yes — additive |
 | `resources/templates/list` | 4 / 5 templates | identical (no new templates in v5.0) | yes |

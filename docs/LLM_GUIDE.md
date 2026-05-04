@@ -109,7 +109,7 @@ The `agent_id` parameter passed at `ssh_connect` time scopes ownership of every 
 
 **Violation.** Agent emits `ssh_shell_read(shell_id, wait=true, wait_timeout_secs=1)` in a `while true` loop. After a minute the host has consumed 60 round-trips and ~12 KB of redundant tool-response framing.
 
-**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscriber its own debounced push lane (50 ms coalesce, 1 s force flush, 30 s keepalive). Server does the work once; LLM consumes events as conversation context; cursor advances exactly as fast as the consumer needs.
+**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscriber its own debounced push lane (200 ms coalesce, 1 s force flush, 30 s keepalive). Server does the work once; LLM consumes events as conversation context; cursor advances exactly as fast as the consumer needs.
 
 **How to comply.**
 - Use `resources/subscribe` (or `ssh_subscribe` once Phase 3 lands) immediately after `ssh_shell_open`.
@@ -891,7 +891,7 @@ flowchart LR
 ### #1 — Hot-poll loop on `ssh_shell_read`
 
 **Symptom.** LLM emits `ssh_shell_read(shell_id, wait=true, wait_timeout_secs=1)` in a tight loop instead of subscribing once and consuming `notifications/resources/updated` events.
-**Why bad.** Token waste (every poll round-trips a markdown body and a structured JSON), increased latency (50 ms+ per poll regardless of activity), nontrivial CPU on the server (debouncer wakes per poll cycle even with no new bytes). Push pipeline already coalesces output every 50 ms; a 1-second poll loop converts a 20 Hz native event rate into a 1 Hz client view.
+**Why bad.** Token waste (every poll round-trips a markdown body and a structured JSON), increased latency (50 ms+ per poll regardless of activity), nontrivial CPU on the server (debouncer wakes per poll cycle even with no new bytes). Push pipeline already coalesces output every 200 ms; a 1-second poll loop converts a 5 Hz native event rate into a 1 Hz client view.
 **Fix.** `ssh_shell_open` -> `resources/subscribe shell://<sid>/output` -> on each push notification, `resources/read?cursor=auto`. Reserve `ssh_shell_read` for hosts that genuinely cannot subscribe.
 **Detection.** Per-session call rate of `ssh_shell_read` > 1 Hz with no matching `subscribe` in the same session.
 

@@ -136,7 +136,7 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
     append_hint(
         out,
         HintStrength::Recommended,
-        "Data arrives async via notifications/resources/updated. Wait for the push, then resources/read?cursor=auto. Do NOT use any MCP tool as a sleep. If you must idle between reads, sleep LOCALLY with low values: Unix `sleep 0.05` / `sleep 0.1`, PowerShell `Start-Sleep -Milliseconds 50`. Push fires on whichever fires first: ~50ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 10-100ms local sleeps cover both budgets.",
+        "Data arrives async via notifications/resources/updated. Wait for the push, then resources/read?cursor=auto. Do NOT use any MCP tool as a sleep. If you must idle between reads, sleep LOCALLY with low values: Unix `sleep 0.1` / `sleep 0.2`, PowerShell `Start-Sleep -Milliseconds 100`. Push fires on whichever fires first: ~200ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 50-200ms local sleeps cover both budgets.",
     );
 }
 
