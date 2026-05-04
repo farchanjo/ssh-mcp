@@ -211,7 +211,7 @@ def _scenario_send_key_plus_write_concurrent(target: ChaosSshTarget) -> dict:
                     pool.submit(
                         call_tool_text,
                         client,
-                        "ssh_shell_send_key",
+                        "ssh_shell_press",
                         {"shell_id": shid, "key": "arrow_up"},
                     )
                     for _ in range(100)
@@ -325,7 +325,7 @@ def _scenario_burst_execute_cancel(target: ChaosSshTarget) -> dict:
                             pool.submit(
                                 call_tool_text,
                                 client,
-                                "ssh_execute",
+                                "ssh_exec",
                                 {"session_id": sid, "command": "sleep 30"},
                             )
                         )
@@ -343,7 +343,7 @@ def _scenario_burst_execute_cancel(target: ChaosSshTarget) -> dict:
                     pool.submit(
                         call_tool_text,
                         client,
-                        "ssh_cancel_command",
+                        "ssh_exec_cancel",
                         {"command_id": cid},
                     )
                     for cid in cmd_ids
@@ -385,7 +385,7 @@ def _scenario_concurrent_transfers(target: ChaosSshTarget, tmp_dir: Path) -> dic
             mkdir = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {
                         "session_id": sid,
                         "command": f"mkdir -p /tmp/ssh-mcp-chaos-{sid}",
@@ -395,7 +395,7 @@ def _scenario_concurrent_transfers(target: ChaosSshTarget, tmp_dir: Path) -> dic
             if mkdir:
                 call_tool_text(
                     client,
-                    "ssh_get_command_output",
+                    "ssh_exec_output",
                     {"command_id": mkdir, "wait": True, "wait_timeout_secs": 5},
                     timeout=10,
                 )
@@ -450,7 +450,7 @@ def _scenario_open_cancel_close_race(target: ChaosSshTarget) -> dict:
                 ctrl_fut = pool.submit(
                     call_tool_text,
                     client,
-                    "ssh_shell_send_key",
+                    "ssh_shell_press",
                     {"shell_id": shid, "key": "ctrl_c"},
                 )
                 close_fut = pool.submit(

@@ -73,7 +73,7 @@ def test_ssh_run_disconnect_after_false_keeps_session(
     assert sid
     # Session must still appear in ssh_list_sessions.
     listed = parse_block(
-        call_tool_text(stdio_client, "ssh_list_sessions", {"agent_id": "run-test"})
+        call_tool_text(stdio_client, "ssh_sessions", {"agent_id": "run-test"})
     )
     assert listed.get("count", 0) >= 1, listed
     # Cleanup.

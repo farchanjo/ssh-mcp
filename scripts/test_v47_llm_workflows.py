@@ -116,7 +116,7 @@ def _wait_transfer_completed(
 ) -> dict:
     text = call_tool_text(
         client,
-        "ssh_get_transfer_progress",
+        "ssh_transfer_progress",
         {
             "transfer_id": transfer_id,
             "wait": True,
@@ -135,7 +135,7 @@ def _wait_command_completed(
 ) -> dict:
     text = call_tool_text(
         client,
-        "ssh_get_command_output",
+        "ssh_exec_output",
         {
             "command_id": command_id,
             "wait": True,
@@ -261,7 +261,7 @@ def test_w02_run_and_capture(stdio_client: McpClient, ssh_target) -> None:
     try:
         text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {
                 "session_id": sid,
                 "command": "for i in 1 2 3 4 5; do echo line-$i; sleep 0.2; done",
@@ -334,7 +334,7 @@ def test_w03_upload_then_verify(stdio_client: McpClient, ssh_target, tmp_path: P
             parse_block(
                 call_tool_text(
                     stdio_client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {
                         "session_id": sid,
                         "command": f"mkdir -p {remote_dir} && rm -f {remote_path}",
@@ -363,7 +363,7 @@ def test_w03_upload_then_verify(stdio_client: McpClient, ssh_target, tmp_path: P
         # Re-use the SAME session for the verification command.
         verify_text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": f"sha256sum {remote_path}"},
         )
         verify_cid = parse_block(verify_text).get("command_id")
@@ -399,7 +399,7 @@ def test_w04_round_trip(stdio_client: McpClient, ssh_target, tmp_path: Path) -> 
             parse_block(
                 call_tool_text(
                     stdio_client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": f"mkdir -p {remote_dir}"},
                 )
             ).get("command_id"),
@@ -469,7 +469,7 @@ def test_w05_multiplexed_mixed_workload(stdio_client: McpClient, ssh_target, tmp
             parse_block(
                 call_tool_text(
                     stdio_client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": f"mkdir -p {remote_dir}"},
                 )
             ).get("command_id"),
@@ -479,7 +479,7 @@ def test_w05_multiplexed_mixed_workload(stdio_client: McpClient, ssh_target, tmp
         # Kick off long-running async command first so it has a head start.
         cmd_text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {
                 "session_id": sid,
                 "command": "sleep 6 && echo W5_DONE",
@@ -617,7 +617,7 @@ def test_w06_multi_agent_coexistence(ssh_target) -> None:
 
         # ssh_list_sessions filters by agent_id.
         list_a = parse_block(
-            call_tool_text(client_a, "ssh_list_sessions", {"agent_id": "w6-A"})
+            call_tool_text(client_a, "ssh_sessions", {"agent_id": "w6-A"})
         )
         assert list_a.get("count", 0) == 1, list_a
         # B's session is on a separate stdio server, so neither client can
@@ -632,7 +632,7 @@ def test_w06_multi_agent_coexistence(ssh_target) -> None:
 
         # B's session is still alive — verify by listing on B.
         list_b = parse_block(
-            call_tool_text(client_b, "ssh_list_sessions", {"agent_id": "w6-B"})
+            call_tool_text(client_b, "ssh_sessions", {"agent_id": "w6-B"})
         )
         assert list_b.get("count", 0) == 1, list_b
 
@@ -750,7 +750,7 @@ def test_w08_ssh_run_equivalence(stdio_client: McpClient, ssh_target) -> None:
     assert structured.get("disconnected") is True, structured
 
     # Confirm the disconnect_after=true side-effect: no listed session.
-    list_text = call_tool_text(stdio_client, "ssh_list_sessions", {"agent_id": "w8-run"})
+    list_text = call_tool_text(stdio_client, "ssh_sessions", {"agent_id": "w8-run"})
     assert parse_block(list_text).get("count", 0) == 0, list_text
 
     # Branch 2: ssh_run with disconnect_after=false leaves a live session.
@@ -765,7 +765,7 @@ def test_w08_ssh_run_equivalence(stdio_client: McpClient, ssh_target) -> None:
     sid = parsed2.get("session_id")
     assert sid, parsed2
 
-    list_keep = call_tool_text(stdio_client, "ssh_list_sessions", {"agent_id": "w8-keep"})
+    list_keep = call_tool_text(stdio_client, "ssh_sessions", {"agent_id": "w8-keep"})
     assert parse_block(list_keep).get("count", 0) == 1, list_keep
 
     # Branch 3: equivalent connect + execute + wait pipeline.
@@ -774,7 +774,7 @@ def test_w08_ssh_run_equivalence(stdio_client: McpClient, ssh_target) -> None:
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid3, "command": "echo W8_OK_PIPELINE"},
             )
         ).get("command_id")
@@ -806,7 +806,7 @@ def test_w09_batch_mid_failure(stdio_client: McpClient, ssh_target) -> None:
         # Branch 1: stop_on_failure=true — should HALT after slot 2.
         text_halt = call_tool_text(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": commands,
@@ -819,7 +819,7 @@ def test_w09_batch_mid_failure(stdio_client: McpClient, ssh_target) -> None:
         assert parsed_halt.get("__status") == "HALTED", text_halt
         # Use the structured channel for precise assertions about per-slot state.
         result_halt = stdio_client.call_tool(
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": commands,
@@ -851,7 +851,7 @@ def test_w09_batch_mid_failure(stdio_client: McpClient, ssh_target) -> None:
 
         # Branch 2: stop_on_failure=false — every slot must run.
         result_run = stdio_client.call_tool(
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": commands,
@@ -894,7 +894,7 @@ def test_w10_idempotency_retry_storm(stdio_client: McpClient, ssh_target, tmp_pa
             parse_block(
                 call_tool_text(
                     stdio_client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": f"mkdir -p {marker_dir}"},
                 )
             ).get("command_id"),
@@ -908,7 +908,7 @@ def test_w10_idempotency_retry_storm(stdio_client: McpClient, ssh_target, tmp_pa
         retry_responses: list[str] = []
         for _ in range(5):
             result = stdio_client.call_tool_with_meta(
-                "ssh_execute",
+                "ssh_exec",
                 {
                     "session_id": sid,
                     "command": f"echo TOUCHED >> {marker_path}",
@@ -934,7 +934,7 @@ def test_w10_idempotency_retry_storm(stdio_client: McpClient, ssh_target, tmp_pa
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": f"wc -l {marker_path}"},
             )
         ).get("command_id")
@@ -978,7 +978,7 @@ def test_w11_cancel_mid_flight(stdio_client: McpClient, ssh_target) -> None:
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "sleep 60"},
             )
         ).get("command_id")
@@ -988,7 +988,7 @@ def test_w11_cancel_mid_flight(stdio_client: McpClient, ssh_target) -> None:
         time.sleep(0.5)
 
         cancel_text = call_tool_text(
-            stdio_client, "ssh_cancel_command", {"command_id": cid}
+            stdio_client, "ssh_exec_cancel", {"command_id": cid}
         )
         cancel_parsed = parse_block(cancel_text)
         assert cancel_parsed.get("__status") in {"CANCELLED", "NOOP"}, cancel_text
@@ -997,7 +997,7 @@ def test_w11_cancel_mid_flight(stdio_client: McpClient, ssh_target) -> None:
         # MUST surface the command in CANCELLED status. This anchors the
         # diagnostic — the row is reachable, only snapshot_command fails.
         list_text = call_tool_text(
-            stdio_client, "ssh_list_commands", {"session_id": sid}
+            stdio_client, "ssh_commands", {"session_id": sid}
         )
         list_parsed = parse_block(list_text)
         listed = [c for c in (list_parsed.get("commands") or []) if c.get("command_id") == cid]
@@ -1010,7 +1010,7 @@ def test_w11_cancel_mid_flight(stdio_client: McpClient, ssh_target) -> None:
         # Now wait for the terminal status — should resolve quickly.
         text = call_tool_text(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 10},
             timeout=20,
         )
@@ -1041,15 +1041,15 @@ def test_w12_cookbook_workflows(stdio_client: McpClient, ssh_target, tmp_path: P
     # Workflow 3 references: ssh_upload + ssh_get_transfer_progress.
     expected_tools = {
         "ssh_connect",
-        "ssh_execute",
-        "ssh_get_command_output",
+        "ssh_exec",
+        "ssh_exec_output",
         "ssh_shell_open",
         "ssh_shell_write",
-        "ssh_shell_send_key",
+        "ssh_shell_press",
         "ssh_shell_close",
         "ssh_disconnect",
         "ssh_upload",
-        "ssh_get_transfer_progress",
+        "ssh_transfer_progress",
         "ssh_disconnect_agent",
     }
     missing = expected_tools - available_tools
@@ -1098,7 +1098,7 @@ def test_w12_cookbook_workflows(stdio_client: McpClient, ssh_target, tmp_path: P
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "uname -a"},
             )
         ).get("command_id")
@@ -1141,7 +1141,7 @@ def test_w12_cookbook_workflows(stdio_client: McpClient, ssh_target, tmp_path: P
             # send_key → ctrl_c works.
             send_text = call_tool_text(
                 stdio_client,
-                "ssh_shell_send_key",
+                "ssh_shell_press",
                 {"shell_id": shell_id, "key": "ctrl_c"},
             )
             assert parse_block(send_text).get("__status") == "OK", send_text
@@ -1162,7 +1162,7 @@ def test_w12_cookbook_workflows(stdio_client: McpClient, ssh_target, tmp_path: P
             parse_block(
                 call_tool_text(
                     stdio_client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid2, "command": f"mkdir -p {remote_dir}"},
                 )
             ).get("command_id"),
@@ -1265,7 +1265,7 @@ def test_w14_closest_match_typo_recovery(stdio_client: McpClient, ssh_target) ->
         for mangled in mangles:
             text = call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": mangled, "command": "echo nope"},
             )
             parsed = parse_block(text)

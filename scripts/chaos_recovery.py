@@ -88,7 +88,7 @@ def _scenario_kill_during_command(target: ChaosSshTarget) -> dict:
             cid = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": "sleep 30"},
                 )
             ).get("command_id")
@@ -102,7 +102,7 @@ def _scenario_kill_during_command(target: ChaosSshTarget) -> dict:
             after = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_get_command_output",
+                    "ssh_exec_output",
                     {"command_id": cid, "wait": True, "wait_timeout_secs": 5},
                     timeout=10,
                 )
@@ -138,7 +138,7 @@ def _scenario_sigterm_session(target: ChaosSshTarget) -> dict:
         # surface SESSION_NOT_FOUND, never panic.
         results = []
         for tool, args in [
-            ("ssh_execute", {"session_id": sid, "command": "echo zombie"}),
+            ("ssh_exec", {"session_id": sid, "command": "echo zombie"}),
             ("ssh_shell_open", {"session_id": sid}),
             (
                 "ssh_upload",
@@ -245,7 +245,7 @@ def _scenario_cancel_during_cancel(target: ChaosSshTarget) -> dict:
             cid = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": "sleep 30"},
                 )
             ).get("command_id")
@@ -256,13 +256,13 @@ def _scenario_cancel_during_cancel(target: ChaosSshTarget) -> dict:
                 f1 = pool.submit(
                     call_tool_text,
                     client,
-                    "ssh_cancel_command",
+                    "ssh_exec_cancel",
                     {"command_id": cid},
                 )
                 f2 = pool.submit(
                     call_tool_text,
                     client,
-                    "ssh_cancel_command",
+                    "ssh_exec_cancel",
                     {"command_id": cid},
                 )
                 r1 = parse_block(f1.result())

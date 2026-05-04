@@ -56,7 +56,7 @@ def _worker(client: McpClient, sid: str, stop_at: float, stats: dict) -> None:
     while time.monotonic() < stop_at:
         for _ in range(OPS_PER_SECOND // SESSIONS):
             text = call_tool_text(
-                client, "ssh_execute", {"session_id": sid, "command": "sleep 30"}
+                client, "ssh_exec", {"session_id": sid, "command": "sleep 30"}
             )
             cid = parse_block(text).get("command_id")
             executed += 1
@@ -65,7 +65,7 @@ def _worker(client: McpClient, sid: str, stop_at: float, stats: dict) -> None:
                 continue
             # Cancel almost immediately.
             cresp = parse_block(
-                call_tool_text(client, "ssh_cancel_command", {"command_id": cid})
+                call_tool_text(client, "ssh_exec_cancel", {"command_id": cid})
             )
             if cresp.get("__status") == "CANCELLED":
                 cancelled += 1

@@ -162,7 +162,7 @@ def subscribe_uri(client: McpClient, uri: str, **extra: Any) -> str:
     """Subscribe to ``uri`` (any scheme) and return SUB_ID."""
     args: dict[str, Any] = {"uri": uri}
     args.update(extra)
-    rsp = call(client, "ssh_subscribe", args)
+    rsp = call(client, "sub_open", args)
     sub = rsp.parsed.get("sub_id")
     assert sub, f"subscribe failed: {rsp.text!r}"
     return sub
@@ -354,14 +354,14 @@ class TestSshExecuteAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """Unknown ``session_id`` -> ``SESSION_NOT_FOUND``."""
-        rsp = call(adv_client, "ssh_execute",
+        rsp = call(adv_client, "ssh_exec",
                    {"session_id": "ghost-session", "command": "true"})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "SESSION_NOT_FOUND"
 
     def test_execute_missing_command_field(self, adv_client: McpClient) -> None:
         """Required ``command`` field rejected by deserializer."""
-        rsp = call(adv_client, "ssh_execute", {"session_id": "any"})
+        rsp = call(adv_client, "ssh_exec", {"session_id": "any"})
         assert rsp.rpc_error is not None
         assert "command" in (rsp.rpc_error.get("message") or "")
 
@@ -369,32 +369,32 @@ class TestSshExecuteAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """``commands`` must contain at least one entry."""
-        rsp = call(adv_client, "ssh_execute_batch",
+        rsp = call(adv_client, "ssh_exec_batch",
                    {"session_id": "ghost", "commands": []})
         assert rsp.status == "ERROR" or rsp.rpc_error is not None
 
     def test_execute_batch_too_many_commands(self, adv_client: McpClient) -> None:
         """``commands`` capped at 16 — 100 entries rejected."""
-        rsp = call(adv_client, "ssh_execute_batch",
+        rsp = call(adv_client, "ssh_exec_batch",
                    {"session_id": "ghost", "commands": ["true"] * 100})
         assert rsp.status == "ERROR" or rsp.rpc_error is not None
 
     def test_get_command_output_unknown_id(self, adv_client: McpClient) -> None:
         """Unknown ``command_id`` -> ``COMMAND_NOT_FOUND``."""
-        rsp = call(adv_client, "ssh_get_command_output",
+        rsp = call(adv_client, "ssh_exec_output",
                    {"command_id": "ghost", "wait": False})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "COMMAND_NOT_FOUND"
 
     def test_cancel_unknown_command(self, adv_client: McpClient) -> None:
         """Unknown ``command_id`` -> ``COMMAND_NOT_FOUND`` on cancel."""
-        rsp = call(adv_client, "ssh_cancel_command", {"command_id": "ghost"})
+        rsp = call(adv_client, "ssh_exec_cancel", {"command_id": "ghost"})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "COMMAND_NOT_FOUND"
 
     def test_list_commands_unknown_session(self, adv_client: McpClient) -> None:
         """``ssh_list_commands`` against unknown session is OK with empty list (read-only)."""
-        rsp = call(adv_client, "ssh_list_commands", {"session_id": "ghost"})
+        rsp = call(adv_client, "ssh_commands", {"session_id": "ghost"})
         # Implementation may return OK + empty list or SESSION_NOT_FOUND;
         # both shapes are acceptable.
         assert rsp.status in {"OK", "ERROR"}, rsp.text
@@ -429,7 +429,7 @@ class TestSshExecuteAdversarial:
         try:
             spawn = call(
                 adv_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "sleep 30"},
                 timeout=10,
             )
@@ -442,7 +442,7 @@ class TestSshExecuteAdversarial:
                 # Slight delay so the exec actually starts.
                 time.sleep(0.2)
                 cancel_done.append(
-                    call(adv_client, "ssh_cancel_command",
+                    call(adv_client, "ssh_exec_cancel",
                          {"command_id": cid}, timeout=10)
                 )
 
@@ -489,21 +489,21 @@ class TestSshShellAdversarial:
 
     def test_send_key_repeat_zero_invalid(self, adv_client: McpClient) -> None:
         """``repeat=0`` triggers ``INVALID_REPEAT`` before any shell lookup."""
-        rsp = call(adv_client, "ssh_shell_send_key",
+        rsp = call(adv_client, "ssh_shell_press",
                    {"shell_id": "ghost", "key": "enter", "repeat": 0})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "INVALID_REPEAT"
 
     def test_send_key_repeat_above_cap_invalid(self, adv_client: McpClient) -> None:
         """``repeat>64`` triggers ``INVALID_REPEAT``."""
-        rsp = call(adv_client, "ssh_shell_send_key",
+        rsp = call(adv_client, "ssh_shell_press",
                    {"shell_id": "ghost", "key": "enter", "repeat": 65})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "INVALID_REPEAT"
 
     def test_send_key_unknown_key_name(self, adv_client: McpClient) -> None:
         """Unknown semantic key name rejected by deserializer."""
-        rsp = call(adv_client, "ssh_shell_send_key",
+        rsp = call(adv_client, "ssh_shell_press",
                    {"shell_id": "ghost", "key": "no_such_key"})
         assert rsp.rpc_error is not None
         assert "expected" in (rsp.rpc_error.get("message") or "")
@@ -569,7 +569,7 @@ class TestSshShellAdversarial:
             t1.join(timeout=20); t2.join(timeout=20)
             assert not (t1.is_alive() or t2.is_alive())
             # Sanity: server still alive — list_sessions returns OK.
-            sanity = call(adv_client, "ssh_list_sessions", {})
+            sanity = call(adv_client, "ssh_sessions", {})
             assert sanity.status == "OK", sanity.text
         finally:
             call(adv_client, "ssh_disconnect", {"session_id": sid})
@@ -585,13 +585,13 @@ class TestSshSubscribeAdversarial:
 
     def test_subscribe_invalid_uri_scheme(self, adv_client: McpClient) -> None:
         """URI with unknown scheme -> ``INVALID_ARGUMENT``."""
-        rsp = call(adv_client, "ssh_subscribe", {"uri": "badscheme://x/y"})
+        rsp = call(adv_client, "sub_open", {"uri": "badscheme://x/y"})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "INVALID_ARGUMENT"
 
     def test_subscribe_invalid_lifetime_string(self, adv_client: McpClient) -> None:
         """Unknown ``lifetime`` value rejected at deserialize."""
-        rsp = call(adv_client, "ssh_subscribe",
+        rsp = call(adv_client, "sub_open",
                    {"uri": "shell://x/output", "lifetime": "forever"})
         assert rsp.rpc_error is not None
         msg = rsp.rpc_error.get("message", "") if rsp.rpc_error else ""
@@ -599,37 +599,37 @@ class TestSshSubscribeAdversarial:
 
     def test_subscribe_invalid_lag_policy(self, adv_client: McpClient) -> None:
         """Unknown ``lag_policy`` rejected at deserialize."""
-        rsp = call(adv_client, "ssh_subscribe",
+        rsp = call(adv_client, "sub_open",
                    {"uri": "shell://x/output", "lag_policy": "BlockSlow"})
         assert rsp.rpc_error is not None
 
     def test_subscribe_invalid_filter_regex(self, adv_client: McpClient) -> None:
         """Malformed regex compiled at subscribe time -> ``INVALID_ARGUMENT``."""
-        rsp = call(adv_client, "ssh_subscribe",
+        rsp = call(adv_client, "sub_open",
                    {"uri": "shell://x/output", "filter": "["})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "INVALID_ARGUMENT"
 
     def test_subscribe_missing_required_uri(self, adv_client: McpClient) -> None:
         """Missing ``uri`` rejected at deserialize."""
-        rsp = call(adv_client, "ssh_subscribe", {})
+        rsp = call(adv_client, "sub_open", {})
         assert rsp.rpc_error is not None
         assert "uri" in (rsp.rpc_error.get("message") or "")
 
     def test_unsubscribe_unknown_sub_id(self, adv_client: McpClient) -> None:
         """Unknown ``sub_id`` -> ``SUB_NOT_FOUND``."""
-        rsp = call(adv_client, "ssh_unsubscribe", {"sub_id": "ghost-sub"})
+        rsp = call(adv_client, "sub_close", {"sub_id": "ghost-sub"})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "SUB_NOT_FOUND"
 
     @pytest.mark.parametrize(
         "tool, extra",
         [
-            ("ssh_sub_pause", {}),
-            ("ssh_sub_resume", {}),
-            ("ssh_sub_filter", {"regex": ".*"}),
-            ("ssh_sub_replay", {"from_cursor": 0}),
-            ("ssh_sub_stats", {}),
+            ("sub_pause", {}),
+            ("sub_resume", {}),
+            ("sub_filter", {"regex": ".*"}),
+            ("sub_replay", {"from_cursor": 0}),
+            ("sub_stats", {}),
         ],
     )
     def test_sub_admin_unknown_sub_id_returns_not_found(
@@ -645,12 +645,12 @@ class TestSshSubscribeAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """Missing ``sub_id`` rejected at deserialize for pause."""
-        rsp = call(adv_client, "ssh_sub_pause", {})
+        rsp = call(adv_client, "sub_pause", {})
         assert rsp.rpc_error is not None
 
     def test_sub_filter_missing_required_regex(self, adv_client: McpClient) -> None:
         """``ssh_sub_filter`` requires both ``sub_id`` and ``regex``."""
-        rsp = call(adv_client, "ssh_sub_filter", {"sub_id": "ghost"})
+        rsp = call(adv_client, "sub_filter", {"sub_id": "ghost"})
         assert rsp.rpc_error is not None
         assert "regex" in (rsp.rpc_error.get("message") or "")
 
@@ -658,7 +658,7 @@ class TestSshSubscribeAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """``from_cursor`` is u64; -1 rejected at deserialize."""
-        rsp = call(adv_client, "ssh_sub_replay",
+        rsp = call(adv_client, "sub_replay",
                    {"sub_id": "ghost", "from_cursor": -1})
         assert rsp.rpc_error is not None
 
@@ -680,13 +680,13 @@ class TestSshSubscribeAdversarial:
             ok = []
             for _i in range(2):
                 ok.append(subscribe_uri(client, uri))
-            rsp = call(client, "ssh_subscribe", {"uri": uri})
+            rsp = call(client, "sub_open", {"uri": uri})
             try:
                 assert rsp.status == "ERROR", rsp.text
                 assert rsp.reason_code == "MAX_SUBS_PER_URI_EXCEEDED", rsp.text
             finally:
                 for sub_id in ok:
-                    call(client, "ssh_unsubscribe", {"sub_id": sub_id})
+                    call(client, "sub_close", {"sub_id": sub_id})
 
     def test_subscribe_unsubscribe_concurrent_burst(
         self, ssh_mcp_stdio_bin: Path
@@ -700,7 +700,7 @@ class TestSshSubscribeAdversarial:
                     sub_id = subscribe_uri(
                         client, f"shell://burst-{idx}/output"
                     )
-                    call(client, "ssh_unsubscribe", {"sub_id": sub_id})
+                    call(client, "sub_close", {"sub_id": sub_id})
                 except Exception as exc:
                     errors.append(f"{idx}: {exc!r}")
 
@@ -713,14 +713,14 @@ class TestSshSubscribeAdversarial:
                 assert not t.is_alive(), "subscribe burst hung"
             assert not errors, errors
             # Final list -> server stayed alive.
-            rsp = call(client, "ssh_sub_list", {})
+            rsp = call(client, "sub_list", {})
             assert rsp.status == "OK", rsp.text
 
     def test_replay_unknown_sub_returns_sub_not_found(
         self, adv_client: McpClient
     ) -> None:
         """Replay on unknown sub_id -> ``SUB_NOT_FOUND`` (RING_BUFFER_OVERFLOW only fires on a real lane with a stale cursor)."""
-        rsp = call(adv_client, "ssh_sub_replay",
+        rsp = call(adv_client, "sub_replay",
                    {"sub_id": "ghost", "from_cursor": 999_999})
         assert rsp.reason_code == "SUB_NOT_FOUND"
 
@@ -733,11 +733,11 @@ class TestSshSubscribeAdversarial:
             # Body parse already happened; re-fetch via raw response is overkill.
             # Subscribe with the same client and inspect raw text.
             rsp_text = call_tool_text(
-                adv_client, "ssh_subscribe", {"uri": "shell://hint-test-2/output"}
+                adv_client, "sub_open", {"uri": "shell://hint-test-2/output"}
             )
             assert "HINT: REQUIRED NEXT STEP" in rsp_text
         finally:
-            call(adv_client, "ssh_unsubscribe", {"sub_id": sub_id})
+            call(adv_client, "sub_close", {"sub_id": sub_id})
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +766,7 @@ class TestSftpAdversarial:
 
     def test_get_transfer_progress_unknown_id(self, adv_client: McpClient) -> None:
         """Unknown transfer_id -> ``TRANSFER_NOT_FOUND``."""
-        rsp = call(adv_client, "ssh_get_transfer_progress",
+        rsp = call(adv_client, "ssh_transfer_progress",
                    {"transfer_id": "ghost"})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "TRANSFER_NOT_FOUND"
@@ -889,7 +889,7 @@ class TestDaemonStatsAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """No active lanes -> all aggregates report 0."""
-        rsp = call(adv_client, "ssh_daemon_stats", {})
+        rsp = call(adv_client, "sub_stats_all", {})
         assert rsp.status == "OK"
         # Lane count should be a non-negative integer; any active lane
         # from prior tests in the same process won't appear here because
@@ -906,8 +906,8 @@ class TestDaemonStatsAdversarial:
             sub_ids.append(subscribe_uri(adv_client, f"shell://churn-{i}/output"))
         # Unsubscribe half before listing.
         for sub_id in sub_ids[:5]:
-            call(adv_client, "ssh_unsubscribe", {"sub_id": sub_id})
-        rsp = call(adv_client, "ssh_sub_list", {})
+            call(adv_client, "sub_close", {"sub_id": sub_id})
+        rsp = call(adv_client, "sub_list", {})
         assert rsp.status == "OK"
         body = rsp.parsed.get("__text", "")
         # Remaining 5 sub ids should appear.
@@ -915,11 +915,11 @@ class TestDaemonStatsAdversarial:
             assert sub_id in body, body
         # Cleanup remaining.
         for sub_id in sub_ids[5:]:
-            call(adv_client, "ssh_unsubscribe", {"sub_id": sub_id})
+            call(adv_client, "sub_close", {"sub_id": sub_id})
 
     def test_sub_stats_unknown_id(self, adv_client: McpClient) -> None:
         """``ssh_sub_stats`` against unknown id -> ``SUB_NOT_FOUND``."""
-        rsp = call(adv_client, "ssh_sub_stats", {"sub_id": "ghost"})
+        rsp = call(adv_client, "sub_stats", {"sub_id": "ghost"})
         assert rsp.reason_code == "SUB_NOT_FOUND"
 
 
@@ -951,8 +951,8 @@ class TestIdempotencyAdversarial:
         try:
             meta = {"idempotency_key": f"adv-{uuid.uuid4()}"}
             args = {"session_id": sid, "command": "echo IDEMPOTENT"}
-            first = call(adv_client, "ssh_execute", args, meta=meta)
-            second = call(adv_client, "ssh_execute", args, meta=meta)
+            first = call(adv_client, "ssh_exec", args, meta=meta)
+            second = call(adv_client, "ssh_exec", args, meta=meta)
             assert first.text == second.text, (first.text, second.text)
         finally:
             call(adv_client, "ssh_disconnect", {"session_id": sid})
@@ -964,9 +964,9 @@ class TestIdempotencyAdversarial:
         sid = connect_local(adv_client, local_fx, agent="idemp-distinct")
         try:
             args = {"session_id": sid, "command": "true"}
-            first = call(adv_client, "ssh_execute", args,
+            first = call(adv_client, "ssh_exec", args,
                          meta={"idempotency_key": "k1"})
-            second = call(adv_client, "ssh_execute", args,
+            second = call(adv_client, "ssh_exec", args,
                           meta={"idempotency_key": "k2"})
             cid_a = first.parsed.get("command_id")
             cid_b = second.parsed.get("command_id")
@@ -983,9 +983,9 @@ class TestIdempotencyAdversarial:
             try:
                 meta = {"idempotency_key": "ttl-key"}
                 args = {"session_id": sid, "command": "true"}
-                first = call(client, "ssh_execute", args, meta=meta)
+                first = call(client, "ssh_exec", args, meta=meta)
                 time.sleep(3)
-                second = call(client, "ssh_execute", args, meta=meta)
+                second = call(client, "ssh_exec", args, meta=meta)
                 # Different command_ids prove a fresh execution.
                 cid_a = first.parsed.get("command_id")
                 cid_b = second.parsed.get("command_id")
@@ -1009,7 +1009,7 @@ class TestIdempotencyAdversarial:
             meta = {"idempotency_key": f"adv-mismatch-{uuid.uuid4()}"}
             first = call(
                 adv_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo FIRST"},
                 meta=meta,
             )
@@ -1019,7 +1019,7 @@ class TestIdempotencyAdversarial:
             # INVALID_ARGUMENT with the IDEMPOTENCY_KEY_MISMATCH tag.
             second = call(
                 adv_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo SECOND"},
                 meta=meta,
             )

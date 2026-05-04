@@ -50,7 +50,7 @@ def test_batch_all_success_returns_ok(stdio_client: McpClient, ssh_target) -> No
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": ["echo a", "echo b", "echo c"],
@@ -58,7 +58,7 @@ def test_batch_all_success_returns_ok(stdio_client: McpClient, ssh_target) -> No
             },
             timeout=60,
         )
-        assert structured["tool"] == "ssh_execute_batch"
+        assert structured["tool"] == "ssh_exec_batch"
         assert structured["status"] == "ok"
         assert structured.get("total") == 3
         assert structured.get("executed") == 3
@@ -80,7 +80,7 @@ def test_batch_stop_on_failure_halts_after_first_error(
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": ["echo first", "false", "echo unreachable"],
@@ -109,7 +109,7 @@ def test_batch_stop_on_failure_false_runs_all(stdio_client: McpClient, ssh_targe
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": ["echo first", "false", "echo third"],
@@ -136,7 +136,7 @@ def test_batch_empty_commands_rejected(stdio_client: McpClient, ssh_target) -> N
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {"session_id": sid, "commands": []},
         )
         parsed = parse_block(text)
@@ -154,7 +154,7 @@ def test_batch_too_many_commands_rejected(stdio_client: McpClient, ssh_target) -
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": [f"echo {i}" for i in range(17)],  # 17 > 16
@@ -170,7 +170,7 @@ def test_batch_too_many_commands_rejected(stdio_client: McpClient, ssh_target) -
 def test_batch_unknown_session_rejected(stdio_client: McpClient) -> None:
     text, structured, _ = call_tool_pair(
         stdio_client,
-        "ssh_execute_batch",
+        "ssh_exec_batch",
         {"session_id": make_session_id(), "commands": ["echo nope"]},
     )
     parsed = parse_block(text)
@@ -184,7 +184,7 @@ def test_batch_at_exact_limit_runs(stdio_client: McpClient, ssh_target) -> None:
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": [f"echo {i}" for i in range(16)],
@@ -294,13 +294,13 @@ def test_batch_idempotency_dedups(stdio_client: McpClient, ssh_target) -> None:
     try:
         meta = {"idempotency_key": "batch-once"}
         first = stdio_client.call_tool_with_meta(
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {"session_id": sid, "commands": ["echo dedup"]},
             meta=meta,
             timeout=30,
         )
         second = stdio_client.call_tool_with_meta(
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {"session_id": sid, "commands": ["echo dedup"]},
             meta=meta,
             timeout=30,

@@ -80,7 +80,7 @@ def test_investigate_session_renders_with_args(stdio_client: McpClient) -> None:
     assert "_rpc_error" not in result
     text = ((result.get("messages") or [{}])[0].get("content") or {}).get("text", "")
     assert "sess-foobar" in text
-    assert "ssh_list_commands" in text
+    assert "ssh_commands" in text
     assert "session://sess-foobar/health" in text
     assert "ssh_disconnect" in text
 

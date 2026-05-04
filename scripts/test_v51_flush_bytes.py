@@ -73,7 +73,7 @@ def test_subscribe_hint_mentions_flush_bytes_knob(flush_bytes_http_server):
         # assert here, not the resource liveness.
         body = call_tool_text(
             client,
-            "ssh_subscribe",
+            "sub_open",
             {"uri": "command://placeholder/output"},
         )
         assert "SSH_SUBSCRIBE" in body, body

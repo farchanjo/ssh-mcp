@@ -59,7 +59,7 @@ def test_progress_notifications_fire_for_command_output(
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "sleep 8 && echo PROG_DONE"},
             )
         ).get("command_id")
@@ -69,7 +69,7 @@ def test_progress_notifications_fire_for_command_output(
         # Issue the wait with a progress token; collect any notifications that
         # fire during the wait window.
         result = stdio_client.call_tool_with_meta(
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 15},
             meta={"progressToken": "p-cmd-1"},
             timeout=30,
@@ -119,14 +119,14 @@ def test_progress_omitted_when_no_token(stdio_client: McpClient, ssh_target) -> 
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "sleep 4 && echo X"},
             )
         ).get("command_id")
         stdio_client.drain_notifications()
         # No `meta` -> no progress should fire.
         result = stdio_client.call_tool(
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
             timeout=15,
         )
@@ -199,20 +199,20 @@ def test_progress_token_does_not_corrupt_response(
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo SHAPE_OK"},
             )
         ).get("command_id")
         # Without token
         text_a, structured_a, _ = call_tool_pair(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
             timeout=15,
         )
         # Repeat with token (same command_id; should hit the completed path).
         result_b = stdio_client.call_tool_with_meta(
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
             meta={"progressToken": "p-shape-1"},
             timeout=15,
@@ -238,12 +238,12 @@ def test_progress_token_is_arbitrary_string(stdio_client: McpClient, ssh_target)
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo TOKEN_OK"},
             )
         ).get("command_id")
         result = stdio_client.call_tool_with_meta(
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
             meta={"progressToken": "550e8400-e29b-41d4-a716-446655440000"},
             timeout=15,

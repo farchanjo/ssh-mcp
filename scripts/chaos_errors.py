@@ -131,7 +131,7 @@ def _scenario_execute_on_closed_session(client: McpClient, stats: dict) -> None:
     parsed = parse_block(
         call_tool_text(
             client,
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": str(uuid.uuid4()), "command": "echo nope"},
         )
     )
@@ -141,7 +141,7 @@ def _scenario_execute_on_closed_session(client: McpClient, stats: dict) -> None:
 def _scenario_get_command_output_bad_id(client: McpClient, stats: dict) -> None:
     parsed = parse_block(
         call_tool_text(
-            client, "ssh_get_command_output", {"command_id": str(uuid.uuid4())}
+            client, "ssh_exec_output", {"command_id": str(uuid.uuid4())}
         )
     )
     _expect_error(stats, "get_command_output_bad_id", parsed, "COMMAND_NOT_FOUND")
@@ -150,7 +150,7 @@ def _scenario_get_command_output_bad_id(client: McpClient, stats: dict) -> None:
 def _scenario_cancel_command_bad_id(client: McpClient, stats: dict) -> None:
     parsed = parse_block(
         call_tool_text(
-            client, "ssh_cancel_command", {"command_id": str(uuid.uuid4())}
+            client, "ssh_exec_cancel", {"command_id": str(uuid.uuid4())}
         )
     )
     _expect_error(stats, "cancel_command_bad_id", parsed, "COMMAND_NOT_FOUND")
@@ -171,7 +171,7 @@ def _scenario_send_key_invalid_repeat_zero(client: McpClient, stats: dict) -> No
     parsed = parse_block(
         call_tool_text(
             client,
-            "ssh_shell_send_key",
+            "ssh_shell_press",
             {"shell_id": str(uuid.uuid4()), "key": "arrow_up", "repeat": 0},
         )
     )
@@ -183,7 +183,7 @@ def _scenario_send_key_invalid_repeat_high(client: McpClient, stats: dict) -> No
     parsed = parse_block(
         call_tool_text(
             client,
-            "ssh_shell_send_key",
+            "ssh_shell_press",
             {"shell_id": str(uuid.uuid4()), "key": "arrow_up", "repeat": 65},
         )
     )
@@ -274,7 +274,7 @@ def _scenario_download_no_session(client: McpClient, stats: dict) -> None:
 def _scenario_transfer_progress_bad_id(client: McpClient, stats: dict) -> None:
     parsed = parse_block(
         call_tool_text(
-            client, "ssh_get_transfer_progress", {"transfer_id": str(uuid.uuid4())}
+            client, "ssh_transfer_progress", {"transfer_id": str(uuid.uuid4())}
         )
     )
     _expect_error(stats, "transfer_progress_bad_id", parsed, "TRANSFER_NOT_FOUND")
@@ -368,7 +368,7 @@ def _scenario_max_commands_exceeded(client: McpClient, stats: dict, target: Chao
             parsed = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": "sleep 30"},
                 )
             )
@@ -447,19 +447,19 @@ def _scenario_cancel_completed_command(client: McpClient, stats: dict, target: C
         _assert(stats, "cancel_completed_command", False, got="connect failed")
         return
     cid = parse_block(
-        call_tool_text(client, "ssh_execute", {"session_id": sid, "command": "true"})
+        call_tool_text(client, "ssh_exec", {"session_id": sid, "command": "true"})
     ).get("command_id")
     # Wait for completion.
     parse_block(
         call_tool_text(
             client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 10},
             timeout=15,
         )
     )
     parsed = parse_block(
-        call_tool_text(client, "ssh_cancel_command", {"command_id": cid})
+        call_tool_text(client, "ssh_exec_cancel", {"command_id": cid})
     )
     # Cancel after completion is idempotent — accepts NOOP / CANCELLED / completed status.
     ok = parsed.get("__status") in {"NOOP", "CANCELLED", "OK"} or (
@@ -505,7 +505,7 @@ def _scenario_upload_local_missing(client: McpClient, stats: dict, target: Chaos
         terminal = parse_block(
             call_tool_text(
                 client,
-                "ssh_get_transfer_progress",
+                "ssh_transfer_progress",
                 {"transfer_id": transfer_id, "wait": True, "wait_timeout_secs": 10},
                 timeout=15,
             )
@@ -553,7 +553,7 @@ def _scenario_upload_directory(client: McpClient, stats: dict, target: ChaosSshT
             terminal = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_get_transfer_progress",
+                    "ssh_transfer_progress",
                     {"transfer_id": transfer_id, "wait": True, "wait_timeout_secs": 10},
                     timeout=15,
                 )
@@ -599,7 +599,7 @@ def _scenario_download_remote_missing(client: McpClient, stats: dict, target: Ch
             terminal = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_get_transfer_progress",
+                    "ssh_transfer_progress",
                     {"transfer_id": transfer_id, "wait": True, "wait_timeout_secs": 10},
                     timeout=15,
                 )

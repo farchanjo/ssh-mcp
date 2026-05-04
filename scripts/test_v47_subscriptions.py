@@ -374,7 +374,7 @@ def test_s03_command_subscribe_streams_incrementally(stdio_client: McpClient, ss
     try:
         text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {
                 "session_id": sid,
                 "command": "for i in 1 2 3 4 5; do echo S3_LINE_$i; sleep 0.5; done",
@@ -474,7 +474,7 @@ def test_s04_transfer_subscribe_streams_progress(stdio_client: McpClient, ssh_ta
             # Fixture may have completed too fast — accept terminal-only path.
             final = call_tool_text(
                 stdio_client,
-                "ssh_get_transfer_progress",
+                "ssh_transfer_progress",
                 {"transfer_id": tid, "wait": True, "wait_timeout_secs": 30},
                 timeout=45,
             )
@@ -502,7 +502,7 @@ def test_s05_session_health_subscribe_emits_notifications(stdio_client: McpClien
         # Force a probe by side-effect: an ssh_execute health-walks the
         # transport, and the keepalive tick alone gives us at least one
         # notification within 5s.
-        call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "echo S5_OK"})
+        call_tool_text(stdio_client, "ssh_exec", {"session_id": sid, "command": "echo S5_OK"})
 
         notif = _wait_for_uri_notification(stdio_client, uri, timeout=5.0)
         assert notif is not None, "no session://...health notification within 5s"
@@ -819,7 +819,7 @@ def test_s12_meta_envelope_keys_present_per_scheme(stdio_client: McpClient, ssh_
         shell_id = _open_shell(stdio_client, sid)
         text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo S12_OK"},
         )
         cid = parse_block(text).get("command_id")
@@ -828,7 +828,7 @@ def test_s12_meta_envelope_keys_present_per_scheme(stdio_client: McpClient, ssh_
         # Wait for command completion so command:// has output.
         call_tool_text(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 5},
             timeout=10,
         )
@@ -1159,7 +1159,7 @@ def test_s20_progress_and_resources_updated_do_not_collide(stdio_client: McpClie
     try:
         text = call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {
                 "session_id": sid,
                 "command": "for i in 1 2 3 4 5; do echo S20_LINE_$i; sleep 0.5; done",
@@ -1175,7 +1175,7 @@ def test_s20_progress_and_resources_updated_do_not_collide(stdio_client: McpClie
 
         def _wait_call() -> dict:
             return stdio_client.call_tool_with_meta(
-                "ssh_get_command_output",
+                "ssh_exec_output",
                 {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
                 meta={"progressToken": progress_token},
                 timeout=15,

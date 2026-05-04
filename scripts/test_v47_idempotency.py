@@ -74,12 +74,12 @@ def test_same_key_dedups_ssh_execute(stdio_client: McpClient, ssh_target) -> Non
     try:
         meta = {"idempotency_key": "exec-once-only"}
         first = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo IDEMP"},
             meta=meta,
         )
         second = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo IDEMP"},
             meta=meta,
         )
@@ -92,7 +92,7 @@ def test_same_key_dedups_ssh_execute(stdio_client: McpClient, ssh_target) -> Non
         assert cid_a == cid_b, (cid_a, cid_b)
         # Verify with ssh_list_commands that only ONE async command was spawned.
         listed = parse_block(
-            call_tool_text(stdio_client, "ssh_list_commands", {"session_id": sid})
+            call_tool_text(stdio_client, "ssh_commands", {"session_id": sid})
         )
         # Count from bullet list.
         commands = listed.get("commands") or []
@@ -105,12 +105,12 @@ def test_different_keys_reexecute(stdio_client: McpClient, ssh_target) -> None:
     sid = _connect(stdio_client, ssh_target, agent="idemp-diff")
     try:
         first = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo A"},
             meta={"idempotency_key": "k1"},
         )
         second = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo B"},
             meta={"idempotency_key": "k2"},
         )
@@ -127,10 +127,10 @@ def test_no_key_reexecutes_each_call(stdio_client: McpClient, ssh_target) -> Non
     sid = _connect(stdio_client, ssh_target, agent="idemp-none")
     try:
         first = stdio_client.call_tool(
-            "ssh_execute", {"session_id": sid, "command": "echo X"}
+            "ssh_exec", {"session_id": sid, "command": "echo X"}
         )
         second = stdio_client.call_tool(
-            "ssh_execute", {"session_id": sid, "command": "echo X"}
+            "ssh_exec", {"session_id": sid, "command": "echo X"}
         )
         cid_a = parse_block(((first.get("content") or [{}])[0].get("text") or "")).get(
             "command_id"
@@ -147,12 +147,12 @@ def test_empty_key_treated_as_absent(stdio_client: McpClient, ssh_target) -> Non
     sid = _connect(stdio_client, ssh_target, agent="idemp-empty")
     try:
         first = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo Y"},
             meta={"idempotency_key": ""},
         )
         second = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo Y"},
             meta={"idempotency_key": ""},
         )
@@ -173,7 +173,7 @@ def test_oversized_key_rejected(stdio_client: McpClient, ssh_target) -> None:
     try:
         too_long = "x" * 257
         result = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo nope"},
             meta={"idempotency_key": too_long},
         )
@@ -191,7 +191,7 @@ def test_key_at_exact_limit_accepted(stdio_client: McpClient, ssh_target) -> Non
     try:
         key = "x" * 256
         result = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo OK"},
             meta={"idempotency_key": key},
         )
@@ -216,13 +216,13 @@ def test_ttl_expiry_reexecutes(ssh_target) -> None:
         try:
             meta = {"idempotency_key": "ttl-key"}
             first = client.call_tool_with_meta(
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo TTL_A"},
                 meta=meta,
             )
             time.sleep(3.0)
             second = client.call_tool_with_meta(
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo TTL_B"},
                 meta=meta,
             )
@@ -254,12 +254,12 @@ def test_readonly_list_sessions_ignores_key(stdio_client: McpClient, ssh_target)
     try:
         meta = {"idempotency_key": "ro-key"}
         first = stdio_client.call_tool_with_meta(
-            "ssh_list_sessions", {"agent_id": "idemp-ro"}, meta=meta
+            "ssh_sessions", {"agent_id": "idemp-ro"}, meta=meta
         )
         # Add a second session.
         sid2 = _connect(stdio_client, ssh_target, agent="idemp-ro")
         second = stdio_client.call_tool_with_meta(
-            "ssh_list_sessions", {"agent_id": "idemp-ro"}, meta=meta
+            "ssh_sessions", {"agent_id": "idemp-ro"}, meta=meta
         )
         text_a = ((first.get("content") or [{}])[0].get("text") or "")
         text_b = ((second.get("content") or [{}])[0].get("text") or "")
@@ -292,7 +292,7 @@ def test_same_key_different_tools_no_collision(
         meta = {"idempotency_key": "shared-key"}
         # First: ssh_execute
         result_exec = stdio_client.call_tool_with_meta(
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": "echo EXEC"},
             meta=meta,
         )
