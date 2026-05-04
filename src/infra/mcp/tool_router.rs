@@ -73,8 +73,8 @@ use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::infra::mcp::args::serial::{
-    SerialCloseArgs, SerialListOpenArgs, SerialListPortsArgs, SerialOpenArgs,
-    SerialPressArgs, SerialWriteArgs,
+    SerialCloseArgs, SerialListOpenArgs, SerialListPortsArgs, SerialOpenArgs, SerialPressArgs,
+    SerialWriteArgs,
 };
 use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
@@ -91,16 +91,15 @@ use crate::infra::mcp::resource_templates;
 #[cfg(feature = "port_forward")]
 use crate::infra::mcp::results::SshForwardResult;
 use crate::infra::mcp::results::{
-    SshExecCancelResult, SshConnectResult, SshDisconnectAgentResult, SshDisconnectManyResult,
-    SshDisconnectResult, SshDownloadResult, SshExecBatchResult, SshExecResult,
-    SshExecOutputResult, SshTransferProgressResult, SshCommandsResult,
-    SshSessionsResult, SshRunResult, SshShellCloseResult, SshShellOpenResult,
-    SshShellReadResult, SshShellPressResult, SshShellWaitForResult, SshShellWriteResult,
-    SshUploadResult,
-};
-use crate::infra::mcp::results::{
     SerialCloseResult, SerialListOpenResult, SerialListPortsResult, SerialOpenResult,
     SerialPressResult, SerialWriteResult,
+};
+use crate::infra::mcp::results::{
+    SshCommandsResult, SshConnectResult, SshDisconnectAgentResult, SshDisconnectManyResult,
+    SshDisconnectResult, SshDownloadResult, SshExecBatchResult, SshExecCancelResult,
+    SshExecOutputResult, SshExecResult, SshRunResult, SshSessionsResult, SshShellCloseResult,
+    SshShellOpenResult, SshShellPressResult, SshShellReadResult, SshShellWaitForResult,
+    SshShellWriteResult, SshTransferProgressResult, SshUploadResult,
 };
 use crate::infra::mcp::suggestions::{closest_ids, render_closest_matches};
 use crate::ports::auth_strategy::AuthStrategyPort;
@@ -124,19 +123,19 @@ use super::args::connection::{
     SshSessionsArgs,
 };
 use super::args::execute::{
-    SshExecCancelArgs, SshExecArgs, SshExecBatchArgs, SshExecOutputArgs,
-    SshCommandsArgs, SshRunArgs,
+    SshCommandsArgs, SshExecArgs, SshExecBatchArgs, SshExecCancelArgs, SshExecOutputArgs,
+    SshRunArgs,
 };
 #[cfg(feature = "port_forward")]
 use super::args::forward::SshForwardArgs;
 use super::args::sftp::{SshDownloadArgs, SshTransferProgressArgs, SshUploadArgs};
 use super::args::shell::{
-    SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellPressArgs,
-    SshShellWaitForArgs, SshShellWriteArgs,
+    SshShellCloseArgs, SshShellOpenArgs, SshShellPressArgs, SshShellReadArgs, SshShellWaitForArgs,
+    SshShellWriteArgs,
 };
 use super::args::subscription::{
-    LifetimeKind, SubStatsAllArgs, SubFilterArgs, SubListArgs, SubPauseArgs,
-    SubReplayArgs, SubResumeArgs, SubStatsArgs, SubOpenArgs, SubCloseArgs,
+    LifetimeKind, SubCloseArgs, SubFilterArgs, SubListArgs, SubOpenArgs, SubPauseArgs,
+    SubReplayArgs, SubResumeArgs, SubStatsAllArgs, SubStatsArgs,
 };
 use super::peer_handle::{PeerTable, RmcpPeerHandle};
 use super::resource_handlers;
@@ -1278,7 +1277,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_exec, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward.\n- `AGENT_ID`: optional grouping; passed to ssh_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_exec `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retried calls within the v4.7-step5 cache TTL.",
+        description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_exec, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward. ALSO subscribe via `sub_open uri=session://<SESSION_ID>/health` for live transport health pushes (PREFERRED over polling ssh_sessions).\n- `AGENT_ID`: optional grouping; passed to ssh_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_exec `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retried calls within the v4.7-step5 cache TTL.",
         output_schema = schema_for_type::<SshConnectResult>()
     )]
     async fn ssh_connect(
@@ -1349,7 +1348,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List active SSH sessions on the server.\n\nWhen to use:\n- Inspecting sessions known to this server (optionally narrowed to one agent).\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
+        description = "List active SSH sessions on the server.\n\nWhen to use:\n- One-shot inventory of sessions known to this server (optionally narrowed to one agent).\n- For LIVE health observation prefer `sub_open uri=session://<SESSION_ID>/health` per session — push delivers HealthEvent ticks without poll loops.\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n3. Each session id can be wrapped in `sub_open uri=session://<id>/health` for live monitoring; cancel via sub_close when done.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
         output_schema = schema_for_type::<SshSessionsResult>()
     )]
     async fn ssh_sessions(
@@ -1506,12 +1505,9 @@ where
                 let body = render::execute::get_command_output_render(result);
                 Ok(ok_text_and_structured(body, structured))
             }
-            Err(err) => Ok(render_tool_error_smart(
-                "SSH_EXEC_OUTPUT",
-                &err,
-                self.id_lister.as_ref(),
-            )
-            .await),
+            Err(err) => {
+                Ok(render_tool_error_smart("SSH_EXEC_OUTPUT", &err, self.id_lister.as_ref()).await)
+            }
         }
     }
 
@@ -1522,7 +1518,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List asynchronous commands tracked on the server.\n\nWhen to use:\n- Inspecting every command (optionally filtered by session and/or status).\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over async commands. Cheap.",
+        description = "List asynchronous commands tracked on the server.\n\nWhen to use:\n- One-shot inventory of every command (optionally filtered by session and/or status).\n- For RUNNING entries the response NEXT line steers you to `sub_open uri=command://<COMMAND_ID>/output` — strictly preferred over chained ssh_exec_output(wait=true) polling.\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n4. For each running command_id, open a push lane via sub_open before consuming output.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over async commands. Cheap.",
         output_schema = schema_for_type::<SshCommandsResult>()
     )]
     async fn ssh_commands(
@@ -1604,7 +1600,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- Prefer subscribing to `shell://<shell_id>/output` over polling ssh_shell_read.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_press, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
+        description = "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- IMMEDIATELY after open, call `sub_open uri=shell://<SHELL_ID>/output` for push delivery — strictly preferred over polling ssh_shell_read. Push fires on whichever fires first: ~200 ms debounce window OR 64 KiB byte-threshold.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_press, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close. ALSO the target of `sub_open uri=shell://<SHELL_ID>/output` (PREFERRED for streaming output).\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
         output_schema = schema_for_type::<SshShellOpenResult>()
     )]
     async fn ssh_shell_open(
@@ -1746,7 +1742,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Read the buffered output of a PTY shell.\n\nWhen to use:\n- FALLBACK polling when subscribing to `shell://<shell_id>/output` is not feasible.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        description = "Read the buffered output of a PTY shell. POLLING FALLBACK — strictly cheaper to use `sub_open uri=shell://<shell_id>/output` (push delivery, no round-trip per delta).\n\nWhen to use:\n- ONLY when the host genuinely cannot consume `notifications/resources/updated` push events. Every other situation, prefer `sub_open uri=shell://<shell_id>/output` + `resources/read?cursor=auto` on each push.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND.\n\nCost: O(buffer) per call + 1 tool round-trip. Subscribe is one tool call total per shell — strictly cheaper for any workflow with >1 expected response.",
         output_schema = schema_for_type::<SshShellReadResult>()
     )]
     async fn ssh_shell_read(
@@ -1872,7 +1868,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- IMMEDIATELY after upload start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
         output_schema = schema_for_type::<SshUploadResult>()
     )]
     async fn ssh_upload(
@@ -1917,7 +1913,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- IMMEDIATELY after download start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
         output_schema = schema_for_type::<SshDownloadResult>()
     )]
     async fn ssh_download(
@@ -1987,12 +1983,12 @@ where
                 let body = render::sftp::transfer_progress_render(&result);
                 Ok(ok_text_and_structured(body, structured))
             }
-            Err(err) => Ok(render_tool_error_smart(
-                "SSH_TRANSFER_PROGRESS",
-                &err,
-                self.id_lister.as_ref(),
-            )
-            .await),
+            Err(err) => {
+                Ok(
+                    render_tool_error_smart("SSH_TRANSFER_PROGRESS", &err, self.id_lister.as_ref())
+                        .await,
+                )
+            }
         }
     }
 
@@ -2098,7 +2094,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward. Subscribe to forward://<id>/events for the event log.",
+        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n- IMMEDIATELY after the forwarder is up, call `sub_open uri=forward://<FORWARD_ID>/events` for live accept/connect/close pushes — strictly preferred over polling resources/read.\n\nImportant identifiers in response:\n- `FORWARD_ID`: target of `sub_open uri=forward://<FORWARD_ID>/events` (PREFERRED — push event log).\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward.",
         output_schema = schema_for_type::<SshForwardResult>()
     )]
     async fn ssh_forward(
@@ -2145,7 +2141,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is reserved for the Phase 4 NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn sub_open(
         &self,
@@ -2370,7 +2366,7 @@ where
     #[tool(
         title = "Write to a serial port",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
-        description = "Enqueue bytes for transmission on a SERIAL_ID. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648, for binary protocols). Newlines are NOT auto-appended; use serial_press for `enter`/`cr`/`lf`/`crlf`.\n\nAfter the write — DO NOT poll. The response arrives via push on the existing serial://<id>/output subscription. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full — local sleep + retry).\n\nCost: O(input.len). Sub-ms typical.",
+        description = "Enqueue bytes for transmission on a SERIAL_ID. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648, for binary protocols). Newlines are NOT auto-appended; use serial_press for `enter`/`cr`/`lf`/`crlf`.\n\nAfter the write — DO NOT poll. The response arrives via push on the existing `sub_open uri=serial://<SERIAL_ID>/output` subscription. If you have not subscribed yet, call `sub_open` FIRST. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full — local sleep + retry).\n\nCost: O(input.len). Sub-ms typical.",
         output_schema = schema_for_type::<SerialWriteResult>()
     )]
     async fn serial_write(
@@ -2383,7 +2379,7 @@ where
     #[tool(
         title = "Send a named keystroke to a serial port",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
-        description = "Send a named control keystroke without crafting the bytes manually. Accepted: `enter`/`cr` (\\r), `lf` (\\n), `crlf` (\\r\\n), `esc` (\\x1b), `tab` (\\t), `backspace` (\\x08), `ctrl_c` (\\x03), `ctrl_d` (\\x04), `ctrl_z` (\\x1a). Optional `repeat` 1..=64.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.\n\nCost: O(repeat).",
+        description = "Send a named control keystroke without crafting the bytes manually. Accepted: `enter`/`cr` (\\r), `lf` (\\n), `crlf` (\\r\\n), `esc` (\\x1b), `tab` (\\t), `backspace` (\\x08), `ctrl_c` (\\x03), `ctrl_d` (\\x04), `ctrl_z` (\\x1a). Optional `repeat` 1..=64.\n\nAfter the keystroke — DO NOT poll. The response arrives via push on the existing `sub_open uri=serial://<SERIAL_ID>/output` subscription. If you have not subscribed yet, call `sub_open` FIRST. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.\n\nCost: O(repeat).",
         output_schema = schema_for_type::<SerialPressResult>()
     )]
     async fn serial_press(
@@ -2695,12 +2691,9 @@ where
                 let body = render::execute::get_command_output_render(result);
                 Ok(ok_text_and_structured(body, structured))
             }
-            Err(err) => Ok(render_tool_error_smart(
-                "SSH_EXEC_OUTPUT",
-                &err,
-                self.id_lister.as_ref(),
-            )
-            .await),
+            Err(err) => {
+                Ok(render_tool_error_smart("SSH_EXEC_OUTPUT", &err, self.id_lister.as_ref()).await)
+            }
         }
     }
 
@@ -3176,12 +3169,12 @@ where
                 let body = render::sftp::transfer_progress_render(&result);
                 Ok(ok_text_and_structured(body, structured))
             }
-            Err(err) => Ok(render_tool_error_smart(
-                "SSH_TRANSFER_PROGRESS",
-                &err,
-                self.id_lister.as_ref(),
-            )
-            .await),
+            Err(err) => {
+                Ok(
+                    render_tool_error_smart("SSH_TRANSFER_PROGRESS", &err, self.id_lister.as_ref())
+                        .await,
+                )
+            }
         }
     }
 
@@ -3287,7 +3280,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is reserved for the Phase 4 NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn sub_open(
         &self,
@@ -3578,14 +3571,14 @@ mod serial_tool_helpers {
     };
     use crate::domain::ids::SerialId;
     use crate::infra::mcp::args::serial::{
-        SerialCloseArgs, SerialListOpenArgs, SerialListPortsArgs, SerialOpenArgs,
-        SerialPressArgs, SerialWriteArgs,
+        SerialCloseArgs, SerialListOpenArgs, SerialListPortsArgs, SerialOpenArgs, SerialPressArgs,
+        SerialWriteArgs,
     };
     use crate::infra::mcp::helpers::structured::ok_text_and_structured;
     use crate::infra::mcp::render::serial as render_serial;
     use crate::infra::mcp::results::{
-        SerialCloseResult, SerialListOpenResult, SerialListPortsResult,
-        SerialOpenResult, SerialPressResult, SerialWriteResult,
+        SerialCloseResult, SerialListOpenResult, SerialListPortsResult, SerialOpenResult,
+        SerialPressResult, SerialWriteResult,
     };
     use bytes::Bytes;
     use serde_json::json;
@@ -4687,27 +4680,31 @@ fn server_capabilities() -> ServerCapabilities {
         .build()
 }
 
-/// Few-shot bootstrap text for the `port_forward` build (21 tools / 5
-/// streams). Three canonical workflows steer 27B-class models away from
-/// the most common failure modes (forgetting `wait=true`, leaking
-/// sessions, polling instead of subscribing). v4.7 adds `ssh_run` +
-/// batches and the `structured_content` channel.
+/// Few-shot bootstrap text for the `port_forward` build (36 tools across
+/// three eixos `ssh_*` (21) / `sub_*` (9) / `serial_*` (6) and 6 push
+/// streams). Workflows steer 27B-class models away from the most common
+/// failure modes (forgetting `wait=true`, leaking sessions, polling
+/// instead of subscribing).
 #[cfg(feature = "port_forward")]
-const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 21 tools, 5 push streams \
-(shell://, command://, transfer://, session://, forward://). All tools return \
-block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
-structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
+const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 36 tools, 6 push streams \
+(shell://, command://, transfer://, session://, forward://, serial://). \
+All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed \
+JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
 Happy paths (PREFERRED — keep sessions alive, never re-handshake):\n\
 1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. \
 Then sub_open command://<id>/output for push. sub_close when done. \
 Reuse the SESSION_ID for every follow-up call against this host.\n\
 2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
-the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. \
+the prompt arrives within 100ms). Then sub_open shell://<id>/output. \
 Drive with ssh_shell_write or ssh_shell_press. Read deltas via \
 resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
-3) Upload: ssh_upload. Then ssh_transfer_progress wait=true.\n\
-4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
+3) Upload: ssh_upload. Then sub_open transfer://<id>/progress, OR \
+ssh_transfer_progress wait=true.\n\
+4) Local serial (no SSH): serial_open path=/dev/ttyUSB0 baud_rate=115200. \
+Then sub_open serial://<id>/output for push. Drive with serial_write or \
+serial_press. serial_close when done.\n\
+5) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
 NEVER touch this host again. Pays a full handshake every call and tears the \
 session down. Two ssh_run calls cost as much as one ssh_connect + two \
 ssh_exec calls. Default to path 1.\n\
@@ -4716,25 +4713,28 @@ Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
 lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 /// Few-shot bootstrap text for the build without `port_forward`
-/// (20 tools / 4 streams). Identical workflows minus the `forward://`
-/// stream; the catalogue claim is dropped so callers do not look for
-/// `ssh_forward`.
+/// (35 tools / 5 streams — same as the default minus `forward://` and
+/// `ssh_forward`).
 #[cfg(not(feature = "port_forward"))]
-const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 20 tools, 4 push streams \
-(shell://, command://, transfer://, session://). All tools return block \
-markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
-structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
+const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 35 tools, 5 push streams \
+(shell://, command://, transfer://, session://, serial://). \
+All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed \
+JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
 Happy paths (PREFERRED — keep sessions alive, never re-handshake):\n\
 1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. \
 Then sub_open command://<id>/output for push. sub_close when done. \
 Reuse the SESSION_ID for every follow-up call against this host.\n\
 2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
-prompt arrives within 100ms). Then resources/subscribe shell://<SHELL_ID>/output. \
+prompt arrives within 100ms). Then sub_open shell://<SHELL_ID>/output. \
 Drive with ssh_shell_write or ssh_shell_press. Read deltas via \
 resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
-3) Upload: ssh_upload. Then ssh_transfer_progress wait=true.\n\
-4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
+3) Upload: ssh_upload. Then sub_open transfer://<id>/progress, OR \
+ssh_transfer_progress wait=true.\n\
+4) Local serial (no SSH): serial_open path=/dev/ttyUSB0 baud_rate=115200. \
+Then sub_open serial://<id>/output for push. Drive with serial_write or \
+serial_press. serial_close when done.\n\
+5) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
 NEVER touch this host again. Pays a full handshake every call and tears the \
 session down. Two ssh_run calls cost as much as one ssh_connect + two \
 ssh_exec calls. Default to path 1.\n\

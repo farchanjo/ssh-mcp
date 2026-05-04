@@ -35,6 +35,7 @@ pub fn build_list() -> Vec<ResourceTemplate> {
         command_template(),
         transfer_template(),
         session_template(),
+        serial_template(),
     ];
     #[cfg(feature = "port_forward")]
     {
@@ -114,6 +115,24 @@ fn session_template() -> ResourceTemplate {
     .no_annotation()
 }
 
+/// Native UART / TTY / COM byte stream — cursor-paginated text payload.
+/// ADR 0009 (v5.2). Always advertised — local serial transport is not
+/// gated by `port_forward`.
+fn serial_template() -> ResourceTemplate {
+    RawResourceTemplate::new(
+        "serial://{serial_id}/output{?cursor}",
+        "Native UART/TTY/COM byte stream",
+    )
+    .with_title("Native UART/TTY/COM byte stream")
+    .with_description(
+        "Live byte stream from a local serial port (RS-232 / RS-485 / TTL UART / CDC-ACM). \
+         Pass `cursor=auto` (or an absolute byte offset) to receive only the new bytes \
+         since the last read; omit to start from the head of the buffer.",
+    )
+    .with_mime_type("text/plain")
+    .no_annotation()
+}
+
 /// Port-forward event log — cursor-paginated JSON event stream. Feature-gated
 /// so the no-forward build does not advertise a stream it cannot serve.
 #[cfg(feature = "port_forward")]
@@ -146,6 +165,7 @@ mod tests {
             "transfer://",
             "session://",
             "forward://",
+            "serial://",
         ]
         .iter()
         .any(|s| uri.starts_with(s));
@@ -155,14 +175,15 @@ mod tests {
 
     #[cfg(not(feature = "port_forward"))]
     #[test]
-    fn returns_four_templates_without_forward_feature() {
+    fn returns_five_templates_without_forward_feature() {
         let list = build_list();
-        assert_eq!(list.len(), 4, "expected 4 templates without port_forward");
+        assert_eq!(list.len(), 5, "expected 5 templates without port_forward");
         let schemes: Vec<&str> = list.iter().map(|t| t.uri_template.as_str()).collect();
         assert!(schemes.iter().any(|s| s.starts_with("shell://")));
         assert!(schemes.iter().any(|s| s.starts_with("command://")));
         assert!(schemes.iter().any(|s| s.starts_with("transfer://")));
         assert!(schemes.iter().any(|s| s.starts_with("session://")));
+        assert!(schemes.iter().any(|s| s.starts_with("serial://")));
         assert!(
             !schemes.iter().any(|s| s.starts_with("forward://")),
             "forward stream must not be advertised when port_forward is disabled"
@@ -171,15 +192,16 @@ mod tests {
 
     #[cfg(feature = "port_forward")]
     #[test]
-    fn returns_five_templates_with_forward_feature() {
+    fn returns_six_templates_with_forward_feature() {
         let list = build_list();
-        assert_eq!(list.len(), 5, "expected 5 templates with port_forward");
+        assert_eq!(list.len(), 6, "expected 6 templates with port_forward");
         let schemes: Vec<&str> = list.iter().map(|t| t.uri_template.as_str()).collect();
         assert!(schemes.iter().any(|s| s.starts_with("shell://")));
         assert!(schemes.iter().any(|s| s.starts_with("command://")));
         assert!(schemes.iter().any(|s| s.starts_with("transfer://")));
         assert!(schemes.iter().any(|s| s.starts_with("session://")));
         assert!(schemes.iter().any(|s| s.starts_with("forward://")));
+        assert!(schemes.iter().any(|s| s.starts_with("serial://")));
     }
 
     #[test]
@@ -210,12 +232,15 @@ mod tests {
 
     #[test]
     fn cursor_streams_advertise_query_param_template() {
-        // Shell, command, and (when enabled) forward templates expose a
-        // cursor query param via RFC 6570 `{?cursor}` form-style expansion.
+        // Shell, command, serial, and (when enabled) forward templates expose
+        // a cursor query param via RFC 6570 `{?cursor}` form-style expansion.
         let list = build_list();
         for tpl in &list {
             let uri = tpl.uri_template.as_str();
-            if uri.starts_with("shell://") || uri.starts_with("command://") {
+            if uri.starts_with("shell://")
+                || uri.starts_with("command://")
+                || uri.starts_with("serial://")
+            {
                 assert!(
                     uri.contains("{?cursor}"),
                     "byte-stream template {uri} must advertise {{?cursor}}"
