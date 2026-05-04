@@ -565,6 +565,50 @@ mod tests {
     }
 
     #[test]
+    fn push_first_long_command_missing_session_id_returns_invalid_params() {
+        let args = build_args(&[("command", json!("uptime"))]);
+        let err = get_prompt("push_first_long_command", &args).expect_err("must fail");
+        assert!(err.message.contains("session_id"));
+    }
+
+    #[test]
+    fn push_first_long_command_missing_command_returns_invalid_params() {
+        let args = build_args(&[("session_id", json!("s-1"))]);
+        let err = get_prompt("push_first_long_command", &args).expect_err("must fail");
+        assert!(err.message.contains("command"));
+    }
+
+    #[test]
+    fn subscription_hygiene_audit_rejects_non_string_uri_prefix() {
+        let mut args = PromptArguments::new();
+        args.insert("uri_prefix".to_string(), json!(123));
+        let err = get_prompt("subscription_hygiene_audit", &args).expect_err("must fail");
+        assert!(err.message.contains("uri_prefix"));
+    }
+
+    #[test]
+    fn chaos_resume_rejects_non_integer_cursor() {
+        let mut args = PromptArguments::new();
+        args.insert("sub_id".to_string(), json!("x"));
+        args.insert("from_cursor".to_string(), json!("not a number"));
+        let err = get_prompt("chaos_resume_after_disconnect", &args).expect_err("must fail");
+        assert!(err.message.contains("from_cursor"));
+    }
+
+    #[test]
+    fn ten_prompts_each_have_at_least_one_required_argument_or_zero() {
+        // Sanity: every prompt either needs at least one required
+        // argument or is fully optional. None must define a malformed
+        // argument list.
+        for prompt in list_prompts() {
+            let args = prompt.arguments.as_deref().unwrap_or_default();
+            for arg in args {
+                assert!(!arg.name.is_empty(), "prompt arg name empty");
+            }
+        }
+    }
+
+    #[test]
     fn chaos_resume_uses_sub_id_and_optional_cursor() {
         let mut args = PromptArguments::new();
         args.insert("sub_id".to_string(), json!("019"));

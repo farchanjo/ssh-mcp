@@ -271,4 +271,64 @@ mod tests {
             Some(&Value::from(0_u64))
         );
     }
+
+    #[test]
+    fn ssh_subscribe_args_round_trip_with_full_payload() {
+        let v = json!({
+            "uri": "shell://x/output",
+            "lifetime": "auto_close",
+            "grace_ms": 5000,
+            "ttl_secs": 60,
+            "lag_policy": "drop_oldest",
+            "filter": "ERR.*"
+        });
+        let parsed: SshSubscribeArgs = serde_json::from_value(v).expect("parse");
+        assert_eq!(parsed.uri, "shell://x/output");
+        assert_eq!(parsed.lifetime, Some(LifetimeKind::AutoClose));
+        assert_eq!(parsed.grace_ms, Some(5_000));
+        assert_eq!(parsed.ttl_secs, Some(60));
+        assert_eq!(parsed.filter.as_deref(), Some("ERR.*"));
+    }
+
+    #[test]
+    fn ssh_sub_filter_args_accept_empty_regex() {
+        // Empty regex clears the filter — the args struct accepts it.
+        let v = json!({"sub_id": "x", "regex": ""});
+        let parsed: SshSubFilterArgs = serde_json::from_value(v).expect("parse");
+        assert!(parsed.regex.is_empty());
+    }
+
+    #[test]
+    fn ssh_sub_replay_args_negative_cursor_is_rejected() {
+        // u64 deserialisation rejects negative values via serde.
+        let v = json!({"sub_id": "x", "from_cursor": -1});
+        assert!(serde_json::from_value::<SshSubReplayArgs>(v).is_err());
+    }
+
+    #[test]
+    fn ssh_subscribe_args_rejects_unknown_lifetime() {
+        let v = json!({"uri": "shell://x/output", "lifetime": "forever"});
+        assert!(serde_json::from_value::<SshSubscribeArgs>(v).is_err());
+    }
+
+    #[test]
+    fn ssh_subscribe_args_rejects_unknown_lag_policy() {
+        let v = json!({"uri": "shell://x/output", "lag_policy": "nope"});
+        assert!(serde_json::from_value::<SshSubscribeArgs>(v).is_err());
+    }
+
+    #[test]
+    fn ssh_sub_list_args_round_trip_with_both_filters() {
+        let v = json!({"uri_prefix": "shell://", "peer_id": "p-1"});
+        let parsed: SshSubListArgs = serde_json::from_value(v).expect("parse");
+        assert_eq!(parsed.uri_prefix.as_deref(), Some("shell://"));
+        assert_eq!(parsed.peer_id.as_deref(), Some("p-1"));
+    }
+
+    #[test]
+    fn lifetime_kind_is_copy() {
+        let k = LifetimeKind::Manual;
+        let twin = k;
+        assert_eq!(k, twin);
+    }
 }

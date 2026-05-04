@@ -4026,8 +4026,91 @@ where
     reason = "Rust 2024 requires unsafe for env::set_var; the env-mutating tests run --test-threads=1 so the global env stays serialised"
 )]
 mod tests {
-    use super::{classify_error, parse_address, parse_human_bytes};
+    use super::{
+        classify_error, filter_from_str, lifecycle_from_args, lifetime_from_args, parse_address,
+        parse_human_bytes,
+    };
     use crate::domain::error::DomainError;
+
+    #[test]
+    fn lifecycle_from_args_returns_none_when_both_unset() {
+        assert!(lifecycle_from_args(None, None).is_none());
+    }
+
+    #[test]
+    fn lifecycle_from_args_carries_release_when_no_subs() {
+        let p = lifecycle_from_args(Some(true), None).expect("policy");
+        assert!(p.release_when_no_subs);
+        assert_eq!(p.grace_ms, 2_000);
+        assert!(!p.cascade_session);
+    }
+
+    #[test]
+    fn lifecycle_from_args_carries_grace_ms_only() {
+        let p = lifecycle_from_args(None, Some(500)).expect("policy");
+        // release_when_no_subs is false by default — caller must opt in.
+        assert!(!p.release_when_no_subs);
+        assert_eq!(p.grace_ms, 500);
+    }
+
+    #[test]
+    fn lifecycle_from_args_carries_both_overrides() {
+        let p = lifecycle_from_args(Some(true), Some(7_500)).expect("policy");
+        assert!(p.release_when_no_subs);
+        assert_eq!(p.grace_ms, 7_500);
+    }
+
+    #[test]
+    fn filter_from_str_none_for_empty() {
+        assert_eq!(
+            filter_from_str(None),
+            crate::domain::subscription::FilterRule::None
+        );
+        assert_eq!(
+            filter_from_str(Some("")),
+            crate::domain::subscription::FilterRule::None
+        );
+    }
+
+    #[test]
+    fn filter_from_str_regex_for_non_empty() {
+        let r = filter_from_str(Some("abc"));
+        assert_eq!(
+            r,
+            crate::domain::subscription::FilterRule::Regex("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn lifetime_from_args_default_is_manual() {
+        let lt = lifetime_from_args(None, None, None);
+        assert_eq!(
+            lt,
+            crate::domain::subscription::SubscriptionLifetime::Manual
+        );
+    }
+
+    #[test]
+    fn lifetime_from_args_auto_close_uses_grace_ms() {
+        let lt = lifetime_from_args(
+            Some(super::LifetimeKind::AutoClose),
+            Some(1_500),
+            None,
+        );
+        assert_eq!(
+            lt,
+            crate::domain::subscription::SubscriptionLifetime::AutoClose { grace_ms: 1_500 }
+        );
+    }
+
+    #[test]
+    fn lifetime_from_args_lease_uses_ttl_secs() {
+        let lt = lifetime_from_args(Some(super::LifetimeKind::Lease), None, Some(60));
+        assert_eq!(
+            lt,
+            crate::domain::subscription::SubscriptionLifetime::Lease { ttl_secs: 60 }
+        );
+    }
 
     #[test]
     fn parse_address_with_explicit_port() {
