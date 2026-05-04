@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 v5.0 is in flight on the `feat/v5-foundation` branch. Phase 1 (lifecycle binding) and Phase 2 (channel mux + sub_id) are merged; Phase 3 (LLM UX overhaul) and Phase 4 (NDJSON daemon) are running in parallel by other agents and will land before the rc1 tag. Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. See [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) for the host migration guide and the eight ADRs at [docs/adr/0001..0008.md](docs/adr/) for the design narrative.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    P1["Phase 1<br/>Lifecycle binding<br/>ADR 0003"]
+    P2["Phase 2<br/>Channel mux + sub_id<br/>ADR 0004"]
+    P3["Phase 3<br/>LLM UX overhaul<br/>ADR 0005 / 0007"]
+    P4["Phase 4<br/>NDJSON daemon<br/>ADR 0008"]
+
+    P1 --> P2 --> P3 --> P4
+
+    style P1 fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style P2 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style P3 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P4 fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+```
+
 ### Highlights
 
 - **Subscribe-first architecture.** `ResourceLifecycle` CAS state machine (`Owned -> Observed -> Releasing -> Closed`) plus per-session cascade refcount on `SessionLifecycle.active_refs`; grace timer arms when last subscriber detaches; new subscribes within the window cancel the timer; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` opts a resource into auto-cleanup. Default preserves v4 semantics. See [ADR 0003](docs/adr/0003-lifecycle-binding.md).
