@@ -72,10 +72,15 @@ use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
 use crate::infra::mcp::prompts;
 use crate::infra::mcp::render;
 use crate::infra::mcp::resource_templates;
+#[cfg(feature = "port_forward")]
+use crate::infra::mcp::results::SshForwardResult;
 use crate::infra::mcp::results::{
-    SshConnectResult, SshDisconnectManyResult, SshExecuteBatchResult, SshExecuteResult,
-    SshGetCommandOutputResult, SshGetTransferProgressResult, SshRunResult, SshShellOpenResult,
-    SshShellReadResult,
+    SshCancelCommandResult, SshConnectResult, SshDisconnectAgentResult, SshDisconnectManyResult,
+    SshDisconnectResult, SshDownloadResult, SshExecuteBatchResult, SshExecuteResult,
+    SshGetCommandOutputResult, SshGetTransferProgressResult, SshListCommandsResult,
+    SshListSessionsResult, SshRunResult, SshShellCloseResult, SshShellOpenResult,
+    SshShellReadResult, SshShellSendKeyResult, SshShellWaitForResult, SshShellWriteResult,
+    SshUploadResult,
 };
 use crate::infra::mcp::suggestions::{closest_ids, render_closest_matches};
 use crate::ports::auth_strategy::AuthStrategyPort;
@@ -875,7 +880,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect an SSH session.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- Cancels every async command, closes every PTY, and aborts every in-flight SFTP transfer for the session.\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds."
+        description = "Disconnect an SSH session.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- Cancels every async command, closes every PTY, and aborts every in-flight SFTP transfer for the session.\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds.",
+        output_schema = schema_for_type::<SshDisconnectResult>()
     )]
     async fn ssh_disconnect(
         &self,
@@ -914,7 +920,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List active SSH sessions on the server.\n\nWhen to use:\n- Inspecting sessions known to this server (optionally narrowed to one agent).\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over current sessions. Cheap to call repeatedly."
+        description = "List active SSH sessions on the server.\n\nWhen to use:\n- Inspecting sessions known to this server (optionally narrowed to one agent).\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
+        output_schema = schema_for_type::<SshListSessionsResult>()
     )]
     async fn ssh_list_sessions(
         &self,
@@ -947,7 +954,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over agent sessions. Tens of ms typical."
+        description = "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
+        output_schema = schema_for_type::<SshDisconnectAgentResult>()
     )]
     async fn ssh_disconnect_agent(
         &self,
@@ -1059,7 +1067,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List asynchronous commands tracked on the server.\n\nWhen to use:\n- Inspecting every command (optionally filtered by session and/or status).\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over async commands. Cheap."
+        description = "List asynchronous commands tracked on the server.\n\nWhen to use:\n- Inspecting every command (optionally filtered by session and/or status).\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over async commands. Cheap.",
+        output_schema = schema_for_type::<SshListCommandsResult>()
     )]
     async fn ssh_list_commands(
         &self,
@@ -1089,7 +1098,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Cancel an asynchronous command.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_execute.\n- Returns the partial stdout/stderr captured so far when the command was running.\n\nStatus values: CANCELLED, NOOP.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands)."
+        description = "Cancel an asynchronous command.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_execute.\n- Returns the partial stdout/stderr captured so far when the command was running.\n\nStatus values: CANCELLED, NOOP.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).",
+        output_schema = schema_for_type::<SshCancelCommandResult>()
     )]
     async fn ssh_cancel_command(
         &self,
@@ -1172,7 +1182,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Write raw bytes to a PTY shell.\n\nWhen to use:\n- Submitting a typed command (append `\\n`).\n- Sending raw control sequences (e.g. `\\x03` for Ctrl+C, `\\x1b[A` for arrow up).\n- Prefer ssh_shell_send_key for named keystrokes.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response."
+        description = "Write raw bytes to a PTY shell.\n\nWhen to use:\n- Submitting a typed command (append `\\n`).\n- Sending raw control sequences (e.g. `\\x03` for Ctrl+C, `\\x1b[A` for arrow up).\n- Prefer ssh_shell_send_key for named keystrokes.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+        output_schema = schema_for_type::<SshShellWriteResult>()
     )]
     async fn ssh_shell_write(
         &self,
@@ -1208,7 +1219,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nWhen to use:\n- Sending arrows, function keys, control codes, navigation keys without crafting the bytes manually.\n- Optional Shift / Alt / Ctrl modifiers; optional `repeat` (1..=64).\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT (bad repeat / modifier combination), TRANSPORT_ERROR.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response."
+        description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nWhen to use:\n- Sending arrows, function keys, control codes, navigation keys without crafting the bytes manually.\n- Optional Shift / Alt / Ctrl modifiers; optional `repeat` (1..=64).\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT (bad repeat / modifier combination), TRANSPORT_ERROR.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+        output_schema = schema_for_type::<SshShellSendKeyResult>()
     )]
     async fn ssh_shell_send_key(
         &self,
@@ -1281,7 +1293,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort)."
+        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
+        output_schema = schema_for_type::<SshShellWaitForResult>()
     )]
     async fn ssh_shell_wait_for(
         &self,
@@ -1321,7 +1334,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Close a PTY shell and free its resources.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds."
+        description = "Close a PTY shell and free its resources.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds.",
+        output_schema = schema_for_type::<SshShellCloseResult>()
     )]
     async fn ssh_shell_close(
         &self,
@@ -1362,7 +1376,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_get_transfer_progress.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress."
+        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_get_transfer_progress.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        output_schema = schema_for_type::<SshUploadResult>()
     )]
     async fn ssh_upload(
         &self,
@@ -1396,7 +1411,8 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress."
+        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- Subscribe to `transfer://<transfer_id>/progress` for live progress events.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        output_schema = schema_for_type::<SshDownloadResult>()
     )]
     async fn ssh_download(
         &self,
@@ -1551,7 +1567,8 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward. Subscribe to forward://<id>/events for the event log."
+        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward. Subscribe to forward://<id>/events for the event log.",
+        output_schema = schema_for_type::<SshForwardResult>()
     )]
     async fn ssh_forward(
         &self,
@@ -1648,7 +1665,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect an SSH session.\n\nCost: O(1). Always succeeds."
+        description = "Disconnect an SSH session.\n\nCost: O(1). Always succeeds.",
+        output_schema = schema_for_type::<SshDisconnectResult>()
     )]
     async fn ssh_disconnect(
         &self,
@@ -1687,7 +1705,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List active SSH sessions.\n\nCost: O(N) over current sessions. Cheap to call repeatedly."
+        description = "List active SSH sessions.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
+        output_schema = schema_for_type::<SshListSessionsResult>()
     )]
     async fn ssh_list_sessions(
         &self,
@@ -1720,7 +1739,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect every session bound to a given agent.\n\nCost: O(N) over agent sessions. Tens of ms typical."
+        description = "Disconnect every session bound to a given agent.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
+        output_schema = schema_for_type::<SshDisconnectAgentResult>()
     )]
     async fn ssh_disconnect_agent(
         &self,
@@ -1832,7 +1852,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "List asynchronous commands tracked on the server.\n\nCost: O(N) over async commands. Cheap."
+        description = "List asynchronous commands tracked on the server.\n\nCost: O(N) over async commands. Cheap.",
+        output_schema = schema_for_type::<SshListCommandsResult>()
     )]
     async fn ssh_list_commands(
         &self,
@@ -1862,7 +1883,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Cancel an asynchronous command.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands)."
+        description = "Cancel an asynchronous command.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).",
+        output_schema = schema_for_type::<SshCancelCommandResult>()
     )]
     async fn ssh_cancel_command(
         &self,
@@ -1945,7 +1967,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Write raw bytes to a PTY shell.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response."
+        description = "Write raw bytes to a PTY shell.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+        output_schema = schema_for_type::<SshShellWriteResult>()
     )]
     async fn ssh_shell_write(
         &self,
@@ -1981,7 +2004,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response."
+        description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+        output_schema = schema_for_type::<SshShellSendKeyResult>()
     )]
     async fn ssh_shell_send_key(
         &self,
@@ -2054,7 +2078,8 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort)."
+        description = "Block until a substring pattern appears in the shell output.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
+        output_schema = schema_for_type::<SshShellWaitForResult>()
     )]
     async fn ssh_shell_wait_for(
         &self,
@@ -2094,7 +2119,8 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Close a PTY shell.\n\nCost: O(1). Always succeeds."
+        description = "Close a PTY shell.\n\nCost: O(1). Always succeeds.",
+        output_schema = schema_for_type::<SshShellCloseResult>()
     )]
     async fn ssh_shell_close(
         &self,
@@ -2135,7 +2161,8 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Upload a local file to the remote host via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress."
+        description = "Upload a local file to the remote host via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        output_schema = schema_for_type::<SshUploadResult>()
     )]
     async fn ssh_upload(
         &self,
@@ -2169,7 +2196,8 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Download a remote file via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress."
+        description = "Download a remote file via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
+        output_schema = schema_for_type::<SshDownloadResult>()
     )]
     async fn ssh_download(
         &self,
