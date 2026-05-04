@@ -1,4 +1,4 @@
-# ssh-mcp v5.0 — Subscribe-First SSH Model Context Protocol Server
+# ssh-mcp
 
 [![Version](https://img.shields.io/badge/version-5.0.0--rc1-blue.svg)]()
 [![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange.svg)](https://www.rust-lang.org/)
@@ -6,161 +6,203 @@
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-purple.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
 
-> Push-first observability. Lock-free hot path. Lifecycle-bound resources.
-> Self-cleaning on disconnect. NDJSON daemon for hosts without subscribe.
+**Subscribe-first SSH server for the Model Context Protocol.** Run remote commands, drive interactive shells, and stream SFTP transfers from any MCP-compatible LLM host with realtime push notifications, lock-free hot path, and resources that clean themselves up when nobody's watching.
 
-> [!CAUTION]
-> Not the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). Rewritten on `russh` 0.55 + `rmcp` 1.6 with a strict hexagonal layout. v5.0 is wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue and adds 9 net-new MCP tools plus a third binary (`ssh-mcp-tail`) for tier-2 / tier-3 LLM hosts that do not surface push notifications to the model.
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','mainBkg':'#161b22','clusterBkg':'#0d1117','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    LLM[("LLM host<br/>Claude / Cline / mcp-inspector")]
+    SM["ssh-mcp<br/>(stdio · http · NDJSON)"]
+    REM[("Remote hosts<br/>via russh + SFTP")]
+    LLM <-->|tools/call<br/>resources/subscribe| SM
+    SM <-->|SSH 2.0| REM
 
-## TL;DR
-
-| You want | You call |
-|---|---|
-| One-shot command | `ssh_run` |
-| Long command + push | `ssh_execute` + `ssh_subscribe` |
-| Interactive shell | `ssh_shell_open` + `ssh_subscribe` + `ssh_shell_*` |
-| File transfer + progress | `ssh_upload` + `ssh_subscribe` |
-| Cleanup my sessions | `ssh_disconnect_agent` |
-| Hosts without subscribe | use `ssh-mcp-tail daemon` (NDJSON pipeline) |
-
-Why subscribe-first? See [docs/llm-ux/GOLDEN_RULES.md](docs/llm-ux/GOLDEN_RULES.md) and [ADR 0003](docs/adr/0003-lifecycle-binding.md).
-
-## Quickstart (push-first, ~30 s)
-
-```bash
-git clone https://github.com/farchanjo/ssh-mcp.git && cd ssh-mcp
-cargo build --release
-sudo cp target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
-ssh-mcp-stdio          # stdio transport (recommended for local MCP hosts)
+    classDef host fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef core fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef remote fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class LLM host
+    class SM core
+    class REM remote
 ```
 
-In your MCP host (mcp-inspector / Claude Desktop / Cline) call:
+## Why ssh-mcp
+
+- **Push, not poll.** Subscribers get coalesced (50 ms) push notifications the moment SSH bytes arrive. No tight `tool_call` loops burning tokens on empty reads.
+- **Self-cleaning resources.** Open a shell with `release_when_no_subs=true` and it disappears when the last subscriber leaves — no zombie sessions waiting on the inactivity TTL.
+- **Lock-free hot path.** Every long-running primitive (shell history, command output, transfer progress) is `AtomicU64` / `ArcSwap` / `mpsc` / `Notify`. Zero `Mutex` on the data path. Verified by clippy `await_holding_lock = "deny"` plus 16 loom invariant tests.
+- **Three transports, one core.** HTTP (`axum`), stdio (rmcp), and NDJSON daemon (`ssh-mcp-tail`) all share the same hexagonal use cases. Pick the transport your LLM host supports; behaviour is identical.
+- **30 MCP tools, 5 resource schemes, 10 ready-made prompts.** Wire-compatible with every v3 / v4 host on the legacy 21 tools, plus 9 v5 tools for sub_id / lag policy / replay / stats.
+- **Fits 27B-class LLMs.** `HINT: REQUIRED NEXT STEP:` lines, push-first `NEXT:` ordering, golden-rules root prompt, and a `SUB_LEAK_RISK` watcher that flags lazy callers before they leak.
+
+## Demo
 
 ```text
-ssh_connect         host=vm.example.com user=root key=~/.ssh/id_rsa agent_id=alice
-ssh_execute         session_id=...        command="tail -f /var/log/app.log" release_when_no_subs=true
-ssh_subscribe       uri=command://<cid>/output  lifetime=auto-close lag_policy=snapshot
-# drain push events on resources/updated until ev=completed
-ssh_unsubscribe     sub_id=...
+ssh_connect          host=vm.example.com user=root key=~/.ssh/id_rsa agent_id=alice
+  -> SESSION_ID=4ac5f7be
+ssh_execute          session_id=4ac5f7be command="tail -f /var/log/app.log"
+                     release_when_no_subs=true
+  -> COMMAND_ID=7cccfb6f  HINT: REQUIRED NEXT STEP: ssh_subscribe ...
+ssh_subscribe        uri=command://7cccfb6f/output lifetime=auto-close
+                     lag_policy=snapshot
+  -> SUB_ID=01928a3f-7f...
+# push events arrive here as the remote process emits stdout
+ssh_unsubscribe      sub_id=01928a3f-7f...
 ssh_disconnect_agent agent_id=alice
 ```
 
-Every long-running tool emits a `HINT: REQUIRED NEXT STEP:` line that names the exact successor. See [docs/llm-ux/PROMPTS_CATALOG.md](docs/llm-ux/PROMPTS_CATALOG.md) for the full 10-prompt library.
-
-## Quickstart (NDJSON daemon)
-
-For hosts without `resources/subscribe` (Claude Code CLI, several IDE integrations) drive `ssh-mcp-tail` as a subprocess:
+Same flow as a Unix pipeline (NDJSON daemon mode, ideal for hosts without `resources/subscribe`):
 
 ```bash
-cat <<'EOF' | ssh-mcp-tail daemon | jq 'select(.ev == "push")' | tee log.ndjson
-{"op":"connect","host":"vm.example.com","user":"root","key":"/home/user/.ssh/id_rsa","id":"c1"}
-{"op":"exec","sid":"<sid-from-ack>","cmd":"tail -f /var/log/app.log","id":"c2"}
-{"op":"subscribe","uri":"command://<cid>/output","lifetime":"auto-close","lag_policy":"snapshot","id":"c3"}
+cat <<'EOF' | ssh-mcp-tail daemon | jq 'select(.ev=="push") | .delta'
+{"op":"connect","host":"vm.example.com","user":"root","key":"/root/.ssh/id_rsa"}
+{"op":"exec","sid":"<from-ack>","cmd":"tail -f /var/log/app.log"}
+{"op":"subscribe","uri":"command://<cid>/output","lifetime":"auto-close"}
 EOF
 ```
 
-Stdin is NDJSON ops; stdout is NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`); stderr is `RUST_LOG`-controlled tracing. Full op + event schema: [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md).
+## Quickstart
 
-## Architecture (1 paragraph)
+```bash
+git clone https://github.com/farchanjo/ssh-mcp.git
+cd ssh-mcp
+cargo build --release
+sudo install -m 0755 target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
+```
 
-ssh-mcp v5.0 keeps the hexagonal v4.1 split (`domain` / `ports` / `application` / `adapters` / `infra` / `composition`) and adds three v5 layers: a **lifecycle adapter** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) wiring every long-lived resource to a CAS state machine + cascade refcount + grace timer; a **subscription mux** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) keying push lanes on `(SubId, Uri)` with per-lane LagPolicy / filter / stats; and an **embed transport** ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md)) that lets `ssh-mcp-tail` host an in-process MCP client + server pair across `tokio::io::duplex`. The hot path stays lock-free — every new field is `AtomicU8` / `AtomicUsize` / `AtomicU64` / `ArcSwap<Policy>` / `Notify`, never `Mutex`. Full layer-by-layer module map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Pick a transport:
 
-## When to use which transport
-
-| Transport | Best for |
+| Binary | Use |
 |---|---|
-| `ssh-mcp` | HTTP host (Claude Desktop, browsers, axum-fronted services) |
-| `ssh-mcp-stdio` | stdio MCP host (mcp-inspector, IDEs, Cline) |
-| `ssh-mcp-tail` | Unix pipelines, hosts without `resources/subscribe` (Claude Code CLI, IDE integrations) |
+| `ssh-mcp-stdio` | Local MCP host (mcp-inspector, IDEs, Cline). Default. |
+| `ssh-mcp` | HTTP host (Claude Desktop, browsers). Bind `0.0.0.0:8000`. |
+| `ssh-mcp-tail daemon` | Unix pipelines + hosts without `resources/subscribe`. |
 
-All three reuse `composition::prod` adapters. Only the transport binding differs. See [docs/ARCHITECTURE.md#binary-targets](docs/ARCHITECTURE.md).
+Drive it from any MCP-compatible host using the demo flow above. Full command reference: [docs/API.md](docs/API.md). Push-first patterns: [docs/llm-ux/GOLDEN_RULES.md](docs/llm-ux/GOLDEN_RULES.md).
 
-## MCP tool catalogue
+## How it works
 
-v5.0 ships **30 tools** (29 without `port_forward`):
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','mainBkg':'#161b22','clusterBkg':'#0d1117','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph Inbound["inbound transport"]
+        HTTP[axum HTTP]
+        STDIO[rmcp stdio]
+        TAIL[NDJSON daemon]
+    end
 
-- **21 carry-over from v4.7 / v4.8** — `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_many`, `ssh_list_sessions`, `ssh_disconnect_agent`, `ssh_execute`, `ssh_execute_batch`, `ssh_run`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_read`, `ssh_shell_wait_for`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`, `ssh_forward`.
-- **9 net-new in v5.0 (Phase 3)** — `ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`. All key on the new `SubId` (UUIDv7) introduced by [ADR 0004](docs/adr/0004-channel-mux-fairness.md).
+    subgraph Core["hexagonal core"]
+        UC[use cases]
+        DOM[domain<br/>entities · errors]
+        PORTS[ports<br/>traits · AFIT]
+        ADAP[adapters<br/>russh · sftp · DashMap · ArcSwap]
+    end
 
-Per-tool input / output schemas, response shape, and structured payload: [docs/API.md](docs/API.md). Phase 3 implementation is in flight on `feat/v5-foundation` — Phase 1 + 2 (lifecycle + mux) are merged.
+    subgraph Outbound["outbound transport"]
+        SUB[subscription mux<br/>SubId · LagPolicy · filter]
+        LIFE[lifecycle adapter<br/>CAS state · grace timer · cascade]
+        SSH[(remote SSH)]
+    end
 
-## Resource streams (5 schemes, subscribe-first)
+    HTTP --> UC
+    STDIO --> UC
+    TAIL --> UC
+    UC --> PORTS
+    PORTS --> ADAP
+    UC --> DOM
+    ADAP --> SSH
+    ADAP --> LIFE
+    LIFE --> SUB
 
-| URI scheme | Pushes | Cursor | MIME |
-|---|---|---|---|
-| `shell://<shell-id>/output` | PTY output stream | yes | `text/plain` |
-| `command://<command-id>/output` | Async command stdout/stderr | yes | `text/plain` |
-| `transfer://<transfer-id>/progress` | SFTP point-in-time progress | no | `application/json` |
-| `session://<session-id>/health` | Session health snapshot | no | `application/json` |
-| `forward://<forward-id>/events` (feature `port_forward`) | Port-forward event log | yes | `application/json` |
+    classDef inb fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef core fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef out fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef rem fill:#21262d,color:#8b949e,stroke:#30363d
+    class HTTP,STDIO,TAIL inb
+    class UC,DOM,PORTS,ADAP core
+    class SUB,LIFE out
+    class SSH rem
+```
 
-Producer events coalesce on `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms), force-flush after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1 s), keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). Each event carries a sequence number for gap detection; v5 lagged subscribers auto-recover via the per-lane `Snapshot` policy ([ADR 0006](docs/adr/0006-backpressure-policies.md)). Full contract: [docs/RESOURCES.md](docs/RESOURCES.md). Token-efficient subscribe-first patterns: [docs/llm-ux/GOLDEN_RULES.md](docs/llm-ux/GOLDEN_RULES.md).
+Three v5 layers stack on the v4.1 hexagonal base:
+
+- **Lifecycle binding** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — every long-lived resource (shell, command, transfer, forward) is wrapped in a CAS state machine (`Owned → Observed → Releasing → Closed`) plus a per-session refcount. Last subscriber leaves + `release_when_no_subs=true` arms a grace timer; new subscribe within the window cancels it. Lock-free, loom-verifiable.
+- **Channel mux** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) — push lanes key on `(SubId, Uri)` (UUIDv7), each owns its own `mpsc::channel`, `LagPolicy` (`BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot` (default)), filter pipeline, replay window, and `SubscriberStats`. A round-robin drainer guarantees a slow subscriber never starves a fast one.
+- **Embed transport** ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md)) — `ssh-mcp-tail` hosts the rmcp server + an in-process rmcp client across `tokio::io::duplex`. Single binary, no IPC, real push events on the daemon's stdout for hosts that cannot consume MCP subscribe directly.
+
+Full per-module map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Performance
+
+The data path is engineered for sub-millisecond latency between SSH stdout and MCP push delivery on local hosts.
+
+| Scenario | Behaviour |
+|---|---|
+| Subscribe → first push (warm session) | < 5 ms p50 (50 ms debounce dominates after that) |
+| Lane mpsc full → snapshot recovery | O(buf_size); sub-ms with default 1 MB ring |
+| Round-robin mux fairness | < 1 % drift between adjacent lanes under burst |
+| Lock-free hot path | 0 `Mutex` on shell / command / transfer state |
+| Loom invariants | 16 tests across lifecycle, mux, ring buffer, cascade |
+
+Hard numbers from `criterion` benchmarks live under [docs/PERFORMANCE.md](docs/PERFORMANCE.md) (work in progress); the strict baseline is encoded in `clippy.toml` (`cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`) plus the `[lints.clippy]` `await_holding_lock` / `mutex_atomic` / `significant_drop_tightening` denials.
+
+## MCP catalogue (compact)
+
+- **30 tools** total — 21 carry-over from v4.7 / v4.8, 9 net-new in v5.0 (`ssh_subscribe` ... `ssh_daemon_stats`). Full schema: [docs/API.md](docs/API.md).
+- **5 resource schemes** — `shell://`, `command://`, `transfer://`, `session://`, `forward://`. Cursor + sequence semantics: [docs/RESOURCES.md](docs/RESOURCES.md).
+- **10 prompts** — 5 v4 carry-overs + 5 v5 push-first workflows. Catalogue: [docs/llm-ux/PROMPTS_CATALOG.md](docs/llm-ux/PROMPTS_CATALOG.md).
+- **38 error codes** in 7 retry categories. Code-by-code handbook: [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md).
 
 ## Configuration
 
-Three-tier resolution: **Parameter > Environment Variable > Built-in default**. Full env-var table (33+ vars including v5 lifecycle / lane / mux / daemon knobs): [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The five v5 categories:
-
-- Lifecycle ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — `SSH_LIFECYCLE_GRACE_MS`, `SSH_LIFECYCLE_OWN_GRACE_MS`, `SSH_SESSION_IDLE_GRACE_MS`.
-- Lane / mux ([ADR 0006](docs/adr/0006-backpressure-policies.md)) — `SSH_LAG_POLICY_DEFAULT`, `SSH_LANE_BUFFER`, `SSH_MUX_BUFFER`, `SSH_BP_BLOCK_TIMEOUT_MS`, `SSH_REPLAY_WINDOW_BYTES`, `SSH_FILTER_REGEX_MAX`, `SSH_MAX_SUBS_PER_URI`, `SSH_MAX_SUBS_TOTAL`.
-- LLM hygiene ([ADR 0005](docs/adr/0005-llm-ux-priorities.md)) — `SSH_SUB_LEAK_RISK_WARN_S`, `SSH_SUB_LEAK_RISK_KILL_S`.
-- NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md)) — `SSH_NDJSON_LINE_MAX`, `SSH_HEARTBEAT_INTERVAL_S`, `SSH_DAEMON_STATS_INTERVAL_S`, `SSH_GRACE_HARD_TIMEOUT_S`.
-
-## Troubleshooting
-
-Common failure shapes (`SUB_LEAK_RISK`, `LAG_BACKPRESSURE`, `RESOURCE_GONE`, `LANE_BUFFER_FULL`, ...): [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Code-by-code error handbook: [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md). Anti-patterns: [docs/llm-ux/ANTIPATTERNS.md](docs/llm-ux/ANTIPATTERNS.md).
+Three-tier resolution: **Parameter > Environment Variable > Built-in default**. Full table (33+ vars across lifecycle, mux, lane, daemon, retry, broadcast caps): [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Development
 
 ```bash
-cargo build --release                                              # all three binaries
-cargo build --release --bin ssh-mcp                                # HTTP only
-cargo build --release --bin ssh-mcp-stdio                          # stdio only
-cargo build --release --bin ssh-mcp-tail                           # NDJSON daemon only
-cargo build --release --no-default-features                        # without port_forward
-cargo test --lib --quiet                                           # ~1378 unit tests (Phase 1+2 merged)
-cargo test --tests --quiet                                         # 2 integration tests
-cargo test --features test-fixtures                                # use cases against in-memory adapters
+cargo build --release                                # all three binaries
+cargo test --lib --quiet                             # ~1378 unit tests
 cargo fmt --all -- --check
-cargo clippy --release --all-features -- -D warnings               # production gate (must exit 0)
+cargo clippy --release --all-features -- -D warnings # production gate (must exit 0)
 ```
 
-The clippy gate is **production-only**. The `forbid(unwrap_used / expect_used)` policy is structurally incompatible with `#[tokio::test]` macro expansion; test targets are gated by `cargo test --lib` and `cargo build --release --all-targets`. Details: [CLAUDE.md](CLAUDE.md).
+The clippy gate is **production-only**. Test targets are gated by `cargo test --lib` plus `cargo build --release --all-targets` (the strict `forbid(unwrap_used / expect_used)` baseline is structurally incompatible with the `#[tokio::test]` macro expansion). Details + invariants: [CLAUDE.md](CLAUDE.md), [docs/LOCKS.md](docs/LOCKS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-For changes touching shell / command / transfer hot-path state, read [docs/LOCKS.md](docs/LOCKS.md) before introducing any `Mutex`. For changes spanning multiple layers, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) shows where each layer's responsibility lies.
+## Documentation
 
-## Documentation map
-
-| Document | Description |
+| Document | Purpose |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout, v5 layers (lifecycle / mux / embed), per-module map, sequence diagrams |
-| [docs/API.md](docs/API.md) | All 30 MCP tools (inputs, outputs, structured_content, errors) |
-| [docs/RESOURCES.md](docs/RESOURCES.md) | 5 resource schemes, cursor / sequence semantics, `_meta` envelope |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full env-var table (33+ vars, floors and caps, tuning profiles) |
-| [docs/ERRORS.md](docs/ERRORS.md) | Wire-format error envelope (REASON + DETAIL) |
-| [docs/LOCKS.md](docs/LOCKS.md) | Lock-free invariants per layer + Clippy enforcement |
-| [docs/FLOWS.md](docs/FLOWS.md) | Sequence diagrams for connect / execute / shell / SFTP / subscribe |
-| [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md) | `ssh-mcp-tail daemon` NDJSON op + event schema |
-| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom -> cause -> cure runbook |
-| [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) | v4.x to v5.0 host migration guide |
-| [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) | Contributor migration guide (v4.1 deep-decouple addendum) |
-| [docs/llm-ux/](docs/llm-ux/) | LLM UX kit: golden rules, prompts catalog, anti-patterns, error handbook, 27B / 70B root prompts |
-| [docs/adr/](docs/adr/) | 8 architecture decision records (0001 rmcp, 0002 hexagonal, 0003 lifecycle, 0004 mux, 0005 LLM UX, 0006 backpressure, 0007 errors, 0008 daemon) |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout · v5 layers · per-module map |
+| [docs/API.md](docs/API.md) | All 30 MCP tools (inputs · outputs · errors) |
+| [docs/RESOURCES.md](docs/RESOURCES.md) | 5 resource schemes · cursor semantics |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Env-var table · floors · caps |
+| [docs/LOCKS.md](docs/LOCKS.md) | Lock-free invariants · clippy enforcement |
+| [docs/FLOWS.md](docs/FLOWS.md) | Sequence diagrams (connect / execute / shell / SFTP / subscribe) |
+| [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md) | `ssh-mcp-tail` NDJSON op + event schema |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → cure runbook |
+| [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) | Host upgrade guide |
+| [docs/llm-ux/](docs/llm-ux/) | LLM UX kit — golden rules · prompts · anti-patterns · error handbook |
+| [docs/adr/](docs/adr/) | 8 architecture decision records |
 
 ## Contributing
 
-See [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md) for the architecture invariants this project enforces. Open issues at <https://github.com/farchanjo/ssh-mcp/issues>; pre-commit must pass `cargo fmt --all -- --check` and `cargo clippy --release --all-features -- -D warnings`.
+Before opening a PR: `cargo fmt --all -- --check` and `cargo clippy --release --all-features -- -D warnings` must both exit 0. Architecture invariants are pinned in [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md). Issues: <https://github.com/farchanjo/ssh-mcp/issues>.
 
 ## License
 
 MIT — declared via `license = "MIT"` in `Cargo.toml`.
 
-## Author and links
+---
 
-- Author: Fabricio Archanjo (<fabricio@archanjo.com>)
+### About this fork
+
+This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 + `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, and a third NDJSON daemon binary. v5.0 stays wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+
+### Author and links
+
+- Author: Fabricio Archanjo · <fabricio@archanjo.com>
 - Issues: <https://github.com/farchanjo/ssh-mcp/issues>
 - Releases: <https://github.com/farchanjo/ssh-mcp/releases>
-- Original concept: [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)
-- SSH library: [russh](https://github.com/warp-tech/russh) — SFTP via [russh-sftp](https://github.com/AspectUnk/russh-sftp)
+- SSH library: [russh](https://github.com/warp-tech/russh) · SFTP via [russh-sftp](https://github.com/AspectUnk/russh-sftp)
 - MCP framework: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) (official Rust SDK)
 - HTTP host: [axum](https://github.com/tokio-rs/axum) + [tower](https://github.com/tower-rs/tower)
 - Lock-free primitives: [arc-swap](https://github.com/vorner/arc-swap), [dashmap](https://github.com/xacrimon/dashmap)
