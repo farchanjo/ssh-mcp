@@ -278,3 +278,21 @@ What did NOT change:
 For external crates implementing one of the 21 typed result structs as a deserialisation target: every struct is `#[non_exhaustive]` so callers cannot match exhaustively across versions. Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire — pre-v4.8 serde validators that accepted the v4.7 payload continue to accept the v4.8 payload.
 
 **No client-side migration required** — v3 / v4.0 / v4.5 / v4.6 / v4.7 hosts work against v4.8 servers without any change.
+
+## v4.8 -> v4.8.1 addendum (no migration steps required)
+
+**v4.8.1 is a wire-correctness patch.** No source-level migration steps are required for contributors of in-flight v4.8 patches.
+
+What changed:
+
+- `ssh_get_transfer_progress` now reports live `bytes_transferred` mid-flight (was always 0 until the terminal hand-off through v4.8.0). The `transfer://<id>/progress` resource read path is transparently fixed too.
+- A new per-transfer `spawn_progress_watcher` task in `src/adapters/sftp/russh_sftp_adapter.rs` consumes the `progress_tx` broadcast and calls `TransferStatusSink::record_progress(...)` (a sink hook present since v4.2 with no producer until now), throttled at 250 ms.
+- 1168 -> 1172 lib tests (4 new `progress_watcher_tests` unit tests). New file `scripts/test_transfer_progress.py` adds 2 `requires_sshd` Python integration tests.
+
+What did NOT change:
+
+- `ssh_get_transfer_progress` Markdown body and `structured_content` shape: byte-identical to v4.8.0 on every field name. Only the *value* of `bytes_transferred` during running snapshots — it now reports real live bytes instead of the stale 0.
+- `TransferStatusSink::record_progress`, `RepoTransferStatusSink::record_progress`, `NoopTransferStatusSink::record_progress`, `TransferEntity::with_progress(bytes)`: all already declared since v4.2; this patch simply wires a producer.
+- Env vars, error codes, runtime behaviour beyond the progress observable, lock-free invariants, channel sizes, port surface: all unchanged.
+
+**No client-side migration required** — v3 / v4.0 / v4.5 / v4.6 / v4.7 / v4.8 hosts work against v4.8.1 servers without any change.

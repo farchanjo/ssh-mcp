@@ -5,6 +5,37 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.8.1] — 2026-05-04
+
+### Highlights
+
+- **Fix: `ssh_get_transfer_progress` now reports live `bytes_transferred` during running uploads/downloads.** Prior behaviour: the snapshot always returned `bytes_transferred = 0` until the transfer reached terminal state, even though the file on disk was growing. Users had to poll local file size as a workaround. The fix is wire-compatible — the structured payload shape, env vars, and error codes are unchanged.
+
+### Fixed
+
+- **`ssh_get_transfer_progress` always returned `bytes_transferred = 0` mid-flight** (v4.8.1 BUG, reproducible on any non-instant upload or download). Root cause: the SFTP streaming task incremented the live `Arc<AtomicU64>` per chunk and emitted `ProgressEvent::Tick` on a `tokio::sync::broadcast`, but no listener pumped those ticks into the `TransferEntity` row in the repository — the row was born at `bytes_transferred = 0` (via `fresh_entity`) and only updated on the terminal frame by `spawn_status_watcher`. The use case `get_transfer_progress` reads from `TransferRepository::get(...)`, so it inherited the stale 0 throughout the running window. The same staleness affected `transfer://<id>/progress` resource reads (the broadcast notification fired correctly, but the subsequent `resources/read` returned the stale entity). Fix (`adapters/sftp/russh_sftp_adapter.rs`): a per-transfer progress watcher (`spawn_progress_watcher`) is spawned alongside the existing status watcher; it subscribes to the same broadcast and calls `TransferStatusSink::record_progress(...)` on each Tick, throttled by `PROGRESS_TICK_THROTTLE` (250 ms wall clock) to avoid hot-write per 32 KB chunk. The sink hook, the `RepoTransferStatusSink::record_progress` impl, the `NoopTransferStatusSink::record_progress` impl, and the `TransferEntity::with_progress(bytes)` projection were all already declared since v4.2 — the only missing piece was the producer task that consumed the broadcast. The progress watcher's close-flush guarantees the latest pending value lands before exit, and a terminal frame received before any Tick exits with zero `record_progress` calls so the existing terminal `mark_completed` write is never raced by a stale partial.
+
+### Audit (sibling bug class)
+
+The same shape (live counter incremented by a streaming task, never mirrored to the repo until terminal state) was checked across every subsystem with a streaming surface:
+
+- `ssh_get_command_output` — uses live `ArcSwap<OutputBuffer>` already (correct, not affected).
+- `ssh_shell_read` — uses live `ArcSwap<RingBuffer>` already (correct, not affected).
+- `forward://<id>/events` — N/A (no live byte counter).
+
+Only the SFTP transfer path was affected; this fix is the only required change.
+
+### Tests
+
+- **4 new Rust unit tests** in `progress_watcher_tests` (in `src/adapters/sftp/russh_sftp_adapter.rs`): first-tick is forwarded immediately + close-flush emits last pending value; 50-tick burst is throttled to fewer writes with monotonic non-decreasing values; 250 ms quiet window releases the throttle gate; terminal-before-tick exits with zero `record_progress` calls.
+- **2 new Python integration tests** in `scripts/test_transfer_progress.py` (`requires_sshd` mark, mirrors `test_v47_progress.py` / `test_stdio.py` conventions): `test_upload_progress_reports_live_partial_bytes` and `test_download_progress_reports_live_partial_bytes` upload/download a 5 MiB blob, poll `ssh_get_transfer_progress` at 100 ms cadence for up to 30 s, assert `0 < bytes_transferred < total_bytes` is observed at least once mid-flight (the exact pre-fix bug shape would fail this), assert monotonic non-decreasing `bytes_transferred` across polls, and assert terminal `bytes_transferred == total_bytes`.
+- Lib tests: **1168 → 1172** (+4 progress watcher unit tests). Integration tests: 2 / 2 unchanged in `tests/`. Python integration tests: 2 new in `scripts/`.
+
+### Compatibility
+
+- Wire shape: byte-identical to v4.8.0 on the Markdown body and on the `structured_content` JSON payload. The fix is observable only in the *value* of `bytes_transferred` during running snapshots — it now reports real live bytes instead of `0`. No env vars added, no error codes added, no port / sink / repo trait surface changes (the `record_progress` hook was already declared since v4.2).
+- v3 / v4.0 / v4.5 / v4.6 / v4.7 / v4.8 hosts work against v4.8.1 servers without any change.
+
 ## [4.8.0] — 2026-05-03
 
 ### Highlights
@@ -483,6 +514,7 @@ See `docs/MIGRATION_v2_to_v3.md` for client upgrade instructions.
 
 See `git log` for the v2.x changes; this CHANGELOG was introduced in v3.0.0.
 
+[4.8.1]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.8.1
 [4.8.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.8.0
 [4.7.1]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.7.1
 [4.7.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.7.0

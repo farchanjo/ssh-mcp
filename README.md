@@ -1,12 +1,12 @@
 # ssh-mcp
 
-[![Version](https://img.shields.io/badge/version-4.8.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-4.8.1-blue.svg)]()
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
-[![Tests](https://img.shields.io/badge/lib%20tests-1168%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/lib%20tests-1172%20passing-brightgreen.svg)]()
 
 > [!CAUTION]
 > This is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). Rewritten from scratch — different SSH library (`russh` 0.55), different MCP transport (`rmcp` 1.6), different threading model, lock-free hot-path state, full Hexagonal (Ports + Adapters) layout.
@@ -28,7 +28,7 @@ ssh-mcp-stdio                              # stdio transport (recommended for lo
 ssh-mcp                                    # HTTP transport on 0.0.0.0:8000/
 ```
 
-## Highlights (v4.8.0)
+## Highlights (v4.8.1)
 
 | Surface | Count | Notes |
 |:---|:---:|:---|
@@ -39,7 +39,7 @@ ssh-mcp                                    # HTTP transport on 0.0.0.0:8000/
 | RFC 6570 resource templates | **4** (5 with `port_forward`) | Advertised on `resources/templates/list` |
 | Mutating tools wrapped by idempotency cache | **15** | Dedup via `_meta.idempotency_key` |
 | Wire error tags | **14 + 1** | All live as of v4.6, plus v4.7 `IDEMPOTENCY_KEY_TOO_LONG` |
-| Lib tests | **1168** | Plus 2 integration, 11 v4.7 pytest suites, 4 stress scripts |
+| Lib tests | **1172** | Plus 2 integration, 11 v4.7 pytest suites, v4.8.1 transfer-progress integration, 4 stress scripts |
 
 The text channel is byte-identical to v3.0.0 / v4.0.x / v4.5 / v4.6 / v4.7. The v4.7 `structured_content` JSON channel sits next to it. v4.8 adds typed schema *advertisement* on every tool's `tools/list` metadata — runtime payloads unchanged. Hosts walking the Markdown body keep working without modification.
 
