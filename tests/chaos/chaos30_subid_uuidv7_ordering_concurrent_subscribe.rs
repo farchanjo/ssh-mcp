@@ -18,9 +18,11 @@ use uuid::Uuid;
 
 const SUBSCRIBES: u32 = 100;
 
-/// `UUIDv7` id generator (the production [`UuidIds`] adapter uses
-/// `Uuid::new_v4`; v5 contracts prefer v7 for time-ordering of
-/// `SubId`).
+/// `UUIDv7` id generator. As of v5 the production [`UuidIds`]
+/// adapter at `src/adapters/id_generator/uuid.rs` also mints v7 ids
+/// — the chaos30 fixture lives on as a deliberate, ADR-0004-pinned
+/// reference so this test still asserts the contract independently
+/// of the production wiring.
 #[derive(Debug, Default)]
 struct UuidV7Ids;
 
