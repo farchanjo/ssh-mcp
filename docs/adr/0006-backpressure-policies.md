@@ -4,6 +4,8 @@
 
 Proposed (v5.0.0). Implementation tracked under Phase 2 of the v5 roadmap. Depends on ADR 0004 (Channel Mux).
 
+**Amendment 1 (v5.1.0 — proposed):** Adds byte-threshold flush trigger to the debouncer fronteira plus per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe`. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold** and switches env-var interface from raw `*_MS`/`*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy `*_MS` aliases remain accepted for one minor with a `DEPRECATED:` log nudge. See [Byte-threshold flush trigger](#byte-threshold-flush-trigger) and [Per-call overrides on `ssh_subscribe`](#per-call-overrides-on-ssh_subscribe).
+
 ## Context
 
 ```mermaid
@@ -113,7 +115,7 @@ stateDiagram-v2
 |---|---|---|---|
 | russh recv | TCP window | n/a | Backpressure propagates to remote sshd. |
 | ring buffer | `max_buffer_size` head-drop + `compensate_truncation` | `SSH_SHELL_MAX_BUFFER`, `SSH_COMMAND_MAX_BUFFER_SIZE` | Cursor monotonicity preserved; head bytes lost. |
-| debouncer | 50 ms coalesce, 1 s force flush, 30 s keepalive | `SSH_NOTIFY_DEBOUNCE_MS`, `SSH_NOTIFY_FORCE_FLUSH_MS`, `SSH_NOTIFY_KEEPALIVE_S` | One outbound notification per window regardless of input rate. |
+| debouncer | 200 ms coalesce, 1 s force flush, 30 s keepalive, 64 KiB byte-threshold | `SSH_NOTIFY_DEBOUNCE`, `SSH_NOTIFY_FORCE_FLUSH`, `SSH_NOTIFY_KEEPALIVE`, `SSH_NOTIFY_FLUSH_BYTES` (also per-call `debounce` / `flush_bytes` on `ssh_subscribe`) | Flush whichever fires first: debounce window expiry, force-flush tick, keepalive tick, **or** accumulated bytes since last broadcast crossing `SSH_NOTIFY_FLUSH_BYTES`. |
 | **lane mpsc (per sub_id)** | `Snapshot` | `SSH_LAG_POLICY_DEFAULT`, per-call `lag_policy` | Per LagPolicy table above. |
 | **mux mpsc (global)** | bounded; round-robin yields when full | `SSH_MUX_BUFFER` (default 8192) | Mux yields back to dispatcher via `try_send` failure handling; lane producer detects this and follows its lag policy. |
 | stdout writer | OS pipe buffer; `SIGPIPE` triggers daemon shutdown grace | n/a | Daemon detects pipe broken, drains pending events, exits cleanly. |
@@ -146,6 +148,95 @@ The global mux mpsc capacity is `SSH_MUX_BUFFER` (default 8192). When full:
 2. The mux drain loop is wakeup-driven; no spinning. When the outbound writer drains, it `notify_one` on the mux waker, and lanes resume.
 3. If the outbound writer is genuinely stuck (e.g. NDJSON consumer paused), every lane's `Snapshot` rebuild will produce identical "drop and re-snapshot on resume" behaviour — no deadlock, no unbounded growth.
 
+### Byte-threshold flush trigger
+
+The original debouncer (Phase 2) is purely time-driven: every `(kind, resource_id)` flushes on debounce expiry, force-flush tick, or keepalive tick. Bursty producers that emit ≥8 KiB inside a single 50 ms debounce window therefore wait the full window before subscribers see anything — acceptable for chat output, painful for compile logs and `tail -f` of busy logs.
+
+Amendment 1 adds a fourth wakeup source: **whenever the bytes accumulated for `(kind, resource_id)` since the last broadcast cross `SSH_NOTIFY_FLUSH_BYTES`, the debouncer broadcasts immediately and resets the byte counter.** First trigger to fire wins; the others rearm after broadcast.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    P["producer<br/>(russh / SFTP)"]
+    R["record_bytes(kind, id, n)<br/>fetch_add → AtomicUsize"]
+    C{"counter ≥<br/>SSH_NOTIFY<br/>_FLUSH_BYTES?"}
+    W["wake() (debounce)"]
+    F["flush_now.notify_one()<br/>(immediate)"]
+    D["debouncer select!"]
+    B["broadcast()<br/>+ reset counter"]
+
+    P --> R --> C
+    C -- no --> W --> D
+    C -- yes --> F --> D
+    D --> B
+
+    classDef ext fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef ours fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef hot fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    class P ext
+    class R,W,D,B ours
+    class C,F hot
+```
+
+**Knobs.**
+
+| Env var | Default | Range | Parse | Behaviour |
+|---|---|---|---|---|
+| `SSH_NOTIFY_FLUSH_BYTES` | `64k` (65 536) | `[1k, 1m]` | bytesize string (`512`, `8k`, `64k`, `1m`, `2mb`, `1mib`) → `u64` bytes | Accumulated bytes per resource that force an immediate flush. `0` disables byte-threshold (time-only debouncer, v5.0 behaviour). |
+| `SSH_NOTIFY_DEBOUNCE` | `200ms` | `[5ms, 5s]` | duration string (`50ms`, `200ms`, `1s`, `1500ms`) → `Duration` | Coalesce window. Per-call override lands at the same fronteira (debouncer). Replaces `SSH_NOTIFY_DEBOUNCE_MS` (deprecated alias still accepted as raw `u64` ms for one minor). |
+| `SSH_NOTIFY_FORCE_FLUSH` | `1s` | `[100ms, 60s]` | duration string | Hard ceiling between broadcasts. Replaces `SSH_NOTIFY_FORCE_FLUSH_MS`. |
+| `SSH_NOTIFY_KEEPALIVE` | `30s` | `[5s, 300s]` | duration string | Idle ping cadence. Replaces `SSH_NOTIFY_KEEPALIVE_S`. |
+
+**Interface rationale.** Operators tuning bursty workloads compare values in human terms (`200ms` not `200`, `64k` not `65536`). Raw integer env vars stay backward-compatible for one minor (`SSH_NOTIFY_DEBOUNCE_MS=50` still parses as `Duration::from_millis(50)`); a `DEPRECATED:` log line nudges migration. Parser pseudo-rules:
+
+- **Duration** — uses `humantime::parse_duration` semantics: bare integer with unit suffix `ms`/`s`/`m`/`h`. Bare integer (no unit) is rejected on the new env vars to avoid the "is this ms or s?" ambiguity that bit operators on `SSH_NOTIFY_KEEPALIVE_S` (seconds) vs. `SSH_NOTIFY_DEBOUNCE_MS` (ms).
+- **Bytesize** — uses `bytesize::ByteSize::from_str` semantics: bare integer = bytes; suffixes `k`/`m`/`g` = decimal (1k = 1000); `kib`/`mib`/`gib` = binary (1kib = 1024); `kb`/`mb` accepted as decimal aliases. Default and clamps quoted in **kib/mib** for predictability (`64k` parses as 65 000 bytes, `64kib` as 65 536; the canonical default is `64kib`, but the docs and CLI examples use `64k` because LLM-host configs are forgiving).
+
+### Per-call overrides on `ssh_subscribe`
+
+Both knobs are also exposed as optional fields on the `ssh_subscribe` tool. Accept either typed primitives or the same human-readable strings as the env vars — the LLM picks whichever its prompt happens to surface:
+
+```jsonc
+{
+  "name": "ssh_subscribe",
+  "arguments": {
+    "uri": "shell://<id>/output",
+    // Either form is valid:
+    "flush_bytes": "16k",         // string → bytesize parser → 16 000 bytes
+    // "flush_bytes": 16384,      // integer → raw bytes
+    "debounce":   "25ms"          // string → humantime parser → Duration
+    // "debounce":   { "ms": 25 } // structured form also accepted
+    // "debounce_ms": 25          // legacy alias kept for one minor
+  }
+}
+```
+
+**Precedence (highest wins):** tool argument → env var → compile-time default.
+
+**Schema contract.** JSON Schema declares `flush_bytes: oneOf[integer, string-pattern]` and `debounce: oneOf[string-pattern, {ms: integer}]` so structured-output models do not need free-form regex. Server-side, both branches funnel through the same `parse_bytesize` / `parse_duration` helpers used by the env-var loaders — single canonical source of validation.
+
+**Scope.** A per-call override is recorded on the **resource debouncer**, not on the lane. Because the debouncer is shared across all subscribers of `(kind, resource_id)`, the **first subscriber's override wins for the lifetime of the debouncer**. Subsequent subscribers may pass different values, but they are stored as a hint only and surface a wire-level `HINT: NOTIFY_OVERRIDE_IGNORED` informational line — the debouncer is not reconfigured mid-flight to avoid races on the byte counter and the `tokio::time::interval` ticks.
+
+When the last subscriber detaches and the debouncer task exits (Phase 1 lifecycle policy `release_when_no_subs = true`) or the resource closes, the next `ssh_subscribe` resets the values from the new caller's override. This matches the existing "first subscriber owns the resource debouncer" invariant from v4.
+
+**Validation.** Tool arguments are clamped to the same `[min, max]` range as the env vars; out-of-range values return `[CFG_INVALID]` with `DETAIL` pointing at the violated field and the parsed canonical form (e.g. `DETAIL: debounce "10000ms" exceeds max 5s; clamp or pass <=5s`). `flush_bytes: 0` (or `"0"`) is accepted — disables byte-threshold for this resource. `debounce` below 5 ms is rejected. Parser failures (`"24x"`, `"fast"`, `"-1k"`) return `[CFG_PARSE]` with the offending substring quoted.
+
+**Stats.** `ssh_sub_stats` returns the *effective* values (`effective_flush_bytes`, `effective_debounce_ms`) for the resource the lane attaches to, so the LLM can verify its override took effect or reason about why it was overridden by a prior subscriber.
+
+**Implementation contract.**
+
+- `MemoryRegistry` adds `bytes_since_flush: DashMap<ResourceKey, AtomicUsize>` and `flush_now: DashMap<ResourceKey, Arc<Notify>>`.
+- New port method on `SubscriberRegistryPort`: `record_bytes(kind, resource_id, n)`. Producers (russh shell/exec stdout, SFTP transfer progress) call this every time they append to the resource's ring buffer. The counter is incremented with `fetch_add(Relaxed)`; on cross of threshold the producer also calls `flush_now.notify_one()`.
+- `debouncer_task` `select!` gains a fourth biased branch consuming `flush_now.notified()`. The branch broadcasts immediately and `store(0, Relaxed)` on the byte counter — no debounce sleep. The other branches (`waker`, `force_flush_tick`, `keepalive_tick`) also reset the counter on broadcast so subsequent crossings are measured from a clean baseline.
+- `broadcast()` is the single reset point. Any concurrent `record_bytes` call between threshold cross and reset is bounded above by `SSH_NOTIFY_FLUSH_BYTES * 2`; subsequent flushes converge.
+- Memory ordering: byte counter uses `Relaxed` everywhere (it is a coalescing hint, not a synchronisation primitive). Cursor and seq monotonicity remain governed by the existing `byte_cursor: AtomicU64` on the lane.
+
+**LagPolicy interaction.** None. Byte-threshold lives at fronteira 3 (debouncer); LagPolicy lives at fronteira 4 (lane mpsc). A byte-triggered flush enqueues to the lane mpsc exactly like a time-triggered one; the lane's policy takes over on `try_send` failure.
+
+**Counter on `SubscriberStats`.** Add `byte_triggered_flushes: AtomicU64` (per-resource fan-out, attributed to every lane on the resource — so one byte-triggered broadcast bumps the counter on every active sub on that URI). Exposed via `ssh_sub_stats` and aggregated in `ssh_daemon_stats`.
+
+**Disable path.** `SSH_NOTIFY_FLUSH_BYTES=0` skips the `record_bytes` increment branch entirely (early return) and the debouncer never installs the `flush_now` branch in `select!`. Zero overhead vs. v5.0 behaviour.
+
 ### Filter pipeline interaction
 
 When a lane has a filter (regex / level), filtering happens **before** the mpsc enqueue. A lane with a strict filter that excludes 99 % of events will rarely fill its mpsc; backpressure stats will reflect the filtered rate, not the raw production rate.
@@ -158,12 +249,16 @@ When a lane has a filter (regex / level), filtering happens **before** the mpsc 
 - **No deadlocks.** Every fronteira has a documented overflow strategy. The daemon never spins on `send` indefinitely; `BlockSlow` has a timeout escape hatch.
 - **Self-attributing failures.** A laggy consumer shows up in its own stats without affecting peers. Operators see exactly which sub_id is the bottleneck.
 - **Snapshot is the safe default.** A consumer that does nothing special inherits zero-loss-with-gap-bridging behaviour. The ring buffer absorbs all reasonable transient slowness.
+- **Byte-threshold flush bounds tail-of-the-window latency.** A producer emitting at 1 MiB/s no longer waits 200 ms (200 KiB queued) before the consumer sees the first byte — first 64 KiB triggers an immediate broadcast (~64 ms at that rate). Bursty workloads (compile output, `tail -f`, log floods) become viable on default knobs. Quiet workloads (chat shell, single-line prompts) coalesce on the 200 ms window and pay for ≤1 notification every 200 ms regardless of input rate.
+- **Human-readable knobs.** `64k` and `200ms` are immediately legible in tool calls, env files, and runbooks — fewer "ms or s?" tickets, easier to copy from a Grafana panel into a tool argument.
 
 ### Negative
 
 - **More state per lane.** Eight atomic counters + the `LagPolicy` + the filter regex add ~200 bytes of state per sub_id. At 65 K subs that's 13 MB of stats, dominated by the filter compiled regex. Acceptable.
 - **Snapshot rebuild is O(buf_size).** A consumer recovering from drop pays a constant cost per gap. With 1 MB buffers the cost is sub-ms; with 16 MB buffers it can be tens of ms. Operators that need lower-latency recovery tune `SSH_SHELL_MAX_BUFFER` down.
 - **Operator-visible warnings.** `LAG_BACKPRESSURE` and `LAG_DETECTED` markers are wire-level events; misconfigured consumers will produce a steady stream until tuned.
+- **Higher notification rate on bursty workloads.** A 10 MiB/s log producer emits ≥160 byte-triggered broadcasts per second (64 KiB threshold) vs. the previous ceiling of `1000ms / 200ms` = 5/s. rmcp transport and the consumer must keep up; otherwise the lane mpsc fills and the LagPolicy kicks in. Tune up with `SSH_NOTIFY_FLUSH_BYTES=256k` for chatty resources or set `0` to disable entirely.
+- **One atomic per resource, not per lane.** Byte counter lives on the registry keyed by `(kind, resource_id)`, not on each `MultiplexLane`. Three subscribers on the same URI share one counter; a single byte cross fans out to all three. This is the right granularity (debouncer is per-resource) but means stats attribution under "who triggered this flush" is not 1:1 with sub_id — see counter note above.
 
 ### Neutral
 
