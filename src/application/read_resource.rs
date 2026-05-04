@@ -86,6 +86,11 @@ pub enum ParseError {
     BadScheme(String),
     /// The path portion does not contain a non-empty resource id.
     MissingId,
+    /// The id segment contains characters outside the safe charset
+    /// (`[A-Za-z0-9_-]+`). Rejecting unsafe ids at parse time
+    /// prevents downstream URI matching, debouncer-key collisions, and
+    /// shell-escaping pitfalls.
+    BadIdCharset(String),
     /// The sub-path does not match the scheme (e.g. `shell://abc/progress`).
     BadSubPath {
         /// Expected sub-path.
@@ -105,6 +110,10 @@ impl fmt::Display for ParseError {
                 "unsupported scheme {scheme:?}: expected one of shell, command, transfer, session, forward, serial"
             ),
             Self::MissingId => write!(f, "resource URI is missing the resource id segment"),
+            Self::BadIdCharset(id) => write!(
+                f,
+                "resource id {id:?} contains unsafe characters: only [A-Za-z0-9_-] allowed"
+            ),
             Self::BadSubPath { expected, got } => {
                 write!(f, "expected sub-path {expected:?} but found {got:?}")
             }
@@ -164,6 +173,9 @@ pub fn parse_uri(uri: &str) -> Result<ParsedUri, ParseError> {
     if id.is_empty() {
         return Err(ParseError::MissingId);
     }
+    if !is_safe_id(id) {
+        return Err(ParseError::BadIdCharset(id.to_string()));
+    }
     let expected = sub_path_of(kind);
     if sub_path != expected {
         return Err(ParseError::BadSubPath {
@@ -177,6 +189,15 @@ pub fn parse_uri(uri: &str) -> Result<ParsedUri, ParseError> {
         id: id.to_string(),
         cursor,
     })
+}
+
+/// Reject URI ids that contain anything other than `[A-Za-z0-9_-]`.
+/// Keeps debouncer keys, shell escaping, log lines, and downstream URI
+/// matching predictable. `UUIDv7` ids and the legacy `snake_case` ids
+/// emitted by the system fit comfortably inside this charset.
+fn is_safe_id(id: &str) -> bool {
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn parse_scheme(scheme: &str) -> Result<ResourceKind, ParseError> {
@@ -1011,6 +1032,7 @@ mod tests {
             ResourceKind::Transfer,
             ResourceKind::Session,
             ResourceKind::Forward,
+            ResourceKind::Serial,
         ] {
             let uri = canonical_uri(kind, "abc");
             let parsed = parse_uri(&uri).expect("parse");
@@ -1018,6 +1040,35 @@ mod tests {
             assert_eq!(parsed.id, "abc");
             assert_eq!(parsed.cursor, CursorMode::Snapshot);
         }
+    }
+
+    #[test]
+    fn parse_uri_rejects_unsafe_id_charset() {
+        for bad in [
+            "shell://id with spaces/output",
+            "command://nonexistent_with_unicode_😀_/output",
+            "shell://id\nnewline/output",
+            "command://id'quote/output",
+            "shell://id;semicolon/output",
+            "command://id..dotdot/output",
+        ] {
+            let err = parse_uri(bad).expect_err("must error");
+            assert!(
+                matches!(err, ParseError::BadIdCharset(_)),
+                "expected BadIdCharset for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_uri_accepts_uuidv7_and_legacy_id_charsets() {
+        // UUIDv7-style id (lowercase hex + dashes).
+        let parsed = parse_uri("shell://01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab/output")
+            .expect("parse uuidv7");
+        assert_eq!(parsed.id, "01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab");
+        // Legacy snake-case + numeric id.
+        let parsed = parse_uri("command://cmd_42-abc/output").expect("parse legacy");
+        assert_eq!(parsed.id, "cmd_42-abc");
     }
 
     #[test]
