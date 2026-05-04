@@ -26,7 +26,8 @@ fn build_lane(buffer: usize, policy: LagPolicy) -> Arc<SubscriberLaneAdapter<Uui
         lag_policy: policy,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: buffer, peer: None,
+        buffer_size: buffer,
+        peer: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

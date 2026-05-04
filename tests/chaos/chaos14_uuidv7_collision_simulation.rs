@@ -67,7 +67,8 @@ async fn chaos14_uuid_collision_does_not_corrupt_registry() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4, peer: None,
+        buffer_size: 4,
+        peer: None,
     };
 
     let first = adapter

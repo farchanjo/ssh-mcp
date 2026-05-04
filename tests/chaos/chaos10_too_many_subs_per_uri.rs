@@ -24,7 +24,8 @@ async fn chaos10_too_many_subs_per_uri_surfaces_typed_error() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4, peer: None,
+        buffer_size: 4,
+        peer: None,
     };
 
     // Saturate the URI cap.
