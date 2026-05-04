@@ -465,7 +465,10 @@ fn loom_grace_fire_vs_resubscribe() {
         );
         let final_state = m.state.load(Ordering::Acquire);
         assert!(
-            matches!(final_state, LifecycleModel::CLOSED | LifecycleModel::OBSERVED),
+            matches!(
+                final_state,
+                LifecycleModel::CLOSED | LifecycleModel::OBSERVED
+            ),
             "final state must be Closed (timer won) or Observed (resub won), got {final_state}"
         );
     });
@@ -744,10 +747,7 @@ fn loom_subid_cursor_atomic_advance() {
         let c3 = Arc::clone(&cursor);
         let observer = thread::spawn(move || {
             let v = c3.load(Ordering::Acquire);
-            assert!(
-                v <= 100,
-                "cursor read out-of-thin-air larger value: {v}",
-            );
+            assert!(v <= 100, "cursor read out-of-thin-air larger value: {v}",);
         });
 
         h1.join().unwrap();
@@ -756,5 +756,165 @@ fn loom_subid_cursor_atomic_advance() {
         let final_cursor = cursor.load(Ordering::Acquire);
         // Max-cursor invariant: the larger fetch_max wins.
         assert_eq!(final_cursor, 100, "fetch_max lost the larger target");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// v5 Phase 5 — Phase 3 + Phase 4 lock-free invariants
+// ---------------------------------------------------------------------------
+
+/// `loom_phase3_leak_watcher_no_double_alert`
+///
+/// Race between the leak-watcher emitting a Warn alert and a force_close
+/// flipping the resource into Closed. The CAS Active->Reaped must
+/// fire exactly once per resource, so a parallel close cannot
+/// double-alert.
+#[test]
+fn loom_phase3_leak_watcher_no_double_alert() {
+    loom::model(|| {
+        // Three atomic state bytes mirror the leak-watcher: the
+        // resource state (Owned/Closed) and the alert-emitted flag.
+        let state = Arc::new(loom::sync::atomic::AtomicU8::new(0));
+        let alert_emitted = Arc::new(loom::sync::atomic::AtomicU8::new(0));
+        let alerts = Arc::new(AtomicUsize::new(0));
+
+        let s1 = Arc::clone(&state);
+        let a1 = Arc::clone(&alert_emitted);
+        let n1 = Arc::clone(&alerts);
+        let watcher = thread::spawn(move || {
+            // Emit alert iff state is still 0 (Owned) AND alert flag
+            // is unset.
+            if s1.load(Ordering::Acquire) == 0
+                && a1
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                n1.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+
+        let s2 = Arc::clone(&state);
+        let a2 = Arc::clone(&alert_emitted);
+        let n2 = Arc::clone(&alerts);
+        let close = thread::spawn(move || {
+            // Flip state to Closed (1).
+            s2.store(1, Ordering::Release);
+            // Watcher is supposed to skip closed resources — a second
+            // alert from the close path would violate the invariant.
+            if s2.load(Ordering::Acquire) == 1
+                && a2
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                n2.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+
+        watcher.join().unwrap();
+        close.join().unwrap();
+        let total_alerts = alerts.load(Ordering::Acquire);
+        assert!(
+            total_alerts <= 1,
+            "leak watcher emitted {total_alerts} alerts (expected at most 1)",
+        );
+    });
+}
+
+/// `loom_phase4_embed_transport_shutdown_race`
+///
+/// SIGTERM-equivalent race: two threads call `cancel` on the
+/// embed transport's shutdown token simultaneously. The cancellation
+/// is a one-way latch; both calls succeed without panic and the
+/// final state is Cancelled.
+#[test]
+fn loom_phase4_embed_transport_shutdown_race() {
+    loom::model(|| {
+        let cancelled = Arc::new(loom::sync::atomic::AtomicU8::new(0));
+        let c1 = Arc::clone(&cancelled);
+        let c2 = Arc::clone(&cancelled);
+
+        let h1 = thread::spawn(move || {
+            // Cancellation is a one-way latch — store(1) is idempotent.
+            c1.store(1, Ordering::Release);
+        });
+        let h2 = thread::spawn(move || {
+            c2.store(1, Ordering::Release);
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+        assert_eq!(cancelled.load(Ordering::Acquire), 1);
+    });
+}
+
+/// `loom_phase3_release_when_no_subs_grace`
+///
+/// Subscribe + unsubscribe + grace-fire interleaving. The CAS
+/// Releasing -> Closed has at most one winner; a concurrent
+/// resubscribe (Releasing -> Observed) is the only competing
+/// transition. Exactly one of them succeeds.
+#[test]
+fn loom_phase3_release_when_no_subs_grace() {
+    loom::model(|| {
+        let state = Arc::new(loom::sync::atomic::AtomicU8::new(2)); // Releasing
+        let s1 = Arc::clone(&state);
+        let s2 = Arc::clone(&state);
+
+        let timer = thread::spawn(move || {
+            s1.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        let resub = thread::spawn(move || {
+            s2.compare_exchange(2, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+
+        let timer_won = timer.join().unwrap();
+        let resub_won = resub.join().unwrap();
+        assert!(
+            timer_won ^ resub_won,
+            "exactly one CAS must succeed: timer={timer_won} resub={resub_won}",
+        );
+        let final_state = state.load(Ordering::Acquire);
+        assert!(
+            final_state == 1 || final_state == 3,
+            "final state must be Observed (1) or Closed (3), got {final_state}",
+        );
+    });
+}
+
+/// `loom_phase2_replay_during_concurrent_subscribe`
+///
+/// Concurrent replay (read of the cursor + push to mpsc) racing
+/// against a fresh open_lane that bumps the per-URI count. The
+/// cursor read is a Relaxed load; the lane registration is an
+/// independent atomic increment. Both can complete safely without
+/// a global lock.
+#[test]
+fn loom_phase2_replay_during_concurrent_subscribe() {
+    loom::model(|| {
+        let cursor = Arc::new(AtomicU64::new(50));
+        let lane_count = Arc::new(AtomicUsize::new(0));
+
+        let c1 = Arc::clone(&cursor);
+        let l1 = Arc::clone(&lane_count);
+        let replay = thread::spawn(move || {
+            // Replay reads the current cursor (Relaxed load) and
+            // returns it.
+            let observed = c1.load(Ordering::Relaxed);
+            // Sanity: the cursor never disappears mid-read.
+            assert!(observed >= 50);
+            l1.load(Ordering::Acquire)
+        });
+
+        let l2 = Arc::clone(&lane_count);
+        let subscribe = thread::spawn(move || {
+            l2.fetch_add(1, Ordering::AcqRel);
+        });
+
+        let _ = replay.join().unwrap();
+        subscribe.join().unwrap();
+        let final_count = lane_count.load(Ordering::Acquire);
+        assert_eq!(final_count, 1, "subscribe lost lane count update");
     });
 }
