@@ -24,7 +24,7 @@ async fn chaos18_replay_during_producer_keeps_cursor_monotonic() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 8,
+        buffer_size: 8, peer: None,
     };
     let sub_id = adapter
         .open_lane(

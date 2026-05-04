@@ -26,7 +26,7 @@ fn build_lane(
         lag_policy: policy,
         lifetime: SubscriptionLifetime::Manual,
         filter,
-        buffer_size: buffer,
+        buffer_size: buffer, peer: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -35,7 +35,7 @@ proptest! {
             lag_policy: LagPolicy::Snapshot,
             lifetime: SubscriptionLifetime::Manual,
             filter: FilterRule::None,
-            buffer_size: 64,
+            buffer_size: 64, peer: None,
         };
         let sub_id = rt.block_on(adapter.open_lane(
             URI.to_string(),

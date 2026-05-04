@@ -24,7 +24,7 @@ async fn chaos22_drop_newest_keeps_oldest_events_dropping_overflow() {
         lag_policy: LagPolicy::DropNewest,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: CAPACITY,
+        buffer_size: CAPACITY, peer: None,
     };
     let sub_id = adapter
         .open_lane(

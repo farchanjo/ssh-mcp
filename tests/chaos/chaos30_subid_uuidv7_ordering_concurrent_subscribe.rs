@@ -51,7 +51,7 @@ async fn chaos30_uuidv7_concurrent_subscribe_unique_and_time_ordered() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4,
+        buffer_size: 4, peer: None,
     };
 
     let mut handles = Vec::with_capacity(SUBSCRIBES as usize);

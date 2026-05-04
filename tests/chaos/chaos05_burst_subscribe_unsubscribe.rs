@@ -24,7 +24,7 @@ async fn chaos05_burst_subscribe_unsubscribe_no_leak() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4,
+        buffer_size: 4, peer: None,
     };
 
     for _ in 0..CYCLES {
