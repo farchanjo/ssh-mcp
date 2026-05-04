@@ -1411,7 +1411,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and observing its output. Prefer subscribing to `command://<COMMAND_ID>/output` over polling (see ssh_subscribe).\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: target of ssh_subscribe `command://<COMMAND_ID>/output` (push, preferred) or ssh_get_command_output (poll fallback). Also accepted by ssh_cancel_command.\n\nWorkflow (push-first, recommended):\n1. Call ssh_execute with the SESSION_ID and command line.\n2. ssh_subscribe uri=command://<COMMAND_ID>/output to stream stdout/stderr without polling.\n3. ssh_unsubscribe sub_id=... when the command terminates (or set release_when_no_subs=true).\n4. Optional ssh_cancel_command to interrupt.\n\nWorkflow (poll fallback):\n1. ssh_execute, then ssh_get_command_output wait=true in a loop.\n\nOverlap guidance:\n- For atomic short commands (single round-trip), prefer ssh_run.\n- For >=3 sequential commands on the same session, prefer ssh_execute_batch (saves ~70% wire vs N x ssh_execute).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and observing its output. Prefer subscribing to `command://<COMMAND_ID>/output` over polling (see ssh_subscribe).\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: target of ssh_subscribe `command://<COMMAND_ID>/output` (push, preferred) or ssh_get_command_output (poll fallback). Also accepted by ssh_cancel_command.\n\nWorkflow (push-first, recommended):\n1. Call ssh_execute with the SESSION_ID and command line.\n2. ssh_subscribe uri=command://<COMMAND_ID>/output to stream stdout/stderr without polling.\n3. ssh_unsubscribe sub_id=... when the command terminates (or set release_when_no_subs=true).\n4. Optional ssh_cancel_command to interrupt.\n\nWorkflow (poll fallback):\n1. ssh_execute, then ssh_get_command_output wait=true in a loop.\n\nOverlap guidance:\n- For atomic short commands, STILL prefer ssh_execute on a session opened with ssh_connect(reuse=auto). Avoid ssh_run unless you will never touch this host again — it pays a fresh handshake every call.\n- For >=3 sequential commands on the same session, prefer ssh_execute_batch (saves ~70% wire vs N x ssh_execute).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
         output_schema = schema_for_type::<SshExecuteResult>()
     )]
     async fn ssh_execute(
@@ -1982,7 +1982,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Connect, execute a short command synchronously, and (by default) disconnect — all in one call.\n\nWhen to use:\n- Short atomic commands (uptime, hostname, cat /etc/release).\n- Smaller LLMs that prefer not to choreograph connect -> execute -> wait by hand.\n\nOverlap guidance:\n- For >1 command on the same host, prefer ssh_connect (reuse=auto) + ssh_execute (subscribe-first) — saves N-1 SSH handshakes vs N x ssh_run.\n- For a fixed pipeline of >=3 sequential commands, prefer ssh_execute_batch — single round-trip, ~70% wire savings.\n- For long-running output, ssh_execute + ssh_subscribe `command://<id>/output` streams without poll loops.\n\nWorkflow:\n1. ssh_run mints (or reuses) a session via reuse=auto.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
+        description = "PENALIZED FALLBACK — connect, execute one command, disconnect, all in one call. Pays a full SSH handshake (200-2000 ms) and tears down the session on every call. Use ONLY when you genuinely cannot keep state across calls.\n\nDO NOT USE WHEN:\n- You will touch the same host more than once. Open a session with ssh_connect (reuse=auto) and reuse it.\n- You expect any follow-up: tail logs, retry, run a sibling command, open a shell. Re-handshaking throws away cwd, env, agent forwarding, multiplexed channels, and any subscription you might want next.\n- The command emits more than a few KiB of output. Stream via ssh_execute + ssh_subscribe `command://<id>/output` instead.\n\nPreferred path (use this 95 %% of the time):\n1. ssh_connect address username [agent_id] reuse=auto  -> SESSION_ID\n2. ssh_execute SESSION_ID command  -> COMMAND_ID\n3. ssh_subscribe uri=command://<COMMAND_ID>/output  -> stream stdout/stderr\n4. ssh_unsubscribe sub_id=...  (or release_when_no_subs=true on step 2)\n5. Keep SESSION_ID for the next call. ssh_disconnect only at the end of the workload.\n\nWhen ssh_run is acceptable:\n- A truly one-shot probe from a context that will never touch this host again (e.g. capability sniffing across many distinct hosts, with N=1 command per host).\n- A test harness asserting end-to-end happy path in a single call.\n\nCost: 1 SSH handshake (200-2000 ms) + 1 channel + (optional) full session teardown. Multiply this by every call you make. Two ssh_run calls to the same host cost as much as one ssh_connect + two ssh_execute calls.\n\nWorkflow (if you must):\n1. ssh_run mints (or with reuse=auto, reuses) a session.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down — this is the expensive bit.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.",
         output_schema = schema_for_type::<SshRunResult>()
     )]
     async fn ssh_run(
@@ -2016,7 +2016,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_execute per command dominates. Saves ~70% wire vs N x ssh_execute when N>=3.\n\nOverlap guidance:\n- Atomic single command across new session: prefer ssh_run.\n- Long-running streaming command: prefer ssh_execute + ssh_subscribe `command://<id>/output`.\n- Truly parallel commands: open multiple ssh_execute (this batch is serial by design).\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
+        description = "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_execute per command dominates. Saves ~70% wire vs N x ssh_execute when N>=3.\n\nOverlap guidance:\n- Atomic single command on a host you will not revisit: ssh_run is the only justification, and even then only N=1. For any reuse, do ssh_connect(reuse=auto) + ssh_execute.\n- Long-running streaming command: prefer ssh_execute + ssh_subscribe `command://<id>/output`.\n- Truly parallel commands: open multiple ssh_execute (this batch is serial by design).\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
         output_schema = schema_for_type::<SshExecuteBatchResult>()
     )]
     async fn ssh_execute_batch(
@@ -4119,15 +4119,19 @@ const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 21 tools, 5 push streams \
 block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
 structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
-Happy paths:\n\
-1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
-2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
-ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
-3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+Happy paths (PREFERRED — keep sessions alive, never re-handshake):\n\
+1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_execute. \
+Then ssh_subscribe command://<id>/output for push. ssh_unsubscribe when done. \
+Reuse the SESSION_ID for every follow-up call against this host.\n\
+2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
 the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. \
 Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
 resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
-4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
+NEVER touch this host again. Pays a full handshake every call and tears the \
+session down. Two ssh_run calls cost as much as one ssh_connect + two \
+ssh_execute calls. Default to path 1.\n\
 \n\
 Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
 lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
@@ -4142,15 +4146,19 @@ const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 20 tools, 4 push streams \
 markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
 structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
-Happy paths:\n\
-1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
-2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
-ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
-3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+Happy paths (PREFERRED — keep sessions alive, never re-handshake):\n\
+1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_execute. \
+Then ssh_subscribe command://<id>/output for push. ssh_unsubscribe when done. \
+Reuse the SESSION_ID for every follow-up call against this host.\n\
+2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
 prompt arrives within 100ms). Then resources/subscribe shell://<SHELL_ID>/output. \
 Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
 resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
-4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
+4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will \
+NEVER touch this host again. Pays a full handshake every call and tears the \
+session down. Two ssh_run calls cost as much as one ssh_connect + two \
+ssh_execute calls. Default to path 1.\n\
 \n\
 Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
 lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
