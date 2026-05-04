@@ -26,6 +26,7 @@
 //!   wires the v3 `_meta` cursor envelope.
 
 pub mod args;
+pub mod error_detail;
 pub mod helpers;
 pub mod idempotency;
 pub mod peer_handle;

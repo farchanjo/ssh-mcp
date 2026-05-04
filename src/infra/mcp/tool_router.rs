@@ -63,6 +63,7 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
+use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::idempotency::{
@@ -128,8 +129,9 @@ use super::server::McpSshServer;
 /// variant so the LLM can branch on it.
 pub(crate) fn render_tool_error(tool: &str, err: &DomainError) -> CallToolResult {
     let (code, reason, detail) = classify_error(err);
-    let body = format_error(tool, code, &reason, detail.as_deref());
-    let structured = format_error_structured(tool, code, &reason, detail.as_deref());
+    let merged = error_detail::with_detail(code, detail.as_deref());
+    let body = format_error(tool, code, &reason, merged.as_deref());
+    let structured = format_error_structured(tool, code, &reason, merged.as_deref());
     error_text_and_structured(body, structured)
 }
 
@@ -173,7 +175,11 @@ pub(crate) async fn render_tool_error_with_suggestions(
 ) -> CallToolResult {
     let (code, reason, detail) = classify_error(err);
     let candidates = collect_suggestions(err, lister).await;
-    let detail_with_hints = match (detail.as_deref(), render_closest_matches(&candidates)) {
+    // Compose: <static cure>; <classify_error detail>; <closest matches>.
+    // Each segment is inserted only when present; missing segments do
+    // not produce dangling separators.
+    let merged_static = error_detail::with_detail(code, detail.as_deref());
+    let detail_with_hints = match (merged_static.as_deref(), render_closest_matches(&candidates)) {
         (Some(d), Some(hint)) => Some(format!("{d}; {hint}")),
         (Some(d), None) => Some(d.to_string()),
         (None, Some(hint)) => Some(hint),
@@ -3745,7 +3751,16 @@ mod tests {
         assert_eq!(json["status"], "error");
         assert_eq!(json["code"], "EMPTY_PATTERNS");
         assert_eq!(json["reason"], "must contain >=1");
-        assert!(json["detail"].is_null());
+        // v5 Phase 3: every wire code carries a static DETAIL pedagogy
+        // line via [`crate::infra::mcp::error_detail`]; assert the cure
+        // surfaces even for codes without a per-call dynamic detail.
+        let detail = json["detail"]
+            .as_str()
+            .expect("v5 DETAIL pedagogy must populate the structured detail");
+        assert!(
+            detail.contains("patterns must contain at least one entry"),
+            "expected pedagogy line, got {detail}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -3822,7 +3837,11 @@ mod tests {
             .unwrap_or_default();
         assert!(!body.contains("closest matches:"), "body: {body}");
         let json = result.structured_content.expect("structured present");
-        assert_eq!(json["detail"], "s-missing");
+        // v5 Phase 3: DETAIL pedagogy is appended ahead of the
+        // missing-id context. The id is still present at the tail.
+        let detail = json["detail"].as_str().expect("detail present");
+        assert!(detail.contains("ssh_list_sessions"), "{detail}");
+        assert!(detail.ends_with("s-missing"), "{detail}");
     }
 
     // ---------------------------------------------------------------
