@@ -803,6 +803,8 @@ REASON: [PERMISSION_DENIED] write '/tmp/locked.csv': permission denied
 
 `DIRECTION` is uppercase (`UPLOAD` / `DOWNLOAD`). `PROGRESS` is rendered as `<integer>% (<bytes_transferred>/<total_bytes> bytes)` — raw bytes, easy to parse. v4.6 `NEXT:` emitted only on `RUNNING`; terminal statuses (`COMPLETED` / `FAILED` / `CANCELLED`) omit it.
 
+**v4.8.1 fix**: prior to v4.8.1 the `RUNNING` snapshot always reported `bytes_transferred = 0` until terminal hand-off (the streaming task incremented a live atomic but no path mirrored it to the repo entity). v4.8.1 adds a per-transfer progress watcher that consumes the `progress_tx` broadcast and syncs the repo within ~250 ms of the latest chunk, so `RUNNING` snapshots and `transfer://<id>/progress` resource reads now reflect real live bytes. The wire shape is unchanged — only the *value* of `bytes_transferred` during running snapshots is now correct.
+
 **Errors**: `TRANSFER_NOT_FOUND`. SFTP failure codes (carried in `REASON: [...]` of a `FAILED` transfer body, not a tool ERROR): `FILE_NOT_FOUND`, `PERMISSION_DENIED`, `DISK_FULL`, `CONNECTION_LOST`, `REMOTE_DIR_NOT_FOUND`, `READ_ONLY_FS`, `SFTP_PROTOCOL`, `TIMEOUT`, `IO_ERROR`.
 
 **Wire codes**: `TRANSFER_NOT_FOUND`.

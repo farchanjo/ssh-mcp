@@ -392,8 +392,10 @@ Three canonical workflows that map 1:1 to the few-shot `instructions` constant. 
    -> capture TRANSFER_ID + SIZE
 3. (Recommended) resources/subscribe { uri: "transfer://<TRANSFER_ID>/progress" }
    On notification, resources/read returns JSON with bytes_transferred / total_bytes / status.
+   Both bytes_transferred and total_bytes reflect live progress (v4.8.1) — mid-flight reads return the real
+   running value within ~250 ms of the latest chunk, not the stale 0 the pre-v4.8.1 server returned.
    OR
-   ssh_get_transfer_progress { transfer_id, wait=true } long-poll fallback.
+   ssh_get_transfer_progress { transfer_id, wait=true } long-poll fallback (also live since v4.8.1).
 4. (Optional verify) ssh_execute { command: "sha256sum <remote_path>" }
    -> ssh_get_command_output wait=true
 5. ssh_disconnect_agent { agent_id="my-agent" } when done.
