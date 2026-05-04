@@ -41,12 +41,14 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior, interval};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::adapters::config::internal::{
     resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
+use crate::domain::subscription::SubId;
 use crate::ports::notifier::{NotifierPort, PeerHandle};
 use crate::ports::subscriber_registry::{
     ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,
@@ -69,6 +71,10 @@ struct Subscriber {
     /// Stable peer identifier (mirrored from `peer.id()`; cached here so
     /// snapshots and removals do not need a virtual call).
     peer_id: PeerId,
+    /// v5 Phase 2: per-call subscriber id minted at `subscribe` time.
+    /// Lets a single peer fan out to N independent consumers — see
+    /// [ADR 0004](../docs/adr/0004-channel-mux-fairness.md).
+    sub_id: SubId,
     /// Live peer handle. Cloning the registry's snapshot also clones every
     /// `Arc<dyn PeerHandle>` (cheap pointer bump).
     peer: Arc<dyn PeerHandle>,
@@ -82,6 +88,7 @@ impl fmt::Debug for Subscriber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Subscriber")
             .field("peer_id", &self.peer_id)
+            .field("sub_id", &self.sub_id)
             .field("kind", &self.kind)
             .field("resource_id", &self.resource_id)
             .finish_non_exhaustive()
@@ -90,6 +97,7 @@ impl fmt::Debug for Subscriber {
 
 type ResourceKey = (ResourceKind, String);
 type PeerUriKey = (PeerId, String);
+type SubUriKey = (SubId, String);
 
 /// In-process [`SubscriberRegistryPort`] +
 /// [`SubscriberRegistryAsync`] adapter.
@@ -100,8 +108,14 @@ type PeerUriKey = (PeerId, String);
 pub struct MemoryRegistry<N> {
     /// `uri` -> list of subscribers.
     subscribers: DashMap<String, Vec<Subscriber>>,
-    /// `(peer_id, uri)` -> shared cursor state.
+    /// `(peer_id, uri)` -> shared cursor state. v4 backward-compat
+    /// keying — kept so the rmcp `resources/read?cursor=auto` path
+    /// keeps working without protocol changes.
     peer_progress: DashMap<PeerUriKey, Arc<PeerProgress>>,
+    /// `(sub_id, uri)` -> shared cursor state. v5 Phase 2 keying —
+    /// the [`SubId`] lets one peer fan out to N independent
+    /// subscribers, each with its own cursor (see ADR 0004).
+    sub_progress: DashMap<SubUriKey, Arc<PeerProgress>>,
     /// `(kind, resource_id)` -> running debouncer task.
     debounce_tasks: DashMap<ResourceKey, JoinHandle<()>>,
     /// `(kind, resource_id)` -> sequence counter.
@@ -140,11 +154,62 @@ where
         Arc::new_cyclic(|weak| Self {
             subscribers: DashMap::new(),
             peer_progress: DashMap::new(),
+            sub_progress: DashMap::new(),
             debounce_tasks: DashMap::new(),
             sequence_counters: DashMap::new(),
             wakers: DashMap::new(),
             notifier,
             self_ref: Weak::clone(weak),
+        })
+    }
+
+    /// Get-or-create the cursor entry for `(sub_id, uri)`. Phase 2
+    /// per-`SubId` cursor — the v4 `(peer_id, uri)` cursor stays
+    /// available via [`Self::peer_progress`].
+    #[must_use]
+    pub fn sub_progress(&self, sub_id: &SubId, uri: &str) -> Arc<PeerProgress> {
+        let key = (sub_id.clone(), uri.to_string());
+        if let Some(entry) = self.sub_progress.get(&key) {
+            return Arc::clone(entry.value());
+        }
+        let progress = Arc::new(PeerProgress::default());
+        self.sub_progress
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&progress));
+        progress
+    }
+
+    /// Read the current per-`SubId` byte cursor for `(sub_id, uri)`.
+    /// Returns `0` when no cursor has ever been allocated.
+    #[must_use]
+    pub fn sub_byte_cursor(&self, sub_id: &SubId, uri: &str) -> u64 {
+        self.sub_progress
+            .get(&(sub_id.clone(), uri.to_string()))
+            .map_or(0, |entry| entry.byte_cursor.load(Ordering::Relaxed))
+    }
+
+    /// Advance the per-`SubId` byte cursor for `(sub_id, uri)` to at
+    /// least `target` (atomic max). Returns the cursor value AFTER
+    /// the bump.
+    #[must_use]
+    pub fn advance_sub_byte_cursor(&self, sub_id: &SubId, uri: &str, target: u64) -> u64 {
+        let progress = self.sub_progress(sub_id, uri);
+        progress.byte_cursor.fetch_max(target, Ordering::Relaxed);
+        progress.byte_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Look up the `sub_id` of the most recent `(peer, uri)`
+    /// subscription. Used by the v5 application layer to surface the
+    /// synthesised [`SubId`] via `_meta.sub_id` on the legacy
+    /// `resources/subscribe` path.
+    #[must_use]
+    pub fn sub_id_for(&self, peer_id: &PeerId, uri: &str) -> Option<SubId> {
+        self.subscribers.get(uri).and_then(|entry| {
+            entry
+                .value()
+                .iter()
+                .find(|s| &s.peer_id == peer_id)
+                .map(|s| s.sub_id.clone())
         })
     }
 
@@ -218,6 +283,21 @@ where
     /// Sync flavour of `unsubscribe` shared by both the async port impl
     /// and `drop_peer_sync`.
     fn unsubscribe_sync(&self, peer_id: &PeerId, uri: &str) {
+        // Snapshot the sub_ids attached to the peer on this URI so
+        // we can clear matching `(sub_id, uri)` cursors after the
+        // peer has been removed.
+        let sub_ids: Vec<SubId> = self
+            .subscribers
+            .get(uri)
+            .map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|s| &s.peer_id == peer_id)
+                    .map(|s| s.sub_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let became_empty = self.subscribers.get_mut(uri).is_some_and(|mut entry| {
             entry.retain(|s| &s.peer_id != peer_id);
             entry.is_empty()
@@ -230,21 +310,54 @@ where
         }
         self.peer_progress
             .remove(&(peer_id.clone(), uri.to_string()));
+        for sub_id in sub_ids {
+            self.sub_progress.remove(&(sub_id, uri.to_string()));
+        }
     }
 
-    /// Sync flavour of `subscribe`. Returns `true` when this is the
-    /// first subscriber for `(kind, resource_id)` (i.e. the caller must
-    /// spawn the debouncer).
+    /// v5 Phase 2 entry point — register a peer with an
+    /// already-minted `sub_id` (typically synthesised by the
+    /// [`crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter`]).
+    /// Returns the same `sub_id` so the use case can echo it back via
+    /// `_meta.sub_id` on the `resources/subscribe` response.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok` — the result is wrapped in
+    /// [`Result`] to match the async port surface so future Phase 3
+    /// validation can plug in without a breaking change.
+    pub fn subscribe_with_sub_id(
+        &self,
+        kind: ResourceKind,
+        resource_id: &str,
+        uri: &str,
+        peer: Arc<dyn PeerHandle>,
+        sub_id: SubId,
+    ) -> Result<SubId, DomainError> {
+        let first = self.insert_subscriber(kind, resource_id, uri, peer, sub_id.clone());
+        if first {
+            self.ensure_debouncer(kind, resource_id);
+        }
+        Ok(sub_id)
+    }
+
+    /// Sync flavour of `subscribe`. Returns `true` when this call
+    /// attached the very first subscriber for `(kind, resource_id)`
+    /// (i.e. the caller must spawn the debouncer). `sub_id` is the
+    /// per-call subscriber id surfaced via `_meta.sub_id` on the
+    /// legacy `resources/subscribe` path (Phase 2).
     fn insert_subscriber(
         &self,
         kind: ResourceKind,
         resource_id: &str,
         uri: &str,
         peer: Arc<dyn PeerHandle>,
+        sub_id: SubId,
     ) -> bool {
         let peer_id = peer.id();
         let sub = Subscriber {
             peer_id: peer_id.clone(),
+            sub_id: sub_id.clone(),
             peer,
             kind,
             resource_id: resource_id.to_string(),
@@ -256,9 +369,15 @@ where
         let first = entry.len() == 1;
         drop(entry);
 
-        // Make sure the (peer, uri) cursor exists before any read happens.
+        // Make sure the (peer, uri) and (sub_id, uri) cursors exist
+        // before any read happens. The two paths share `PeerProgress`
+        // shape so v4 callers and v5 lane callers see consistent
+        // semantics.
         self.peer_progress
             .entry((peer_id, uri.to_string()))
+            .or_insert_with(|| Arc::new(PeerProgress::default()));
+        self.sub_progress
+            .entry((sub_id, uri.to_string()))
             .or_insert_with(|| Arc::new(PeerProgress::default()));
         first
     }
@@ -290,6 +409,17 @@ where
             return;
         }
         for entry in &self.peer_progress {
+            if entry.key().1 == uri {
+                let progress = entry.value();
+                let current = progress.byte_cursor.load(Ordering::Relaxed);
+                let next = current.saturating_sub(bytes_dropped);
+                progress.byte_cursor.store(next, Ordering::Relaxed);
+            }
+        }
+        // Mirror the cursor compensation on the v5 (sub_id, uri)
+        // index so per-`SubId` consumers stay in sync after a head
+        // truncation in the resource ring buffer.
+        for entry in &self.sub_progress {
             if entry.key().1 == uri {
                 let progress = entry.value();
                 let current = progress.byte_cursor.load(Ordering::Relaxed);
@@ -355,7 +485,13 @@ where
         uri: String,
         peer: Arc<dyn PeerHandle>,
     ) -> Result<(), DomainError> {
-        let first = self.insert_subscriber(kind, &resource_id, &uri, peer);
+        // v4-compat path: synthesise a fresh UUIDv7 sub_id so the
+        // (sub_id, uri) cursor index is populated alongside the v4
+        // (peer_id, uri) cursor. Hosts that consume the new
+        // `_meta.sub_id` channel get a stable handle; legacy hosts
+        // that ignore it observe identical v4 behaviour.
+        let sub_id = SubId::new(Uuid::now_v7().to_string());
+        let first = self.insert_subscriber(kind, &resource_id, &uri, peer, sub_id);
         if first {
             // First subscriber for this resource — spawn the debouncer.
             // The task itself runs against an `Arc<Self>` upgraded from
@@ -762,5 +898,142 @@ mod tests {
     fn parse_uri_rejects_unknown_scheme() {
         assert!(parse_uri("foo://x/output").is_none());
         assert!(parse_uri("shell-no-scheme").is_none());
+    }
+
+    // --- v5 Phase 2 SubId-keyed cursor tests ----------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_synthesises_sub_id_for_legacy_path() {
+        let reg = registry();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-A");
+        let peer_id = PeerId::new("peer-A".to_string());
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "abc".to_string(),
+            "shell://abc/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+        // The legacy subscribe path mints a SubId and indexes it on
+        // the `(sub_id, uri)` cursor map — verifiable via the new
+        // `sub_id_for` helper.
+        let sub_id = reg
+            .sub_id_for(&peer_id, "shell://abc/output")
+            .expect("sub_id must be synthesised on legacy path");
+        assert!(!sub_id.as_str().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_with_sub_id_uses_caller_supplied_id() {
+        use crate::domain::subscription::SubId;
+        let reg = registry();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-A");
+        let supplied = SubId::new("019028a3-1111".to_string());
+        let returned = reg
+            .subscribe_with_sub_id(
+                ResourceKind::Shell,
+                "abc",
+                "shell://abc/output",
+                peer,
+                supplied.clone(),
+            )
+            .unwrap();
+        assert_eq!(returned, supplied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sub_byte_cursor_is_zero_before_advance() {
+        use crate::domain::subscription::SubId;
+        let reg = registry();
+        let cursor = reg.sub_byte_cursor(&SubId::new("ghost".to_string()), "shell://x/output");
+        assert_eq!(cursor, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn advance_sub_byte_cursor_is_atomic_max() {
+        use crate::domain::subscription::SubId;
+        let reg = registry();
+        let sub_id = SubId::new("s1".to_string());
+        let v = reg.advance_sub_byte_cursor(&sub_id, "shell://x/output", 100);
+        assert_eq!(v, 100);
+        let v = reg.advance_sub_byte_cursor(&sub_id, "shell://x/output", 50);
+        assert_eq!(v, 100); // monotonic — fetch_max keeps the higher value
+        let v = reg.advance_sub_byte_cursor(&sub_id, "shell://x/output", 250);
+        assert_eq!(v, 250);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compensate_truncation_decrements_sub_progress_index() {
+        use crate::domain::subscription::SubId;
+        let reg = registry();
+        let sub_id = SubId::new("s1".to_string());
+        let _ = reg.advance_sub_byte_cursor(&sub_id, "shell://x/output", 100);
+        reg.compensate_truncation("shell://x/output", 30);
+        assert_eq!(reg.sub_byte_cursor(&sub_id, "shell://x/output"), 70);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compensate_truncation_saturates_sub_cursor_at_zero() {
+        use crate::domain::subscription::SubId;
+        let reg = registry();
+        let sub_id = SubId::new("s1".to_string());
+        let _ = reg.advance_sub_byte_cursor(&sub_id, "shell://x/output", 10);
+        reg.compensate_truncation("shell://x/output", 1_000);
+        assert_eq!(reg.sub_byte_cursor(&sub_id, "shell://x/output"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_clears_sub_progress() {
+        let reg = registry();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-A");
+        let peer_id = PeerId::new("peer-A".to_string());
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "abc".to_string(),
+            "shell://abc/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+        let sub_id = reg
+            .sub_id_for(&peer_id, "shell://abc/output")
+            .expect("synthesised sub_id");
+        let _ = reg.advance_sub_byte_cursor(&sub_id, "shell://abc/output", 50);
+        SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output").await;
+        // After unsubscribe the (sub_id, uri) cursor is gone — a
+        // fresh read returns the default 0 (the entry is no longer
+        // tracked).
+        assert_eq!(reg.sub_byte_cursor(&sub_id, "shell://abc/output"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sub_id_for_returns_none_when_no_subscription() {
+        let reg = registry();
+        let peer_id = PeerId::new("ghost".to_string());
+        assert!(reg.sub_id_for(&peer_id, "shell://x/output").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_subscribe_keeps_v4_peer_cursor_path_working() {
+        let reg = registry();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-A");
+        let peer_id = PeerId::new("peer-A".to_string());
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "abc".to_string(),
+            "shell://abc/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+        // v4 host that ignores _meta.sub_id keeps using the
+        // (peer_id, uri) cursor — exact same shape as v4.
+        let v = reg.advance_peer_byte_cursor(&peer_id, "shell://abc/output", 64);
+        assert_eq!(v, 64);
+        assert_eq!(reg.peer_byte_cursor(&peer_id, "shell://abc/output"), 64);
     }
 }
