@@ -6,13 +6,13 @@
 
 Drive remote shells, asynchronous commands, SFTP transfers, and TCP forwards from any MCP-capable LLM host. Output streams to your model the moment SSH bytes arrive — no polling loops, no empty payloads, no token waste.
 
-[![Version](https://img.shields.io/badge/version-5.2.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.2.0)
+[![Version](https://img.shields.io/badge/version-5.3.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.3.0)
 [![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)](https://modelcontextprotocol.io/)
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-a371f7?style=flat-square)](docs/ARCHITECTURE.md)
 [![Lock-free](https://img.shields.io/badge/hot--path-lock--free-238636?style=flat-square)](docs/DEVELOPMENT.md#lock-free-invariants)
-[![Tests](https://img.shields.io/badge/lib%20tests-1633-238636?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/lib%20tests-1657-238636?style=flat-square)]()
 [![Code-signed](https://img.shields.io/badge/macOS-codesigned-238636?style=flat-square)]()
 
 </div>
@@ -56,6 +56,21 @@ Most LLM-driven SSH wrappers fall back to polling. The model issues `get_output(
 | **Subscribe + drain** | **~1 500 tokens** | One setup call; events delivered as bytes arrive. |
 
 Same throughput, ~30× cheaper, and the model reacts the moment the remote process speaks.
+
+## What's new in 5.3.0
+
+Lane fanout pipeline + production port-forward listener — drop-in for any v3 / v4 / v5.0.x / v5.1 / v5.2 host.
+
+- **`ssh_subscribe` push delivery wired end-to-end on stdio/HTTP transport.** Lanes carry the rmcp peer captured at tool-invocation time; the new `LaneFanoutBridge` (`src/adapters/subscription/lane_bridge.rs`) walks the lane snapshot for the broadcast URI, calls `notifier.notify_resource_updated` per peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The Phase 4 NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
+- **`ProducerForwarder` mirrors legacy `SUBSCRIPTION_REGISTRY` → hexagonal `MemoryRegistry`.** Every producer poke / record_bytes from russh / sftp / serial / shell PTY is forwarded into the hexagonal registry so `ssh_subscribe` lanes track real producer events instead of just the 1 s force-flush keepalive tick. Lazy-insert byte counter survives pre-subscribe accumulation; `ensure_debouncer` reuses the existing counter so spawn does not lose the bytes already accumulated.
+- **`DebouncerActivator`** lets `ssh_subscribe`-only flows wake the per-resource debouncer the legacy `resources/subscribe` path uses.
+- **Real port-forward listener.** `ssh_forward` no longer drops the listener after preflight: the russh adapter now binds the listener, spawns an accept loop, and per-connection opens a `direct-tcpip` channel + pumps bytes both ways via `tokio::io::copy_bidirectional`. Sessions cascade-close their forwards on disconnect — no port leaks, no zombie listeners.
+- **URI charset hardening.** Resource ids outside `[A-Za-z0-9_-]+` (whitespace, unicode, control chars, dot-dot) are rejected at parse time with `BadIdCharset`. UUIDv7 + legacy snake_case ids unaffected.
+- **`serial://` scheme** now first-class on the `ssh_subscribe` URI parser.
+- **Schema spec compliance.** `SshSerialListPortsArgs` / `SshSerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts (Claude Code) accept the full `tools/list` batch.
+- **1657 lib tests + 41 chaos + 32 property + 2 v5_smoke + 13 integration** all green; production clippy strict gate (`cargo clippy --release --all-features --bin ssh-mcp-stdio -- -D warnings`) exit 0.
+
+Full notes: [CHANGELOG.md → 5.3.0](CHANGELOG.md#530--2026-05-04).
 
 ## What's new in 5.2.0
 
@@ -250,7 +265,7 @@ The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.c
 | Raw `ssh` from a shell tool | no | no | n/a | manual | one-off command |
 | `paramiko` or `asyncssh` glue script | no (poll) | no | varies | manual | one host at a time |
 | Other MCP SSH wrappers | usually no | usually no | varies | usually no | tool-only |
-| **`ssh-mcp` v5.2.0** | **yes** | **yes** | **yes** | **NDJSON daemon + native UART/TTY/COM** | **multi-session, multi-host, multi-port (SSH + serial), agent-grouped** |
+| **`ssh-mcp` v5.3.0** | **yes** | **yes** | **yes** | **NDJSON daemon + native UART/TTY/COM + production TCP forward** | **multi-session, multi-host, multi-port (SSH + serial), agent-grouped, real port-forward listener** |
 
 ## Install
 
@@ -305,7 +320,7 @@ Restart the host. The model should now see thirty SSH tools and ten ready-made p
 
 ## Tool catalogue
 
-`ssh-mcp` v5.2.0 ships **36 MCP tools** across six push-resource schemes and ten prompt templates (35 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes; the new `ssh_serial_*` tools and the `serial://` scheme are additive.
+`ssh-mcp` v5.3.0 ships **36 MCP tools** across six push-resource schemes and ten prompt templates (35 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 / v5.0–5.2 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes; the new `ssh_serial_*` tools, the `serial://` scheme, the v5.3 lane fanout pipeline, and the production port-forward listener are all additive.
 
 | Family | Tools | Push resource |
 |---|---|---|
@@ -400,7 +415,7 @@ MIT. Declared via `license = "MIT"` in [`Cargo.toml`](Cargo.toml).
 
 ### About this fork
 
-This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.2.0 adds a sixth push-resource scheme (`serial://<id>/output`) plus 6 native UART / TTY / COM tools while staying wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.3.0 wires the lane fanout pipeline end-to-end (`ssh_subscribe` push delivery on stdio/HTTP) and ships a production port-forward listener with cascade close on session disconnect, on top of v5.2's sixth push-resource scheme (`serial://<id>/output`) plus 6 native UART / TTY / COM tools — wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
 
 ### Author and links
 
