@@ -133,6 +133,11 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
             outcome.sub_id
         ),
     );
+    append_hint(
+        out,
+        HintStrength::Recommended,
+        "Data arrives async via notifications/resources/updated. Wait for the push, then resources/read?cursor=auto. Do NOT use any MCP tool as a sleep. If you must idle between reads, sleep LOCALLY with low values: Unix `sleep 0.05` / `sleep 0.1`, PowerShell `Start-Sleep -Milliseconds 50`. Push fires on whichever fires first: ~50ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 10-100ms local sleeps cover both budgets.",
+    );
 }
 
 /// Render the structured JSON twin for `ssh_subscribe`.
@@ -514,6 +519,13 @@ mod tests {
         assert!(body.contains("GRACE_MS: 2000"));
         assert!(body.contains("NEXT: "));
         assert!(body.contains("HINT: REQUIRED NEXT STEP: ssh_unsubscribe sub_id=019"));
+        assert!(
+            body.contains(
+                "HINT: RECOMMENDED: Data arrives async via notifications/resources/updated"
+            )
+        );
+        assert!(body.contains("Do NOT use any MCP tool as a sleep"));
+        assert!(body.contains("Start-Sleep -Milliseconds 50"));
         assert!(body.contains("Cleanup: ssh_unsubscribe"));
         assert!(body.contains("Cost: O(1) lane open"));
         assert!(body.contains("Idempotency: Pass _meta.idempotency_key"));
@@ -648,6 +660,7 @@ mod tests {
             queue_depth: 3,
             queue_high_watermark: 4,
             block_total_ms: 5,
+            byte_triggered_flushes: 0,
         };
         let outcome = SubStatsOutcome {
             sub_id: sub_id("s"),
