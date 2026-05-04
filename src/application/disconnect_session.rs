@@ -45,9 +45,11 @@ use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
 use crate::domain::session::SessionEntity;
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_registry::ResourceKind;
 use crate::ports::transfer_repo::TransferRepository;
 
 /// Inbound DTO. Built by the rmcp tool wrapper (etapa H16).
@@ -93,6 +95,11 @@ where
     commands: Arc<CR>,
     shells: Arc<ShR>,
     transfers: Arc<TR>,
+    /// v5.3 lifecycle cascade — closes child resource lifecycle entries
+    /// alongside the repo removal so `SUB_LEAK_RISK` warnings clear on
+    /// `ssh_disconnect` / `ssh_disconnect_agent`. Optional so test
+    /// fixtures can construct without the full lifecycle adapter.
+    lifecycle: Option<Arc<dyn LifecyclePolicyPort>>,
 }
 
 impl<S, R, CR, ShR, TR> DisconnectSessionUseCase<S, R, CR, ShR, TR>
@@ -103,7 +110,9 @@ where
     ShR: ShellRepository + Send + Sync,
     TR: TransferRepository + Send + Sync,
 {
-    /// Wire the use case from already-shared adapter handles.
+    /// Wire the use case from already-shared adapter handles. No
+    /// lifecycle cascade — used by tests / fixtures that bypass the
+    /// full production wiring.
     #[must_use]
     pub const fn new(
         ssh: Arc<S>,
@@ -118,6 +127,30 @@ where
             commands,
             shells,
             transfers,
+            lifecycle: None,
+        }
+    }
+
+    /// Wire the use case with the lifecycle cascade installed —
+    /// production composition uses this constructor so child resources
+    /// (commands / shells / transfers) transition to `Closed` in the
+    /// lifecycle adapter alongside the repo removal.
+    #[must_use]
+    pub fn with_lifecycle(
+        ssh: Arc<S>,
+        sessions: Arc<R>,
+        commands: Arc<CR>,
+        shells: Arc<ShR>,
+        transfers: Arc<TR>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+    ) -> Self {
+        Self {
+            ssh,
+            sessions,
+            commands,
+            shells,
+            transfers,
+            lifecycle: Some(lifecycle),
         }
     }
 
@@ -165,6 +198,9 @@ where
             let _ = self.ssh.cancel(&cmd.id).await;
         }
         for cmd in commands {
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Command, cmd.id.as_str());
+            }
             self.commands.remove(&cmd.id).await?;
         }
         Ok(count)
@@ -177,6 +213,9 @@ where
         let shells = self.shells.list_filtered(Some(session_id)).await?;
         let count = shells.len();
         for shell in shells {
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Shell, shell.id.as_str());
+            }
             self.shells.remove(&shell.id).await?;
         }
         Ok(count)
@@ -188,6 +227,9 @@ where
         let transfers = self.transfers.list_filtered(Some(session_id)).await?;
         let count = transfers.len();
         for xfer in transfers {
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Transfer, xfer.id.as_str());
+            }
             self.transfers.remove(&xfer.id).await?;
         }
         Ok(count)
