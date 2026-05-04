@@ -152,7 +152,7 @@ impl ForwardRepository for DashMapForwardRepo {
 
     async fn remove(&self, id: &ForwardId) -> Result<Option<ForwardEntity>, DomainError> {
         let removed = self.by_id.remove(id).map(|(_, entity)| entity);
-        if let Some(ref entity) = removed {
+        if let Some(entity) = &removed {
             self.index_detach(&entity.session_id, id);
         }
         Ok(removed)
@@ -162,8 +162,15 @@ impl ForwardRepository for DashMapForwardRepo {
         &self,
         session_id: Option<&SessionId>,
     ) -> Result<Vec<ForwardEntity>, DomainError> {
-        match session_id {
-            Some(session) => {
+        session_id.map_or_else(
+            || {
+                let mut out = Vec::with_capacity(self.by_id.len());
+                for entry in self.by_id.iter() {
+                    out.push(entry.value().clone());
+                }
+                Ok(out)
+            },
+            |session| {
                 // Snapshot the bucket to a `Vec<ForwardId>` so we drop
                 // the shard guard before issuing per-id lookups —
                 // otherwise a `get` on the same shard could deadlock.
@@ -179,15 +186,8 @@ impl ForwardRepository for DashMapForwardRepo {
                     }
                 }
                 Ok(out)
-            }
-            None => {
-                let mut out = Vec::with_capacity(self.by_id.len());
-                for entry in self.by_id.iter() {
-                    out.push(entry.value().clone());
-                }
-                Ok(out)
-            }
-        }
+            },
+        )
     }
 }
 
