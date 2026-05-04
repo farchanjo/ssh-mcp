@@ -349,6 +349,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&shells),
         Arc::clone(&transfers),
         Arc::clone(&lifecycle),
+        Arc::clone(&lane_admin),
     ));
     let list_sessions = Arc::new(ListSessionsUseCase::new(
         Arc::clone(&ssh),
@@ -363,6 +364,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&shells),
         Arc::clone(&transfers),
         Arc::clone(&lifecycle),
+        Arc::clone(&lane_admin),
     ));
 
     let execute = Arc::new(

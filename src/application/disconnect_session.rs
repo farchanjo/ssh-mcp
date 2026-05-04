@@ -44,11 +44,13 @@ use std::sync::Arc;
 use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
 use crate::domain::session::SessionEntity;
+use crate::domain::subscription::SubId;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_lane::LaneAdmin;
 use crate::ports::subscriber_registry::ResourceKind;
 use crate::ports::transfer_repo::TransferRepository;
 
@@ -100,6 +102,10 @@ where
     /// `ssh_disconnect` / `ssh_disconnect_agent`. Optional so test
     /// fixtures can construct without the full lifecycle adapter.
     lifecycle: Option<Arc<dyn LifecyclePolicyPort>>,
+    /// v5.3.2 lane cascade — closes orphaned `ssh_subscribe` lanes
+    /// bound to the resources owned by this session so they don't
+    /// outlive their producer. Optional for the same fixture reason.
+    lane_admin: Option<Arc<dyn LaneAdmin>>,
 }
 
 impl<S, R, CR, ShR, TR> DisconnectSessionUseCase<S, R, CR, ShR, TR>
@@ -128,6 +134,7 @@ where
             shells,
             transfers,
             lifecycle: None,
+            lane_admin: None,
         }
     }
 
@@ -143,6 +150,7 @@ where
         shells: Arc<ShR>,
         transfers: Arc<TR>,
         lifecycle: Arc<dyn LifecyclePolicyPort>,
+        lane_admin: Arc<dyn LaneAdmin>,
     ) -> Self {
         Self {
             ssh,
@@ -151,6 +159,25 @@ where
             shells,
             transfers,
             lifecycle: Some(lifecycle),
+            lane_admin: Some(lane_admin),
+        }
+    }
+
+    /// Close every `ssh_subscribe` lane bound to a resource id.
+    /// Best-effort: per-lane close failures are swallowed so one bad
+    /// lane does not abort the wider cleanup.
+    async fn close_lanes_for_resource(&self, resource_id: &str) {
+        let Some(lane_admin) = self.lane_admin.as_ref() else {
+            return;
+        };
+        let stale: Vec<SubId> = lane_admin
+            .list()
+            .into_iter()
+            .filter(|s| s.resource_id == resource_id)
+            .map(|s| s.sub_id)
+            .collect();
+        for sub_id in stale {
+            let _ = lane_admin.close(&sub_id).await;
         }
     }
 
@@ -201,6 +228,7 @@ where
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Command, cmd.id.as_str());
             }
+            self.close_lanes_for_resource(cmd.id.as_str()).await;
             self.commands.remove(&cmd.id).await?;
         }
         Ok(count)
@@ -216,6 +244,7 @@ where
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Shell, shell.id.as_str());
             }
+            self.close_lanes_for_resource(shell.id.as_str()).await;
             self.shells.remove(&shell.id).await?;
         }
         Ok(count)
@@ -230,6 +259,7 @@ where
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Transfer, xfer.id.as_str());
             }
+            self.close_lanes_for_resource(xfer.id.as_str()).await;
             self.transfers.remove(&xfer.id).await?;
         }
         Ok(count)
