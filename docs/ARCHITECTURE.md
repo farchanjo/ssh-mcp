@@ -1,73 +1,14 @@
 # SSH MCP Architecture (v5.0 — subscribe-first hexagonal)
 
-This document describes the architecture of the SSH Model Context Protocol (MCP) server. It reflects the **v5.0** codebase on `feat/v5-foundation`. The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — and three v5 layers are stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — in flight), and the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new MCP tools and a third binary `ssh-mcp-tail`.
+Architecture of the SSH Model Context Protocol (MCP) server on the `feat/v5-foundation` branch. The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with three v5 layers stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — in flight), and the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new MCP tools and a third binary `ssh-mcp-tail`.
 
-### Version trail
+Version trail (one line each):
 
-- **v4.0 / v4.1** — original hexagonal restructuring; v3 monolith deleted; `src/mcp/` hard-deleted; `async-trait` direct dep dropped. See [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md).
-- **v4.5 / v4.6 / v4.7 / v4.8** — LLM UX foundation (`PeerId`, `_meta` envelope, 14+1 wire error codes, `Implementation` identity, `ToolAnnotations`, `NEXT:` / `HINT:` lines, JSON Schema `default`, `Cost:` hints, `AGENT_ID:` rename), MCP inter-tool conversation surface (`structured_content`, `resources/templates/list`, `notifications/progress`, `prompts/list` + `prompts/get` (5 workflows), idempotency cache, NOT_FOUND closest-match), and full `output_schema` coverage on every tool. Tool catalogue grew 18 -> 21.
-- **v5.0** — subscribe-first refresh. CAS-driven `ResourceLifecycle` + cascade refcount + grace timer ([ADR 0003](./adr/0003-lifecycle-binding.md)). `(SubId, Uri)` channel keying with per-lane `LagPolicy` / filter / replay / stats and round-robin `ChannelMux` ([ADR 0004](./adr/0004-channel-mux-fairness.md)). 9 net-new MCP tools (`ssh_subscribe` etc.), `HINT:` severity escalation, 10-prompt catalog, `SUB_LEAK_RISK` watcher, 38-code error taxonomy ([ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0007](./adr/0007-error-taxonomy.md)). `ssh-mcp-tail` daemon binary ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md)). MSRV bumped to Rust 1.95.
+- **v4.0 / v4.1** — original hexagonal restructuring; `src/mcp/` deleted; `async-trait` dropped. See [ADR 0002](./adr/0002-adopt-hexagonal-architecture.md).
+- **v4.5 / v4.6 / v4.7 / v4.8** — LLM UX foundation (`PeerId`, `_meta` envelope, granular wire codes, `Implementation` identity, `ToolAnnotations`, `NEXT:` / `HINT:` lines, JSON Schema defaults, `Cost:` hints, `AGENT_ID:` rename), MCP inter-tool conversation surface (`structured_content`, `resources/templates/list`, `notifications/progress`, prompts catalog, idempotency cache, NOT_FOUND closest-match), full `output_schema` coverage. Tool catalogue grew 18 → 21.
+- **v5.0** — subscribe-first refresh. See ADRs [0003](./adr/0003-lifecycle-binding.md), [0004](./adr/0004-channel-mux-fairness.md), [0005](./adr/0005-llm-ux-priorities.md), [0006](./adr/0006-backpressure-policies.md), [0007](./adr/0007-error-taxonomy.md), [0008](./adr/0008-ndjson-daemon-protocol.md). 9 net-new MCP tools, `ssh-mcp-tail` daemon binary, MSRV bumped to Rust 1.95.
 
 [[_TOC_]]
-
-## High-level diagram
-
-```text
-                                         ┌─────────────────────────────┐
-   LLM hosts                              │  ssh-mcp v5.0  (one crate)  │
-   ───────────────────────                │                             │
-   Claude Desktop  ──┐                    │   ┌─────────────────────┐   │
-   mcp-inspector  ───┤   rmcp 1.6 HTTP    │   │   src/infra/mcp/    │   │
-   Cline          ──┐│   (axum 0.8)       │   │   30 #[tool] fns    │   │
-   custom rmcp ────┐│└──── ssh-mcp ──────►│   │   resources/*       │   │
-                   │└────────────────────►│   │   prompts (10)      │   │
-   IDE / stdio  ───┴──── ssh-mcp-stdio  ──┤   │   templates (4/5)   │   │
-   Claude Code  ───┐                       │   │   idempotency       │   │
-   pipelines    ───┴──── ssh-mcp-tail  ──►│   │   error_detail      │   │
-                  NDJSON  +  duplex       │   └──────────┬──────────┘   │
-                                          │              │              │
-                                          │   ┌──────────▼───────────┐  │
-                                          │   │  src/application/    │  │
-                                          │   │  ~22 *UseCase<...>    │  │
-                                          │   │  static dispatch      │  │
-                                          │   └──────────┬───────────┘  │
-                                          │              │              │
-                                          │   ┌──────────▼───────────┐  │
-                                          │   │   src/ports/         │  │
-                                          │   │   trait skeletons    │  │
-                                          │   │   v5 +3:             │  │
-                                          │   │   lifecycle_policy   │  │
-                                          │   │   channel_mux        │  │
-                                          │   │   subscriber_lane    │  │
-                                          │   └──────────▲───────────┘  │
-                                          │              │              │
-                                          │   ┌──────────┴───────────┐  │
-                                          │   │   src/adapters/      │  │
-                                          │   │   v4 set + v5:       │  │
-                                          │   │   lifecycle/         │  │
-                                          │   │   subscription/lane  │  │
-                                          │   │   subscription/mux   │  │
-                                          │   └──────────┬───────────┘  │
-                                          │              │              │
-                                          │   ┌──────────▼───────────┐  │
-                                          │   │  src/composition/    │  │
-                                          │   │  prod | embed | fixt │  │
-                                          │   └──────────┬───────────┘  │
-                                          │              │              │
-                                          │   ┌──────────▼───────────┐  │
-                                          │   │  src/main.rs    HTTP │  │
-                                          │   │  src/bin/stdio  STDIO│  │
-                                          │   │  src/bin/tail   NDJ  │  │
-                                          │   └──────────────────────┘  │
-                                          │                             │
-                                          └─────────────────────────────┘
-                                                       │
-                              russh 0.55 (SSH + SFTP)  │
-                                                       ▼
-                                            sshd / SFTP / agent
-```
-
-The four layers from v4.1 (`domain`, `ports`, `application`, `adapters`) plus `infra` (inbound MCP) and `composition` (root wiring) are unchanged. v5 stacks new ports + adapters under each layer, never re-roots the layout.
 
 ## Hexagonal layer map
 
@@ -303,33 +244,9 @@ Each runtime adapter owns its private internals under `internal/` (the v4.1 deep
 
 ## Phase 1 — Lifecycle binding (merged)
 
-ADR: [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md). Every long-lived resource (shell, async command, SFTP transfer, port forward) is wrapped in a CAS state machine plus a per-session refcount. The atomic state machine lives in `src/adapters/lifecycle/refcount.rs`; the grace timer task lives in `src/adapters/lifecycle/grace_timer.rs`; cascade through `SessionLifecycle.active_refs` lives in `src/adapters/lifecycle/cascade.rs`.
+ADR: [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md). Every long-lived resource (shell, async command, SFTP transfer, port forward) is wrapped in a CAS state machine plus a per-session refcount. State machine lives in `src/adapters/lifecycle/refcount.rs`, grace timer task in `src/adapters/lifecycle/grace_timer.rs`, cascade in `src/adapters/lifecycle/cascade.rs`.
 
 ### State machine
-
-```text
-       subscribe (sub_count++)
-     ┌────────────────────────┐
-     │                        │
-     ▼                        │
-┌──────────────┐      ┌───────┴────────┐
-│    Owned     │ ───▶ │   Observed     │
-│ (sub_count=0)│ first│ (sub_count>=1) │
-└──────┬───────┘ sub  └────────┬───────┘
-       │                       │
-       │ explicit close        │ last unsubscribe
-       ▼                       ▼
-┌──────────────┐      ┌────────────────┐
-│    Closed    │ ◀─── │   Releasing    │
-│ (released)   │grace │ (sub_count=0,  │
-└──────────────┘timer │  timer armed)  │
-       ▲      fires   └────────┬───────┘
-       │                       │
-       │                       │ new subscribe
-       └───────────────────────┘  within grace
-                                  ─▶ Observed
-                                  (cancel timer)
-```
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -423,35 +340,21 @@ sequenceDiagram
 ### Defaults preserve v4 semantics
 
 ```text
-LifecyclePolicy {
-    release_when_no_subs: false,       // v4-compat: callers must close explicitly
-    grace_ms: 2_000,                    // 2 s grace window when opted in
-    cascade_session: true,
-}
-
-SessionPolicy {
-    persistent: false,                  // honours the existing ssh_connect persistent flag
-    idle_grace_ms: 5_000,               // 5 s before the session-level reaper fires
-}
+LifecyclePolicy { release_when_no_subs: false, grace_ms: 2_000, cascade_session: true }
+SessionPolicy   { persistent: false, idle_grace_ms: 5_000 }
 ```
 
-`release_when_no_subs` is exposed on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` (Phase 3 surfaces the parameter in the MCP tool schema). Phase 1 wired the layer with the v4-compat default; existing MCP hosts see no behaviour change.
+`release_when_no_subs` is exposed on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` (Phase 3 surfaces it in the MCP tool schema). Phase 1 wired the layer with the v4-compat default; existing MCP hosts see no behaviour change.
 
-### Loom invariants (Phase 1 — 4 new interleavings)
-
-`tests/lockfree_invariants.rs` ships four new loom tests (commit `c01156d`): subscribe / unsubscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity. See [LOCKS.md](./LOCKS.md) for the full lock-free invariants summary.
+Loom coverage: 4 new interleavings in `tests/lockfree_invariants.rs` (subscribe / unsubscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity). Full lock-free invariants summary: [LOCKS.md](./LOCKS.md).
 
 ## Phase 2 — Channel mux + sub_id (merged)
 
-ADR: [adr/0004-channel-mux-fairness.md](./adr/0004-channel-mux-fairness.md). The cursor key shifts from `(PeerId, Uri)` (v4) to `(SubId, Uri)` (v5). Each subscription now owns its own state. A new `ChannelMux` provides round-robin fair drain.
-
-### SubId
-
-`SubId` is a UUIDv7 wrapper (`src/domain/subscription.rs`). UUIDv7 carries a unix-ms timestamp prefix, making subscriptions sortable by creation time without a separate timestamp column.
+ADR: [adr/0004-channel-mux-fairness.md](./adr/0004-channel-mux-fairness.md). Cursor key shifts from `(PeerId, Uri)` (v4) to `(SubId, Uri)` (v5). Each subscription owns its own state via a `MultiplexLane`; a `ChannelMux` provides round-robin fair drain. `SubId` is a UUIDv7 wrapper (`src/domain/subscription.rs`) — the unix-ms timestamp prefix makes subs sortable by creation time without a separate column.
 
 ### Per-lane state
 
-Per-lane state lives behind `Arc<MultiplexLane>`:
+`Arc<MultiplexLane>` (`src/adapters/subscription/subscriber_lane.rs`):
 
 | Field | Type | Why |
 |---|---|---|
@@ -463,28 +366,11 @@ Per-lane state lives behind `Arc<MultiplexLane>`:
 | `stats` | `SubscriberStats` (8 atomics) | events_sent, lag_drops, queue_depth, ... |
 | `pause_flag` | `AtomicBool` | suspend drain without disconnecting |
 
-### LagPolicy variants
-
-| Variant | Behaviour | When to use |
-|---|---|---|
-| `BlockSlow` | Producer (debouncer) `.await`s on `mpsc::Sender::send` until consumer drains. Zero loss; latency cost = lag duration. | Forensic / audit log capture. |
-| `DropOldest` | Pop oldest event from the lane's mpsc; push the new one. Emit `{"ev":"lagged","sub_id":...,"dropped":N}` marker. | Monitoring with gap tolerance. |
-| `DropNewest` | Ignore the new event when full. Emit lagged marker. | Rare; prefer historical context. |
-| `Snapshot` (default) | Drop the lane's mpsc backlog. Next drain triggers a `read_resource(uri, cursor=current_seq)` rebuild from the ring buffer. Emit `{"ev":"snapshot","sub_id":...,"cursor":N,"delta":<bytes>}`. Zero loss as long as the ring buffer covers the gap. | Default — best tradeoff. |
-
-`Snapshot` is the default because the ring buffer already holds the live tail and rebuild is sub-ms on local memory. See [ADR 0006](./adr/0006-backpressure-policies.md) for the per-fronteira behaviour matrix.
+LagPolicy variants and per-fronteira behaviour: [ADR 0006](./adr/0006-backpressure-policies.md). `Snapshot` is the default — drop backlog and rebuild from the ring buffer; sub-ms on local memory.
 
 ### ChannelMux fairness
 
-`ChannelMux` owns a `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin drain (`src/adapters/subscription/channel_mux.rs`):
-
-1. Snapshot active lanes via the DashMap iterator.
-2. Park on `Notify` if no lanes are active.
-3. Round-robin from `cursor_lane.load(Acquire)`. For each lane in order, `try_recv`. First non-empty wins.
-4. Forward to the outbound writer (rmcp peer, NDJSON formatter, …).
-5. `cursor_lane.store((idx + 1) % lanes.len(), Release)` (wrapping). Park if no lane had work.
-
-Fairness invariant: between two adjacent backlogged lanes A and B, the mux drains them in alternation. A 10x faster lane will not starve a slower one. Verified under loom (commit `c48a0ba` — 4 new interleavings).
+`ChannelMux` owns `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin drain (`src/adapters/subscription/channel_mux.rs`). The drain loop snapshots active lanes, parks on `Notify` if empty, round-robins from `cursor_lane.load(Acquire)` calling `try_recv` on each lane (first non-empty wins), forwards to the outbound writer (rmcp peer or NDJSON formatter), then `cursor_lane.store((idx + 1) % lanes.len(), Release)`. Fairness invariant: between two backlogged lanes A and B, the mux drains them in alternation — a 10x faster lane never starves a slower one. Loom-verified (commit `c48a0ba` — 4 new interleavings).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -524,13 +410,11 @@ flowchart LR
     style LANES fill:#161b22,color:#f0f6fc,stroke:#30363d
 ```
 
-### Resource lifecycle integration
-
-When a `SubId` is registered, `lifecycle_policy.on_subscribe(kind, resource_id)` (ADR 0003) fires. When the last `SubId` on a `(kind, resource_id)` pair unsubscribes, `lifecycle_policy.on_unsubscribe` fires. The lifecycle layer decides whether to arm the grace timer based on the resource's policy (set at creation time by `open_shell` / `execute` / `upload` / `download`). Subscribers can never extend or shorten a resource's lifetime — only its creator can.
+Subscribers cannot extend or shorten a resource's lifetime — only its creator can. When a `SubId` is registered, `lifecycle_policy.on_subscribe(kind, resource_id)` (ADR 0003) fires; when the last `SubId` on a `(kind, resource_id)` pair unsubscribes, `lifecycle_policy.on_unsubscribe` fires. The lifecycle layer decides whether to arm the grace timer based on the resource's policy (set at creation time).
 
 ## Resource scheme topology
 
-The 5 push-capable URI schemes map to the 4 long-running tools. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
+5 push-capable URI schemes map to the 4 long-running tools. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -581,15 +465,15 @@ Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(Su
 
 ## Phase 3 — LLM UX surface (in flight)
 
-ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools advertised as `ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`. Plus `HINT:` line severity escalation (REQUIRED / RECOMMENDED / informational), 10-prompt catalog (5 carry-overs + 5 push-first), `SUB_LEAK_RISK` auto-warning watcher, and a 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
+ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
 
-The implementation is in flight on `feat/v5-foundation` by a separate agent. This document tracks the names; the canonical reference is [docs/llm-ux/PROMPTS_CATALOG.md](./llm-ux/PROMPTS_CATALOG.md), [docs/llm-ux/GOLDEN_RULES.md](./llm-ux/GOLDEN_RULES.md), [docs/llm-ux/ANTIPATTERNS.md](./llm-ux/ANTIPATTERNS.md), [docs/llm-ux/ERROR_HANDBOOK.md](./llm-ux/ERROR_HANDBOOK.md).
+This document tracks names; canonical references are [docs/llm-ux/](./llm-ux/) — `PROMPTS_CATALOG.md`, `GOLDEN_RULES.md`, `ANTIPATTERNS.md`, `ERROR_HANDBOOK.md`.
 
 ## Phase 4 — NDJSON daemon (in flight)
 
-ADR: [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md). New binary `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds an rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. Stdin reads NDJSON ops; stdout emits NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`). The full op + event schema is enumerated in [docs/INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
+ADR: [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md). Binary `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds an rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. Stdin reads NDJSON ops; stdout emits NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`).
 
-The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. Driving it as a subprocess gives the LLM real push delivery without host-level subscribe support.
+The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. Driving it as a subprocess gives the LLM real push delivery without host-level subscribe support. Full op + event schema: [docs/INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -634,52 +518,7 @@ flowchart TB
     style UC fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
 ```
 
-Full op + event schema: [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
-
 ## Subscribe pipeline (v5 layered view)
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│ Producer (russh PTY reader, async cmd reader, SFTP, health)     │
-│   poke(kind, id) -> next_seq -> RunningX broadcast::Sender      │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ MemoryRegistry<N> (per-resource debouncer task)                 │
-│   coalesce on SSH_NOTIFY_DEBOUNCE_MS (50 ms default)            │
-│   force-flush on SSH_NOTIFY_FORCE_FLUSH_MS (1 s default)        │
-│   keepalive on SSH_NOTIFY_KEEPALIVE_S (30 s default)            │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼     ─── v5 fan-out ────────────────────
-┌─────────────────────────────────────────────────────────────────┐
-│ For each (SubId, Uri) — bounded mpsc lane                       │
-│                                                                  │
-│   filter(FilterRule)                                             │
-│         ↓                                                        │
-│   apply LagPolicy (BlockSlow / DropOldest / DropNewest / Snap)   │
-│         ↓                                                        │
-│   record SubscriberStats atomics                                 │
-│         ↓                                                        │
-│   mpsc::Sender<SubscriptionMessage>(N=SSH_LANE_BUFFER, def 1024) │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ ChannelMux (round-robin fair drain)                             │
-│   cursor_lane: AtomicUsize  (Acquire load, Release store)       │
-│   wakes on Notify; no spinning                                  │
-│   try_recv each lane in order; bump cursor on success           │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Outbound writer                                                  │
-│   - rmcp Peer (notifications/resources/updated)                  │
-│   - or NDJSON formatter (ssh-mcp-tail stdout)                    │
-└─────────────────────────────────────────────────────────────────┘
-```
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -737,25 +576,20 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 
 ## Cross references
 
-- [LOCKS.md](./LOCKS.md) — lock-free patterns, acquisition order, channel sizing, loom invariants.
-- [API.md](./API.md) — MCP tool reference (schemas, response shape).
-- [RESOURCES.md](./RESOURCES.md) — `resources/*` contract, cursor semantics, `_meta` envelope.
-- [ERRORS.md](./ERRORS.md) — wire-format error envelope (REASON + DETAIL).
-- [CONFIGURATION.md](./CONFIGURATION.md) — env-var table.
-- [FLOWS.md](./FLOWS.md) — end-to-end sequence diagrams.
-- [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md) — `ssh-mcp-tail daemon` NDJSON op + event schema.
-- [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) — symptom -> cause -> cure runbook.
-- [llm-ux/](./llm-ux/) — LLM UX kit: golden rules, prompts catalog, anti-patterns, error handbook, 27B / 70B root prompts.
-- [MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md) — host migration guide.
-- [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) — contributor migration narrative (v4.1 deep-decouple addendum).
-- [adr/0001-migrate-to-rmcp.md](./adr/0001-migrate-to-rmcp.md) — v3 transport choice.
-- [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) — v4 architecture choice.
-- [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md) — v5 lifecycle layer.
-- [adr/0004-channel-mux-fairness.md](./adr/0004-channel-mux-fairness.md) — v5 sub_id + mux.
-- [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md) — v5 LLM UX surface.
-- [adr/0006-backpressure-policies.md](./adr/0006-backpressure-policies.md) — v5 LagPolicy.
-- [adr/0007-error-taxonomy.md](./adr/0007-error-taxonomy.md) — v5 error categorisation.
-- [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md) — v5 daemon binary.
+| Doc | Purpose |
+|---|---|
+| [LOCKS.md](./LOCKS.md) | Lock-free patterns, acquisition order, channel sizing, loom invariants |
+| [API.md](./API.md) | MCP tool reference (schemas, response shape) |
+| [RESOURCES.md](./RESOURCES.md) | `resources/*` contract, cursor semantics, `_meta` envelope |
+| [ERRORS.md](./ERRORS.md) | Wire-format error envelope (REASON + DETAIL) |
+| [CONFIGURATION.md](./CONFIGURATION.md) | Env-var table |
+| [FLOWS.md](./FLOWS.md) | End-to-end sequence diagrams |
+| [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md) | `ssh-mcp-tail daemon` NDJSON op + event schema |
+| [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | Symptom → cause → cure runbook |
+| [llm-ux/](./llm-ux/) | LLM UX kit (golden rules, prompts, anti-patterns, error handbook, 27B / 70B root prompts) |
+| [MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md) | Host migration guide |
+| [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) | Contributor migration (v4.1 deep-decouple addendum) |
+| [adr/](./adr/) | 0001 rmcp · 0002 hexagonal · 0003 lifecycle · 0004 mux+sub_id · 0005 LLM UX · 0006 LagPolicy · 0007 errors · 0008 daemon |
 
 ## Future work
 
