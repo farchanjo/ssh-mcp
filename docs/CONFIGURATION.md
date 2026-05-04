@@ -1,8 +1,8 @@
 # SSH MCP Configuration Guide (v4.8.0)
 
-Reference for every tunable exposed by the v4.8.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Every tunable on the v4.8.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x ([MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)).
 
-> **v4.8 — no env-var changes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement; no new tunables, no renamed vars, no changed defaults. Every variable below is identical to v4.7.1.
+> **v4.8 — no env-var changes.** Strictly additive on `tools/list[].outputSchema`; everything below is byte-identical to v4.7.1.
 
 [[_TOC_]]
 
