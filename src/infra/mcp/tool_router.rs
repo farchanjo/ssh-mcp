@@ -110,7 +110,7 @@ use crate::ports::config::ConfigPort;
 #[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 use crate::ports::id_generator::IdGeneratorPort;
-use crate::ports::notifier::NotifierPort;
+use crate::ports::notifier::{NotifierPort, PeerHandle};
 use crate::ports::output_stream::OutputStreamPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::sftp_client::SftpClientPort;
@@ -138,7 +138,7 @@ use super::args::subscription::{
     LifetimeKind, SshDaemonStatsArgs, SshSubFilterArgs, SshSubListArgs, SshSubPauseArgs,
     SshSubReplayArgs, SshSubResumeArgs, SshSubStatsArgs, SshSubscribeArgs, SshUnsubscribeArgs,
 };
-use super::peer_handle::PeerTable;
+use super::peer_handle::{PeerTable, RmcpPeerHandle};
 use super::resource_handlers;
 use super::server::McpSshServer;
 
@@ -239,6 +239,10 @@ enum LookupTarget<'a> {
 /// Pick the lookup arm — exhaustive match keeps every existing
 /// `DomainError` variant under compile-time scrutiny without inflating
 /// `collect_suggestions` past the 30-line threshold.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive DomainError match — pre-existing, unchanged by lane-bridge plumbing"
+)]
 fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
     match err {
         DomainError::SessionNotFound(id) => Some(LookupTarget::Session(id.as_str())),
@@ -1023,12 +1027,14 @@ where
 async fn run_sub_subscribe(
     use_case: &SubscribeUseCase,
     args: SshSubscribeArgs,
+    peer: Option<Arc<dyn PeerHandle>>,
 ) -> Result<CallToolResult, McpError> {
     let req = SubscribeRequest {
         uri: args.uri,
         lifetime: lifetime_from_args(args.lifetime, args.grace_ms, args.ttl_secs),
         lag_policy: args.lag_policy.unwrap_or(LagPolicy::Snapshot),
         filter: filter_from_str(args.filter.as_deref()),
+        peer,
     };
     match use_case.execute(req).await {
         Ok(outcome) => {
@@ -2139,7 +2145,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for a ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan into the lane through the channel mux outbound sink.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is reserved for the Phase 4 NDJSON daemon.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn ssh_subscribe(
         &self,
@@ -2151,7 +2157,11 @@ where
             &ctx,
             "ssh_subscribe",
             fingerprint_args(&args),
-            || async { run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await },
+            || async {
+                let peer: Option<Arc<dyn PeerHandle>> =
+                    Some(Arc::new(RmcpPeerHandle::resolve(&ctx, &self.peer_table)));
+                run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args, peer).await
+            },
         )
         .await
     }
@@ -3277,7 +3287,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for a ssh-mcp resource URI.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is reserved for the Phase 4 NDJSON daemon.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn ssh_subscribe(
         &self,
@@ -3289,7 +3299,11 @@ where
             &ctx,
             "ssh_subscribe",
             fingerprint_args(&args),
-            || async { run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await },
+            || async {
+                let peer: Option<Arc<dyn PeerHandle>> =
+                    Some(Arc::new(RmcpPeerHandle::resolve(&ctx, &self.peer_table)));
+                run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args, peer).await
+            },
         )
         .await
     }

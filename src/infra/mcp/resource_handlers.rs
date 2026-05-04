@@ -81,6 +81,10 @@ enum ResourceErrorCategory {
     Internal,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive DomainError match — pre-existing, unchanged by lane-bridge plumbing"
+)]
 const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
     match err {
         DomainError::InvalidArgument(_)
