@@ -36,7 +36,9 @@ use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
 use crate::ports::id_generator::IdGeneratorPort;
-use crate::ports::subscriber_lane::{LanePolicy, SubSummary, SubscriberLaneAsync, SubscriberLanePort};
+use crate::ports::subscriber_lane::{
+    LaneAdmin, LaneFuture, LanePolicy, SubSummary, SubscriberLaneAsync, SubscriberLanePort,
+};
 use crate::ports::subscriber_registry::ResourceKind;
 
 /// Live message pushed into a lane mpsc.
@@ -553,6 +555,24 @@ impl<I: IdGeneratorPort> SubscriberLanePort for SubscriberLaneAdapter<I> {
             .iter()
             .map(|entry| entry.value().summary())
             .collect()
+    }
+}
+
+impl<I: IdGeneratorPort + fmt::Debug> LaneAdmin for SubscriberLaneAdapter<I> {
+    fn open(
+        &self,
+        uri: String,
+        kind: ResourceKind,
+        resource_id: String,
+        policy: LanePolicy,
+    ) -> LaneFuture<'_, Result<SubId, DomainError>> {
+        Box::pin(async move {
+            <Self as SubscriberLaneAsync>::open_lane(self, uri, kind, resource_id, policy).await
+        })
+    }
+
+    fn close<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>> {
+        Box::pin(async move { <Self as SubscriberLaneAsync>::close_lane(self, sub_id).await })
     }
 }
 

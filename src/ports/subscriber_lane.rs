@@ -10,11 +10,20 @@
 //! See [ADR 0004](../docs/adr/0004-channel-mux-fairness.md) for the
 //! full design.
 
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::domain::error::DomainError;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
 use crate::ports::subscriber_registry::ResourceKind;
+
+/// Boxed future returned by [`LaneAdmin`] methods. Aliased so the
+/// trait surface stays compact and the absolute-path lint stays
+/// happy.
+pub type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Caller-controllable knobs that flow into the lane at registration
 /// time. Phase 3 expands the surface with auth-class metadata; Phase
@@ -68,6 +77,30 @@ pub trait SubscriberLanePort: Send + Sync + 'static {
 
     /// List every active lane.
     fn list_subs(&self) -> Vec<SubSummary>;
+}
+
+/// Cold-path, dyn-safe shim for the lane open/close calls.
+///
+/// Used by the subscribe / unsubscribe use cases. Methods box their
+/// futures so the use cases can hold a single `Arc<dyn LaneAdmin>`
+/// without caring about the concrete adapter type.
+///
+/// This trait is **not** for the hot path — Phase 2 producers reach
+/// the lane through the concrete [`SubscriberLanePort`] +
+/// [`SubscriberLaneAsync`] surface to keep the per-event path
+/// virtual-call free.
+pub trait LaneAdmin: fmt::Debug + Send + Sync + 'static {
+    /// Open a lane and return its [`SubId`]. Boxed for dyn dispatch.
+    fn open(
+        &self,
+        uri: String,
+        kind: ResourceKind,
+        resource_id: String,
+        policy: LanePolicy,
+    ) -> LaneFuture<'_, Result<SubId, DomainError>>;
+
+    /// Close a lane.
+    fn close<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
 }
 
 /// Async slice of the per-`SubId` lane registry.
