@@ -761,6 +761,108 @@ pub fn resolve_replay_window_bytes() -> usize {
         .clamp(REPLAY_WINDOW_BYTES_MIN, REPLAY_WINDOW_BYTES_MAX)
 }
 
+// ---------------------------------------------------------------------------
+// v5 Phase 4 — NDJSON daemon-specific resolvers
+// ---------------------------------------------------------------------------
+// These resolvers govern only the `ssh-mcp-tail` binary; the HTTP and
+// stdio binaries never read them. Defaults match `docs/INSTRUCTIONS_DAEMON.md`
+// and the limits table in ADR 0008.
+
+/// Default cap on a single NDJSON line received on the daemon's stdin
+/// (1 MiB).
+pub const DEFAULT_NDJSON_LINE_MAX: usize = 1_048_576;
+/// Floor for the NDJSON line cap. Below this realistic ops would be
+/// rejected.
+pub const NDJSON_LINE_MAX_MIN: usize = 1_024;
+/// Hard cap on the NDJSON line cap (16 MiB).
+pub const NDJSON_LINE_MAX_CAP: usize = 16 * 1_048_576;
+/// Environment variable for the NDJSON line cap.
+pub const NDJSON_LINE_MAX_ENV_VAR: &str = "SSH_NDJSON_LINE_MAX";
+
+/// Default heartbeat emit interval (seconds).
+pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 30;
+/// Floor for the heartbeat interval.
+pub const HEARTBEAT_INTERVAL_S_MIN: u64 = 1;
+/// Cap for the heartbeat interval.
+pub const HEARTBEAT_INTERVAL_S_MAX: u64 = 3_600;
+/// Environment variable for the heartbeat interval.
+pub const HEARTBEAT_INTERVAL_S_ENV_VAR: &str = "SSH_HEARTBEAT_INTERVAL_S";
+
+/// Default daemon-stats emit interval (seconds).
+pub const DEFAULT_DAEMON_STATS_INTERVAL_S: u64 = 60;
+/// Floor for the daemon-stats interval.
+pub const DAEMON_STATS_INTERVAL_S_MIN: u64 = 1;
+/// Cap for the daemon-stats interval.
+pub const DAEMON_STATS_INTERVAL_S_MAX: u64 = 3_600;
+/// Environment variable for the daemon-stats interval.
+pub const DAEMON_STATS_INTERVAL_S_ENV_VAR: &str = "SSH_DAEMON_STATS_INTERVAL_S";
+
+/// Default hard-shutdown deadline (seconds) for the daemon's grace
+/// drain.
+pub const DEFAULT_GRACE_HARD_TIMEOUT_S: u64 = 30;
+/// Floor for the hard-shutdown deadline.
+pub const GRACE_HARD_TIMEOUT_S_MIN: u64 = 1;
+/// Cap for the hard-shutdown deadline.
+pub const GRACE_HARD_TIMEOUT_S_MAX: u64 = 3_600;
+/// Environment variable for the hard-shutdown deadline.
+pub const GRACE_HARD_TIMEOUT_S_ENV_VAR: &str = "SSH_GRACE_HARD_TIMEOUT_S";
+
+/// Default for the optional pretty-print flag on outbound NDJSON.
+pub const DEFAULT_NDJSON_PRETTY: bool = false;
+/// Environment variable for the pretty-print flag.
+pub const NDJSON_PRETTY_ENV_VAR: &str = "SSH_NDJSON_PRETTY";
+
+/// Resolve the per-line NDJSON byte cap (`SSH_NDJSON_LINE_MAX`).
+#[must_use]
+pub fn resolve_ndjson_line_max() -> usize {
+    env::var(NDJSON_LINE_MAX_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_NDJSON_LINE_MAX)
+        .clamp(NDJSON_LINE_MAX_MIN, NDJSON_LINE_MAX_CAP)
+}
+
+/// Resolve the heartbeat emit interval (`SSH_HEARTBEAT_INTERVAL_S`).
+#[must_use]
+pub fn resolve_heartbeat_interval_s() -> u64 {
+    env::var(HEARTBEAT_INTERVAL_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_S)
+        .clamp(HEARTBEAT_INTERVAL_S_MIN, HEARTBEAT_INTERVAL_S_MAX)
+}
+
+/// Resolve the daemon-stats emit interval (`SSH_DAEMON_STATS_INTERVAL_S`).
+#[must_use]
+pub fn resolve_daemon_stats_interval_s() -> u64 {
+    env::var(DAEMON_STATS_INTERVAL_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DAEMON_STATS_INTERVAL_S)
+        .clamp(DAEMON_STATS_INTERVAL_S_MIN, DAEMON_STATS_INTERVAL_S_MAX)
+}
+
+/// Resolve the hard-shutdown grace deadline (`SSH_GRACE_HARD_TIMEOUT_S`).
+#[must_use]
+pub fn resolve_grace_hard_timeout_s() -> u64 {
+    env::var(GRACE_HARD_TIMEOUT_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GRACE_HARD_TIMEOUT_S)
+        .clamp(GRACE_HARD_TIMEOUT_S_MIN, GRACE_HARD_TIMEOUT_S_MAX)
+}
+
+/// Resolve the pretty-print flag for outbound NDJSON (`SSH_NDJSON_PRETTY`).
+/// Defaults to `false`; any value other than `true` / `1` returns false.
+#[must_use]
+pub fn resolve_ndjson_pretty() -> bool {
+    env::var(NDJSON_PRETTY_ENV_VAR)
+        .ok()
+        .map_or(DEFAULT_NDJSON_PRETTY, |v| {
+            matches!(v.as_str(), "true" | "1" | "yes")
+        })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
