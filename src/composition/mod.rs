@@ -21,6 +21,7 @@
 //! reference it unconditionally. Production wiring picks the matching
 //! variant in [`prod`].
 
+pub mod embed;
 pub mod fixtures;
 pub mod id_lister;
 pub mod prod;

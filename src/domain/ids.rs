@@ -13,7 +13,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Identifier for an SSH session aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -44,7 +44,7 @@ impl fmt::Display for SessionId {
 }
 
 /// Identifier for an async command aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct CommandId(String);
 
@@ -75,7 +75,7 @@ impl fmt::Display for CommandId {
 }
 
 /// Identifier for an interactive shell aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct ShellId(String);
 
@@ -106,7 +106,7 @@ impl fmt::Display for ShellId {
 }
 
 /// Identifier for an SFTP transfer aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct TransferId(String);
 
@@ -137,7 +137,7 @@ impl fmt::Display for TransferId {
 }
 
 /// Identifier for a port-forwarder aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct ForwardId(String);
 
@@ -168,7 +168,7 @@ impl fmt::Display for ForwardId {
 }
 
 /// Identifier of an external agent that owns one or more sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct AgentId(String);
 
@@ -200,7 +200,7 @@ impl fmt::Display for AgentId {
 
 /// Identifier of a connected MCP peer (subscriber). Stable for the lifetime
 /// of the underlying transport.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct PeerId(String);
 
