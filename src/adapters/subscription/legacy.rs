@@ -29,6 +29,7 @@
 //!   Subscribers see one notification per window regardless of producer
 //!   chatter; `resources/read` does the actual coalescing of bytes.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -42,6 +43,7 @@ use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior, interval};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::adapters::config::internal::{
@@ -232,12 +234,13 @@ impl SubscriptionRegistry {
     /// closed. Returns the number of peers dropped. Used by the binary
     /// entry points (`ssh-mcp` and `ssh-mcp-stdio`) as a periodic GC pass
     /// since rmcp 1.6 does not surface a peer-disconnect callback.
+    #[must_use]
     pub fn gc_closed_peers(&self) -> usize {
         // Snapshot a unique set of (peer_id, peer) pairs before mutating —
         // `drop_peer` re-acquires the same shards, so we must release the
         // outer guards first.
         let mut closed_peer_ids: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for entry in &self.subscribers {
             for handle in entry.value() {
                 if seen.insert(handle.peer_id.clone()) && handle.peer.is_transport_closed() {
@@ -469,14 +472,15 @@ async fn broadcast_resource_updated(uri: &str) {
 /// supplied the GC pass also prunes its closed peers so the v4 side
 /// table stays in sync with the legacy [`SUBSCRIPTION_REGISTRY`] ahead
 /// of the runtime migration.
+#[must_use]
 pub fn spawn_peer_gc(
     interval_secs: u64,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
     peer_table: Option<Arc<PeerTable>>,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = interval(Duration::from_secs(interval_secs.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Drain the immediate first tick so the first real scan happens
         // after the configured interval.
         ticker.tick().await;

@@ -158,7 +158,7 @@ mod tests {
     use super::{Bytes, RusshOutputAdapter};
     use crate::adapters::ssh::internal::async_command::{OutputBuffer, RunningCommand};
     use crate::adapters::ssh::internal::shell::{RingBuffer, RunningShell, WriteRequest};
-    use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
+    use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus};
     use crate::adapters::ssh::russh_adapter::{CommandRecord, ShellRecord};
     use crate::domain::error::DomainError;
     use crate::domain::ids::{CommandId, SessionId, ShellId};
@@ -180,19 +180,9 @@ mod tests {
         }))
     }
 
-    fn sample_shell(session_id: &str, shell_id: &str) -> Arc<RunningShell> {
-        let (input_tx, _input_rx) = mpsc::channel::<WriteRequest>(8);
+    fn sample_shell(_session_id: &str, _shell_id: &str) -> Arc<RunningShell> {
         Arc::new(RunningShell::new(
-            ShellInfo {
-                shell_id: shell_id.to_string(),
-                session_id: session_id.to_string(),
-                term_type: "xterm".to_string(),
-                cols: 80,
-                rows: 24,
-                opened_at: "2024-01-15T10:30:00Z".to_string(),
-            },
             CancellationToken::new(),
-            input_tx,
             10 * 1024 * 1024,
         ))
     }

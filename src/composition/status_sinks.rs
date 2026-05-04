@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
+use crate::adapters::config::env::EnvConfig;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
 #[cfg(feature = "port_forward")]
 use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
@@ -34,6 +35,7 @@ use crate::adapters::ssh::internal::status_sink::{
     TransferRegistrationSink, TransferStatusSink,
 };
 use crate::domain::command::CommandEntity;
+use crate::domain::error::DomainError;
 #[cfg(feature = "port_forward")]
 use crate::domain::forward::ForwardEntity;
 #[cfg(feature = "port_forward")]
@@ -439,7 +441,7 @@ impl ShellRegistrationSink for RepoShellRegistrationSink {
 #[derive(Debug, Clone)]
 pub struct RepoTransferRegistrationSink {
     repo: Arc<DashMapTransferRepo>,
-    config: Arc<crate::adapters::config::env::EnvConfig>,
+    config: Arc<EnvConfig>,
 }
 
 impl RepoTransferRegistrationSink {
@@ -447,11 +449,35 @@ impl RepoTransferRegistrationSink {
     /// already-shared config handle (used to read the live per-session
     /// cap on every register call).
     #[must_use]
-    pub const fn new(
-        repo: Arc<DashMapTransferRepo>,
-        config: Arc<crate::adapters::config::env::EnvConfig>,
-    ) -> Self {
+    pub const fn new(repo: Arc<DashMapTransferRepo>, config: Arc<EnvConfig>) -> Self {
         Self { repo, config }
+    }
+}
+
+impl RepoTransferRegistrationSink {
+    /// Drive the cap-aware insert path for a transfer that did not yet
+    /// have a row in the repository. Errors are downgraded to log
+    /// records: the use case is the canonical source of user-facing
+    /// failures.
+    async fn insert_with_cap(&self, entity: TransferEntity, id: &TransferId) {
+        let cap = self.config.max_transfers_per_session();
+        match self.repo.insert_if_under_cap(entity, cap).await {
+            Ok(()) => {}
+            Err(DomainError::MaxTransfersExceeded { limit }) => {
+                debug!(
+                    transfer_id = %id,
+                    limit,
+                    "transfer registration sink: cap reached (use case will reject)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    transfer_id = %id,
+                    ?err,
+                    "transfer registration sink: insert_if_under_cap failed"
+                );
+            }
+        }
     }
 }
 
@@ -469,28 +495,7 @@ impl TransferRegistrationSink for RepoTransferRegistrationSink {
                         "transfer registration sink: row already present (use case already inserted)"
                     );
                 }
-                Ok(None) => {
-                    let cap = self.config.max_transfers_per_session();
-                    match self.repo.insert_if_under_cap(entity, cap).await {
-                        Ok(()) => {}
-                        Err(crate::domain::error::DomainError::MaxTransfersExceeded { limit }) => {
-                            // Use case will surface the user-visible
-                            // error; the sink merely steps aside.
-                            debug!(
-                                transfer_id = %id,
-                                limit,
-                                "transfer registration sink: cap reached (use case will reject)"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                transfer_id = %id,
-                                ?err,
-                                "transfer registration sink: insert_if_under_cap failed"
-                            );
-                        }
-                    }
-                }
+                Ok(None) => self.insert_with_cap(entity, &id).await,
                 Err(err) => {
                     warn!(
                         transfer_id = %id,

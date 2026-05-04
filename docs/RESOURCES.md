@@ -1,14 +1,10 @@
 # Resources Reference (v4.8.0)
 
-ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure features, and (v4.7) the `resources/templates/list` advertisement. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 put the v3-promised `_meta` envelope on every read, formalised the per-resource MIME types, and derived a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests. v4.6 layered the LLM steering surface onto the tool responses (`HINT:` and `NEXT:` lines). v4.7 adds the parameterised template advertisement so smaller LLMs can scan the URI shape catalogue without enumerating every live instance — see [Resource Templates (v4.7)](#resource-templates-v47) below.
+Source of truth for the MCP `resources/*` family in ssh-mcp: 5 subscribe-friendly URI schemes, URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)).
 
-> **v4.8 — no resource changes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement; resource schemes, URI grammar, cursor semantics, `_meta` envelope, subscribe lifecycle, and `resources/templates/list` payload are byte-identical to v4.7.1. Every section below carries forward unchanged.
+> **v4.8 — no resource changes.** Strictly additive on `tools/list[].outputSchema`; everything below carries forward byte-identical to v4.7.1.
 
-Cross references:
-
-- [API.md](./API.md) — tool reference (each tool documents the resource URI it produces).
-- [LLM_GUIDE.md](./LLM_GUIDE.md) — decision table for when to subscribe vs poll.
-- [LOCKS.md](./LOCKS.md) — lock-free patterns underpinning the broadcast / cursor layer.
+Cross-refs: [API.md](./API.md) (tool reference) · [LLM_GUIDE.md](./LLM_GUIDE.md) (subscribe vs poll decision table) · [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants) (lock-free patterns underpinning the broadcast / cursor layer).
 
 ## Capabilities advertised
 

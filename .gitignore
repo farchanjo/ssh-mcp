@@ -17,7 +17,12 @@ privkey
 
 # Python cache
 __pycache__/
+**/__pycache__/
 *.pyc
+
+# Pytest cache (every depth — top-level, scripts/*, helpers/*)
+.pytest_cache/
+**/.pytest_cache/
 
 # Logs
 *.log
@@ -41,3 +46,17 @@ Thumbs.db
 # Claude Code local state (per-machine, never committed)
 .claude/
 .venv/
+
+# GitHub configuration kept local-only on this checkout (per project policy)
+.github/
+
+# Local script caches (mypy / ruff / coverage / tox when invoked under scripts/)
+scripts/.cache/
+scripts/.mypy_cache/
+scripts/.ruff_cache/
+scripts/.tox/
+scripts/.coverage
+scripts/htmlcov/
+
+# v5 Phase 5 — soak / stress harness output
+scripts/soak_metrics.csv

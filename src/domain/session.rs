@@ -54,7 +54,7 @@ impl SessionEntity {
 
     /// Apply a fresh health probe outcome and return the updated entity.
     #[must_use]
-    pub fn with_health(mut self, at: DateTime<Utc>, healthy: bool) -> Self {
+    pub const fn with_health(mut self, at: DateTime<Utc>, healthy: bool) -> Self {
         self.last_health_check = Some(at);
         self.healthy = Some(healthy);
         self

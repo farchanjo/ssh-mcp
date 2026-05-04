@@ -43,9 +43,13 @@ use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, TransferId};
+use crate::domain::lifecycle::LifecyclePolicy;
+use crate::domain::session::SessionEntity;
+use crate::domain::transfer::TransferEntity;
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::lifecycle_policy::{LifecyclePolicyPort, NoopLifecycle};
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::sftp_client::{DownloadRequest as PortDownloadRequest, SftpClientPort};
 use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryPort};
@@ -62,10 +66,14 @@ pub struct DownloadRequest {
     /// is the responsibility of the production [`SftpClientPort`] adapter so
     /// the use case stays free of filesystem assumptions.
     pub local_path: String,
+    /// v5 Phase 3 — optional lifecycle policy override.
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
-/// must render. Mirrors the shape of
+/// must render.
+///
+/// Mirrors the shape of
 /// [`crate::application::upload_file::UploadOutcome`] so the inbound
 /// adapter can render both directions through a single helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +119,8 @@ where
     ids: Arc<I>,
     config: Arc<Cfg>,
     subscribers: Arc<Sub>,
+    /// v5 lifecycle: tracks the freshly minted transfer.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<F, SR, TR, C, I, Cfg, Sub> DownloadFileUseCase<F, SR, TR, C, I, Cfg, Sub>
@@ -123,9 +133,12 @@ where
     Cfg: ConfigPort + Send + Sync,
     Sub: SubscriberRegistryPort + Send + Sync,
 {
-    /// Wire the use case from already-shared adapter handles.
+    /// Wire the use case from already-shared adapter handles. Use
+    /// [`Self::with_lifecycle`] to bind the v5 lifecycle adapter post
+    /// construction so the constructor stays under the
+    /// `too_many_arguments` clippy threshold.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         sftp: Arc<F>,
         sessions: Arc<SR>,
         transfers: Arc<TR>,
@@ -142,7 +155,15 @@ where
             ids,
             config,
             subscribers,
+            lifecycle: Arc::new(NoopLifecycle),
         }
+    }
+
+    /// Builder helper that swaps in the production v5 lifecycle adapter.
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: Arc<dyn LifecyclePolicyPort>) -> Self {
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// Drive the download orchestration. See module-level docs for the
@@ -167,37 +188,31 @@ where
         // `TransferRepository::insert_if_under_cap` — see
         // [`crate::application::upload_file`] for the same rationale.
         self.guard_transfer_cap(&req.session_id).await?;
-
         let transfer_id = self.ids.new_transfer_id();
-        let entity = self
-            .sftp
-            .download(
-                transfer_id.clone(),
-                PortDownloadRequest {
-                    session_id: req.session_id.clone(),
-                    remote_path: req.remote_path.clone(),
-                    local_path: req.local_path.clone(),
-                },
-            )
-            .await?;
-
+        let entity = self.spawn_download(&transfer_id, &req).await?;
         // Snapshot before the move into `insert`.
         let resolved_local = entity.local_path.clone();
         let resolved_remote = entity.remote_path.clone();
         let total_bytes = entity.total_bytes;
         let started_at = entity.started_at;
-
         self.persist_or_rollback(&transfer_id, entity).await?;
-
+        // v5 lifecycle binding: register the freshly spawned download.
+        // The policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
+        self.lifecycle.track_resource(
+            ResourceKind::Transfer,
+            transfer_id.as_str(),
+            &req.session_id,
+            req.lifecycle_policy.unwrap_or_default(),
+        );
         self.subscribers
             .poke(ResourceKind::Transfer, transfer_id.as_str());
-
         // Touching the clock keeps the port plumbed even though the
         // adapter owns the canonical `started_at`. A future iteration
         // can route every timestamp through the clock without another
         // constructor churn.
         let _ = self.clock.utc_now();
-
         Ok(DownloadOutcome {
             transfer_id,
             session_id: req.session_id,
@@ -209,12 +224,28 @@ where
         })
     }
 
+    /// Drive the SFTP adapter to spawn the download streaming task and
+    /// return the snapshot transfer entity.
+    async fn spawn_download(
+        &self,
+        transfer_id: &TransferId,
+        req: &DownloadRequest,
+    ) -> Result<TransferEntity, DomainError> {
+        self.sftp
+            .download(
+                transfer_id.clone(),
+                PortDownloadRequest {
+                    session_id: req.session_id.clone(),
+                    remote_path: req.remote_path.clone(),
+                    local_path: req.local_path.clone(),
+                },
+            )
+            .await
+    }
+
     /// Resolve the session entity, mapping `Ok(None)` to
     /// [`DomainError::SessionNotFound`].
-    async fn lookup_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<crate::domain::session::SessionEntity, DomainError> {
+    async fn lookup_session(&self, session_id: &SessionId) -> Result<SessionEntity, DomainError> {
         self.sessions
             .get(session_id)
             .await?
@@ -240,7 +271,7 @@ where
     async fn persist_or_rollback(
         &self,
         transfer_id: &TransferId,
-        entity: crate::domain::transfer::TransferEntity,
+        entity: TransferEntity,
     ) -> Result<(), DomainError> {
         let cap = self.config.max_transfers_per_session();
         if let Err(err) = self.transfers.insert_if_under_cap(entity, cap).await {
@@ -362,6 +393,12 @@ mod tests {
         let ids = Arc::new(SequentialIds::default());
         let cfg = Arc::new(config);
         let registry = Arc::new(RecordingRegistry::new());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(
+                cascade,
+                Arc::clone(&clock),
+            );
         let uc = DownloadFileUseCase::new(
             Arc::clone(&sftp),
             Arc::clone(&sessions),
@@ -370,7 +407,8 @@ mod tests {
             Arc::clone(&ids),
             Arc::clone(&cfg),
             Arc::clone(&registry),
-        );
+        )
+        .with_lifecycle(lifecycle);
         Wired {
             uc,
             sftp,
@@ -450,6 +488,7 @@ mod tests {
             session_id,
             remote_path: "/srv/source.bin".to_string(),
             local_path: "/tmp/dest.bin".to_string(),
+            lifecycle_policy: None,
         }
     }
 

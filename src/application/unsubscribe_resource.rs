@@ -22,6 +22,9 @@ use std::sync::Arc;
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
+use crate::domain::subscription::SubId;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+use crate::ports::subscriber_lane::LaneAdmin;
 use crate::ports::subscriber_registry::SubscriberRegistryAsync;
 
 /// Inbound DTO.
@@ -31,6 +34,11 @@ pub struct UnsubscribeResourceRequest {
     pub uri: String,
     /// Peer id (must match the id used at subscribe time).
     pub peer_id: PeerId,
+    /// Optional v5 Phase 2 [`SubId`] — when present the use case
+    /// also closes the matching [`LaneAdmin`] entry (best-effort:
+    /// the lane may already be gone if Phase 3 lifetime auto-close
+    /// fired first).
+    pub sub_id: Option<SubId>,
 }
 
 /// Outbound DTO surfacing the canonical URI.
@@ -47,6 +55,13 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
+    /// v5 Phase 2 — optional [`LaneAdmin`] handle. When wired, the
+    /// use case closes the matching lane before the legacy registry
+    /// unsubscribe so the
+    /// [`crate::ports::lifecycle_policy::LifecyclePolicyPort::on_unsubscribe`]
+    /// cascade observes the cleanup in the right order.
+    lane: Option<Arc<dyn LaneAdmin>>,
 }
 
 impl<Sub> UnsubscribeResourceUseCase<Sub>
@@ -55,8 +70,19 @@ where
 {
     /// Wire the use case from an already-shared adapter handle.
     #[must_use]
-    pub const fn new(subscribers: Arc<Sub>) -> Self {
-        Self { subscribers }
+    pub const fn new(subscribers: Arc<Sub>, lifecycle: Arc<dyn LifecyclePolicyPort>) -> Self {
+        Self {
+            subscribers,
+            lifecycle,
+            lane: None,
+        }
+    }
+
+    /// Install the v5 Phase 2 [`LaneAdmin`] handle.
+    #[must_use]
+    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
+        self.lane = Some(lane);
+        self
     }
 
     /// Drive the unsubscribe orchestration. See module-level docs.
@@ -73,7 +99,27 @@ where
         let parsed =
             parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
+        // v5 Phase 2: close the lane first so its lifecycle hook
+        // fires before the registry releases the (peer, uri) cursor.
+        // SubNotFound is tolerated — Phase 3 lifetime auto-close may
+        // have already torn the lane down.
+        if let Some(lane) = self.lane.as_ref()
+            && let Some(sub_id) = req.sub_id.as_ref()
+        {
+            match lane.close(sub_id).await {
+                Ok(()) | Err(DomainError::SubNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.subscribers.unsubscribe(&req.peer_id, &canonical).await;
+        // v5 lifecycle: debit the resource refcount. Errors here are
+        // bug-class (underflow on a never-tracked resource); surface
+        // them so the caller can report the regression rather than
+        // silently swallow it. The legacy registry tolerates unknown
+        // (peer, uri) pairs, but the lifecycle adapter is permissive
+        // for unknown resources too — see
+        // `RefcountedLifecycleAdapter::on_unsubscribe`.
+        self.lifecycle.on_unsubscribe(parsed.kind, &parsed.id)?;
         Ok(UnsubscribeResourceOutcome { uri: canonical })
     }
 }
@@ -154,7 +200,11 @@ mod tests {
         Arc<RecordingRegistry>,
     ) {
         let registry = Arc::new(RecordingRegistry::default());
-        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry));
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle);
         (uc, registry)
     }
 
@@ -162,6 +212,7 @@ mod tests {
         UnsubscribeResourceRequest {
             uri: uri.to_string(),
             peer_id: PeerId::new(peer.to_string()),
+            sub_id: None,
         }
     }
 
@@ -250,5 +301,82 @@ mod tests {
             .expect("execute");
         let calls = registry.unsubs();
         assert_eq!(calls[0].0.as_str(), "peer-9");
+    }
+
+    // --- v5 Phase 2 lane wiring ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsubscribe_with_lane_closes_matching_sub_id() {
+        use crate::adapters::id_generator::uuid::UuidIds;
+        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+        use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync};
+
+        let registry = Arc::new(RecordingRegistry::default());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let lane_adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+        let sub_id = lane_adapter
+            .open_lane(
+                "shell://x/output".to_string(),
+                ResourceKind::Shell,
+                "x".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .expect("open");
+
+        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> =
+            Arc::clone(&lane_adapter) as Arc<dyn crate::ports::subscriber_lane::LaneAdmin>;
+        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle)
+            .with_subscriber_lane(lane);
+
+        let _ = uc
+            .execute(UnsubscribeResourceRequest {
+                uri: "shell://x/output".to_string(),
+                peer_id: PeerId::new("peer-1".to_string()),
+                sub_id: Some(sub_id.clone()),
+            })
+            .await
+            .expect("execute");
+
+        // Lane has been closed.
+        assert!(
+            crate::ports::subscriber_lane::SubscriberLanePort::stats_snapshot(
+                &*lane_adapter,
+                &sub_id
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsubscribe_tolerates_unknown_sub_id_when_lane_wired() {
+        use crate::adapters::id_generator::uuid::UuidIds;
+        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+        use crate::domain::subscription::SubId;
+
+        let registry = Arc::new(RecordingRegistry::default());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let lane_adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> = lane_adapter;
+        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle)
+            .with_subscriber_lane(lane);
+
+        // SubId never opened — close should still succeed (tolerated
+        // via SubNotFound -> Ok(()) mapping).
+        let outcome = uc
+            .execute(UnsubscribeResourceRequest {
+                uri: "shell://x/output".to_string(),
+                peer_id: PeerId::new("peer-1".to_string()),
+                sub_id: Some(SubId::new("ghost".to_string())),
+            })
+            .await
+            .expect("execute should tolerate unknown sub_id");
+        assert_eq!(outcome.uri, "shell://x/output");
     }
 }

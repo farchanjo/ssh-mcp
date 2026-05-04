@@ -48,10 +48,12 @@ use std::time::Duration;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, CommandId, SessionId};
+use crate::domain::lifecycle::LifecyclePolicy;
 use crate::ports::clock::ClockPort;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::lifecycle_policy::{LifecyclePolicyPort, NoopLifecycle};
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::ssh_client::SshClientPort;
 use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryPort};
@@ -68,6 +70,8 @@ pub struct ExecuteRequest {
     pub timeout: Option<Duration>,
     /// Whether the channel must allocate a PTY.
     pub use_pty: bool,
+    /// v5 Phase 3 — optional lifecycle policy override.
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing the freshly minted command id and the metadata
@@ -105,6 +109,9 @@ where
     ids: Arc<I>,
     config: Arc<Cfg>,
     subscribers: Arc<Sub>,
+    /// v5 lifecycle: tracked the moment the command is persisted so the
+    /// registry can drive refcount-aware close paths.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<S, R, CR, C, I, Cfg, Sub> ExecuteCommandUseCase<S, R, CR, C, I, Cfg, Sub>
@@ -117,9 +124,12 @@ where
     Cfg: ConfigPort + Send + Sync,
     Sub: SubscriberRegistryPort + Send + Sync,
 {
-    /// Wire the use case from already-shared adapter handles.
+    /// Wire the use case from already-shared adapter handles. Use
+    /// [`Self::with_lifecycle`] to bind the v5 lifecycle adapter post
+    /// construction so the constructor stays under the
+    /// `too_many_arguments` clippy threshold.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         ssh: Arc<S>,
         sessions: Arc<R>,
         commands: Arc<CR>,
@@ -136,7 +146,16 @@ where
             ids,
             config,
             subscribers,
+            lifecycle: Arc::new(NoopLifecycle),
         }
+    }
+
+    /// Builder helper that swaps in the production v5 lifecycle adapter.
+    /// Returns `self` so composition can chain it after [`Self::new`].
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: Arc<dyn LifecyclePolicyPort>) -> Self {
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// Drive the execute orchestration. See module-level docs for the
@@ -164,6 +183,16 @@ where
         self.persist_running_command(&command_id, &req, started_at)
             .await?;
         self.spawn_or_rollback(&command_id, &req).await?;
+        // v5 lifecycle binding: register the freshly spawned command.
+        // The policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
+        self.lifecycle.track_resource(
+            ResourceKind::Command,
+            command_id.as_str(),
+            &req.session_id,
+            req.lifecycle_policy.unwrap_or_default(),
+        );
 
         self.subscribers
             .poke(ResourceKind::Command, command_id.as_str());
@@ -342,6 +371,12 @@ mod tests {
         let ids = Arc::new(SequentialIds::default());
         let cfg = Arc::new(config);
         let registry = Arc::new(RecordingRegistry::new());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(
+                cascade,
+                Arc::clone(&clock),
+            );
         let uc = ExecuteCommandUseCase::new(
             Arc::clone(&ssh),
             Arc::clone(&sessions),
@@ -350,7 +385,8 @@ mod tests {
             Arc::clone(&ids),
             Arc::clone(&cfg),
             Arc::clone(&registry),
-        );
+        )
+        .with_lifecycle(lifecycle);
         Wired {
             uc,
             ssh,
@@ -406,6 +442,7 @@ mod tests {
             command: "ls -la".to_string(),
             timeout: None,
             use_pty: false,
+            lifecycle_policy: None,
         }
     }
 

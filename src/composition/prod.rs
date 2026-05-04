@@ -32,8 +32,18 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::adapters::auth::chain::AuthChainAdapter;
 use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::env::EnvConfig;
-use crate::adapters::config::internal::resolve_peer_gc_interval_s;
+use tokio::sync::mpsc;
+
+use crate::adapters::config::internal::{
+    resolve_lane_buffer, resolve_max_subs_per_uri, resolve_max_subs_total, resolve_mux_buffer,
+    resolve_peer_gc_interval_s,
+};
 use crate::adapters::id_generator::uuid::UuidIds;
+use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+use crate::adapters::lifecycle::leak_watcher::{
+    LeakWatcher, LeakWatcherHandle, LeakWatcherProbe, spawn_default,
+};
+use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
@@ -44,8 +54,10 @@ use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
 use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
 use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegistry};
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
+use crate::adapters::subscription::channel_mux::ChannelMuxAdapter;
 use crate::adapters::subscription::legacy::spawn_peer_gc;
 use crate::adapters::subscription::memory_registry::MemoryRegistry;
+use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
 use crate::application::cancel_command::CancelCommandUseCase;
 use crate::application::close_shell::CloseShellUseCase;
 use crate::application::connect_session::ConnectSessionUseCase;
@@ -66,6 +78,10 @@ use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
+use crate::application::subscription_admin::{
+    DaemonStatsUseCase, ListSubsUseCase, PauseSubUseCase, ReplaySubUseCase, ResumeSubUseCase,
+    SetFilterUseCase, SubStatsUseCase, SubscribeUseCase, UnsubscribeUseCase,
+};
 use crate::application::unsubscribe_resource::UnsubscribeResourceUseCase;
 use crate::application::upload_file::UploadFileUseCase;
 use crate::application::wait_for_pattern::WaitForPatternUseCase;
@@ -80,6 +96,8 @@ use crate::infra::mcp::idempotency::IdempotencyCache;
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 use crate::infra::mcp::tool_router::IdLister;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+use crate::ports::subscriber_lane::LaneAdmin;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
 /// as the legacy v3 `RuntimeError` so binaries do not need to change.
@@ -168,11 +186,17 @@ pub type ProdUseCases = UseCases<
 ///
 /// Returned as a tuple-struct via the deconstruction pattern in
 /// [`build_use_cases`] callers; the type alias keeps signatures readable.
+///
+/// The fifth tuple member is the concrete [`RefcountedLifecycleAdapter`]
+/// handle the binaries hand to the v5 Phase 3 `SUB_LEAK_RISK` leak
+/// watcher (the trait-object handle inside the use case container is
+/// dyn-safe but cannot drive `LeakWatcher::spawn` directly).
 type ProdWiring = (
     Arc<ProdUseCases>,
     Arc<PeerTable>,
     Arc<IdempotencyCache>,
     Arc<dyn IdLister>,
+    Arc<RefcountedLifecycleAdapter<SystemClock>>,
 );
 
 /// Build the production [`UseCases`] container plus the shared peer
@@ -244,7 +268,10 @@ pub fn build_use_cases() -> ProdWiring {
 
     let peer_table = new_peer_table();
     let notifier = Arc::new(RmcpNotifier::new(Arc::clone(&peer_table)));
-    let subscribers = MemoryRegistry::<RmcpNotifier>::new(Arc::clone(&notifier));
+    // v5: enforce SSH_MAX_SUBS_PER_URI / SSH_MAX_SUBS_TOTAL on the
+    // legacy v4-compat subscribe path so callers that bypass the
+    // SubscriberLane layer still hit the documented caps.
+    let subscribers = MemoryRegistry::<RmcpNotifier>::from_env(Arc::clone(&notifier));
 
     let auth = Arc::new(AuthChainAdapter::default_chain());
     let output = Arc::new(RusshOutputAdapter::new(&ssh));
@@ -253,6 +280,47 @@ pub fn build_use_cases() -> ProdWiring {
     // `config` was bound earlier (alongside the transfer registration sink)
     // so the sink shares the same handle as every downstream use case.
     let ids = Arc::new(UuidIds);
+
+    // v5 lifecycle adapter: cascade coordinator + refcounted state
+    // machine. Held as `Arc<dyn LifecyclePolicyPort>` so use cases stay
+    // generics-stable while the v5 wiring rolls out incrementally.
+    // Phase 1 leaves the auto-disconnect hook uninstalled — Phase 3
+    // wires the DisconnectSessionUseCase callback once the use cases
+    // expose a Send + Sync 'static driver.
+    let cascade = CascadeCoordinator::new();
+    let lifecycle_concrete =
+        RefcountedLifecycleAdapter::new(Arc::clone(&cascade), Arc::clone(&clock));
+    // `Arc<RefcountedLifecycleAdapter<_>>` -> `Arc<dyn LifecyclePolicyPort>`
+    // via the standard unsizing coercion. Wrapping via `Arc::clone`
+    // would require erasing the type first, so the explicit binding
+    // is the cleanest path.
+    let lifecycle: Arc<dyn LifecyclePolicyPort> =
+        Arc::<RefcountedLifecycleAdapter<SystemClock>>::clone(&lifecycle_concrete);
+
+    // v5 Phase 2: SubscriberLane + ChannelMux. The lane adapter
+    // mints per-`SubId` UUIDv7 ids through the same id generator
+    // used elsewhere in the wiring. The mux installs an outbound
+    // sink (Phase 4 wires the NDJSON daemon writer); Phase 2 keeps
+    // the sink open so receivers stay drainable but no consumer is
+    // attached yet.
+    let subscriber_lane_adapter = SubscriberLaneAdapter::new(
+        Arc::clone(&ids),
+        resolve_lane_buffer(),
+        resolve_max_subs_per_uri(),
+        resolve_max_subs_total(),
+    );
+    let channel_mux = ChannelMuxAdapter::new();
+    let mux_for_sink = Arc::clone(&channel_mux);
+    subscriber_lane_adapter.install_rx_sink(Box::new(move |sub_id, rx| {
+        mux_for_sink.register_lane(sub_id, rx);
+    }));
+    let (mux_outbound_tx, _mux_outbound_rx) = mpsc::channel(resolve_mux_buffer());
+    channel_mux.install_outbound(mux_outbound_tx);
+    let lane_admin: Arc<dyn LaneAdmin> = lane_admin_from(&subscriber_lane_adapter);
+    // Phase 4 will wire the drain task to the NDJSON daemon stdout
+    // writer. Phase 2 keeps the receiver alive on the composition
+    // root so the mpsc never reports `Closed` and the outbound sink
+    // never blocks.
 
     let connect = Arc::new(ConnectSessionUseCase::new(
         Arc::clone(&ssh),
@@ -282,15 +350,18 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&transfers),
     ));
 
-    let execute = Arc::new(ExecuteCommandUseCase::new(
-        Arc::clone(&ssh),
-        Arc::clone(&sessions),
-        Arc::clone(&commands),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
+    let execute = Arc::new(
+        ExecuteCommandUseCase::new(
+            Arc::clone(&ssh),
+            Arc::clone(&sessions),
+            Arc::clone(&commands),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
     let get_command_output = Arc::new(GetCommandOutputUseCase::new(
         Arc::clone(&commands),
         Arc::clone(&output),
@@ -303,6 +374,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&ssh),
         Arc::clone(&commands),
         Arc::clone(&output),
+        Arc::clone(&lifecycle),
     ));
 
     let open_shell = Arc::new(OpenShellUseCase::new(
@@ -312,6 +384,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&clock),
         Arc::clone(&ids),
         Arc::clone(&config),
+        Arc::clone(&lifecycle),
     ));
     let write_shell = Arc::new(WriteShellUseCase::new(
         Arc::clone(&ssh),
@@ -338,26 +411,33 @@ pub fn build_use_cases() -> ProdWiring {
     let close_shell = Arc::new(CloseShellUseCase::new(
         Arc::clone(&ssh),
         Arc::clone(&shells),
+        Arc::clone(&lifecycle),
     ));
 
-    let upload_file = Arc::new(UploadFileUseCase::new(
-        Arc::clone(&sftp),
-        Arc::clone(&sessions),
-        Arc::clone(&transfers),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
-    let download_file = Arc::new(DownloadFileUseCase::new(
-        Arc::clone(&sftp),
-        Arc::clone(&sessions),
-        Arc::clone(&transfers),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
+    let upload_file = Arc::new(
+        UploadFileUseCase::new(
+            Arc::clone(&sftp),
+            Arc::clone(&sessions),
+            Arc::clone(&transfers),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
+    let download_file = Arc::new(
+        DownloadFileUseCase::new(
+            Arc::clone(&sftp),
+            Arc::clone(&sessions),
+            Arc::clone(&transfers),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
     let get_transfer_progress = Arc::new(GetTransferProgressUseCase::new(Arc::clone(&transfers)));
 
     #[cfg(feature = "port_forward")]
@@ -407,25 +487,49 @@ pub fn build_use_cases() -> ProdWiring {
     ));
 
     #[cfg(feature = "port_forward")]
-    let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
-        Arc::clone(&shells),
-        Arc::clone(&commands),
-        Arc::clone(&transfers),
-        Arc::clone(&sessions),
-        Arc::clone(&forwards),
-        Arc::clone(&subscribers),
-    ));
+    let subscribe_resource = Arc::new(
+        SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&forwards),
+            Arc::clone(&subscribers),
+            Arc::clone(&lifecycle),
+        )
+        .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
     #[cfg(not(feature = "port_forward"))]
-    let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
-        Arc::clone(&shells),
-        Arc::clone(&commands),
-        Arc::clone(&transfers),
-        Arc::clone(&sessions),
-        Arc::clone(&subscribers),
-    ));
+    let subscribe_resource = Arc::new(
+        SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&subscribers),
+            Arc::clone(&lifecycle),
+        )
+        .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
 
-    let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(Arc::clone(&subscribers)));
+    let unsubscribe_resource = Arc::new(
+        UnsubscribeResourceUseCase::new(Arc::clone(&subscribers), Arc::clone(&lifecycle))
+            .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
+
+    // v5 Phase 3 — subscription-administration use cases. All share the
+    // same `Arc<dyn LaneAdmin>` handle so the channel-mux wiring stays
+    // single-sourced.
+    let sub_subscribe = Arc::new(SubscribeUseCase::new(Arc::clone(&lane_admin)));
+    let sub_unsubscribe = Arc::new(UnsubscribeUseCase::new(Arc::clone(&lane_admin)));
+    let sub_pause = Arc::new(PauseSubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_resume = Arc::new(ResumeSubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_filter = Arc::new(SetFilterUseCase::new(Arc::clone(&lane_admin)));
+    let sub_replay = Arc::new(ReplaySubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_list = Arc::new(ListSubsUseCase::new(Arc::clone(&lane_admin)));
+    let sub_stats = Arc::new(SubStatsUseCase::new(Arc::clone(&lane_admin)));
+    let daemon_stats = Arc::new(DaemonStatsUseCase::new(Arc::clone(&lane_admin)));
 
     let idempotency = Arc::new(IdempotencyCache::from_env());
 
@@ -472,17 +576,83 @@ pub fn build_use_cases() -> ProdWiring {
         peer_gc,
         auth,
         notifier,
+        lifecycle_policy: Arc::clone(&lifecycle),
+        sub_subscribe,
+        sub_unsubscribe,
+        sub_pause,
+        sub_resume,
+        sub_filter,
+        sub_replay,
+        sub_list,
+        sub_stats,
+        daemon_stats,
     });
 
-    (use_cases, peer_table, idempotency, id_lister)
+    (
+        use_cases,
+        peer_table,
+        idempotency,
+        id_lister,
+        lifecycle_concrete,
+    )
+}
+
+/// Erase the concrete [`SubscriberLaneAdapter`] handle behind a
+/// [`LaneAdmin`] dyn pointer. The conversion uses the implicit
+/// `Arc<T>` -> `Arc<dyn Trait>` coercion so the `as_conversions`
+/// lint stays happy.
+fn lane_admin_from(adapter: &Arc<SubscriberLaneAdapter<UuidIds>>) -> Arc<dyn LaneAdmin> {
+    let cloned: Arc<SubscriberLaneAdapter<UuidIds>> = Arc::clone(adapter);
+    cloned
 }
 
 /// Build a fresh [`McpSshServer`] backed by the production wiring.
+///
+/// Discards the v5 Phase 3 lifecycle handle. Use [`build_server_with_lifecycle`]
+/// when the caller needs to spawn the `SUB_LEAK_RISK` watcher.
 #[must_use]
 pub fn build_server() -> McpSshServer<ProdUseCases> {
-    let (use_cases, peer_table, idempotency, id_lister) = build_use_cases();
-    McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency).with_id_lister(id_lister)
+    build_server_with_lifecycle().0
 }
+
+/// Build a fresh [`McpSshServer`] and surface the concrete lifecycle
+/// adapter for `SUB_LEAK_RISK` watcher wiring.
+#[must_use]
+pub fn build_server_with_lifecycle() -> (
+    McpSshServer<ProdUseCases>,
+    Arc<RefcountedLifecycleAdapter<SystemClock>>,
+) {
+    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
+    let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
+        .with_id_lister(id_lister);
+    (server, lifecycle_concrete)
+}
+
+/// Build a fresh [`McpSshServer`] with the v5 Phase 3 leak watcher
+/// already plumbed in.
+///
+/// Returns the server (with the watcher wired into both consumer-side
+/// surfaces — progress notifications + list render), the concrete
+/// lifecycle adapter, and the spawned [`LeakWatcherHandle`] the binary
+/// owns until graceful shutdown.
+#[must_use]
+pub fn build_server_with_leak_watcher() -> (
+    McpSshServer<ProdUseCases>,
+    Arc<RefcountedLifecycleAdapter<SystemClock>>,
+    LeakWatcherHandle,
+) {
+    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
+    let leak_handle = spawn_default(&lifecycle_concrete);
+    let watcher_arc: Arc<LeakWatcher> = Arc::new(leak_handle.watcher.clone());
+    let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
+        .with_id_lister(id_lister)
+        .with_leak_watcher(watcher_arc);
+    (server, lifecycle_concrete, leak_handle)
+}
+
+/// Re-export of the [`LeakWatcherProbe`] dyn alias so tests can build a
+/// fake probe without reaching into the adapter layer.
+pub type DynLeakProbe = Arc<dyn LeakWatcherProbe>;
 
 // ---------------------------------------------------------------------------
 // Transport entry points
@@ -590,8 +760,15 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
     // Stdio runs a single `McpSshServer` for the whole process — share
     // its `PeerTable` with the GC pump so closed peers in the v4 side
     // table are pruned alongside the legacy registry.
-    let server = build_server();
+    //
+    // v5 Phase 3 — `build_server_with_leak_watcher` plumbs the
+    // `SUB_LEAK_RISK` watcher into both consumer-side surfaces:
+    //   1. notifications/progress (`leak_warn_bridge`) when the tool
+    //      call supplies `_meta.progressToken`.
+    //   2. WARN: SUB_LEAK_RISK lines on `ssh_list_*` responses.
+    let (server, _lifecycle_concrete, leak_handle) = build_server_with_leak_watcher();
     let peer_table = Arc::clone(server.peer_table());
+    tracing::info!("SUB_LEAK_RISK watcher spawned + wired into rmcp surface");
     let gc_interval = resolve_peer_gc_interval_s();
     let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), Some(peer_table));
     tracing::info!("peer GC task spawned (interval = {gc_interval}s)");
@@ -600,8 +777,12 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
     let waiting_result = service.waiting().await;
 
     gc_cancel.cancel();
+    leak_handle.cancel.cancel();
     if let Err(err) = gc_task.await {
         tracing::warn!("peer GC task join failed: {err}");
+    }
+    if let Err(err) = leak_handle.task.await {
+        tracing::warn!("SUB_LEAK_RISK watcher join failed: {err}");
     }
 
     waiting_result?;

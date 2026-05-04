@@ -9,21 +9,16 @@ use super::command::CommandStatus;
 
 /// Reuse strategy applied by `connect_session` when an existing session
 /// already matches the requested identity triple `(host, port, username)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReusePolicy {
     /// Surface candidate matches to the caller without taking action.
+    #[default]
     Suggest,
     /// Reuse the first matching session automatically.
     Auto,
     /// Always open a fresh session regardless of matches.
     ForceNew,
-}
-
-impl Default for ReusePolicy {
-    fn default() -> Self {
-        Self::Suggest
-    }
 }
 
 /// Filter applied to `list_commands` for the optional `status` predicate.

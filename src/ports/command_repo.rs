@@ -7,7 +7,7 @@ use crate::domain::policy::CommandStatusFilter;
 
 /// Command repository port.
 #[trait_variant::make(CommandRepository: Send)]
-pub trait LocalCommandRepository: Send + Sync {
+pub trait LocalCommandRepository: Sync {
     /// Insert a command entity.
     ///
     /// # Errors

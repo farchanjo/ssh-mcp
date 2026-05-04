@@ -55,10 +55,12 @@ pub fn shell_open_render_with_initial(
     if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
         append_initial_buffer_line(&mut out, bytes);
     }
+    // v5 Phase 3 — subscribe is RECOMMENDED for shells: polling via
+    // ssh_shell_read still works, but push deletes the polling latency.
     append_subscribe_hint(
         &mut out,
         &format!(
-            "subscribe to shell://{shell_id}/output for realtime output (preferred over polling)"
+            "RECOMMENDED: ssh_subscribe uri=shell://{shell_id}/output. Falls back gracefully if you skip (use ssh_shell_read)."
         ),
     );
     append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
@@ -103,13 +105,16 @@ fn append_initial_buffer_line(out: &mut String, bytes: &[u8]) {
     out.push_str(&sanitize_value(&lossy));
 }
 
-/// Successor tools after `ssh_shell_open` — subscribe-first push, or
-/// drive the shell with `ssh_shell_write` / `ssh_shell_send_key`.
+/// Successor tools after `ssh_shell_open`.
+///
+/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then drive the
+/// shell, with the polling fallback (`ssh_shell_read`) listed last.
 fn next_hint_for_shell_open(shell_id: &str) -> String {
     format!(
-        "resources/subscribe shell://{shell_id}/output | \
+        "ssh_subscribe uri=shell://{shell_id}/output | \
          ssh_shell_write | \
-         ssh_shell_send_key"
+         ssh_shell_send_key | \
+         ssh_shell_read (poll fallback)"
     )
 }
 
@@ -306,13 +311,13 @@ pub fn shell_open_structured_with_initial(
             "ssh_shell_send_key",
         ],
     });
-    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "initial_buffer".to_string(),
-                Value::String(String::from_utf8_lossy(bytes).into_owned()),
-            );
-        }
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty())
+        && let Some(obj) = json.as_object_mut()
+    {
+        obj.insert(
+            "initial_buffer".to_string(),
+            Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        );
     }
     json
 }

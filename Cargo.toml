@@ -1,8 +1,8 @@
 [package]
 name = "ssh-mcp"
-version = "4.8.1"
+version = "5.0.0-rc1"
 edition = "2024"
-rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
+rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
 authors = ["farchanjo"]
 default-run = "ssh-mcp"
@@ -18,6 +18,13 @@ path = "src/bin/ssh_mcp_stdio.rs"
 [[bin]]
 name = "ssh-mcp"
 path = "src/main.rs"
+
+# v5 Phase 4: NDJSON daemon binary embedding the rmcp client + server through
+# an in-process `tokio::io::duplex` transport. See ADR 0008 and
+# `docs/INSTRUCTIONS_DAEMON.md`.
+[[bin]]
+name = "ssh-mcp-tail"
+path = "src/bin/ssh_mcp_tail.rs"
 
 [lib]
 name = "ssh_mcp"
@@ -55,9 +62,11 @@ harness = true
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [
     "server",
+    "client",                # v5 Phase 4: NDJSON daemon embeds an rmcp client
     "macros",
     "schemars",
     "transport-io",
+    "transport-async-rw",    # v5 Phase 4: tokio::io::duplex bridge
     "transport-streamable-http-server",
 ] }
 
@@ -97,10 +106,16 @@ dotenvy = "0.15"                                                        # Env va
 futures = "0.3"                                                         # Async utilities
 tracing = "0.1"                                                         # Tracing
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.16", features = ["v4", "serde"] }
+uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
+regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
+# clap intentionally not added — its derive macros emit
+# `#[allow(clippy::restriction)]` which conflicts with our forbid-level
+# Layer A Clippy baseline. The `ssh-mcp-tail` CLI surface is small (3
+# subcommands, ~7 flags) so we hand-roll the parser in `embed::cli`.
 
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
+proptest = "1"              # v5 Phase 5 — property-based tests for state machine, cursor, lag policy invariants
 
 [features]
 default = ["port_forward"]
@@ -176,6 +191,10 @@ unused_assignments         = "deny"
 unreachable_code           = "deny"
 unreachable_patterns       = "deny"
 unused_lifetimes           = "deny"
+# Register the `loom` cfg flag so `tests/lockfree_invariants.rs#![cfg(loom)]`
+# does not trip `unexpected_cfgs`. Loom mode is opt-in via
+# `RUSTFLAGS="--cfg loom"`.
+unexpected_cfgs            = { level = "warn", check-cfg = ['cfg(loom)'] }
 # Re-enabled in E2 (post-tools-migration) once commands.rs is rebuilt against rmcp:
 #   dead_code, unused_variables, unused_qualifications,
 #   trivial_numeric_casts, trivial_casts, let_underscore_drop

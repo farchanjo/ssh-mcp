@@ -16,5 +16,9 @@
 //! [`SubscriberRegistryPort`]: crate::ports::subscriber_registry::SubscriberRegistryPort
 //! [`SubscriberRegistryAsync`]: crate::ports::subscriber_registry::SubscriberRegistryAsync
 
+pub mod channel_mux;
+pub mod filter;
 pub mod legacy;
 pub mod memory_registry;
+pub mod replay;
+pub mod subscriber_lane;

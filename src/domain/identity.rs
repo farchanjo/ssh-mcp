@@ -8,6 +8,7 @@
 //! is a tokio-free newtype over `PathBuf` so the domain stays runtime
 //! agnostic.
 
+use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -83,7 +84,7 @@ impl fmt::Display for AddressError {
     }
 }
 
-impl std::error::Error for AddressError {}
+impl Error for AddressError {}
 
 /// Authentication material requested by a use case. Concrete handshakes are
 /// performed by [`crate::ports::auth_strategy::AuthStrategyPort`].
@@ -128,9 +129,11 @@ impl Credentials {
     }
 }
 
-/// Path to a running SSH agent socket (e.g. `SSH_AUTH_SOCK`). The newtype
-/// exists so adapters cannot accidentally accept an arbitrary `PathBuf` and
-/// the domain stays free of `tokio::net::UnixStream` references.
+/// Path to a running SSH agent socket (e.g. `SSH_AUTH_SOCK`).
+///
+/// The newtype exists so adapters cannot accidentally accept an
+/// arbitrary `PathBuf` and the domain stays free of
+/// `tokio::net::UnixStream` references.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentSocketPath(PathBuf);
 
