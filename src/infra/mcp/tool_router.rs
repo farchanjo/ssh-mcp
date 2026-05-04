@@ -3093,8 +3093,8 @@ fn server_capabilities() -> ServerCapabilities {
 /// Few-shot bootstrap text for the `port_forward` build (21 tools / 5
 /// streams). Three canonical workflows steer 27B-class models away from
 /// the most common failure modes (forgetting `wait=true`, leaking
-/// sessions, polling instead of subscribing). v4.7 adds ssh_run +
-/// batches and the structured_content channel.
+/// sessions, polling instead of subscribing). v4.7 adds `ssh_run` +
+/// batches and the `structured_content` channel.
 #[cfg(feature = "port_forward")]
 const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 21 tools, 5 push streams \
 (shell://, command://, transfer://, session://, forward://). All tools return \
