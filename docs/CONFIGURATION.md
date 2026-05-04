@@ -1,8 +1,8 @@
-# SSH MCP Configuration Guide (v4.8.0)
+# SSH MCP Configuration Guide (v6.0)
 
-Every tunable on the v4.8.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x ([MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)).
+Every tunable on the v6.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every legacy v4 var name, default, floor, and cap carries forward unchanged ([MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v5 adds the lifecycle / lane / mux / daemon families; v6.0 only renames tool strings — env-var surface is byte-identical to v5.3.x.
 
-> **v4.8 — no env-var changes.** Strictly additive on `tools/list[].outputSchema`; everything below is byte-identical to v4.7.1.
+> **v6.0 — no env-var changes.** Strictly additive on `tools/list[]` name strings; every entry below carries forward byte-identical to v5.3.x.
 
 [[_TOC_]]
 
@@ -105,6 +105,35 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 | Variable | Type | Default | Floor | Cap | Description |
 |----------|------|---------|-------|-----|-------------|
 | `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans the subscription registry for peers whose rmcp transport has closed. rmcp 1.6 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
+
+### Subscriber lanes (v5 — ADR 0004 / 0006)
+
+Per-`SubId` lane / `ChannelMux` / backpressure / replay tunables. Wired by the `composition::prod::build_use_cases` root.
+
+| Variable | Type | Default | Floor | Cap | Description |
+|----------|------|---------|-------|-----|-------------|
+| `SSH_LANE_BUFFER` | `usize` | `1024` | `16` | `65536` | Per-`SubId` lane mpsc capacity. Each `sub_open` mints one lane with this many slots; the producer falls back to the lag policy when the lane fills. |
+| `SSH_MUX_BUFFER` | `usize` | `8192` | `64` | `1048576` | `ChannelMux` outbound mpsc capacity (drained by the daemon writer / lane fanout bridge). |
+| `SSH_MAX_SUBS_PER_URI` | `u16` | `16` | `1` | `u16::MAX` | Hard cap on lanes per resource URI. Returns `LANE_LIMIT_PER_URI` once exhausted. |
+| `SSH_MAX_SUBS_TOTAL` | `u16` | `1024` | `1` | `u16::MAX` | Hard cap on lanes server-wide. Returns `LANE_LIMIT_TOTAL` once exhausted. |
+| `SSH_LAG_POLICY_DEFAULT` | enum (`block_slow` / `drop_oldest` / `drop_newest` / `snapshot`) | `snapshot` | — | — | Default lag policy applied by `sub_open` when the call omits `lag_policy`. |
+| `SSH_BP_BLOCK_TIMEOUT_MS` | `u64` (ms) | `5000` | `100` | `600000` | Maximum time the producer waits on `BlockSlow` before giving up and falling through to `Snapshot`. |
+| `SSH_FILTER_REGEX_MAX` | `usize` (chars) | `1024` | `16` | `65536` | Maximum compiled regex length accepted by `sub_open.filter` / `sub_filter`. Returns `FILTER_INVALID` past the cap. |
+| `SSH_REPLAY_WINDOW_BYTES` | `usize` (bytes) | `1048576` | `4096` | `67108864` | Default `sub_replay` window (bytes) when the call omits `bytes`. |
+| `SSH_SUB_LEAK_RISK_WARN_S` | `u32` (s) | `2` | `1` | `3600` | Background scan period for the `SUB_LEAK_RISK` watcher (seconds). |
+| `SSH_SUB_LEAK_RISK_KILL_S` | `u32` (s) | `0` | `0` | `86400` | Auto-kill threshold (seconds) for resources that stay subscriber-less longer than this. `0` disables auto-kill (warning-only). |
+
+## Daemon (`ssh-mcp-tail`, v5 Phase 4 — ADR 0008)
+
+Resolvers consumed only by the `ssh-mcp-tail` binary; the HTTP and stdio binaries never read these.
+
+| Variable | Type | Default | Floor | Cap | Description |
+|----------|------|---------|-------|-----|-------------|
+| `SSH_NDJSON_LINE_MAX` | `usize` (bytes) | `1048576` | `1024` | `16777216` | Cap on a single NDJSON line received on the daemon's stdin. Lines past this are rejected with `LINE_TOO_LONG`. |
+| `SSH_HEARTBEAT_INTERVAL_S` | `u64` (s) | `30` | `1` | `3600` | Heartbeat emit interval. The daemon emits an `ev=heartbeat` line this often even when no other event arrives. |
+| `SSH_DAEMON_STATS_INTERVAL_S` | `u64` (s) | `60` | `1` | `3600` | `ev=daemon_stats` emit interval (lane counts, bytes / events served, error tallies). |
+| `SSH_GRACE_HARD_TIMEOUT_S` | `u64` (s) | `30` | `1` | `3600` | Hard-shutdown deadline on SIGTERM / SIGINT / SIGHUP. The daemon drains lanes for up to this long before force-closing. |
+| `SSH_NDJSON_PRETTY` | `bool` | `false` | — | — | When `true` / `1` / `yes`, the daemon pretty-prints outbound NDJSON (one event per multiple lines). Off by default — strict NDJSON producers expect compact one-line-per-event. |
 
 ## Idempotency cache (v4.7)
 
