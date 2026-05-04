@@ -162,10 +162,10 @@ fn compute_expires_at(
 }
 
 fn render_suggested(matches: &[SessionEntity]) -> String {
-    if matches.len() == 1 {
-        if let Some(m) = matches.first() {
-            return render_suggested_single(m);
-        }
+    if matches.len() == 1
+        && let Some(m) = matches.first()
+    {
+        return render_suggested_single(m);
     }
     render_suggested_multi(matches)
 }

@@ -306,13 +306,13 @@ pub fn shell_open_structured_with_initial(
             "ssh_shell_send_key",
         ],
     });
-    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty()) {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "initial_buffer".to_string(),
-                Value::String(String::from_utf8_lossy(bytes).into_owned()),
-            );
-        }
+    if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty())
+        && let Some(obj) = json.as_object_mut()
+    {
+        obj.insert(
+            "initial_buffer".to_string(),
+            Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        );
     }
     json
 }
