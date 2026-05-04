@@ -69,6 +69,90 @@ This document describes the architecture of the SSH Model Context Protocol (MCP)
 
 The four layers from v4.1 (`domain`, `ports`, `application`, `adapters`) plus `infra` (inbound MCP) and `composition` (root wiring) are unchanged. v5 stacks new ports + adapters under each layer, never re-roots the layout.
 
+## Hexagonal layer map
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph BIN["bin — entry points"]
+        HTTP["src/main.rs"]
+        STDIO["src/bin/ssh_mcp_stdio.rs"]
+        TAIL["src/bin/ssh_mcp_tail.rs<br/>(Phase 4)"]
+    end
+    subgraph COMP["composition — wiring root"]
+        PROD["prod.rs"]
+        EMB["embed.rs<br/>(Phase 4)"]
+        FIX["fixtures.rs"]
+    end
+    subgraph EMBEDLAYER["embed — daemon transport"]
+        DUPLEX["duplex_transport.rs"]
+        DISP["dispatcher.rs"]
+        EVMUX["event_mux.rs"]
+        FMT["formatter.rs"]
+    end
+    subgraph INFRA["infra/mcp — inbound MCP"]
+        SERVER["server.rs"]
+        TR["tool_router.rs<br/>30 #[tool] fns"]
+        RES["resource_handlers.rs"]
+        PROMPTS["prompts.rs"]
+        RESULTS["results.rs"]
+        ERR["error_detail.rs"]
+    end
+    subgraph APP["application — use cases"]
+        UCONN["connect_session<br/>disconnect_*"]
+        UEXE["execute_command<br/>get_command_output"]
+        USHELL["open_shell<br/>read_shell"]
+        USFTP["upload_file<br/>download_file"]
+        URES["subscribe_resource<br/>unsubscribe_resource"]
+    end
+    subgraph PORTS["ports — trait skeletons"]
+        SSHP["ssh_client / sftp_client"]
+        REGP["subscriber_registry"]
+        LIFEP["lifecycle_policy<br/>(Phase 1)"]
+        MUXP["channel_mux<br/>(Phase 2)"]
+        LANEP["subscriber_lane<br/>(Phase 2)"]
+    end
+    subgraph ADAPT["adapters — concrete impls"]
+        RUSSH["ssh/russh_adapter"]
+        SFTP["sftp/russh_sftp_adapter"]
+        REPO["repo/dashmap"]
+        MEMREG["subscription/memory_registry"]
+        LIFE["lifecycle/<br/>refcount + grace_timer +<br/>cascade<br/>(Phase 1)"]
+        LANE["subscription/<br/>subscriber_lane +<br/>channel_mux + filter +<br/>replay<br/>(Phase 2)"]
+        NOTIF["notifier/rmcp_*"]
+    end
+    subgraph DOMAIN["domain — pure"]
+        ENT["entities + ids +<br/>events + lifecycle.rs +<br/>subscription.rs"]
+    end
+
+    BIN --> COMP
+    COMP --> EMBEDLAYER
+    COMP --> INFRA
+    INFRA --> APP
+    APP --> PORTS
+    PORTS -.-> ADAPT
+    ADAPT --> DOMAIN
+    APP --> DOMAIN
+    PORTS --> DOMAIN
+
+    style BIN fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style COMP fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style EMBEDLAYER fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style INFRA fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style APP fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style PORTS fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style ADAPT fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style DOMAIN fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style HTTP fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style STDIO fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TAIL fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LIFE fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style LANE fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LIFEP fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style MUXP fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LANEP fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+```
+
 ## Layer rules
 
 | Layer | What lives here | Allowed deps | Forbidden deps |
@@ -247,6 +331,30 @@ ADR: [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md). Every lon
                                   (cancel timer)
 ```
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+stateDiagram-v2
+    [*] --> Owned: open / execute / upload<br/>(sub_count = 0)
+    Owned --> Observed: first on_subscribe<br/>sub_count 0 -> 1
+    Observed --> Observed: on_subscribe<br/>on_unsubscribe<br/>(sub_count > 0)
+    Observed --> Releasing: last on_unsubscribe<br/>policy.release_when_no_subs<br/>(arm grace_until_ms)
+    Releasing --> Observed: on_subscribe within grace<br/>(cancel timer)
+    Releasing --> Closed: grace timer fires<br/>(state CAS Releasing -> Closed)
+    Owned --> Closed: explicit close
+    Observed --> Closed: explicit close
+    Closed --> [*]: cascade<br/>SessionLifecycle.active_refs--
+
+    classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef releasing fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef closed fill:#cf222e,color:#f0f6fc,stroke:#f85149
+
+    class Owned owned
+    class Observed observed
+    class Releasing releasing
+    class Closed closed
+```
+
 ### Per-resource refcount
 
 Per-resource state lives behind a single `Arc<ResourceLifecycle>`:
@@ -281,6 +389,36 @@ The hot path takes zero `Mutex`. The `await_holding_lock`, `significant_drop_in_
 4. If `active_refs == 0` AND `!session.policy.persistent` AND not already `Releasing`, arm the session-level grace timer.
 
 The session reaper consults `active_refs > 0` before honouring the inactivity TTL — refcount supersedes TTL. A session with active resources is never reaped by TTL alone.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    participant UC as Use case
+    participant RL as ResourceLifecycle
+    participant GT as Grace timer
+    participant SL as SessionLifecycle
+    participant Reaper as SessionReaper
+
+    UC->>RL: track_resource(session_id)
+    RL->>SL: active_refs.fetch_add(1, AcqRel)
+    UC->>RL: on_subscribe()
+    RL->>RL: state CAS Owned -> Observed
+    Note over UC,RL: ... time passes, work happens ...
+    UC->>RL: on_unsubscribe() (last)
+    RL->>RL: state CAS Observed -> Releasing
+    RL->>GT: arm grace_until_ms (= now + grace_ms)
+    GT-->>RL: sleep_until(deadline)
+    Note over GT: timer fires
+    GT->>RL: state CAS Releasing -> Closed
+    RL->>SL: active_refs.fetch_sub(1, AcqRel)
+    alt active_refs == 0 AND not persistent
+        SL->>SL: arm session-level grace
+        Reaper->>SL: tick (consults active_refs)
+        SL-->>Reaper: 0 - proceed disconnect
+    else active_refs nonzero
+        SL-->>Reaper: tick - defer, refcount positive
+    end
+```
 
 ### Defaults preserve v4 semantics
 
@@ -348,9 +486,98 @@ Per-lane state lives behind `Arc<MultiplexLane>`:
 
 Fairness invariant: between two adjacent backlogged lanes A and B, the mux drains them in alternation. A 10x faster lane will not starve a slower one. Verified under loom (commit `c48a0ba` — 4 new interleavings).
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    Prod["Producer<br/>russh / SFTP /<br/>health"]
+    Deb["per-resource debouncer<br/>SSH_NOTIFY_DEBOUNCE_MS=50<br/>SSH_NOTIFY_FORCE_FLUSH_MS=1000"]
+
+    subgraph LANES["per-(SubId, Uri) lanes"]
+        direction TB
+        L1["MultiplexLane A<br/>byte_cursor + tx<br/>filter + LagPolicy<br/>stats + pause"]
+        L2["MultiplexLane B<br/>byte_cursor + tx<br/>filter + LagPolicy<br/>stats + pause"]
+        L3["MultiplexLane C<br/>..."]
+    end
+
+    Mux["ChannelMux<br/>DashMap&lt;SubId,Lane&gt;<br/>cursor_lane AtomicUsize<br/>mux_waker Notify<br/>round-robin"]
+    OutA["rmcp Peer<br/>notifications/<br/>resources/updated"]
+    OutB["NDJSON formatter<br/>(ssh-mcp-tail stdout)"]
+
+    Prod --> Deb
+    Deb --> L1
+    Deb --> L2
+    Deb --> L3
+    L1 --> Mux
+    L2 --> Mux
+    L3 --> Mux
+    Mux --> OutA
+    Mux --> OutB
+
+    style Prod fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Deb fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style L1 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style L2 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style L3 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Mux fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style OutA fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style OutB fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style LANES fill:#161b22,color:#f0f6fc,stroke:#30363d
+```
+
 ### Resource lifecycle integration
 
 When a `SubId` is registered, `lifecycle_policy.on_subscribe(kind, resource_id)` (ADR 0003) fires. When the last `SubId` on a `(kind, resource_id)` pair unsubscribes, `lifecycle_policy.on_unsubscribe` fires. The lifecycle layer decides whether to arm the grace timer based on the resource's policy (set at creation time by `open_shell` / `execute` / `upload` / `download`). Subscribers can never extend or shorten a resource's lifetime — only its creator can.
+
+## Resource scheme topology
+
+The 5 push-capable URI schemes map to the 4 long-running tools. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    subgraph TOOLS["Long-running tools"]
+        TShell["ssh_shell_open"]
+        TExec["ssh_execute"]
+        TSftp["ssh_upload<br/>ssh_download"]
+        TFwd["ssh_forward<br/>(feature-gated)"]
+    end
+    subgraph SCHEMES["Resource URI schemes"]
+        Sshell["shell://&lt;id&gt;/output<br/>(cursor)"]
+        Scmd["command://&lt;id&gt;/output<br/>(cursor)"]
+        Stransfer["transfer://&lt;id&gt;/progress<br/>(snapshot)"]
+        Ssession["session://&lt;id&gt;/health<br/>(snapshot)"]
+        Sforward["forward://&lt;id&gt;/events<br/>(cursor, gated)"]
+    end
+    Sub["ssh_subscribe<br/>(SubId, Uri) lane"]
+    Push["resources/updated<br/>push events"]
+
+    TShell --> Sshell
+    TExec --> Scmd
+    TSftp --> Stransfer
+    TFwd --> Sforward
+    Sshell --> Sub
+    Scmd --> Sub
+    Stransfer --> Sub
+    Ssession --> Sub
+    Sforward --> Sub
+    Sub --> Push
+
+    style TShell fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TExec fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TSftp fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TFwd fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Sshell fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Scmd fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Stransfer fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Ssession fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Sforward fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Sub fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Push fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style TOOLS fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style SCHEMES fill:#161b22,color:#f0f6fc,stroke:#30363d
+```
+
+Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(SubId, Uri)` lane atomics: [LOCKS.md](./LOCKS.md#subscription-mux-invariants-phase-2).
 
 ## Phase 3 — LLM UX surface (in flight)
 
@@ -363,6 +590,51 @@ The implementation is in flight on `feat/v5-foundation` by a separate agent. Thi
 ADR: [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md). New binary `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds an rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. Stdin reads NDJSON ops; stdout emits NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`). The full op + event schema is enumerated in [docs/INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
 
 The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. Driving it as a subprocess gives the LLM real push delivery without host-level subscribe support.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph PIPE["Unix pipeline (host process)"]
+        Stdin["stdin: NDJSON ops"]
+        Stdout["stdout: NDJSON events"]
+        Stderr["stderr: tracing"]
+    end
+
+    subgraph DAEMON["ssh-mcp-tail (one process)"]
+        direction TB
+        Disp["dispatcher<br/>parse NDJSON op"]
+        EvMux["event_mux<br/>fan-in MCP notifs +<br/>tool replies"]
+        Fmt["formatter<br/>JSON line writer"]
+        subgraph BRIDGE["composition::embed::wire()"]
+            ClientSide["rmcp client<br/>(stdin half)"]
+            Duplex{{"tokio::io::duplex<br/>buffered"}}
+            ServerSide["rmcp server<br/>(stdout half)"]
+        end
+        UC["UseCases&lt;...&gt;<br/>composition::prod adapters"]
+    end
+
+    Stdin --> Disp
+    Disp --> ClientSide
+    ClientSide <--> Duplex
+    Duplex <--> ServerSide
+    ServerSide --> UC
+    UC --> ServerSide
+    ServerSide --> EvMux
+    EvMux --> Fmt
+    Fmt --> Stdout
+    UC -.-> Stderr
+
+    style PIPE fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style DAEMON fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style BRIDGE fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style Stdin fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Stdout fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Stderr fill:#21262d,color:#8b949e,stroke:#30363d
+    style Duplex fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style UC fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
+
+Full op + event schema: [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
 
 ## Subscribe pipeline (v5 layered view)
 
@@ -407,6 +679,27 @@ The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI
 │   - rmcp Peer (notifications/resources/updated)                  │
 │   - or NDJSON formatter (ssh-mcp-tail stdout)                    │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    P1["Producer<br/>russh PTY / async cmd /<br/>SFTP / health"]
+    P2["MemoryRegistry&lt;N&gt;<br/>per-resource debouncer task<br/>coalesce 50 ms / flush 1 s /<br/>keepalive 30 s"]
+    P3["per (SubId, Uri) lane<br/>filter -> LagPolicy -><br/>stats atomics -><br/>mpsc(SSH_LANE_BUFFER=1024)"]
+    P4["ChannelMux<br/>cursor_lane AtomicUsize<br/>round-robin try_recv<br/>mux_waker Notify"]
+    P5["Outbound writer<br/>rmcp Peer notifications/<br/>resources/updated<br/>or NDJSON formatter"]
+
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
+    P4 --> P5
+
+    style P1 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P2 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P3 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style P4 fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style P5 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
 ```
 
 ## Lock-free invariants summary
