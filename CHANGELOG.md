@@ -5,6 +5,21 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.2] — 2026-05-04
+
+Hotfix on top of 5.3.1 — lane cascade on session / agent disconnect. Wire-compatible drop-in.
+
+### Fixed
+
+- **`ssh_subscribe` lanes cascade-close on disconnect.** Stress test surfaced that `ssh_subscribe`-created lanes outlived their parent session even after `force_close` fired on the underlying resource. Per ADR 0004, lane lifetime is intentionally independent of session lifecycle (lifetime variants `auto_close` / `lease` exist for that), but the manual-lifetime case left orphan lanes consuming `lanes_total` and leaking the `SubId` registry. `DisconnectSessionUseCase` and `DisconnectAgentUseCase` now hold an optional `LaneAdmin` handle and call `lane_admin.close(sub_id)` for every lane bound to the resource id of each child being torn down — same pass that fires `lifecycle.force_close`.
+
+After the fix: `lanes_total = 0` immediately after `ssh_disconnect` / `ssh_disconnect_agent`. Manual subscribers can still call `ssh_unsubscribe` explicitly while the session is alive — only orphan lanes (resource gone) are reaped.
+
+### Quality
+
+- 1657 lib + 41 chaos + 32 property + 2 v5_smoke + 13 integration tests all green.
+- Production clippy strict gate exit 0.
+
 ## [5.3.1] — 2026-05-04
 
 Hotfix on top of 5.3.0 — lifecycle cascade on session / agent disconnect. Wire-compatible drop-in.
