@@ -282,7 +282,15 @@ mod tests {
             | DomainError::Storage(_)
             | DomainError::ResourceGone(_)
             | DomainError::LifecycleStateConflict { .. }
-            | DomainError::SessionRefcountUnderflow(_) => {
+            | DomainError::SessionRefcountUnderflow(_)
+            | DomainError::SubNotFound(_)
+            | DomainError::MaxSubsPerUriExceeded { .. }
+            | DomainError::MaxSubsTotalExceeded { .. }
+            | DomainError::LaneBufferFull { .. }
+            | DomainError::LagDetected { .. }
+            | DomainError::MuxBackpressure
+            | DomainError::InvalidLagPolicy(_)
+            | DomainError::InvalidLifetime(_) => {
                 panic!("unexpected error variant: {err:?}")
             }
         }

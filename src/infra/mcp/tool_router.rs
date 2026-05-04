@@ -228,7 +228,15 @@ fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
         | DomainError::MaxTransfersExceeded { .. }
         | DomainError::ResourceGone(_)
         | DomainError::LifecycleStateConflict { .. }
-        | DomainError::SessionRefcountUnderflow(_) => None,
+        | DomainError::SessionRefcountUnderflow(_)
+        | DomainError::SubNotFound(_)
+        | DomainError::MaxSubsPerUriExceeded { .. }
+        | DomainError::MaxSubsTotalExceeded { .. }
+        | DomainError::LaneBufferFull { .. }
+        | DomainError::LagDetected { .. }
+        | DomainError::MuxBackpressure
+        | DomainError::InvalidLagPolicy(_)
+        | DomainError::InvalidLifetime(_) => None,
     }
 }
 
@@ -534,6 +542,47 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "INTERNAL_ERROR",
             format!("session refcount underflow on {id}"),
             Some(id.as_str().to_string()),
+        ),
+        DomainError::SubNotFound(sub_id) => (
+            "SUB_NOT_FOUND",
+            "no subscription with the given sub_id".to_string(),
+            Some(sub_id.as_str().to_string()),
+        ),
+        DomainError::MaxSubsPerUriExceeded { uri, limit } => (
+            "MAX_SUBS_PER_URI_EXCEEDED",
+            "per-URI subscription cap reached".to_string(),
+            Some(format!("uri={uri},limit={limit}")),
+        ),
+        DomainError::MaxSubsTotalExceeded { limit } => (
+            "MAX_SUBS_TOTAL_EXCEEDED",
+            "global subscription cap reached".to_string(),
+            Some(format!("limit={limit}")),
+        ),
+        DomainError::LaneBufferFull { sub_id, capacity } => (
+            "LANE_BUFFER_FULL",
+            "lane mpsc full and policy refused to drop".to_string(),
+            Some(format!("sub_id={sub_id},capacity={capacity}")),
+        ),
+        DomainError::LagDetected { sub_id, dropped } => (
+            "LAG_DETECTED",
+            "events dropped under lag policy".to_string(),
+            Some(format!("sub_id={sub_id},dropped={dropped}")),
+        ),
+        DomainError::MuxBackpressure => (
+            "MUX_BACKPRESSURE",
+            "mux outbound writer is blocked".to_string(),
+            None,
+        ),
+        DomainError::InvalidLagPolicy(value) => (
+            "INVALID_LAG_POLICY",
+            "lag_policy must be one of {block_slow, drop_oldest, drop_newest, snapshot}"
+                .to_string(),
+            Some(value.clone()),
+        ),
+        DomainError::InvalidLifetime(value) => (
+            "INVALID_LIFETIME",
+            "lifetime must be one of {manual, auto_close, lease}".to_string(),
+            Some(value.clone()),
         ),
     }
 }

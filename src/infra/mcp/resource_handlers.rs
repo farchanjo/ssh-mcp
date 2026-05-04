@@ -51,22 +51,45 @@ use super::peer_handle::{PeerTable, RmcpPeerHandle};
 
 /// Map a [`DomainError`] onto an [`McpError`] for resource handlers.
 ///
-/// The mapping mirrors v3 conventions: validation/parse errors become
-/// `invalid_params`, not-found errors become `resource_not_found`,
-/// everything else becomes `internal_error`.
-fn map_resource_error(err: DomainError) -> McpError {
+/// The mapping mirrors v3 conventions: validation / parse errors
+/// become `invalid_params`, not-found errors become
+/// `resource_not_found`, everything else becomes `internal_error`.
+fn map_resource_error(err: &DomainError) -> McpError {
+    let message = err.to_string();
+    match resource_error_category(err) {
+        ResourceErrorCategory::InvalidParams => McpError::invalid_params(message, None),
+        ResourceErrorCategory::NotFound => McpError::resource_not_found(message, None),
+        ResourceErrorCategory::Internal => McpError::internal_error(message, None),
+    }
+}
+
+/// Classify a [`DomainError`] for resource-handler rendering.
+///
+/// Split out of [`map_resource_error`] so the dispatcher stays under
+/// the 30-line clippy threshold while keeping every variant under
+/// compile-time scrutiny.
+enum ResourceErrorCategory {
+    InvalidParams,
+    NotFound,
+    Internal,
+}
+
+const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
     match err {
-        DomainError::InvalidArgument(reason) => McpError::invalid_params(reason, None),
-        // `ResourceGone` is semantically a not-found that documents the
-        // closed-then-attached race so the caller can stop polling. Folded
-        // into the same arm as the `*NotFound` variants to keep the wire
-        // mapping consistent and silence `clippy::match_same_arms`.
+        DomainError::InvalidArgument(_)
+        | DomainError::InvalidLagPolicy(_)
+        | DomainError::InvalidLifetime(_) => ResourceErrorCategory::InvalidParams,
+        // `ResourceGone` is semantically a not-found that documents
+        // the closed-then-attached race so the caller can stop
+        // polling. Folded into the same arm as the `*NotFound`
+        // variants to keep the wire mapping consistent.
         DomainError::SessionNotFound(_)
         | DomainError::ShellNotFound(_)
         | DomainError::CommandNotFound(_)
         | DomainError::TransferNotFound(_)
         | DomainError::ForwardNotFound(_)
-        | DomainError::ResourceGone(_) => McpError::resource_not_found(err.to_string(), None),
+        | DomainError::ResourceGone(_)
+        | DomainError::SubNotFound(_) => ResourceErrorCategory::NotFound,
         DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
         | DomainError::Transport(_)
@@ -79,9 +102,12 @@ fn map_resource_error(err: DomainError) -> McpError {
         | DomainError::MaxShellsExceeded { .. }
         | DomainError::MaxTransfersExceeded { .. }
         | DomainError::LifecycleStateConflict { .. }
-        | DomainError::SessionRefcountUnderflow(_) => {
-            McpError::internal_error(err.to_string(), None)
-        }
+        | DomainError::SessionRefcountUnderflow(_)
+        | DomainError::MaxSubsPerUriExceeded { .. }
+        | DomainError::MaxSubsTotalExceeded { .. }
+        | DomainError::LaneBufferFull { .. }
+        | DomainError::LagDetected { .. }
+        | DomainError::MuxBackpressure => ResourceErrorCategory::Internal,
     }
 }
 
@@ -104,7 +130,7 @@ where
     let outcome = use_case
         .execute(ListResourcesRequest)
         .await
-        .map_err(map_resource_error)?;
+        .map_err(|e| map_resource_error(&e))?;
     Ok(ListResourcesResult::with_all_items(
         outcome.resources.iter().map(make_resource).collect(),
     ))
@@ -129,7 +155,7 @@ where
     let outcome = use_case
         .execute(ListResourcesRequest)
         .await
-        .map_err(map_resource_error)?;
+        .map_err(|e| map_resource_error(&e))?;
     Ok(ListResourcesResult::with_all_items(
         outcome.resources.iter().map(make_resource).collect(),
     ))
@@ -269,7 +295,7 @@ where
         uri: request.uri,
         peer_id: handle.id(),
     };
-    let outcome = use_case.execute(req).await.map_err(map_resource_error)?;
+    let outcome = use_case.execute(req).await.map_err(|e| map_resource_error(&e))?;
     Ok(ReadResourceResult::new(vec![render_outcome(outcome)]))
 }
 
@@ -299,7 +325,7 @@ where
         uri: request.uri,
         peer_id: handle.id(),
     };
-    let outcome = use_case.execute(req).await.map_err(map_resource_error)?;
+    let outcome = use_case.execute(req).await.map_err(|e| map_resource_error(&e))?;
     Ok(ReadResourceResult::new(vec![render_outcome(outcome)]))
 }
 
@@ -494,7 +520,7 @@ where
         })
         .await
         .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))
 }
 
 /// Handle `resources/subscribe` for the v4 server (with `port_forward`).
@@ -525,7 +551,7 @@ where
         })
         .await
         .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))
 }
 
 /// Handle `resources/unsubscribe` for the v4 server.
@@ -557,7 +583,7 @@ where
         })
         .await
         .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))
 }
 
 #[cfg(test)]
@@ -570,13 +596,13 @@ mod tests {
 
     #[test]
     fn invalid_argument_maps_to_invalid_params() {
-        let err = map_resource_error(DomainError::InvalidArgument("x".to_string()));
+        let err = map_resource_error(&DomainError::InvalidArgument("x".to_string()));
         assert!(err.message.contains('x'));
     }
 
     #[test]
     fn transport_error_maps_to_internal_error() {
-        let err = map_resource_error(DomainError::Transport("boom".to_string()));
+        let err = map_resource_error(&DomainError::Transport("boom".to_string()));
         assert!(err.message.contains("boom"));
     }
 
