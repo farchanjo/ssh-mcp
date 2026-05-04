@@ -115,7 +115,7 @@ impl TransferRepository for DashMapTransferRepo {
         // guard blocks concurrent `index_session` / `deindex_session`
         // calls on the same key — exactly the TOCTOU window we are
         // closing here.
-        let mut bucket = self.by_session.entry(session_id.clone()).or_default();
+        let mut bucket = self.by_session.entry(session_id).or_default();
         if bucket.len() >= cap {
             // The shard guard drops at end of scope; nothing else changed.
             return Err(DomainError::MaxTransfersExceeded { limit: cap });
@@ -125,7 +125,7 @@ impl TransferRepository for DashMapTransferRepo {
         // against another `insert` racing on the same id. The `by_id`
         // shard is independent of `by_session`, so no nested-guard
         // dead-lock window exists.
-        match self.by_id.entry(id.clone()) {
+        let result = match self.by_id.entry(id.clone()) {
             Entry::Vacant(slot) => {
                 drop(slot.insert(entity));
                 bucket.insert(id);
@@ -134,7 +134,9 @@ impl TransferRepository for DashMapTransferRepo {
             Entry::Occupied(_) => Err(DomainError::Internal(format!(
                 "transfer {id} already exists; remove() before re-insert"
             ))),
-        }
+        };
+        drop(bucket);
+        result
     }
 
     async fn update(&self, entity: TransferEntity) -> Result<(), DomainError> {
