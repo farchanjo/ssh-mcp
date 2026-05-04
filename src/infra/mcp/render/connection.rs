@@ -121,11 +121,21 @@ fn append_next_line(out: &mut String, hint: &str) {
 
 /// Successor tools after a connect-style response — execute / shell-open
 /// / disconnect, each pre-filled with the freshly minted `SESSION_ID`.
+/// Successor tools after `ssh_connect: OK | REUSED` — spawn a resource
+/// (command / shell / transfer / forward) whose ID becomes the target of
+/// `ssh_subscribe` for push-first observation, then `ssh_disconnect`
+/// (or `ssh_disconnect_agent` / `ssh_disconnect_many`) to close.
+///
+/// v5 narrative closure: the trailing `(then ssh_subscribe ...)` reminds
+/// 27B-class models that every spawned ID is a push-stream entry point,
+/// not a poll target.
 fn next_hint_for_session(session_id: &str) -> String {
     format!(
         "ssh_execute(session_id={session_id}, command=...) | \
          ssh_shell_open(session_id={session_id}) | \
-         ssh_disconnect(session_id={session_id})"
+         ssh_upload(session_id={session_id}, ...) | \
+         ssh_disconnect(session_id={session_id}) \
+         (each spawn returns an ID that ssh_subscribe streams as push)"
     )
 }
 
@@ -396,19 +406,29 @@ const fn resource_kind_label(k: ResourceKind) -> &'static str {
     }
 }
 
-/// Successor tools after a non-empty `ssh_list_sessions` — bulk-cleanup
-/// with `ssh_disconnect_agent` when an agent owns sessions, else a
+/// Successor tools after a non-empty `ssh_list_sessions` — observe a
+/// session via push (`ssh_subscribe session://<id>/health`), bulk-cleanup
+/// with `ssh_disconnect_agent` when an agent owns sessions, or a
 /// targeted `ssh_disconnect` against any listed `session_id`.
+///
+/// v5 narrative closure: subscribe listed FIRST so discovery flows
+/// terminate in a push lane, not in poll/teardown.
 fn next_hint_for_list_sessions(healthy: &[SessionEntity]) -> String {
     let agent = healthy
         .iter()
         .find_map(|s| s.agent_id.as_ref().map(AgentId::as_str));
     let session_id = healthy.first().map_or("<id>", |s| s.id.as_str());
     agent.map_or_else(
-        || format!("ssh_disconnect(session_id={session_id})"),
+        || {
+            format!(
+                "ssh_subscribe uri=session://{session_id}/health | \
+                 ssh_disconnect(session_id={session_id})"
+            )
+        },
         |agent_id| {
             format!(
-                "ssh_disconnect_agent(agent_id={agent_id}) | \
+                "ssh_subscribe uri=session://{session_id}/health | \
+                 ssh_disconnect_agent(agent_id={agent_id}) | \
                  ssh_disconnect(session_id={session_id})"
             )
         },
