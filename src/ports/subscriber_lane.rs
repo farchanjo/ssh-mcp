@@ -79,11 +79,12 @@ pub trait SubscriberLanePort: Send + Sync + 'static {
     fn list_subs(&self) -> Vec<SubSummary>;
 }
 
-/// Cold-path, dyn-safe shim for the lane open/close calls.
+/// Cold-path, dyn-safe shim for lane administration calls.
 ///
-/// Used by the subscribe / unsubscribe use cases. Methods box their
-/// futures so the use cases can hold a single `Arc<dyn LaneAdmin>`
-/// without caring about the concrete adapter type.
+/// Used by the subscribe / unsubscribe use cases AND the v5 Phase 3
+/// `ssh_sub_*` tools. Methods box their futures so the use cases can
+/// hold a single `Arc<dyn LaneAdmin>` without caring about the
+/// concrete adapter type.
 ///
 /// This trait is **not** for the hot path — Phase 2 producers reach
 /// the lane through the concrete [`SubscriberLanePort`] +
@@ -101,6 +102,34 @@ pub trait LaneAdmin: fmt::Debug + Send + Sync + 'static {
 
     /// Close a lane.
     fn close<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
+
+    /// Pause drain on `sub_id`. Subsequent events accumulate in the
+    /// mpsc until [`Self::resume`].
+    fn pause<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
+
+    /// Resume drain on `sub_id`.
+    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
+
+    /// Hot-reload the lane filter.
+    fn set_filter<'a>(
+        &'a self,
+        sub_id: &'a SubId,
+        filter: FilterRule,
+    ) -> LaneFuture<'a, Result<(), DomainError>>;
+
+    /// Re-emit the lane buffer starting at `cursor` (within the
+    /// adapter's replay window).
+    fn replay<'a>(
+        &'a self,
+        sub_id: &'a SubId,
+        cursor: u64,
+    ) -> LaneFuture<'a, Result<(), DomainError>>;
+
+    /// Snapshot per-lane statistics. Returns `None` for unknown lanes.
+    fn stats(&self, sub_id: &SubId) -> Option<SubscriberStats>;
+
+    /// Read-only summary list for `ssh_sub_list`.
+    fn list(&self) -> Vec<SubSummary>;
 }
 
 /// Async slice of the per-`SubId` lane registry.

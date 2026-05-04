@@ -379,10 +379,7 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
         );
         let lane_arc = Arc::new(lane);
         self.lanes.insert(sub_id.clone(), Arc::clone(&lane_arc));
-        self.by_uri
-            .entry(uri.to_string())
-            .or_default()
-            .push(sub_id);
+        self.by_uri.entry(uri.to_string()).or_default().push(sub_id);
         lane_arc
     }
 
@@ -471,9 +468,7 @@ fn lane_dispatch_drop_oldest(
     // `Lagged` marker, increment the drop counter, and try once more
     // (some racing consumer may have drained between attempts).
     lane.atomics.record_drop();
-    let _ = lane
-        .tx
-        .try_send(LaneMsg::Lagged { dropped: 1 });
+    let _ = lane.tx.try_send(LaneMsg::Lagged { dropped: 1 });
     match lane.tx.try_send(msg) {
         Ok(()) => {
             lane.atomics.record_send(payload_size);
@@ -574,6 +569,42 @@ impl<I: IdGeneratorPort + fmt::Debug> LaneAdmin for SubscriberLaneAdapter<I> {
     fn close<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>> {
         Box::pin(async move { <Self as SubscriberLaneAsync>::close_lane(self, sub_id).await })
     }
+
+    fn pause<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>> {
+        Box::pin(async move { <Self as SubscriberLaneAsync>::pause_lane(self, sub_id).await })
+    }
+
+    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>> {
+        Box::pin(async move { <Self as SubscriberLaneAsync>::resume_lane(self, sub_id).await })
+    }
+
+    fn set_filter<'a>(
+        &'a self,
+        sub_id: &'a SubId,
+        filter: FilterRule,
+    ) -> LaneFuture<'a, Result<(), DomainError>> {
+        Box::pin(async move {
+            <Self as SubscriberLaneAsync>::set_filter(self, sub_id, filter).await
+        })
+    }
+
+    fn replay<'a>(
+        &'a self,
+        sub_id: &'a SubId,
+        cursor: u64,
+    ) -> LaneFuture<'a, Result<(), DomainError>> {
+        Box::pin(async move {
+            <Self as SubscriberLaneAsync>::replay_from_cursor(self, sub_id, cursor).await
+        })
+    }
+
+    fn stats(&self, sub_id: &SubId) -> Option<SubscriberStats> {
+        <Self as SubscriberLanePort>::stats_snapshot(self, sub_id)
+    }
+
+    fn list(&self) -> Vec<SubSummary> {
+        <Self as SubscriberLanePort>::list_subs(self)
+    }
 }
 
 impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
@@ -662,9 +693,7 @@ mod tests {
     use crate::adapters::id_generator::uuid::UuidIds;
     use crate::domain::error::DomainError;
     use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
-    use crate::ports::subscriber_lane::{
-        LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
-    };
+    use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync, SubscriberLanePort};
     use crate::ports::subscriber_registry::ResourceKind;
 
     fn adapter() -> Arc<SubscriberLaneAdapter<UuidIds>> {
