@@ -5,6 +5,37 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.0] — 2026-05-04
+
+ADR 0006 Amendment 1 — byte-threshold debouncer flush is now wired end-to-end. Adds a fourth wakeup source on the per-resource debouncer (`flush_now`) plus per-resource byte counters that live alongside the existing time-based pipeline. No wire-format breakage; tool catalogue, structured_content schema, and error taxonomy unchanged.
+
+### What changed
+
+- **New env var `SSH_NOTIFY_FLUSH_BYTES`** — default `65_536` (64 KiB). Accepts bare integer bytes (`65536`) or bytesize strings (`8k`, `64k`, `1m`, `1mib`, `2mb`). `0` disables byte-threshold (debouncer reverts to v5.0 time-only behaviour). Clamps to `[1024, 1_048_576]` for non-zero values; unknown suffixes fall back to default.
+- **Port `SubscriberRegistryPort::record_bytes(kind, resource_id, bytes_added)`** — new method with default no-op so test fixtures and the legacy adapter compile unchanged.
+- **`MemoryRegistry`** (hexagonal v5 lane) — new `flush_now: DashMap<_, Arc<Notify>>`, `bytes_since_flush: DashMap<_, Arc<AtomicUsize>>`, cached `flush_bytes_threshold`, and process-wide `byte_triggered_flushes: AtomicU64`. `record_bytes` increments the per-resource counter (`Relaxed`) and fires `flush_now.notify_one()` exactly once per crossing.
+- **`SubscriptionRegistry`** (legacy v4 adapter) — same fields and semantics. Both registries flush on whichever wakes first: debounce window expiry, force-flush tick, keepalive tick, or byte-threshold cross.
+- **Producer hooks** — `record_bytes` now called on every chunk write at three production sites:
+  - `src/adapters/ssh/internal/client.rs::publish_stdout` and `publish_stderr` for `command://*/output`.
+  - `src/adapters/sftp/internal/sftp.rs::upload_inner_loop` and `download_inner_loop` for `transfer://*/progress` (per-chunk SFTP delta).
+- **Stats** — `SubscriberStats.byte_triggered_flushes` field (serde `default = 0` for v5.0/v5.0.x compat). v5.1 populates the resource-level total via `MemoryRegistry::byte_triggered_flushes_total()` / `SubscriptionRegistry::byte_triggered_flushes_total()`. Per-lane attribution is reserved for v5.2 (see "Out of scope" below).
+- **`ssh_subscribe` HINT line** — wire HINT now mentions both knobs explicitly: "Push fires on whichever fires first: ~50ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 10-100ms local sleeps cover both budgets."
+- **Local-sleep guidance** — same HINT line steers the LLM to wait passively for `notifications/resources/updated` and use Unix `sleep 0.05` / PowerShell `Start-Sleep -Milliseconds 50` for any local idling, never an MCP tool as a sleep primitive.
+- **`docs/CONFIGURATION.md`** — env-var reference table updated with the new knob and its semantics.
+
+### Out of scope (deferred to v5.2)
+
+- **Per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe`** — ADR 0006 Amendment 1 documents the schema (oneOf integer | string) and first-subscriber-wins semantics, but implementing the per-resource override + `effective_*` stats requires touching the schema, validation, and shared-debouncer reconfiguration. v5.1 wires the env-var-only path; v5.2 layers the per-call overrides on top.
+- **Per-lane `byte_triggered_flushes` attribution** — v5.1 exposes the resource-level total; bridging the count into `LaneAtomics` so each `ssh_sub_stats` snapshot reflects which lanes saw fan-out increments lands alongside the per-call override work in v5.2.
+- **Shell `shell://*/output` byte-threshold** — shell production uses the per-shell `output_tx` broadcast + `data_notify` rather than `SUBSCRIPTION_REGISTRY.next_seq` / `poke`. Wiring the byte-threshold into the shell flush path requires piping `shell_id` into `flush_shell_buffer`; deferred to v5.2.
+
+### Verified gates
+
+- `cargo build --release` exit 0 (3 binaries: `ssh-mcp`, `ssh-mcp-stdio`, `ssh-mcp-tail`).
+- `cargo fmt --all -- --check` exit 0.
+- `cargo clippy --release --all-features -- -D warnings` exit 0.
+- `cargo test --lib --quiet` — **1649 passed** (was 1636 in 5.0.2; +13 new tests covering the bytesize parser, env-var resolver clamps, `0` disable path, `record_bytes` no-op when no debouncer, sub-threshold no-fire, threshold-boundary fire, and stats getter).
+
 ## [5.0.2] — 2026-05-04
 
 LLM UX patch — penalize `ssh_run`, steer shell drive ops to await push, and propose ADR 0006 Amendment 1 (byte-threshold debouncer flush). No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
