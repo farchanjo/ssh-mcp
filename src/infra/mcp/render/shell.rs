@@ -576,9 +576,7 @@ mod tests {
             last_seq: 0,
         });
         assert!(
-            m.contains(
-                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (PREFERRED — push-first"
-            ),
+            m.contains("\nNEXT: ssh_subscribe uri=shell://shell-1/output (PREFERRED — push-first"),
             "body: {m}"
         );
         assert!(

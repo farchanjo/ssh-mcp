@@ -6,7 +6,7 @@
 
 Drive remote shells, asynchronous commands, SFTP transfers, and TCP forwards from any MCP-capable LLM host. Output streams to your model the moment SSH bytes arrive — no polling loops, no empty payloads, no token waste.
 
-[![Version](https://img.shields.io/badge/version-5.0.1-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.0.1)
+[![Version](https://img.shields.io/badge/version-5.0.2-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.0.2)
 [![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)](https://modelcontextprotocol.io/)
@@ -56,6 +56,16 @@ Most LLM-driven SSH wrappers fall back to polling. The model issues `get_output(
 | **Subscribe + drain** | **~1 500 tokens** | One setup call; events delivered as bytes arrive. |
 
 Same throughput, ~30× cheaper, and the model reacts the moment the remote process speaks.
+
+## What's new in 5.0.2
+
+LLM-UX patch — no wire-format changes, drop-in for any v3 / v4 / v5.0.x host.
+
+- **`ssh_run` is now a `PENALIZED FALLBACK`.** Each call still pays a full SSH handshake (200–2000 ms) and tears the session down. Tool descriptions, root `Implementation.instructions`, and the LLM_GUIDE decision flowchart all steer the model to the cheaper `ssh_connect(reuse=auto)` → `ssh_execute` → `ssh_subscribe` pattern. Two `ssh_run` calls now visibly cost as much as one `ssh_connect` + two `ssh_execute` calls.
+- **Shell drive ops await push, no more `wait_for` chaining.** After `ssh_shell_write` / `ssh_shell_send_key`, the response arrives on the existing `shell://<id>/output` subscription. A new `HINT: RECOMMENDED:` line on every drive response tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`, with an explicit "Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex". `ssh_shell_wait_for` itself is reframed as a one-shot regex GATE — `NEXT:` lines lead with `ssh_subscribe` in both `Matched` and `Timeout` states so the model stops chaining `wait_for` recursively.
+- **ADR 0006 Amendment 1 (proposed)** — byte-threshold debouncer flush. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold**, switches env-var interface to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings, and adds optional per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe`. Documented only — implementation lands in a follow-up minor.
+
+Full notes: [CHANGELOG.md → 5.0.2](CHANGELOG.md#502--2026-05-04).
 
 ## How real-time push actually works
 
@@ -167,7 +177,7 @@ The end result: a byte leaves the remote shell, traverses every layer above, and
 | **Per-subscription lanes** | Independent filter, replay, lag policy per `SubId` | A slow consumer never slows down a fast one. |
 | **Lifecycle binding** | `release_when_no_subs` opt-in; CAS state machine; refcount cascade | No leaked shells, no zombie commands when the host crashes. |
 | **Three transports, one core** | `ssh-mcp` (HTTP), `ssh-mcp-stdio` (MCP over stdio), `ssh-mcp-tail` (NDJSON daemon) | Pick what your host supports; same hexagonal core under the hood. |
-| **Hexagonal architecture** | Use cases generic over ports; adapters swap for testing | Deterministic test fixtures, ~1 633 lib tests, 16 loom interleavings. |
+| **Hexagonal architecture** | Use cases generic over ports; adapters swap for testing | Deterministic test fixtures, ~1 636 lib tests, 16 loom interleavings. |
 | **Lock-free hot path** | Zero `Mutex` on shell, command, or transfer state | Enforced by `clippy::mutex_atomic = deny`; verified by loom tests. |
 | **30 MCP tools, 10 prompts** | Full SSH catalogue plus 9 subscription primitives | Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. |
 | **Strong LLM steering** | `HINT:` lines, `NEXT:` tool chains, push-first prompts, 38-code error taxonomy with single-sentence cures | Smaller open-source models drive it correctly first try. |
@@ -227,7 +237,7 @@ The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.c
 | Raw `ssh` from a shell tool | no | no | n/a | manual | one-off command |
 | `paramiko` or `asyncssh` glue script | no (poll) | no | varies | manual | one host at a time |
 | Other MCP SSH wrappers | usually no | usually no | varies | usually no | tool-only |
-| **`ssh-mcp` v5.0.1** | **yes** | **yes** | **yes** | **NDJSON daemon** | **multi-session, multi-host, agent-grouped** |
+| **`ssh-mcp` v5.0.2** | **yes** | **yes** | **yes** | **NDJSON daemon** | **multi-session, multi-host, agent-grouped** |
 
 ## Install
 
@@ -282,7 +292,7 @@ Restart the host. The model should now see thirty SSH tools and ten ready-made p
 
 ## Tool catalogue
 
-`ssh-mcp` v5.0.1 ships **30 MCP tools** across five push-resource schemes and ten prompt templates (29 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes.
+`ssh-mcp` v5.0.2 ships **30 MCP tools** across five push-resource schemes and ten prompt templates (29 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes.
 
 | Family | Tools | Push resource |
 |---|---|---|
@@ -377,7 +387,7 @@ MIT. Declared via `license = "MIT"` in [`Cargo.toml`](Cargo.toml).
 
 ### About this fork
 
-This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.0.1 stays wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.0.2 stays wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
 
 ### Author and links
 
