@@ -6,6 +6,8 @@
 //! sync (no AFIT methods) so it remains erasable behind `Arc<dyn PeerHandle>`.
 
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::domain::error::DomainError;
@@ -38,6 +40,62 @@ pub trait LocalNotifierPort: Sync {
         peer: Arc<dyn PeerHandle>,
         uri: &str,
     ) -> Result<(), DomainError>;
+}
+
+/// Sync, dyn-safe activator for the per-resource debouncer task.
+///
+/// Lets `ssh_subscribe`-only flows wake the same debouncer the
+/// legacy `resources/subscribe` path uses, so producer pokes /
+/// byte-threshold flushes drive the URI broadcast pipeline. Composition
+/// root wires the production [`MemoryRegistry`] as the impl.
+pub trait DebouncerActivator: Send + Sync + Debug + 'static {
+    /// Ensure a debouncer task is running for the resource URI.
+    /// Idempotent — re-calling on a live debouncer is a no-op.
+    fn ensure_for_uri(&self, uri: &str);
+}
+
+/// Sync, dyn-safe forwarder for legacy producer pokes.
+///
+/// The runtime-side adapters (russh, sftp, serial) feed the legacy
+/// `SUBSCRIPTION_REGISTRY` singleton via `poke` / `record_bytes`. The
+/// hexagonal [`MemoryRegistry`] runs alongside — without forwarding,
+/// `ssh_subscribe` lanes only see the 1 s force-flush tick. Composition
+/// root installs an implementation backed by the hexagonal registry so
+/// every legacy producer event also wakes the lane bridge.
+pub trait ProducerForwarder: Send + Sync + Debug + 'static {
+    /// Forward a producer poke (resource updated, no byte counter
+    /// change) to the hexagonal registry.
+    fn forward_poke(&self, kind: super::subscriber_registry::ResourceKind, id: &str);
+
+    /// Forward a producer byte delta to the hexagonal registry's
+    /// per-URI byte counter.
+    fn forward_record_bytes(
+        &self,
+        kind: super::subscriber_registry::ResourceKind,
+        id: &str,
+        bytes_added: usize,
+    );
+}
+
+/// URI-keyed bridge for the legacy broadcast pipeline.
+///
+/// Fans `resources/updated` notifications out to every per-`SubId`
+/// lane bound to a URI. Composition root installs an implementation
+/// on the `MemoryRegistry` so legacy broadcast wakes up
+/// `ssh_subscribe`-created lanes without a dedicated Phase 4 drain
+/// task. Implementations also increment per-lane atomics
+/// (`events_sent`, `bytes_sent`). Boxed-future return so the trait
+/// stays dyn-safe — `MemoryRegistry` stores it as
+/// `ArcSwap<Option<Arc<dyn LaneNotifierBridge>>>`.
+pub trait LaneNotifierBridge: Send + Sync + Debug + 'static {
+    /// Notify every lane bound to `uri`. `bytes_added` is the byte
+    /// count that triggered the broadcast (used to increment lane
+    /// `bytes_sent`).
+    fn notify_lanes<'a>(
+        &'a self,
+        uri: &'a str,
+        bytes_added: usize,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 #[cfg(test)]
