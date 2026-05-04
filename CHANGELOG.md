@@ -5,6 +5,57 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.2.0] — 2026-05-04
+
+ADR 0009 — native serial / UART / TTY / COM transport. Adds a sixth push-resource scheme `serial://<id>/output` that plugs into the existing v4 `SUBSCRIPTION_REGISTRY` debouncer pipeline (debounce + force_flush + keepalive + ADR 0006 Amendment 1 byte-threshold flush). Wire-compatible drop-in for any v3 / v4 / v5.0.x / v5.1 host: tools, structured_content schema, env vars, and error taxonomy unchanged for non-serial workflows.
+
+### What landed
+
+- **New `tokio-serial = "5"` dependency** (default features only; no extra `serde` / `async-std` shims).
+- **New `ResourceKind::Serial` variant** on the port enum (`src/ports/subscriber_registry.rs`) and the legacy adapter enum (`src/adapters/subscription/legacy.rs`); `format_uri` / `parse_uri` round-trip `serial://<id>/output` on both. Every exhaustive match across the workspace updated atomically.
+- **Domain types** (`src/domain/ids.rs::SerialId`, `src/domain/error.rs::DomainError::SerialNotFound` + `Serial(String)`).
+- **Lock-free per-port aggregate** (`src/adapters/serial/state.rs`):
+  - `SerialPortState` — `ArcSwap<RingBuffer>` history (subscribers slice without locking the OS reader), `mpsc::channel(64)` write queue (slow remote sink fills the queue first; subsequent writes return `SERIAL_BACKPRESSURE` instead of stalling), `CancellationToken` cooperative shutdown, `AtomicU64` activity / max-buffer atomics, `Notify` data hint.
+  - `SerialConfig` — full `stty` parameter coverage: `path`, `baud_rate`, `data_bits` (5..=8), `stop_bits` (1 / 2), `parity` (none / odd / even), `flow_control` (none / software / hardware), `read_timeout`, `max_buffer_size`, `initial_dtr`, `initial_rts`, `label`.
+  - `open_port`, `close_port` (idempotent), `write_port` (returns `SerialWriteError::Backpressure` when the mpsc fills), `available_ports`, `read_history_from_cursor`.
+  - Reader and writer tasks split via `tokio::io::split` over the `tokio_serial::SerialStream`. Reader appends to history via `ArcSwap::rcu` + calls `SUBSCRIPTION_REGISTRY.next_seq` / `poke` / `record_bytes` (ADR 0006 Amendment 1 byte-threshold) — bit-identical to the `command://*/output` producer wiring.
+- **6 new MCP tools** (also documented in [docs/API.md](docs/API.md)):
+  - `ssh_serial_open` — open a port, return `SERIAL_ID` + `serial://<id>/output` URI.
+  - `ssh_serial_close` — idempotent cancel.
+  - `ssh_serial_write` — UTF-8 `text` OR base64 `bytes_base64` (RFC 4648 standard alphabet, inline decoder).
+  - `ssh_serial_send_key` — named keystrokes: `enter`/`cr` (`\r`), `lf` (`\n`), `crlf` (`\r\n`), `esc` (`\x1b`), `tab` (`\t`), `backspace` (`\x08`), `ctrl_c` / `ctrl_d` / `ctrl_z`. Optional `repeat` 1..=64.
+  - `ssh_serial_list_ports` — snapshot OS-visible serial devices.
+  - `ssh_serial_list_open` — snapshot ports currently held by this process.
+- **Resource-handler dispatch** — `try_serial_read` short-circuits `resources/read serial://<id>/output` directly against `SERIAL_REGISTRY` (the application read use case bypasses serial; serial state lives outside the application repositories, mirroring the forward-resource pattern).
+- **LLM-UX hooks** — `ssh_serial_open` `HINT: RECOMMENDED:` line steers the model to subscribe (debounce + 64 KiB byte-threshold flush, same pipeline as shell / command). `ssh_serial_write` / `ssh_serial_send_key` `HINT:` line tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.
+- **ADR 0009** — full design narrative, hexagonal layer map, lock-free contract, configuration surface, MCP tool table, cross-platform device-path notes, deferred-to-v5.3 list.
+- **`docs/RESOURCES.md`** — sixth push-resource scheme documented.
+- **`docs/CONFIGURATION.md`** — no new env vars (serial inherits `SSH_NOTIFY_*` knobs).
+- **`docs/API.md`** — 6 new tool entries + Tool catalogue tally bumped to 36 (35 without `port_forward`).
+- **README** — version bump, comparison table, "What's new in 5.2.0" section.
+
+### Tool count
+
+| Build | Tools | Schemes |
+|---|---|---|
+| default (`port_forward = on`) | **36** (was 30) | `shell`, `command`, `transfer`, `forward`, `session`, **`serial`** |
+| `--no-default-features` | **35** (was 29) | `shell`, `command`, `transfer`, `session`, **`serial`** |
+
+### Out of scope (deferred to v5.3)
+
+- **Per-call `flush_bytes` / `debounce` overrides on serial subscriptions** — same follow-up that gates the equivalent feature on `ssh_subscribe` for shell / command.
+- **Hot reconfigure** (change baud / parity without close-reopen).
+- **Hardware breaks** (`tcsendbreak` via `ssh_serial_send_break`).
+- **Modem control mid-session** (toggle DTR / RTS at runtime — currently only `initial_dtr` / `initial_rts` on open).
+- **Lifecycle binding for serial ports** (`release_when_no_subs=true` mirroring ADR 0003 for shells / commands).
+
+### Verified gates
+
+- `cargo build --release` exit 0 (3 binaries: `ssh-mcp`, `ssh-mcp-stdio`, `ssh-mcp-tail`).
+- `cargo fmt --all -- --check` exit 0.
+- `cargo clippy --release --all-features -- -D warnings` exit 0.
+- `cargo test --lib --quiet` — **1655 passed** (was 1649 in 5.1.0; +6 serial tests covering config defaults, parser round-trips, registry sanity).
+
 ## [5.1.0] — 2026-05-04
 
 ADR 0006 Amendment 1 — byte-threshold debouncer flush is now wired end-to-end. Adds a fourth wakeup source on the per-resource debouncer (`flush_now`) plus per-resource byte counters that live alongside the existing time-based pipeline. No wire-format breakage; tool catalogue, structured_content schema, and error taxonomy unchanged.

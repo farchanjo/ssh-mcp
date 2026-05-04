@@ -6,7 +6,7 @@
 
 Drive remote shells, asynchronous commands, SFTP transfers, and TCP forwards from any MCP-capable LLM host. Output streams to your model the moment SSH bytes arrive — no polling loops, no empty payloads, no token waste.
 
-[![Version](https://img.shields.io/badge/version-5.1.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.1.0)
+[![Version](https://img.shields.io/badge/version-5.2.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.2.0)
 [![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)](https://modelcontextprotocol.io/)
@@ -56,6 +56,18 @@ Most LLM-driven SSH wrappers fall back to polling. The model issues `get_output(
 | **Subscribe + drain** | **~1 500 tokens** | One setup call; events delivered as bytes arrive. |
 
 Same throughput, ~30× cheaper, and the model reacts the moment the remote process speaks.
+
+## What's new in 5.2.0
+
+ADR 0009 — native serial / UART / TTY / COM transport. No wire-format changes for non-serial workflows; drop-in for any v3 / v4 / v5.0.x / v5.1 host.
+
+- **New `serial://<id>/output` push scheme.** Open a UART (`/dev/ttyUSB0`, `/dev/tty.usbserial-XXXX`, `COM3`, …) directly from the LLM host — no SSH gateway required. Subscribe with `ssh_subscribe uri=serial://<SERIAL_ID>/output`; push delivery uses the exact same debouncer + 64 KiB byte-threshold flush as `shell://*/output` and `command://*/output`.
+- **6 new MCP tools.** `ssh_serial_open` (full `stty` parameter coverage: baud / data / stop / parity / flow + DTR / RTS / max_buffer / label), `ssh_serial_close` (idempotent), `ssh_serial_write` (UTF-8 `text` OR base64 `bytes_base64`), `ssh_serial_send_key` (`enter`/`cr`/`lf`/`crlf`/`esc`/`tab`/`backspace`/`ctrl_c`/`ctrl_d`/`ctrl_z` × `repeat` 1..=64), `ssh_serial_list_ports`, `ssh_serial_list_open`.
+- **Lock-free reader / writer split.** History on `ArcSwap<RingBuffer>` (`O(1)` snapshot reads, no blocking); writes funnel through a bounded `mpsc::channel(64)` so a slow remote sink fills the queue first and surfaces `SERIAL_BACKPRESSURE` instead of stalling the request. Subscribers never contend with the OS-level serial reader.
+- **Tool surface bumps** to **36** (with `port_forward`) / **35** (without). Existing v3 / v4 / v5 tools and resource schemes unchanged.
+- **Inherits 5.1.0 byte-threshold flush.** A 921 600 baud firmware dump pushes its first 64 KiB chunk in ~75 ms instead of waiting the full debounce window — perfect for chatty UARTs (GPS NMEA, RS-485 sensor stream, debug console).
+
+Full notes: [CHANGELOG.md → 5.2.0](CHANGELOG.md#520--2026-05-04). Design rationale: [docs/adr/0009-serial-transport.md](docs/adr/0009-serial-transport.md).
 
 ## What's new in 5.1.0
 
@@ -174,13 +186,13 @@ The end result: a byte leaves the remote shell, traverses every layer above, and
 
 | Capability | What you get | Why it matters |
 |---|---|---|
-| **Subscribe-first push** | `ssh_subscribe` on five resource schemes (`shell://`, `command://`, `transfer://`, `forward://`, `session://`) | Real-time delivery, ~30× lower token cost than polling. |
+| **Subscribe-first push** | `ssh_subscribe` on six resource schemes (`shell://`, `command://`, `transfer://`, `forward://`, `session://`, **`serial://`**) | Real-time delivery, ~30× lower token cost than polling. Same pipeline for SSH and UART. |
 | **Per-subscription lanes** | Independent filter, replay, lag policy per `SubId` | A slow consumer never slows down a fast one. |
 | **Lifecycle binding** | `release_when_no_subs` opt-in; CAS state machine; refcount cascade | No leaked shells, no zombie commands when the host crashes. |
 | **Three transports, one core** | `ssh-mcp` (HTTP), `ssh-mcp-stdio` (MCP over stdio), `ssh-mcp-tail` (NDJSON daemon) | Pick what your host supports; same hexagonal core under the hood. |
-| **Hexagonal architecture** | Use cases generic over ports; adapters swap for testing | Deterministic test fixtures, ~1 636 lib tests, 16 loom interleavings. |
+| **Hexagonal architecture** | Use cases generic over ports; adapters swap for testing | Deterministic test fixtures, ~1 655 lib tests, 16 loom interleavings. |
 | **Lock-free hot path** | Zero `Mutex` on shell, command, or transfer state | Enforced by `clippy::mutex_atomic = deny`; verified by loom tests. |
-| **30 MCP tools, 10 prompts** | Full SSH catalogue plus 9 subscription primitives | Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. |
+| **36 MCP tools, 10 prompts** | Full SSH catalogue + 9 subscription primitives + 6 serial / UART / TTY / COM primitives | Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. |
 | **Strong LLM steering** | `HINT:` lines, `NEXT:` tool chains, push-first prompts, 38-code error taxonomy with single-sentence cures | Smaller open-source models drive it correctly first try. |
 | **Atomic ID safety** | UUIDv7 across every id type; `_meta.idempotency_key` for retry deduplication | Time-ordered ids; dedup on transient failures. |
 | **Bulk operations** | `ssh_execute_batch`, `ssh_disconnect_agent`, `ssh_disconnect_many` | One round-trip for the common multi-target patterns. |
@@ -238,7 +250,7 @@ The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.c
 | Raw `ssh` from a shell tool | no | no | n/a | manual | one-off command |
 | `paramiko` or `asyncssh` glue script | no (poll) | no | varies | manual | one host at a time |
 | Other MCP SSH wrappers | usually no | usually no | varies | usually no | tool-only |
-| **`ssh-mcp` v5.1.0** | **yes** | **yes** | **yes** | **NDJSON daemon** | **multi-session, multi-host, agent-grouped** |
+| **`ssh-mcp` v5.2.0** | **yes** | **yes** | **yes** | **NDJSON daemon + native UART/TTY/COM** | **multi-session, multi-host, multi-port (SSH + serial), agent-grouped** |
 
 ## Install
 
@@ -293,7 +305,7 @@ Restart the host. The model should now see thirty SSH tools and ten ready-made p
 
 ## Tool catalogue
 
-`ssh-mcp` v5.1.0 ships **30 MCP tools** across five push-resource schemes and ten prompt templates (29 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes.
+`ssh-mcp` v5.2.0 ships **36 MCP tools** across six push-resource schemes and ten prompt templates (35 tools without the `port_forward` feature). The catalogue is wire-compatible with every v3 / v4 host on the legacy 21-tool surface — adding `ssh-mcp` to an existing v4 deployment requires zero host changes; the new `ssh_serial_*` tools and the `serial://` scheme are additive.
 
 | Family | Tools | Push resource |
 |---|---|---|
@@ -388,7 +400,7 @@ MIT. Declared via `license = "MIT"` in [`Cargo.toml`](Cargo.toml).
 
 ### About this fork
 
-This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.1.0 stays wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel multiplexing, and a third NDJSON daemon binary. v5.2.0 adds a sixth push-resource scheme (`serial://<id>/output`) plus 6 native UART / TTY / COM tools while staying wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
 
 ### Author and links
 
