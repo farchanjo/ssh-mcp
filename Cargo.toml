@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "4.7.1"
+version = "4.8.0"
 edition = "2024"
 rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
