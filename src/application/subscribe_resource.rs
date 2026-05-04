@@ -331,7 +331,13 @@ where
         ResourceKind::Session => ensure_session(id, sessions).await,
         // v3 default: subscribers may attach to a forward URI
         // before the producer publishes the first event.
-        ResourceKind::Forward => Ok(()),
+        // v5.2 (ADR 0009): serial state lives outside the
+        // application repositories — the infra-layer
+        // `serial_open` already validates that the SerialId
+        // exists before any subscribe call reaches this path,
+        // so we accept the attach with the same forward-style
+        // semantics.
+        ResourceKind::Forward | ResourceKind::Serial => Ok(()),
     }
 }
 

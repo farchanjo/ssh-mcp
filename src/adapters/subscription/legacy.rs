@@ -65,6 +65,8 @@ pub enum ResourceKind {
     Session,
     /// `forward://<id>/events`
     Forward,
+    /// `serial://<id>/output` — UART / TTY / COM (v5.2; ADR 0009).
+    Serial,
 }
 
 /// A single MCP peer's subscription to one resource URI.
@@ -447,9 +449,10 @@ pub fn format_uri(kind: ResourceKind, id: &str) -> String {
         ResourceKind::Transfer => "transfer",
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
+        ResourceKind::Serial => "serial",
     };
     let suffix = match kind {
-        ResourceKind::Shell | ResourceKind::Command => "output",
+        ResourceKind::Shell | ResourceKind::Command | ResourceKind::Serial => "output",
         ResourceKind::Transfer => "progress",
         ResourceKind::Session => "health",
         ResourceKind::Forward => "events",
@@ -468,6 +471,7 @@ pub fn parse_uri(uri: &str) -> Option<(ResourceKind, String)> {
         "transfer" => ResourceKind::Transfer,
         "session" => ResourceKind::Session,
         "forward" => ResourceKind::Forward,
+        "serial" => ResourceKind::Serial,
         _ => return None,
     };
     let id = rest.split_once('/').map_or(rest, |(id, _)| id);

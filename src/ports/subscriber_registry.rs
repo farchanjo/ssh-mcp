@@ -30,6 +30,9 @@ pub enum ResourceKind {
     Session,
     /// `forward://<id>/events`
     Forward,
+    /// `serial://<id>/output` — UART / TTY / COM serial-port output
+    /// (v5.2; ADR 0009).
+    Serial,
 }
 
 /// Snapshot of a single subscription record returned by the registry.

@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "5.1.0"
+version = "5.2.0"
 edition = "2024"
 rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
@@ -84,6 +84,12 @@ tokio-util = "0.7"
 # SSH client (async)
 russh = "0.55"
 russh-sftp = "2"
+
+# Serial / UART / TTY / COM transport (v5.2 — ADR 0009)
+# Async serial port wrapper sharing the tokio runtime. Cross-platform:
+# Linux ttyUSB*/ttyACM*, macOS tty.usb*, Windows COM*. Default features
+# only — no extra `serde`/`async-std` shims.
+tokio-serial = { version = "5", default-features = false }
 
 # Trait abstraction (v4 hexagonal)
 trait-variant = "0.1"   # AFIT pattern for ports/adapters (v3 `async-trait` direct dep dropped in H17.6 P2)

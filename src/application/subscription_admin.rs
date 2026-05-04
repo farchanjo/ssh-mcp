@@ -540,6 +540,7 @@ pub const fn summary_kind_str(summary: &SubSummary) -> &'static str {
         ResourceKind::Transfer => "transfer",
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
+        ResourceKind::Serial => "serial",
     }
 }
 

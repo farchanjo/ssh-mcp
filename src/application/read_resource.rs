@@ -120,7 +120,7 @@ impl StdError for ParseError {}
 
 const fn sub_path_of(kind: ResourceKind) -> &'static str {
     match kind {
-        ResourceKind::Shell | ResourceKind::Command => "output",
+        ResourceKind::Shell | ResourceKind::Command | ResourceKind::Serial => "output",
         ResourceKind::Transfer => "progress",
         ResourceKind::Session => "health",
         ResourceKind::Forward => "events",
@@ -134,6 +134,7 @@ const fn scheme_of(kind: ResourceKind) -> &'static str {
         ResourceKind::Transfer => "transfer",
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
+        ResourceKind::Serial => "serial",
     }
 }
 
@@ -506,6 +507,10 @@ where
             ResourceKind::Forward => {
                 read_forward(&*self.forwards, &*self.subscribers, &parsed, &canonical).await
             }
+            ResourceKind::Serial => Err(DomainError::InvalidArgument(
+                "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
+                    .to_string(),
+            )),
         }
     }
 }

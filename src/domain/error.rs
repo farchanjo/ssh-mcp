@@ -7,7 +7,7 @@
 use thiserror::Error;
 
 use super::auth::AuthError;
-use super::ids::{CommandId, ForwardId, SessionId, ShellId, TransferId};
+use super::ids::{CommandId, ForwardId, SerialId, SessionId, ShellId, TransferId};
 use super::lifecycle::LifecycleState;
 use super::subscription::SubId;
 
@@ -33,6 +33,17 @@ pub enum DomainError {
     /// A forwarder referenced by id was not found.
     #[error("forward not found: {0}")]
     ForwardNotFound(ForwardId),
+
+    /// An open serial port referenced by id was not found.
+    /// v5.2 (ADR 0009).
+    #[error("serial not found: {0}")]
+    SerialNotFound(SerialId),
+
+    /// Serial transport-level error surfaced by the adapter
+    /// (open / read / write / close failures).
+    /// v5.2 (ADR 0009).
+    #[error("serial error: {0}")]
+    Serial(String),
 
     /// Per-session command capacity was exhausted.
     #[error("max commands per session exceeded (limit {limit})")]
