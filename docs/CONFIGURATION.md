@@ -98,6 +98,7 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 | `SSH_NOTIFY_DEBOUNCE_MS` | `u64` (ms) | `50` | `5` | `5000` | Debounce window. Producer pokes inside this window collapse into a single `notifications/resources/updated`. |
 | `SSH_NOTIFY_FORCE_FLUSH_MS` | `u64` (ms) | `1000` | `100` | `60000` | Force-flush ticker. Guarantees a notification fires at least every N ms even when poke storms keep resetting the debouncer. |
 | `SSH_NOTIFY_KEEPALIVE_S` | `u64` (s) | `30` | `5` | `300` | Keepalive ticker. Sends a notification this often even when no fresh data arrived (warms SSE / stdio frames). |
+| `SSH_NOTIFY_FLUSH_BYTES` | `usize` (bytes) or bytesize string (`8k`, `64k`, `1m`, `1mib`) | `64k` (`65_536`) | `1024` | `1_048_576` | ADR 0006 Amendment 1 — byte-threshold flush. The per-resource debouncer flushes immediately when bytes-since-last-broadcast cross this value, regardless of `SSH_NOTIFY_DEBOUNCE_MS`. Set to `0` to disable byte-threshold (time-only debouncer, v5.0 behaviour). Hooked on `command://*/output` (stdout/stderr) and `transfer://*/progress` (per-chunk delta). |
 
 ### Peer GC
 
