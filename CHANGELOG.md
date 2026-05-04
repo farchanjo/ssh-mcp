@@ -5,6 +5,38 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.0] — 2026-05-04
+
+Lane fanout pipeline + production port-forward listener. Wire-compatible drop-in for any v3 / v4 / v5.0.x / v5.1 / v5.2 host: tools, structured_content schema, env vars, and error taxonomy unchanged for non-subscribe / non-forward workflows.
+
+### What landed
+
+- **`ssh_subscribe` push delivery wired end-to-end on stdio/HTTP transport.** Lanes carry the rmcp peer captured at tool-invocation time (`SubscribeRequest.peer: Option<Arc<dyn PeerHandle>>`); the new `LaneFanoutBridge` (`src/adapters/subscription/lane_bridge.rs`) walks the lane snapshot for the broadcast URI, calls `notifier.notify_resource_updated` per peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). Phase 4 NDJSON daemon keeps the channel-mux outbound sink (lane peer = `None`).
+- **3 new ports** (`src/ports/notifier.rs`):
+  - `LaneNotifierBridge` — boxed-future, dyn-safe trait the `MemoryRegistry::broadcast` consults before the legacy peer fan-out.
+  - `DebouncerActivator` — lets `ssh_subscribe`-only flows wake the per-resource debouncer the legacy `resources/subscribe` path uses.
+  - `ProducerForwarder` — runtime adapters (russh / sftp / serial / shell PTY) feed the legacy `SUBSCRIPTION_REGISTRY` singleton; the forwarder mirrors every `poke` / `record_bytes` into the hexagonal `MemoryRegistry`.
+- **Memory-registry hardening** (`src/adapters/subscription/memory_registry.rs`):
+  - `record_bytes` lazy-inserts the per-resource counter so producers writing pre-subscribe do not lose accumulation.
+  - `ensure_debouncer` reuses the existing counter (instead of overwriting) so spawn does not lose pre-subscribe bytes.
+  - `lane_bridge: ArcSwap<Option<Arc<dyn LaneNotifierBridge>>>` field + `install_lane_bridge` setter; `broadcast(uri, bytes_added)` now passes the swapped byte counter to the bridge.
+- **Production port-forward listener.** `ssh_forward` no longer drops the listener after preflight: `SshClientPort::open_forward` / `close_forward` (returning a `ForwardHandle { bound_addr }`) drive a real accept loop. Per-connection: `Handle::channel_open_direct_tcpip(remote_addr, remote_port, originator, 0)` + `tokio::io::copy_bidirectional`. Sessions cascade-close their forwards on disconnect — no port leaks, no zombie listeners.
+- **Shell PTY producer wired.** `flush_shell_buffer` now calls `SUBSCRIPTION_REGISTRY.poke(Shell, id)` + `record_bytes(Shell, id, chunk_len)` after every flush, so `shell://<id>/output` lanes see real PTY bytes (not just the 1 s force-flush keepalive tick).
+- **URI charset hardening.** `parse_uri` rejects ids outside `[A-Za-z0-9_-]+` (whitespace, unicode, control chars, dot-dot) with a new `ParseError::BadIdCharset`. UUIDv7 + legacy snake_case ids unaffected.
+- **`serial://` scheme** is now first-class on the `ssh_subscribe` URI parser (the legacy URI parser already supported it; the application-side parser was the only gap).
+- **MCP schema spec compliance.** `SshSerialListPortsArgs` / `SshSerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts (Claude Code) accept the full `tools/list` batch.
+
+### Quality
+
+- **1657 lib tests + 41 chaos + 32 property + 2 v5_smoke + 13 integration** all green.
+- Production clippy strict gate (`cargo clippy --release --all-features --bin ssh-mcp-stdio -- -D warnings`) exit 0.
+- Schema validation: every one of the 36 MCP tools satisfies `inputSchema.type == "object"`.
+- Stress-tested against `vm.services`: 50 MB stdout through subscribe, 1 MB SFTP upload, 6 schemes, 17-sub-per-URI cap fired, 200-char URI accepted, unicode / spaces / control-chars rejected, server stayed responsive across 15 269 push events. No panics, no buffer overflows, no listener leaks.
+
+### Breaking changes
+
+None. Wire-compatible drop-in.
+
 ## [5.2.0] — 2026-05-04
 
 ADR 0009 — native serial / UART / TTY / COM transport. Adds a sixth push-resource scheme `serial://<id>/output` that plugs into the existing v4 `SUBSCRIPTION_REGISTRY` debouncer pipeline (debounce + force_flush + keepalive + ADR 0006 Amendment 1 byte-threshold flush). Wire-compatible drop-in for any v3 / v4 / v5.0.x / v5.1 host: tools, structured_content schema, env vars, and error taxonomy unchanged for non-serial workflows.
