@@ -74,7 +74,7 @@ flowchart TD
 
 1. **Host does not surface `notifications/resources/updated` to the LLM.** Claude Code CLI (as of 2026-Q1) and several IDE integrations accept the protocol but never deliver push notifications as conversation context to the model. The MCP server emits them; the host drops them.
 2. **Subscription was closed by peer GC.** Peer-GC scans the subscription registry every `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed. Reconnecting client gets a fresh `PeerId`; the old `sub_id` is dead.
-3. **Lifecycle moved to `Releasing` without a re-subscribe inside the grace window.** When the last subscriber on a `release_when_no_subs=true` resource unsubscribed, the grace timer started counting down (`SSH_LIFECYCLE_GRACE_MS`, default 2000 ms). A new `subscribe` after grace expired returns `RESOURCE_GONE`.
+3. **Lifecycle moved to `Releasing` without a re-subscribe inside the grace window.** When the last subscriber on a `release_when_no_subs=true` resource unsubscribed, the per-call grace timer started counting down (`LifecyclePolicy.grace_ms`, default 2000 ms). A new `subscribe` after grace expired returns `RESOURCE_GONE`.
 4. **Filter excludes everything.** The lane has a regex / level filter that rejects every event before it hits the mpsc.
 5. **Lane is paused.** A prior `sub_pause` call suspended the drain loop. Producer is still emitting; the lane mpsc fills under its lag policy.
 
@@ -179,7 +179,7 @@ References: [ADR 0006](./adr/0006-backpressure-policies.md), [DAEMON.md](./DAEMO
 
 #### Causes
 
-1. **Grace timer expired between create and subscribe.** A resource was created with `release_when_no_subs=true` and `SSH_LIFECYCLE_OWN_GRACE_MS` elapsed before any subscriber attached. The lifecycle moved `Owned -> Releasing -> Closed`.
+1. **Grace timer expired between create and subscribe.** A resource was created with `release_when_no_subs=true` and the per-call lifecycle grace window elapsed before any subscriber attached. The lifecycle moved `Owned -> Releasing -> Closed`.
 2. **Last unsubscribe + grace timer.** A previous `sub_close` was the last subscriber; the grace timer fired before re-subscribe.
 3. **Cascade close.** The parent session was disconnected; every owned resource cascaded to `Closed`.
 4. **Manual close.** `ssh_shell_close` / `ssh_exec_cancel` was called.
@@ -208,7 +208,7 @@ Recreate the resource and subscribe immediately:
 |---|---|
 | Subscribe-after-create race | Issue `sub_open` immediately after the create call, in the same turn. Default grace window is 2 s. |
 | Long-lived `Owned` without subscriber | Set `release_when_no_subs=false` on resources you intend to keep alive without observing. |
-| Re-subscribe after disconnect | Track the `sub_id` and `uri`. On reconnect, resubscribe to the same URI within `SSH_LIFECYCLE_GRACE_MS`. |
+| Re-subscribe after disconnect | Track the `sub_id` and `uri`. On reconnect, resubscribe to the same URI within the per-call lifecycle grace window. |
 
 References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0007](./adr/0007-error-taxonomy.md), [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
 
@@ -899,14 +899,14 @@ File a bug when:
 
 Capture in the bug report:
 
-- ssh-mcp version (e.g. `v5.0.0-rc1` or branch + commit SHA).
+- ssh-mcp version (e.g. `v6.0.0` or branch + commit SHA).
 - The exact tool / op call sequence that reproduces the issue.
 - `RUST_LOG=ssh_mcp=debug` output for the relevant time window.
 - `sub_stats_all` snapshot at the moment of the issue.
 - The wire response or NDJSON event that surprised you.
 - Reproducer (shell script or Rust test) ideally.
 
-The bug template under `.github/ISSUE_TEMPLATE/bug_report.md` (forthcoming) drives this checklist.
+Use this checklist verbatim when filing the issue at <https://github.com/farchanjo/ssh-mcp/issues>.
 
 ---
 

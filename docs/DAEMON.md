@@ -1,8 +1,8 @@
 # `ssh-mcp-tail` — NDJSON Daemon Reference
 
-`ssh-mcp-tail` is the v5.0 binary for running ssh-mcp as a Unix-composable NDJSON pipe. It embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired to itself through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON commands; stdout emits NDJSON events; stderr emits `RUST_LOG`-controlled tracing.
+`ssh-mcp-tail` is the v6.0 NDJSON-daemon binary for running ssh-mcp as a Unix-composable NDJSON pipe. It embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired to itself through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON commands; stdout emits NDJSON events; stderr emits `RUST_LOG`-controlled tracing.
 
-This document is **forthcoming** until Phase 4 of the v5 roadmap lands the binary. The protocol shape below is the design committed in [ADR 0008](./adr/0008-ndjson-daemon-protocol.md). Sections marked _v5.0 forthcoming_ describe surface that exists as design intent; the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes authoritative when Phase 4 ships.
+The binary is shipped (Phase 4 merged into v5.x; carried forward unchanged into v6.0). Wire shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` is forthcoming and will become the authoritative contract once published.
 
 ## When to use this binary
 
@@ -85,7 +85,7 @@ cat ops.ndjson | ssh-mcp-tail daemon | tee out.ndjson
 
 One JSON object per line, terminated by `\n`. Each op is `serde`-tagged on the `op` field. The optional `id` field on every op is echoed on every event tied to that op for correlation.
 
-The 11 ops below are the v5.0 schema. The shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` is the binding contract once Phase 4 ships.
+The 13 ops below are the v5.0 schema (carried forward unchanged into v6.0). The shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes the binding contract once published.
 
 ### `connect`
 
@@ -156,6 +156,18 @@ Close a push channel. Triggers grace timer if last sub on the URI and `release_w
 
 Errors: `SUB_NOT_FOUND`.
 
+### `read`
+
+Explicit `resources/read` snapshot — returns the current ring-buffer slice for a URI. No subscribe needed; useful for one-shot inspection or cursor-based catch-up after a `lagged` event.
+
+```json
+{"op":"read","uri":"command://<cmd-uuid>/output","cursor":102400,"id":"corr-5"}
+```
+
+Optional `cursor` byte offset; omit to start from the head of the buffer. Returns a `snapshot` event keyed to `id`.
+
+Errors: `RESOURCE_NOT_FOUND`, `RESOURCE_GONE`, `INVALID_CURSOR`.
+
 ### `shell_open`
 
 Open a PTY shell. Returns `ack` with `shid`.
@@ -204,6 +216,16 @@ Upload a local file via SFTP. Returns `ack` with `tid`.
 ```
 
 Errors: `SESSION_NOT_FOUND`, `SFTP_ERROR`, `STORAGE_ERROR`.
+
+### `download`
+
+Download a remote file via SFTP. Returns `ack` with `tid`. Mirrors `upload` (reversed `local` / `remote` semantics).
+
+```json
+{"op":"download","sid":"<session-uuid>","remote":"/srv/file","local":"/tmp/file","release_when_no_subs":true,"id":"corr-9"}
+```
+
+Errors: `SESSION_NOT_FOUND`, `SFTP_OPEN_FAILED`, `REMOTE_METADATA_ERROR`, `SFTP_ERROR`.
 
 ### `cancel`
 
@@ -556,7 +578,7 @@ Every `heartbeat` and `daemon_stats` event carries a `protocol` field in the for
 - Treat unknown `ev` discriminators as informational and skip them.
 - Treat unknown fields on a known `ev` as additive and ignore them.
 
-The full JSON schema (op + event variants, field types, enum values) is at `docs/api/ssh-mcp-ndjson.schema.json` once Phase 4 lands. Until then the schema in this document and [ADR 0008](./adr/0008-ndjson-daemon-protocol.md) is authoritative.
+The full JSON schema (op + event variants, field types, enum values) is forthcoming at `docs/api/ssh-mcp-ndjson.schema.json`. Until then the schema in this document and [ADR 0008](./adr/0008-ndjson-daemon-protocol.md) is authoritative.
 
 ## See also
 
