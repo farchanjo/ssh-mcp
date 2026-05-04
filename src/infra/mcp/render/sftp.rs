@@ -237,8 +237,8 @@ fn render_progress_block(
 /// for push progress events or long-poll the same tool to terminal.
 fn next_hint_for_in_flight_transfer(transfer_id: &str) -> String {
     format!(
-        "resources/subscribe transfer://{transfer_id}/progress | \
-         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true)"
+        "ssh_subscribe uri=transfer://{transfer_id}/progress (preferred) | \
+         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
     )
 }
 
