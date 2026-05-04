@@ -5,6 +5,7 @@
 //! deliver `notifications/resources/updated`. `PeerHandle` is intentionally
 //! sync (no AFIT methods) so it remains erasable behind `Arc<dyn PeerHandle>`.
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::domain::error::DomainError;
@@ -15,7 +16,7 @@ use crate::domain::ids::PeerId;
 /// Implementations wrap the underlying transport (e.g. `rmcp::Peer`) so the
 /// registry can keep holding a closed-transport detection method without
 /// pulling rmcp into the port crate.
-pub trait PeerHandle: Send + Sync + std::fmt::Debug {
+pub trait PeerHandle: Send + Sync + Debug {
     /// Stable identifier minted at subscribe time.
     fn id(&self) -> PeerId;
 
@@ -25,7 +26,7 @@ pub trait PeerHandle: Send + Sync + std::fmt::Debug {
 
 /// Async notifier port. Adapters fan out `resources/updated` notifications.
 #[trait_variant::make(NotifierPort: Send)]
-pub trait LocalNotifierPort: Send + Sync {
+pub trait LocalNotifierPort: Sync {
     /// Notify a single peer that `uri` has changed.
     ///
     /// # Errors

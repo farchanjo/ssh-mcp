@@ -30,10 +30,12 @@ pub struct CommandOutcome {
     pub timed_out: bool,
 }
 
-/// Streaming handle returned by `execute_async`. Use cases consume both the
-/// snapshot entity and a stream of [`OutputChunk`] frames; the concrete
-/// stream type is opaque (the use case adapter holds it) so the port stays
-/// `Send`-bounded without leaking tokio.
+/// Streaming handle returned by `execute_async`.
+///
+/// Use cases consume both the snapshot entity and a stream of
+/// [`OutputChunk`] frames; the concrete stream type is opaque (the use
+/// case adapter holds it) so the port stays `Send`-bounded without
+/// leaking tokio.
 #[derive(Debug)]
 pub struct CommandHandle {
     /// Initial entity snapshot (status starts as `Running`).
@@ -42,7 +44,7 @@ pub struct CommandHandle {
 
 /// SSH client port. Implementations are async (network I/O + handshake).
 #[trait_variant::make(SshClientPort: Send)]
-pub trait LocalSshClientPort: Send + Sync {
+pub trait LocalSshClientPort: Sync {
     /// Open a new SSH session against `address` using `credentials`.
     ///
     /// # Errors
