@@ -126,9 +126,17 @@ const fn default_repeat() -> u32 {
 /// `ssh_serial_list_ports` takes no arguments.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialListPortsArgs;
+#[allow(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars derives type:null for unit structs (`pub struct X;`); MCP spec mandates inputSchema.type==object"
+)]
+pub struct SshSerialListPortsArgs {}
 
 /// `ssh_serial_list_open` takes no arguments.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialListOpenArgs;
+#[allow(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars derives type:null for unit structs (`pub struct X;`); MCP spec mandates inputSchema.type==object"
+)]
+pub struct SshSerialListOpenArgs {}
