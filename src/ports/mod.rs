@@ -16,6 +16,7 @@
 //!   `ClockPort`, etc.) can be erased behind `Arc<dyn Port>` when needed.
 
 pub mod auth_strategy;
+pub mod channel_mux;
 pub mod clock;
 pub mod command_repo;
 pub mod config;
@@ -28,5 +29,6 @@ pub mod session_repo;
 pub mod sftp_client;
 pub mod shell_repo;
 pub mod ssh_client;
+pub mod subscriber_lane;
 pub mod subscriber_registry;
 pub mod transfer_repo;
