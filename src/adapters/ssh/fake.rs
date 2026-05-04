@@ -55,7 +55,11 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
-use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
+use std::io::ErrorKind as IoErrorKind;
+
+use tokio::net::TcpListener;
+
+use crate::ports::ssh_client::{CommandHandle, CommandOutcome, ForwardHandle, SshClientPort};
 
 /// Default rolling buffer size handed back by [`FakeSshClient::open_shell`]
 /// when a test does not customise it. Mirrors the production default in
@@ -637,6 +641,37 @@ impl SshClientPort for FakeSshClient {
             HealthOutcome::Ok => Ok(()),
             HealthOutcome::Err(err) => Err(err),
         }
+    }
+
+    async fn open_forward(
+        &self,
+        _session_id: &SessionId,
+        local_port: u16,
+        _remote_address: String,
+        _remote_port: u16,
+    ) -> Result<ForwardHandle, DomainError> {
+        // Test fake — actually try a bind so unit tests can verify
+        // PortInUse semantics. The listener is dropped immediately;
+        // no per-connection pump is spawned.
+        match TcpListener::bind(("0.0.0.0", local_port)).await {
+            Ok(listener) => {
+                let bound = listener
+                    .local_addr()
+                    .map_or_else(|_| format!("0.0.0.0:{local_port}"), |a| a.to_string());
+                drop(listener);
+                Ok(ForwardHandle { bound_addr: bound })
+            }
+            Err(err) if err.kind() == IoErrorKind::AddrInUse => {
+                Err(DomainError::PortInUse(local_port))
+            }
+            Err(err) => Err(DomainError::Transport(format!(
+                "FORWARD_FAILED: bind 0.0.0.0:{local_port} failed: {err}"
+            ))),
+        }
+    }
+
+    async fn close_forward(&self, _local_port: u16) -> Result<(), DomainError> {
+        Ok(())
     }
 }
 

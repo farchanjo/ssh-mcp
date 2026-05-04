@@ -142,6 +142,47 @@ pub trait LocalSshClientPort: Sync {
     /// Returns `DomainError::Transport` when the keepalive channel fails to
     /// open or the probe command does not return a successful exit code.
     async fn health_check(&self, session_id: &SessionId) -> Result<(), DomainError>;
+
+    /// Spawn the local listener + per-connection direct-tcpip channels for
+    /// `local_port → remote_address:remote_port` over the SSH session.
+    /// The implementation owns the listener and pumps bytes both ways
+    /// for every accepted connection. Returns once the listener is
+    /// bound and accepting; per-connection lifetimes are independent.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::SessionNotFound`] when the session is unknown.
+    /// - [`DomainError::PortInUse`] when the local bind fails on
+    ///   `EADDRINUSE`.
+    /// - [`DomainError::Transport`] for any other I/O / russh failure.
+    async fn open_forward(
+        &self,
+        session_id: &SessionId,
+        local_port: u16,
+        remote_address: String,
+        remote_port: u16,
+    ) -> Result<ForwardHandle, DomainError>;
+
+    /// Stop the listener + cancel every in-flight forwarded connection
+    /// for `local_port`. Idempotent — already-closed forwards return
+    /// `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Transport`] when the underlying cancel
+    /// signal cannot be delivered.
+    async fn close_forward(&self, local_port: u16) -> Result<(), DomainError>;
+}
+
+/// Live handle returned by [`SshClientPort::open_forward`].
+///
+/// The adapter owns the listener + per-connection tasks; the handle
+/// exists so the use case can persist `bound_addr` for diagnostics
+/// without depending on the concrete adapter type.
+#[derive(Debug, Clone)]
+pub struct ForwardHandle {
+    /// Address the listener actually bound to (e.g. `0.0.0.0:8080`).
+    pub bound_addr: String,
 }
 
 #[cfg(test)]
