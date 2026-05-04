@@ -108,7 +108,10 @@ tracing = "0.1"                                                         # Tracin
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
 regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
-clap = { version = "4", features = ["derive"] }    # v5 Phase 4: ssh-mcp-tail CLI subcommands (run / shell / daemon)
+# clap intentionally not added — its derive macros emit
+# `#[allow(clippy::restriction)]` which conflicts with our forbid-level
+# Layer A Clippy baseline. The `ssh-mcp-tail` CLI surface is small (3
+# subcommands, ~7 flags) so we hand-roll the parser in `embed::cli`.
 
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
