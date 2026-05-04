@@ -78,11 +78,15 @@ pub fn serial_open_structured(result: &SerialOpenResult) -> Value {
 /// Render `serial_close`.
 #[must_use]
 pub fn serial_close_render(serial_id: &str, closed: bool) -> String {
-    let mut out = String::with_capacity(96);
+    let mut out = String::with_capacity(160);
     out.push_str("SERIAL_CLOSE: ");
     out.push_str(if closed { "OK" } else { "NOOP" });
     out.push_str("\nSERIAL_ID: ");
     out.push_str(serial_id);
+    next_line(
+        &mut out,
+        "serial_active (audit live ports) | serial_scan (discover devices) | serial_open path=...",
+    );
     out
 }
 
@@ -117,7 +121,7 @@ pub fn serial_send_key_render(
     repeat: u32,
     bytes_sent: usize,
 ) -> String {
-    let mut out = String::with_capacity(192);
+    let mut out = String::with_capacity(256);
     out.push_str("SERIAL_PRESS: OK\nSERIAL_ID: ");
     out.push_str(serial_id);
     out.push_str("\nKEY: ");
@@ -126,18 +130,36 @@ pub fn serial_send_key_render(
     out.push_str(&repeat.to_string());
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_sent.to_string());
+    hint_line(
+        &mut out,
+        &format!(
+            "RECOMMENDED: response arrives via push on serial://{serial_id}/output. Wait for notifications/resources/updated, then drain with resources/read?cursor=auto."
+        ),
+    );
+    next_line(
+        &mut out,
+        &format!(
+            "sub_open uri=serial://{serial_id}/output | resources/read serial://{serial_id}/output?cursor=auto | serial_write serial_id={serial_id}"
+        ),
+    );
     out
 }
 
 /// Render `serial_scan`.
 #[must_use]
 pub fn serial_list_ports_render(paths: &[String]) -> String {
-    let mut out = String::with_capacity(64 + paths.len() * 32);
+    let mut out = String::with_capacity(96 + paths.len() * 32);
     out.push_str("SERIAL_SCAN: OK\nTOTAL: ");
     out.push_str(&paths.len().to_string());
     for p in paths {
         out.push_str("\nPORT: ");
         out.push_str(p);
+    }
+    if !paths.is_empty() {
+        next_line(
+            &mut out,
+            "serial_open path=<PORT> baud_rate=115200 | serial_active (already-open ports)",
+        );
     }
     out
 }
@@ -145,7 +167,7 @@ pub fn serial_list_ports_render(paths: &[String]) -> String {
 /// Render `serial_active`.
 #[must_use]
 pub fn serial_list_open_render(entries: &[SerialOpenEntry]) -> String {
-    let mut out = String::with_capacity(128 + entries.len() * 64);
+    let mut out = String::with_capacity(160 + entries.len() * 64);
     out.push_str("SERIAL_ACTIVE: OK\nTOTAL: ");
     out.push_str(&entries.len().to_string());
     for e in entries {
@@ -159,6 +181,12 @@ pub fn serial_list_open_render(entries: &[SerialOpenEntry]) -> String {
             out.push_str(" LABEL=");
             out.push_str(label);
         }
+    }
+    if !entries.is_empty() {
+        next_line(
+            &mut out,
+            "sub_open uri=serial://<SERIAL_ID>/output | serial_write serial_id=<SERIAL_ID> | serial_close serial_id=<SERIAL_ID>",
+        );
     }
     out
 }

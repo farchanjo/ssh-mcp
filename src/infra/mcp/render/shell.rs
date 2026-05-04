@@ -233,14 +233,38 @@ pub fn shell_read_render(outcome: ReadShellOutcome) -> String {
         ReadShellStatus::Timeout => "TIMEOUT",
     };
     let data_block = render_output_block("data", &nonce, &data, DEFAULT_OUTPUT_BYTES, None);
-    let mut out = String::with_capacity(64 + data_block.len());
+    let mut out = String::with_capacity(192 + data_block.len());
     out.push_str("SSH_SHELL_READ: ");
     out.push_str(status_label);
     out.push_str("\nSHELL_ID: ");
     out.push_str(shell_id.as_str());
     out.push('\n');
     out.push_str(&data_block);
+    if matches!(status, ReadShellStatus::Open | ReadShellStatus::Timeout) {
+        append_shell_read_subscribe_steering(&mut out, shell_id.as_str());
+    }
     out
+}
+
+/// Append the subscribe-first HINT + NEXT advisory pair to a non-terminal
+/// `ssh_shell_read` response. Polling is strictly cheaper to replace
+/// with `sub_open uri=shell://<id>/output` — this steering nudges the
+/// LLM off the poll loop.
+fn append_shell_read_subscribe_steering(out: &mut String, shell_id: &str) {
+    append_subscribe_hint(
+        out,
+        &format!(
+            "RECOMMENDED: replace this poll with sub_open uri=shell://{shell_id}/output. Push delivers deltas as bytes arrive (debounce 200 ms OR 64 KiB byte-threshold) — strictly cheaper than chained ssh_shell_read calls."
+        ),
+    );
+    append_next_line(
+        out,
+        &format!(
+            "sub_open uri=shell://{shell_id}/output (PREFERRED — push-first) | \
+             resources/read shell://{shell_id}/output?cursor=auto (drain delta on push) | \
+             ssh_shell_read(shell_id={shell_id}, wait=true) (poll fallback)"
+        ),
+    );
 }
 
 /// Render a [`WaitForPatternOutcome`] as the v3
