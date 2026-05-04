@@ -12,7 +12,7 @@ cargo test --tests --quiet                         # 2 integration tests (incl. 
 cargo test --all-features                          # Combined run
 cargo test --features test-fixtures                # Use cases with deterministic in-memory adapters
 cargo fmt --all -- --check                         # Check formatting
-cargo clippy --all-features --all-targets --workspace -- -D warnings   # Lint (strict baseline)
+cargo clippy --release --all-features -- -D warnings                   # Lint (strict baseline — production only)
 ```
 
 ## Architecture (v4.7.0 — Hexagonal / Ports and Adapters, deep-decoupled)
@@ -124,6 +124,8 @@ Strict clippy enforcement via `Cargo.toml` `[lints.clippy]`:
 - **Allowed**: `multiple_crate_versions` (transitive deps from russh / axum).
 
 All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disable a lint to silence a warning — fix the code instead.
+
+**Clippy gate is production-only.** The canonical command is `cargo clippy --release --all-features -- -D warnings` and must always exit 0. Test targets are intentionally excluded because the `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` policy is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453). Production code stays under the full strict baseline; test code is gated by `cargo test --lib` (must keep green) plus `cargo build --release --all-targets` (must stay warning-free). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
 
 See `docs/LOCKS.md` for the lock-free invariants enforced by these lints (rewritten for v4 — maps every invariant to the layer that owns it).
 
