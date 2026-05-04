@@ -32,7 +32,7 @@ pub struct DownloadRequest {
 
 /// SFTP client port. Implementations are async (network I/O).
 #[trait_variant::make(SftpClientPort: Send)]
-pub trait LocalSftpClientPort: Send + Sync {
+pub trait LocalSftpClientPort: Sync {
     /// Spawn an upload and return the initial transfer entity (status
     /// `Running`). Progress is published through the
     /// [`crate::ports::output_stream::OutputStreamPort`] adapter.

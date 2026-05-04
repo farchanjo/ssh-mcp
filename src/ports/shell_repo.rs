@@ -6,7 +6,7 @@ use crate::domain::shell::ShellEntity;
 
 /// Shell repository port.
 #[trait_variant::make(ShellRepository: Send)]
-pub trait LocalShellRepository: Send + Sync {
+pub trait LocalShellRepository: Sync {
     /// Insert a shell entity.
     ///
     /// # Errors

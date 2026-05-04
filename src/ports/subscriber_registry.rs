@@ -85,7 +85,7 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
 /// Async slice of the subscription registry. `subscribe` may spawn a
 /// debouncer task on the runtime and is therefore async.
 #[trait_variant::make(SubscriberRegistryAsync: Send)]
-pub trait LocalSubscriberRegistryAsync: Send + Sync {
+pub trait LocalSubscriberRegistryAsync: Sync {
     /// Register `peer` as a subscriber to `uri`.
     ///
     /// # Errors

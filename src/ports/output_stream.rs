@@ -29,7 +29,7 @@ pub struct OutputSnapshot {
 /// adapter may need to acquire an `arc-swap` snapshot under a debounce
 /// guard.
 #[trait_variant::make(OutputStreamPort: Send)]
-pub trait LocalOutputStreamPort: Send + Sync {
+pub trait LocalOutputStreamPort: Sync {
     /// Snapshot the current output for an async command.
     ///
     /// # Errors

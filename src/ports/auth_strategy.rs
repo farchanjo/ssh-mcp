@@ -10,7 +10,7 @@ use crate::domain::identity::Credentials;
 
 /// SSH authentication strategy port.
 #[trait_variant::make(AuthStrategyPort: Send)]
-pub trait LocalAuthStrategyPort: Send + Sync {
+pub trait LocalAuthStrategyPort: Sync {
     /// Stable name for logging (`"password"`, `"private_key"`, `"agent"`).
     fn name(&self) -> &'static str;
 
