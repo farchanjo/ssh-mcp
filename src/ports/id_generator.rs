@@ -1,8 +1,9 @@
 //! Identifier-generation port.
 //!
 //! Use cases mint stable ids through this port instead of pulling `uuid` or
-//! `rand` directly. The production adapter wraps `uuid::Uuid::new_v4`,
-//! while tests can swap a deterministic counter so snapshots stay stable.
+//! `rand` directly. The production adapter wraps `uuid::Uuid::now_v7`
+//! (RFC 9562 §5.7 — monotonic time-ordering, see ADR 0004), while tests
+//! can swap a deterministic counter so snapshots stay stable.
 
 use crate::domain::ids::{CommandId, ForwardId, SessionId, ShellId, TransferId};
 
