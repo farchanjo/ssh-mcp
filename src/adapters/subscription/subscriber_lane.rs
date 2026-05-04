@@ -36,6 +36,7 @@ use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::notifier::PeerHandle;
 use crate::ports::subscriber_lane::{
     LaneAdmin, LaneFuture, LanePolicy, SubSummary, SubscriberLaneAsync, SubscriberLanePort,
 };
@@ -168,6 +169,10 @@ pub struct LaneState {
     /// to the mux; without a sink we keep the receiver alive on the
     /// lane so producers do not see `Closed` errors.
     fallback_rx: AsyncMutex<Option<mpsc::Receiver<LaneMsg>>>,
+    /// Optional rmcp peer the lane should notify on producer events.
+    /// Stored as `Option<Arc<dyn PeerHandle>>` so the NDJSON daemon
+    /// transport can keep using lanes without a peer concept.
+    peer: Option<Arc<dyn PeerHandle>>,
 }
 
 impl fmt::Debug for LaneState {
@@ -197,7 +202,7 @@ impl LaneState {
         capacity: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(capacity);
-        let filter = Arc::new(FilterPipeline::new(policy.filter));
+        let filter = Arc::new(FilterPipeline::new(policy.filter.clone()));
         Self {
             sub_id,
             kind,
@@ -212,7 +217,22 @@ impl LaneState {
             atomics: LaneAtomics::default(),
             capacity,
             fallback_rx: AsyncMutex::new(Some(rx)),
+            peer: policy.peer,
         }
+    }
+
+    /// Borrow the optional peer handle. `None` for transports without
+    /// a peer concept (NDJSON daemon).
+    pub const fn peer(&self) -> Option<&Arc<dyn PeerHandle>> {
+        self.peer.as_ref()
+    }
+
+    /// Increment lane atomics after a successful producer notify. The
+    /// channel-mux drain path is unchanged; this counter increment
+    /// runs from the legacy URI broadcast bridge so stats remain
+    /// observable on stdio/HTTP transports.
+    pub fn record_notify(&self, bytes_added: usize) {
+        self.atomics.record_send(bytes_added);
     }
 
     /// Borrow the live policy without cloning the inner `Arc`.
@@ -329,6 +349,16 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
             }
         }
         last_err.map_or(Ok(()), Err)
+    }
+
+    /// Public lane snapshot for the legacy broadcast bridge. Returns
+    /// every lane bound to `uri`. Used by the `MemoryRegistry`
+    /// notifier integration to fan `notifications/resources/updated`
+    /// out to lane peers and increment lane stats on stdio/HTTP
+    /// transports (Phase 4 NDJSON daemon keeps using the channel-mux
+    /// outbound sink instead).
+    pub fn lanes_for_uri_public(&self, uri: &str) -> Vec<Arc<LaneState>> {
+        self.snapshot_lanes_for_uri(uri)
     }
 
     fn snapshot_lanes_for_uri(&self, uri: &str) -> Vec<Arc<LaneState>> {
@@ -710,7 +740,7 @@ mod tests {
             lag_policy: lag,
             lifetime: SubscriptionLifetime::Manual,
             filter: FilterRule::None,
-            buffer_size: 4,
+            buffer_size: 4, peer: None,
         }
     }
 
@@ -1114,7 +1144,7 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERROR".to_string()),
-                    buffer_size: 4,
+                    buffer_size: 4, peer: None,
                 },
             )
             .await
@@ -1145,7 +1175,7 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERROR".to_string()),
-                    buffer_size: 4,
+                    buffer_size: 4, peer: None,
                 },
             )
             .await
