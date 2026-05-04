@@ -19,6 +19,13 @@ path = "src/bin/ssh_mcp_stdio.rs"
 name = "ssh-mcp"
 path = "src/main.rs"
 
+# v5 Phase 4: NDJSON daemon binary embedding the rmcp client + server through
+# an in-process `tokio::io::duplex` transport. See ADR 0008 and
+# `docs/INSTRUCTIONS_DAEMON.md`.
+[[bin]]
+name = "ssh-mcp-tail"
+path = "src/bin/ssh_mcp_tail.rs"
+
 [lib]
 name = "ssh_mcp"
 path = "src/lib.rs"
@@ -55,9 +62,11 @@ harness = true
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
 rmcp = { version = "1.6", default-features = false, features = [
     "server",
+    "client",                # v5 Phase 4: NDJSON daemon embeds an rmcp client
     "macros",
     "schemars",
     "transport-io",
+    "transport-async-rw",    # v5 Phase 4: tokio::io::duplex bridge
     "transport-streamable-http-server",
 ] }
 
@@ -99,6 +108,7 @@ tracing = "0.1"                                                         # Tracin
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
 regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
+clap = { version = "4", features = ["derive"] }    # v5 Phase 4: ssh-mcp-tail CLI subcommands (run / shell / daemon)
 
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
