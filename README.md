@@ -6,7 +6,7 @@
 
 Drive remote shells, asynchronous commands, SFTP transfers, and TCP forwards from any MCP-capable LLM host. Output streams to your model the moment SSH bytes arrive — no polling loops, no empty payloads, no token waste.
 
-[![Version](https://img.shields.io/badge/version-5.3.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.3.0)
+[![Version](https://img.shields.io/badge/version-5.3.1-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v5.3.1)
 [![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)](https://modelcontextprotocol.io/)

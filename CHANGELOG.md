@@ -5,6 +5,22 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.1] — 2026-05-04
+
+Hotfix on top of 5.3.0 — lifecycle cascade on session / agent disconnect. Wire-compatible drop-in.
+
+### Fixed
+
+- **`DisconnectSessionUseCase` cascade-closes child resource lifecycle entries.** Stress test surfaced that `ssh_disconnect` removed the session entity but left the per-resource lifecycle entries (commands / shells / transfers) in `Owned` state, so the `SUB_LEAK_RISK` watcher kept warning until the resource TTL fired. Use case now optionally holds a `LifecyclePolicyPort` and calls `force_close(kind, id)` on every child before the repo removal — `active_refs` decrements deterministically.
+- **`DisconnectAgentUseCase` cascade-closes too.** Sibling fix — bulk-close path (`ssh_disconnect_agent`) had its own `cleanup_session` flow that did not observe the lifecycle adapter either. Same `with_lifecycle` constructor + `force_close` calls in `cancel_commands` / `close_shells` / `abort_transfers`.
+
+After the fix: `SUB_LEAK_RISK` warnings clear immediately on `ssh_disconnect` / `ssh_disconnect_agent` — no TTL wait, no timer, no timeout.
+
+### Quality
+
+- 1657 lib tests + 41 chaos + 32 property + 2 v5_smoke + 13 integration all green.
+- Production clippy strict gate exit 0.
+
 ## [5.3.0] — 2026-05-04
 
 Lane fanout pipeline + production port-forward listener. Wire-compatible drop-in for any v3 / v4 / v5.0.x / v5.1 / v5.2 host: tools, structured_content schema, env vars, and error taxonomy unchanged for non-subscribe / non-forward workflows.
