@@ -332,3 +332,230 @@ fn sequence_allocation_no_duplicates() {
         assert_eq!(sorted, [0, 1]);
     });
 }
+
+// ---------------------------------------------------------------------------
+// v5 Phase 1 — Lifecycle adapter invariants
+//
+// These models capture the lock-free invariants of
+// `crate::adapters::lifecycle::refcount::ResourceLifecycle`:
+//   - sub_count is consistent under concurrent subscribe / unsubscribe
+//   - grace timer fire vs resubscribe converges on a single winner
+//   - cascade refcount fires the auto-disconnect hook at most once
+//
+// The models reproduce the relevant atomic primitives only; full
+// loom mode against the real adapter is blocked by the russh / axum
+// transitive incompatibility documented at the top of this file.
+// ---------------------------------------------------------------------------
+
+/// Mini-model of the lifecycle sub_count + state byte.
+///
+/// `state` byte encodes Owned (0) / Observed (1) / Releasing (2) /
+/// Closed (3) — matches `LifecycleState::as_u8`.
+struct LifecycleModel {
+    state: loom::sync::atomic::AtomicU8,
+    sub_count: AtomicUsize,
+}
+
+impl LifecycleModel {
+    const OWNED: u8 = 0;
+    const OBSERVED: u8 = 1;
+    const RELEASING: u8 = 2;
+    const CLOSED: u8 = 3;
+
+    fn new() -> Self {
+        Self {
+            state: loom::sync::atomic::AtomicU8::new(Self::OWNED),
+            sub_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn subscribe(&self) {
+        // Promote Owned/Releasing -> Observed via CAS, then bump count.
+        let _ = self
+            .state
+            .compare_exchange(
+                Self::OWNED,
+                Self::OBSERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .or_else(|_| {
+                self.state.compare_exchange(
+                    Self::RELEASING,
+                    Self::OBSERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            });
+        self.sub_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn unsubscribe(&self) {
+        let prev = self.sub_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            let _ = self.state.compare_exchange(
+                Self::OBSERVED,
+                Self::RELEASING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+/// Concurrent sub + unsub keeps the count consistent and bounded.
+#[test]
+fn loom_lifecycle_concurrent_subscribe_unsubscribe() {
+    loom::model(|| {
+        let m = Arc::new(LifecycleModel::new());
+        // Pre-fill so unsub never underflows.
+        m.subscribe();
+        m.subscribe();
+        let m1 = Arc::clone(&m);
+        let m2 = Arc::clone(&m);
+        let h1 = thread::spawn(move || m1.subscribe());
+        let h2 = thread::spawn(move || m2.unsubscribe());
+        h1.join().unwrap();
+        h2.join().unwrap();
+        let count = m.sub_count.load(Ordering::Acquire);
+        // After: started at 2, +1, -1 → count == 2.
+        assert_eq!(count, 2);
+    });
+}
+
+/// Race: grace timer wants to fire `Releasing -> Closed` while
+/// another thread re-subscribes (`Releasing -> Observed`). The CAS
+/// guarantees a single winner; the loser is a no-op.
+#[test]
+fn loom_grace_fire_vs_resubscribe() {
+    loom::model(|| {
+        let m = Arc::new(LifecycleModel::new());
+        // Force into Releasing.
+        m.subscribe();
+        m.unsubscribe();
+        let m1 = Arc::clone(&m);
+        let m2 = Arc::clone(&m);
+        let timer = thread::spawn(move || {
+            // Fire close.
+            m1.state
+                .compare_exchange(
+                    LifecycleModel::RELEASING,
+                    LifecycleModel::CLOSED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        });
+        let resub = thread::spawn(move || {
+            // Re-subscribe.
+            m2.state
+                .compare_exchange(
+                    LifecycleModel::RELEASING,
+                    LifecycleModel::OBSERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        });
+        let timer_won = timer.join().unwrap();
+        let resub_won = resub.join().unwrap();
+        assert!(
+            timer_won ^ resub_won,
+            "exactly one CAS must succeed: timer={timer_won} resub={resub_won}"
+        );
+        let final_state = m.state.load(Ordering::Acquire);
+        assert!(
+            matches!(final_state, LifecycleModel::CLOSED | LifecycleModel::OBSERVED),
+            "final state must be Closed (timer won) or Observed (resub won), got {final_state}"
+        );
+    });
+}
+
+/// Mini-model of the cascade coordinator: an `AtomicUsize` for the
+/// active-resource count and an `AtomicU8` for the reaped flag. The
+/// hook fires exactly once per session — the CAS Active->Reaped is
+/// the marker that another thread already won.
+struct CascadeModel {
+    active: AtomicUsize,
+    reaped: loom::sync::atomic::AtomicU8,
+    fires: AtomicUsize,
+}
+
+impl CascadeModel {
+    const ACTIVE: u8 = 0;
+    const REAPED: u8 = 1;
+
+    fn new(initial: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(initial),
+            reaped: loom::sync::atomic::AtomicU8::new(Self::ACTIVE),
+            fires: AtomicUsize::new(0),
+        }
+    }
+
+    fn close_one(&self) {
+        let prev = self.active.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1
+            && self
+                .reaped
+                .compare_exchange(
+                    Self::ACTIVE,
+                    Self::REAPED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            self.fires.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Two shells closing simultaneously call disconnect at most once.
+#[test]
+fn loom_cascade_double_disconnect() {
+    loom::model(|| {
+        let m = Arc::new(CascadeModel::new(2));
+        let m1 = Arc::clone(&m);
+        let m2 = Arc::clone(&m);
+        let h1 = thread::spawn(move || m1.close_one());
+        let h2 = thread::spawn(move || m2.close_one());
+        h1.join().unwrap();
+        h2.join().unwrap();
+        let fires = m.fires.load(Ordering::Acquire);
+        assert_eq!(fires, 1, "auto-disconnect hook must fire exactly once");
+    });
+}
+
+/// Cursor advance race: two concurrent `fetch_max` writers + a
+/// concurrent state-byte CAS. The cursor is monotonic and the state
+/// byte never observes an intermediate value. Mirrors the
+/// `grace_until_ms` AtomicU64 + state AtomicU8 invariant on
+/// `ResourceLifecycle`.
+#[test]
+fn loom_cursor_atomic_advance() {
+    loom::model(|| {
+        let cursor = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(loom::sync::atomic::AtomicU8::new(0));
+        let c1 = Arc::clone(&cursor);
+        let c2 = Arc::clone(&cursor);
+        let s1 = Arc::clone(&state);
+        let h1 = thread::spawn(move || {
+            c1.fetch_max(100, Ordering::SeqCst);
+        });
+        let h2 = thread::spawn(move || {
+            c2.fetch_max(50, Ordering::SeqCst);
+        });
+        let h3 = thread::spawn(move || {
+            // CAS a state byte while the cursor races.
+            let _ = s1.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h3.join().unwrap();
+        let final_cursor = cursor.load(Ordering::Acquire);
+        let final_state = state.load(Ordering::Acquire);
+        assert_eq!(final_cursor, 100, "cursor must observe the larger writer");
+        assert_eq!(final_state, 1, "state CAS must have succeeded");
+    });
+}
