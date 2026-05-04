@@ -28,6 +28,27 @@ Retry policy semantics (one of):
 
 Cross-references: [`GOLDEN_RULES.md`](./GOLDEN_RULES.md), [`ANTIPATTERNS.md`](./ANTIPATTERNS.md), [ADR 0003](../adr/0003-lifecycle-binding.md), [ADR 0004](../adr/0004-channel-mux-fairness.md), [ADR 0006](../adr/0006-backpressure-policies.md), [ADR 0008](../adr/0008-ndjson-daemon-protocol.md).
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    AUTH["AUTH<br/>fix credentials<br/>never retry"]
+    TR["TRANSPORT<br/>retry w/ backoff<br/>(cap 10s)"]
+    REM["REMOTE<br/>LLM judges by<br/>exit code"]
+    RES["RESOURCE<br/>recreate<br/>never retry"]
+    POL["POLICY<br/>change policy<br/>then retry"]
+    ST["STATE<br/>fresh idem_key<br/>then retry"]
+    INT["INTERNAL<br/>file bug<br/>never retry"]
+
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef warn fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef ok fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef inactive fill:#21262d,color:#8b949e,stroke:#30363d
+
+    class AUTH,RES,INT bad
+    class TR,POL,ST warn
+    class REM ok
+```
+
 ---
 
 ## AUTH
