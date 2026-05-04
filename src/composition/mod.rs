@@ -49,6 +49,10 @@ use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
+use crate::application::subscription_admin::{
+    DaemonStatsUseCase, ListSubsUseCase, PauseSubUseCase, ReplaySubUseCase, ResumeSubUseCase,
+    SetFilterUseCase, SubStatsUseCase, SubscribeUseCase, UnsubscribeUseCase,
+};
 use crate::application::unsubscribe_resource::UnsubscribeResourceUseCase;
 use crate::application::upload_file::UploadFileUseCase;
 use crate::application::wait_for_pattern::WaitForPatternUseCase;
@@ -164,6 +168,26 @@ where
     /// container does not need a generic parameter for the lifecycle
     /// port — the trait is dyn-safe by design.
     pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
+
+    // -- v5 Phase 3 subscription-administration use cases ---------
+    /// `ssh_subscribe` use case (Phase 3 lane admin).
+    pub sub_subscribe: Arc<SubscribeUseCase>,
+    /// `ssh_unsubscribe` use case (Phase 3 lane admin).
+    pub sub_unsubscribe: Arc<UnsubscribeUseCase>,
+    /// `ssh_sub_pause` use case.
+    pub sub_pause: Arc<PauseSubUseCase>,
+    /// `ssh_sub_resume` use case.
+    pub sub_resume: Arc<ResumeSubUseCase>,
+    /// `ssh_sub_filter` use case.
+    pub sub_filter: Arc<SetFilterUseCase>,
+    /// `ssh_sub_replay` use case.
+    pub sub_replay: Arc<ReplaySubUseCase>,
+    /// `ssh_sub_list` use case.
+    pub sub_list: Arc<ListSubsUseCase>,
+    /// `ssh_sub_stats` use case.
+    pub sub_stats: Arc<SubStatsUseCase>,
+    /// `ssh_daemon_stats` use case.
+    pub daemon_stats: Arc<DaemonStatsUseCase>,
 }
 
 /// Generic container for every use case the v4 server exposes (with
@@ -245,4 +269,24 @@ where
     /// container does not need a generic parameter for the lifecycle
     /// port — the trait is dyn-safe by design.
     pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
+
+    // -- v5 Phase 3 subscription-administration use cases ---------
+    /// `ssh_subscribe` use case (Phase 3 lane admin).
+    pub sub_subscribe: Arc<SubscribeUseCase>,
+    /// `ssh_unsubscribe` use case (Phase 3 lane admin).
+    pub sub_unsubscribe: Arc<UnsubscribeUseCase>,
+    /// `ssh_sub_pause` use case.
+    pub sub_pause: Arc<PauseSubUseCase>,
+    /// `ssh_sub_resume` use case.
+    pub sub_resume: Arc<ResumeSubUseCase>,
+    /// `ssh_sub_filter` use case.
+    pub sub_filter: Arc<SetFilterUseCase>,
+    /// `ssh_sub_replay` use case.
+    pub sub_replay: Arc<ReplaySubUseCase>,
+    /// `ssh_sub_list` use case.
+    pub sub_list: Arc<ListSubsUseCase>,
+    /// `ssh_sub_stats` use case.
+    pub sub_stats: Arc<SubStatsUseCase>,
+    /// `ssh_daemon_stats` use case.
+    pub daemon_stats: Arc<DaemonStatsUseCase>,
 }

@@ -56,4 +56,5 @@ pub mod list_resources;
 pub mod peer_gc;
 pub mod read_resource;
 pub mod subscribe_resource;
+pub mod subscription_admin;
 pub mod unsubscribe_resource;

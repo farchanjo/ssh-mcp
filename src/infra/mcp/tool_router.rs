@@ -51,6 +51,12 @@ use crate::application::list_sessions::ListSessionsRequest;
 use crate::application::open_shell::OpenShellRequest;
 use crate::application::read_shell::ReadShellRequest;
 use crate::application::send_key::SendKeyRequest;
+use crate::application::subscription_admin::{
+    DaemonStatsUseCase, ListSubsRequest, ListSubsUseCase, PauseSubUseCase, ReplayRequest,
+    ReplaySubUseCase, ResumeSubUseCase, SetFilterRequest, SetFilterUseCase, SubStatsRequest,
+    SubStatsUseCase, SubToggleRequest, SubscribeRequest, SubscribeUseCase, UnsubscribeRequest,
+    UnsubscribeUseCase,
+};
 use crate::application::upload_file::UploadRequest;
 use crate::application::wait_for_pattern::{
     WaitForPatternOutcome, WaitForPatternRequest, WaitForPatternUseCase,
@@ -61,6 +67,7 @@ use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
+use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 use crate::infra::mcp::error_detail;
@@ -114,6 +121,10 @@ use super::args::sftp::{SshDownloadArgs, SshGetTransferProgressArgs, SshUploadAr
 use super::args::shell::{
     SshShellCloseArgs, SshShellOpenArgs, SshShellReadArgs, SshShellSendKeyArgs,
     SshShellWaitForArgs, SshShellWriteArgs,
+};
+use super::args::subscription::{
+    LifetimeKind, SshDaemonStatsArgs, SshSubFilterArgs, SshSubListArgs, SshSubPauseArgs,
+    SshSubReplayArgs, SshSubResumeArgs, SshSubStatsArgs, SshSubscribeArgs, SshUnsubscribeArgs,
 };
 use super::peer_handle::PeerTable;
 use super::resource_handlers;
@@ -179,7 +190,10 @@ pub(crate) async fn render_tool_error_with_suggestions(
     // Each segment is inserted only when present; missing segments do
     // not produce dangling separators.
     let merged_static = error_detail::with_detail(code, detail.as_deref());
-    let detail_with_hints = match (merged_static.as_deref(), render_closest_matches(&candidates)) {
+    let detail_with_hints = match (
+        merged_static.as_deref(),
+        render_closest_matches(&candidates),
+    ) {
         (Some(d), Some(hint)) => Some(format!("{d}; {hint}")),
         (Some(d), None) => Some(d.to_string()),
         (None, Some(hint)) => Some(hint),
@@ -903,6 +917,198 @@ where
             return None;
         }
         sleep(tick).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v5 Phase 3 — subscription tool helpers (shared between both
+// `#[tool_router]` impls)
+// ---------------------------------------------------------------------------
+
+/// Drive `ssh_subscribe`. Folds the wire `SshSubscribeArgs` into the
+/// application request and renders the v5 block + structured output.
+async fn run_sub_subscribe(
+    use_case: &SubscribeUseCase,
+    args: SshSubscribeArgs,
+) -> Result<CallToolResult, McpError> {
+    let req = SubscribeRequest {
+        uri: args.uri,
+        lifetime: lifetime_from_args(args.lifetime, args.grace_ms, args.ttl_secs),
+        lag_policy: args.lag_policy.unwrap_or(LagPolicy::Snapshot),
+        filter: filter_from_str(args.filter.as_deref()),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::subscribe_structured(&outcome);
+            let body = render::subscription::subscribe_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_SUBSCRIBE", &err)),
+    }
+}
+
+fn lifetime_from_args(
+    kind: Option<LifetimeKind>,
+    grace_ms: Option<u32>,
+    ttl_secs: Option<u32>,
+) -> SubscriptionLifetime {
+    match kind.unwrap_or(LifetimeKind::Manual) {
+        LifetimeKind::Manual => SubscriptionLifetime::Manual,
+        LifetimeKind::AutoClose => SubscriptionLifetime::AutoClose {
+            grace_ms: grace_ms.unwrap_or(2_000),
+        },
+        LifetimeKind::Lease => SubscriptionLifetime::Lease {
+            ttl_secs: ttl_secs.unwrap_or(60),
+        },
+    }
+}
+
+fn filter_from_str(s: Option<&str>) -> FilterRule {
+    match s {
+        Some(text) if !text.is_empty() => FilterRule::Regex(text.to_string()),
+        _ => FilterRule::None,
+    }
+}
+
+/// Drive `ssh_unsubscribe`.
+async fn run_sub_unsubscribe(
+    use_case: &UnsubscribeUseCase,
+    args: SshUnsubscribeArgs,
+) -> Result<CallToolResult, McpError> {
+    let req = UnsubscribeRequest {
+        sub_id: SubId::new(args.sub_id),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::unsubscribe_structured(&outcome);
+            let body = render::subscription::unsubscribe_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_UNSUBSCRIBE", &err)),
+    }
+}
+
+/// Drive `ssh_sub_pause`.
+async fn run_sub_pause(
+    use_case: &PauseSubUseCase,
+    args: SshSubPauseArgs,
+) -> Result<CallToolResult, McpError> {
+    let req = SubToggleRequest {
+        sub_id: SubId::new(args.sub_id),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::pause_structured(&outcome);
+            let body = render::subscription::pause_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_SUB_PAUSE", &err)),
+    }
+}
+
+/// Drive `ssh_sub_resume`.
+async fn run_sub_resume(
+    use_case: &ResumeSubUseCase,
+    args: SshSubResumeArgs,
+) -> Result<CallToolResult, McpError> {
+    let req = SubToggleRequest {
+        sub_id: SubId::new(args.sub_id),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::resume_structured(&outcome);
+            let body = render::subscription::resume_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_SUB_RESUME", &err)),
+    }
+}
+
+/// Drive `ssh_sub_filter`.
+async fn run_sub_filter(
+    use_case: &SetFilterUseCase,
+    args: SshSubFilterArgs,
+) -> Result<CallToolResult, McpError> {
+    let filter = if args.regex.is_empty() {
+        FilterRule::None
+    } else {
+        FilterRule::Regex(args.regex)
+    };
+    let req = SetFilterRequest {
+        sub_id: SubId::new(args.sub_id),
+        filter,
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::filter_structured(&outcome);
+            let body = render::subscription::filter_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_SUB_FILTER", &err)),
+    }
+}
+
+/// Drive `ssh_sub_replay`.
+async fn run_sub_replay(
+    use_case: &ReplaySubUseCase,
+    args: SshSubReplayArgs,
+) -> Result<CallToolResult, McpError> {
+    let req = ReplayRequest {
+        sub_id: SubId::new(args.sub_id),
+        from_cursor: args.from_cursor.unwrap_or(0),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => {
+            let structured = render::subscription::replay_structured(&outcome);
+            let body = render::subscription::replay_render(&outcome);
+            Ok(ok_text_and_structured(body, structured))
+        }
+        Err(err) => Ok(render_tool_error("SSH_SUB_REPLAY", &err)),
+    }
+}
+
+/// Drive `ssh_sub_list`. Errors-free use case — surface as an
+/// always-`Ok` body so the rmcp wrapper can stay symmetric with the
+/// async tools.
+fn run_sub_list(use_case: &ListSubsUseCase, args: SshSubListArgs) -> CallToolResult {
+    let req = ListSubsRequest {
+        uri_prefix: args.uri_prefix,
+        peer_id: args.peer_id,
+    };
+    match use_case.execute(&req) {
+        Ok(outcome) => {
+            let structured = render::subscription::list_structured(&outcome);
+            let body = render::subscription::list_render(&outcome);
+            ok_text_and_structured(body, structured)
+        }
+        Err(err) => render_tool_error("SSH_SUB_LIST", &err),
+    }
+}
+
+/// Drive `ssh_sub_stats`.
+fn run_sub_stats(use_case: &SubStatsUseCase, args: SshSubStatsArgs) -> CallToolResult {
+    let req = SubStatsRequest {
+        sub_id: SubId::new(args.sub_id),
+    };
+    match use_case.execute(&req) {
+        Ok(outcome) => {
+            let structured = render::subscription::sub_stats_structured(&outcome);
+            let body = render::subscription::sub_stats_render(&outcome);
+            ok_text_and_structured(body, structured)
+        }
+        Err(err) => render_tool_error("SSH_SUB_STATS", &err),
+    }
+}
+
+/// Drive `ssh_daemon_stats`.
+fn run_daemon_stats(use_case: &DaemonStatsUseCase) -> CallToolResult {
+    match use_case.execute() {
+        Ok(outcome) => {
+            let structured = render::subscription::daemon_stats_structured(&outcome);
+            let body = render::subscription::daemon_stats_render(&outcome);
+            ok_text_and_structured(body, structured)
+        }
+        Err(err) => render_tool_error("SSH_DAEMON_STATS", &err),
     }
 }
 
@@ -1690,6 +1896,176 @@ where
         })
         .await
     }
+
+    // ---------- Subscription administration (v5 Phase 3) -------------
+
+    #[tool(
+        title = "Subscribe to a resource lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
+        description = "Open a Channel Mux lane for a ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan into the lane through the channel mux outbound sink.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+    )]
+    async fn ssh_subscribe(
+        &self,
+        Parameters(args): Parameters<SshSubscribeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_subscribe", || async {
+            run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Unsubscribe from a resource lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Close a Channel Mux lane previously opened with ssh_subscribe.\n\nCleanup: this IS the cleanup tool — call it for every SUB_ID you obtained.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: tolerate `SUB_NOT_FOUND` — lifetime auto-close may have closed the lane already."
+    )]
+    async fn ssh_unsubscribe(
+        &self,
+        Parameters(args): Parameters<SshUnsubscribeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_unsubscribe", || async {
+            run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Pause a subscription lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Suspend lane drain. Subsequent events accumulate in the lane mpsc until ssh_sub_resume.\n\nCost: O(1)."
+    )]
+    async fn ssh_sub_pause(
+        &self,
+        Parameters(args): Parameters<SshSubPauseArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_pause", || async {
+            run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Resume a subscription lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Resume lane drain after a previous ssh_sub_pause.\n\nCost: O(1)."
+    )]
+    async fn ssh_sub_resume(
+        &self,
+        Parameters(args): Parameters<SshSubResumeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_resume", || async {
+            run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Hot-reload a subscription filter",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Replace the lane regex filter without re-opening the lane. Empty regex clears the filter.\n\nCost: 1 regex compile + atomic swap."
+    )]
+    async fn ssh_sub_filter(
+        &self,
+        Parameters(args): Parameters<SshSubFilterArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_filter", || async {
+            run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Replay a subscription lane from cursor",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Re-emit lane events from `from_cursor` (within the replay window).\n\nCost: O(window-bytes) snapshot rebuild."
+    )]
+    async fn ssh_sub_replay(
+        &self,
+        Parameters(args): Parameters<SshSubReplayArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_replay", || async {
+            run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "List active subscription lanes",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Snapshot the per-`SubId` lane registry. Optional `uri_prefix` filter narrows the result.\n\nCost: O(N) over open lanes."
+    )]
+    async fn ssh_sub_list(
+        &self,
+        Parameters(args): Parameters<SshSubListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_sub_list(self.use_cases.sub_list.as_ref(), args))
+    }
+
+    #[tool(
+        title = "Snapshot subscription lane stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Per-lane atomic counter snapshot — events_sent, bytes_sent, lagged_*, queue depth/high-watermark.\n\nCost: O(1) atomic loads."
+    )]
+    async fn ssh_sub_stats(
+        &self,
+        Parameters(args): Parameters<SshSubStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_sub_stats(self.use_cases.sub_stats.as_ref(), args))
+    }
+
+    #[tool(
+        title = "Aggregate daemon-wide subscription stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Sum / max of every per-lane atomic counter across the whole channel mux.\n\nCost: O(N) over open lanes."
+    )]
+    async fn ssh_daemon_stats(
+        &self,
+        Parameters(_args): Parameters<SshDaemonStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_daemon_stats(self.use_cases.daemon_stats.as_ref()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,6 +2812,176 @@ where
             run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await
         })
         .await
+    }
+
+    // ---------- Subscription administration (v5 Phase 3) -------------
+
+    #[tool(
+        title = "Subscribe to a resource lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
+        description = "Open a Channel Mux lane for a ssh-mcp resource URI.\n\nCleanup: ssh_unsubscribe sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+    )]
+    async fn ssh_subscribe(
+        &self,
+        Parameters(args): Parameters<SshSubscribeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_subscribe", || async {
+            run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Unsubscribe from a resource lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Close a Channel Mux lane previously opened with ssh_subscribe.\n\nCost: O(1)."
+    )]
+    async fn ssh_unsubscribe(
+        &self,
+        Parameters(args): Parameters<SshUnsubscribeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_unsubscribe", || async {
+            run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Pause a subscription lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Suspend lane drain.\n\nCost: O(1)."
+    )]
+    async fn ssh_sub_pause(
+        &self,
+        Parameters(args): Parameters<SshSubPauseArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_pause", || async {
+            run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Resume a subscription lane",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Resume lane drain.\n\nCost: O(1)."
+    )]
+    async fn ssh_sub_resume(
+        &self,
+        Parameters(args): Parameters<SshSubResumeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_resume", || async {
+            run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Hot-reload a subscription filter",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Replace the lane regex filter.\n\nCost: 1 regex compile + atomic swap."
+    )]
+    async fn ssh_sub_filter(
+        &self,
+        Parameters(args): Parameters<SshSubFilterArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_filter", || async {
+            run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "Replay a subscription lane from cursor",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Re-emit lane events from `from_cursor`.\n\nCost: O(window-bytes)."
+    )]
+    async fn ssh_sub_replay(
+        &self,
+        Parameters(args): Parameters<SshSubReplayArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        with_idempotency(&self.idempotency, &ctx, "ssh_sub_replay", || async {
+            run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await
+        })
+        .await
+    }
+
+    #[tool(
+        title = "List active subscription lanes",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Snapshot the per-`SubId` lane registry.\n\nCost: O(N) over open lanes."
+    )]
+    async fn ssh_sub_list(
+        &self,
+        Parameters(args): Parameters<SshSubListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_sub_list(self.use_cases.sub_list.as_ref(), args))
+    }
+
+    #[tool(
+        title = "Snapshot subscription lane stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Per-lane atomic counter snapshot.\n\nCost: O(1)."
+    )]
+    async fn ssh_sub_stats(
+        &self,
+        Parameters(args): Parameters<SshSubStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_sub_stats(self.use_cases.sub_stats.as_ref(), args))
+    }
+
+    #[tool(
+        title = "Aggregate daemon-wide subscription stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Sum / max of every per-lane atomic counter.\n\nCost: O(N) over open lanes."
+    )]
+    async fn ssh_daemon_stats(
+        &self,
+        Parameters(_args): Parameters<SshDaemonStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_daemon_stats(self.use_cases.daemon_stats.as_ref()))
     }
 }
 

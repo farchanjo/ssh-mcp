@@ -75,6 +75,10 @@ use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
+use crate::application::subscription_admin::{
+    DaemonStatsUseCase, ListSubsUseCase, PauseSubUseCase, ReplaySubUseCase, ResumeSubUseCase,
+    SetFilterUseCase, SubStatsUseCase, SubscribeUseCase, UnsubscribeUseCase,
+};
 use crate::application::unsubscribe_resource::UnsubscribeResourceUseCase;
 use crate::application::upload_file::UploadFileUseCase;
 use crate::application::wait_for_pattern::WaitForPatternUseCase;
@@ -281,13 +285,12 @@ pub fn build_use_cases() -> ProdWiring {
     // sink (Phase 4 wires the NDJSON daemon writer); Phase 2 keeps
     // the sink open so receivers stay drainable but no consumer is
     // attached yet.
-    let subscriber_lane_adapter =
-        SubscriberLaneAdapter::new(
-            Arc::clone(&ids),
-            resolve_lane_buffer(),
-            resolve_max_subs_per_uri(),
-            resolve_max_subs_total(),
-        );
+    let subscriber_lane_adapter = SubscriberLaneAdapter::new(
+        Arc::clone(&ids),
+        resolve_lane_buffer(),
+        resolve_max_subs_per_uri(),
+        resolve_max_subs_total(),
+    );
     let channel_mux = ChannelMuxAdapter::new();
     let mux_for_sink = Arc::clone(&channel_mux);
     subscriber_lane_adapter.install_rx_sink(Box::new(move |sub_id, rx| {
@@ -497,6 +500,19 @@ pub fn build_use_cases() -> ProdWiring {
     );
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
 
+    // v5 Phase 3 — subscription-administration use cases. All share the
+    // same `Arc<dyn LaneAdmin>` handle so the channel-mux wiring stays
+    // single-sourced.
+    let sub_subscribe = Arc::new(SubscribeUseCase::new(Arc::clone(&lane_admin)));
+    let sub_unsubscribe = Arc::new(UnsubscribeUseCase::new(Arc::clone(&lane_admin)));
+    let sub_pause = Arc::new(PauseSubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_resume = Arc::new(ResumeSubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_filter = Arc::new(SetFilterUseCase::new(Arc::clone(&lane_admin)));
+    let sub_replay = Arc::new(ReplaySubUseCase::new(Arc::clone(&lane_admin)));
+    let sub_list = Arc::new(ListSubsUseCase::new(Arc::clone(&lane_admin)));
+    let sub_stats = Arc::new(SubStatsUseCase::new(Arc::clone(&lane_admin)));
+    let daemon_stats = Arc::new(DaemonStatsUseCase::new(Arc::clone(&lane_admin)));
+
     let idempotency = Arc::new(IdempotencyCache::from_env());
 
     #[cfg(feature = "port_forward")]
@@ -543,6 +559,15 @@ pub fn build_use_cases() -> ProdWiring {
         auth,
         notifier,
         lifecycle_policy: Arc::clone(&lifecycle),
+        sub_subscribe,
+        sub_unsubscribe,
+        sub_pause,
+        sub_resume,
+        sub_filter,
+        sub_replay,
+        sub_list,
+        sub_stats,
+        daemon_stats,
     });
 
     (use_cases, peer_table, idempotency, id_lister)
