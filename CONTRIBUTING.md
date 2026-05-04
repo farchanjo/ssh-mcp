@@ -7,7 +7,7 @@ Thanks for your interest in ssh-mcp. This guide is for contributors sending patc
 - Read [CLAUDE.md](CLAUDE.md) for the project map, build commands, and the lock-free / use-case-generic invariants the codebase enforces.
 - Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the hexagonal layer contract (domain / ports / application / adapters / infra / composition) and the dependency direction rule.
 - Read [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md) for the architectural invariants and the rationale you must respect when crossing layers.
-- Read [docs/LOCKS.md](docs/LOCKS.md) before touching anything on the hot path (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, subscription registries).
+- Read [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants) before touching anything on the hot path (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, subscription registries).
 - All persisted artifacts are en-US: code, comments, identifiers, log lines, commit messages, ADRs, PR descriptions, and branch names. Chat replies follow the user's language; the repo does not.
 
 ## Pre-commit gates (must pass)
@@ -49,10 +49,10 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 
 - [ ] Tests ship in the same commit as the feature or fix (lib, integration, or both).
 - [ ] `cargo fmt --all -- --check` and `cargo clippy --release --all-features --all-targets --workspace -- -D warnings` are green locally.
-- [ ] No `Mutex` / `RwLock` introduced on the hot path — atomics, `ArcSwap`, `DashMap`, `OnceCell`, `tokio::sync::broadcast`, or `tokio::sync::Notify` only. See [docs/LOCKS.md](docs/LOCKS.md).
+- [ ] No `Mutex` / `RwLock` introduced on the hot path — atomics, `ArcSwap`, `DashMap`, `OnceCell`, `tokio::sync::broadcast`, or `tokio::sync::Notify` only. See [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants).
 - [ ] Use cases stay generic over their ports (no `Box<dyn Trait>` in hot paths, no leak of rmcp / russh / SFTP types into `application/`).
 - [ ] New env vars get a row in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and a floor / cap in `src/adapters/config/internal/mod.rs`.
-- [ ] New error codes get a row in [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md) and a structured variant in `src/domain/error.rs`.
+- [ ] New error codes get a row in [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook) and a structured variant in `src/domain/error.rs`.
 - [ ] New ADRs follow MADR 4.0 (status, context, decision drivers, considered options, decision outcome, consequences) and live under `docs/adr/NNNN-<kebab-title>.md`. ADR numbers are never reused.
 - [ ] Public MCP tool wire shape (markdown body) stays byte-compatible with v3 / v4 unless the change is gated behind a new tool or opt-in flag. Snapshot tests in `tests/v4_smoke.rs` must still pass.
 - [ ] Hot-path changes touching atomics or `ArcSwap` ship with a loom invariant in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`).
@@ -61,19 +61,19 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 
 | Invariant | Canonical doc |
 |---|---|
-| Lock-free hot path (no `Mutex` on `Running*` state) | [docs/LOCKS.md](docs/LOCKS.md) |
+| Lock-free hot path (no `Mutex` on `Running*` state) | [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants) |
 | Hexagonal layer dependency direction (domain knows nothing; adapters depend inward) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Use cases generic over ports — static dispatch, no `Box<dyn>` in hot paths | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Strict clippy baseline (`pedantic` + `nursery` + `cargo` at deny; Layer A forbids) | [`Cargo.toml`](Cargo.toml) `[lints.clippy]`, [CLAUDE.md](CLAUDE.md) |
 | ADR for any decision spanning more than one layer or changing a port surface | [docs/adr/](docs/adr/) |
 | Subscribe-first push delivery for `shell://`, `command://`, `transfer://`, `forward://` | [docs/RESOURCES.md](docs/RESOURCES.md) |
-| Wire compatibility with v3 / v4 hosts on the legacy 21-tool catalogue | [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) |
+| Wire compatibility with v3 / v4 hosts on the legacy 21-tool catalogue | [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4) |
 
 ## Test layers
 
 | Command | Scope | Notes |
 |---|---|---|
-| `cargo test --lib --quiet` | 1156 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop. |
+| `cargo test --lib --quiet` | ~1657 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop. |
 | `cargo test --tests --quiet` | Integration tests including the v4 smoke (`tests/v4_smoke.rs`) | Snapshot-checks the markdown wire shape. |
 | `cargo test --features test-fixtures` | Use cases against deterministic in-memory adapters (`FakeClock`, `DeterministicIdGenerator`) | Add this when authoring application-layer tests. |
 | `cargo test --features port_forward` | Toggles the `ssh_forward` tool and `forward://` resource | Keep parity for both feature combinations. |
@@ -106,7 +106,7 @@ Good bug reports save round-trips. Include:
 - Logs at `RUST_LOG=ssh_mcp=debug,russh=info` for the affected window.
 - For deadlocks or stalls: a `cargo build` SHA and any loom invariant that fires locally.
 
-Security-sensitive issues (auth bypass, key leakage, RCE-class concerns): email the author directly instead of opening a public issue. See [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md) for the full taxonomy of error codes the server emits.
+Security-sensitive issues (auth bypass, key leakage, RCE-class concerns): email the author directly instead of opening a public issue. See [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook) for the full taxonomy of error codes the server emits.
 
 ## Where to ask questions
 
