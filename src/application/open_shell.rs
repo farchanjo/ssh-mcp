@@ -48,13 +48,16 @@ use std::time::Duration;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, ShellId};
+use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_registry::ResourceKind;
 
 /// Default `TERM` value used when the caller omits `term`. Matches the
 /// legacy v3 `ssh_shell_open_impl` default so
@@ -83,6 +86,9 @@ pub struct OpenShellRequest {
     /// Optional rolling output-buffer size override in bytes. Same
     /// semantics as [`Self::inactivity_ttl_secs`].
     pub max_buffer_size: Option<u64>,
+    /// v5 Phase 3 — optional lifecycle policy override. `None` keeps
+    /// the v4 default ([`LifecyclePolicy::default()`]).
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing the freshly opened shell entity together with
@@ -116,6 +122,10 @@ where
     clock: Arc<C>,
     ids: Arc<I>,
     config: Arc<Cfg>,
+    /// v5 lifecycle: tracked at shell open so the registry can drive
+    /// refcount-aware close paths. Held as `Arc<dyn>` to keep the
+    /// generics list stable across use cases.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<S, SR, ShR, C, I, Cfg> OpenShellUseCase<S, SR, ShR, C, I, Cfg>
@@ -136,6 +146,7 @@ where
         clock: Arc<C>,
         ids: Arc<I>,
         config: Arc<Cfg>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
     ) -> Self {
         Self {
             ssh,
@@ -144,6 +155,7 @@ where
             clock,
             ids,
             config,
+            lifecycle,
         }
     }
 
@@ -178,6 +190,16 @@ where
             .await?;
         let entity = apply_overrides(entity, &req);
         self.shells.insert(entity.clone()).await?;
+        // v5 lifecycle binding: register the freshly opened shell. The
+        // policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
+        self.lifecycle.track_resource(
+            ResourceKind::Shell,
+            entity.id.as_str(),
+            &req.session_id,
+            req.lifecycle_policy.unwrap_or_default(),
+        );
 
         Ok(OpenShellOutcome {
             shell: entity,
@@ -236,7 +258,7 @@ fn build_terminal(req: &OpenShellRequest) -> ShellTerminal {
 
 /// Apply caller-supplied `inactivity_ttl_secs` / `max_buffer_size`
 /// overrides on top of whatever the SSH adapter stamped on the entity.
-fn apply_overrides(mut entity: ShellEntity, req: &OpenShellRequest) -> ShellEntity {
+const fn apply_overrides(mut entity: ShellEntity, req: &OpenShellRequest) -> ShellEntity {
     if let Some(secs) = req.inactivity_ttl_secs {
         entity.inactivity_ttl = Duration::from_secs(secs);
     }
@@ -252,6 +274,8 @@ mod tests {
     use crate::adapters::clock::fake::FakeClock;
     use crate::adapters::config::memory::MapConfig;
     use crate::adapters::id_generator::deterministic::SequentialIds;
+    use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+    use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
     use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
     use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
     use crate::adapters::ssh::fake::{FakeSshCall, FakeSshClient};
@@ -260,6 +284,7 @@ mod tests {
     use crate::domain::ids::{AgentId, SessionId, ShellId};
     use crate::domain::session::SessionEntity;
     use crate::domain::shell::ShellStatus;
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::ports::session_repo::SessionRepository;
     use crate::ports::shell_repo::ShellRepository;
     use chrono::Utc;
@@ -291,6 +316,9 @@ mod tests {
         let clock = Arc::new(FakeClock::new(1_777_982_400_000_u64));
         let ids = Arc::new(SequentialIds::default());
         let cfg = Arc::new(config);
+        let cascade = CascadeCoordinator::new();
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            RefcountedLifecycleAdapter::new(cascade, Arc::clone(&clock));
         let uc = OpenShellUseCase::new(
             Arc::clone(&ssh),
             Arc::clone(&sessions),
@@ -298,6 +326,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&ids),
             Arc::clone(&cfg),
+            lifecycle,
         );
         Wired {
             uc,
@@ -355,6 +384,7 @@ mod tests {
             rows: None,
             inactivity_ttl_secs: None,
             max_buffer_size: None,
+            lifecycle_policy: None,
         }
     }
 

@@ -10,7 +10,7 @@ use crate::domain::session::SessionEntity;
 /// (`DashMap`) but the trait stays async so future remote-backed adapters
 /// (Postgres, Redis) fit without breaking the API.
 #[trait_variant::make(SessionRepository: Send)]
-pub trait LocalSessionRepository: Send + Sync {
+pub trait LocalSessionRepository: Sync {
     /// Insert a session entity. Replacing an existing id is treated as an
     /// internal error so callers must call `remove` first if they intend to
     /// rebind the id.

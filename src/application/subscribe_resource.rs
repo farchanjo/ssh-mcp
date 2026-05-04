@@ -26,10 +26,13 @@ use std::sync::Arc;
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
+use crate::domain::subscription::SubId;
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::notifier::PeerHandle;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
+use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy};
 use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryAsync};
 use crate::ports::transfer_repo::TransferRepository;
 
@@ -47,11 +50,17 @@ pub struct SubscribeResourceRequest {
 }
 
 /// Outbound DTO surfacing the canonical URI the inbound adapter must
-/// echo back to the client.
+/// echo back to the client plus the v5 Phase 2 synthesised
+/// [`SubId`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeResourceOutcome {
     /// Canonical URI (no `?cursor=` — the registry keys against this form).
     pub uri: String,
+    /// Per-call [`SubId`] minted by the `SubscriberLane` adapter
+    /// (Phase 2). Surfaced via `_meta.sub_id` on the rmcp
+    /// `resources/subscribe` response. `None` when the lane wiring
+    /// is not installed (legacy v4-only deployments).
+    pub sub_id: Option<SubId>,
 }
 
 /// Subscribe-resource use case (no `port_forward` feature).
@@ -70,6 +79,13 @@ where
     transfers: Arc<TR>,
     sessions: Arc<SR>,
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
+    /// v5 Phase 2 — optional [`LaneAdmin`] handle. When present the
+    /// use case opens a per-`SubId` lane after the v4 registry
+    /// subscribe succeeds and surfaces the [`SubId`] on the
+    /// outcome. When absent the use case mirrors v4 behaviour
+    /// exactly.
+    lane: Option<Arc<dyn LaneAdmin>>,
 }
 
 /// Subscribe-resource use case with the `port_forward` feature enabled.
@@ -90,6 +106,9 @@ where
     sessions: Arc<SR>,
     forwards: Arc<FR>,
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
+    /// v5 Phase 2 — optional [`LaneAdmin`] handle.
+    lane: Option<Arc<dyn LaneAdmin>>,
 }
 
 #[cfg(not(feature = "port_forward"))]
@@ -109,6 +128,7 @@ where
         transfers: Arc<TR>,
         sessions: Arc<SR>,
         subscribers: Arc<Sub>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
     ) -> Self {
         Self {
             shells,
@@ -116,7 +136,20 @@ where
             transfers,
             sessions,
             subscribers,
+            lifecycle,
+            lane: None,
         }
+    }
+
+    /// Install the v5 Phase 2 [`LaneAdmin`] handle. Each subscribe
+    /// call will mint a per-`SubId` lane through the admin and
+    /// surface the SubId on the outcome. Compositional opt-in: v4
+    /// callers that omit this builder method see identical v4
+    /// behaviour.
+    #[must_use]
+    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
+        self.lane = Some(lane);
+        self
     }
 
     /// Drive the subscribe orchestration.
@@ -143,10 +176,37 @@ where
         )
         .await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
+        let parsed_kind = parsed.kind;
+        let parsed_id = parsed.id.clone();
         self.subscribers
             .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
             .await?;
-        Ok(SubscribeResourceOutcome { uri: canonical })
+        // v5 lifecycle: bump the resource refcount so the policy can
+        // drive Owned -> Observed transitions.
+        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
+        let sub_id = self
+            .open_lane_if_wired(canonical.clone(), parsed_kind, parsed_id)
+            .await?;
+        Ok(SubscribeResourceOutcome {
+            uri: canonical,
+            sub_id,
+        })
+    }
+
+    async fn open_lane_if_wired(
+        &self,
+        canonical: String,
+        kind: ResourceKind,
+        resource_id: String,
+    ) -> Result<Option<SubId>, DomainError> {
+        match self.lane.as_ref() {
+            Some(lane) => {
+                let policy = LanePolicy::default();
+                let sub_id = lane.open(canonical, kind, resource_id, policy).await?;
+                Ok(Some(sub_id))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -169,6 +229,7 @@ where
         sessions: Arc<SR>,
         forwards: Arc<FR>,
         subscribers: Arc<Sub>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
     ) -> Self {
         Self {
             shells,
@@ -177,7 +238,16 @@ where
             sessions,
             forwards,
             subscribers,
+            lifecycle,
+            lane: None,
         }
+    }
+
+    /// Install the v5 Phase 2 [`LaneAdmin`] handle.
+    #[must_use]
+    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
+        self.lane = Some(lane);
+        self
     }
 
     /// Drive the subscribe orchestration.
@@ -206,10 +276,37 @@ where
         )
         .await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
+        let parsed_kind = parsed.kind;
+        let parsed_id = parsed.id.clone();
         self.subscribers
             .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
             .await?;
-        Ok(SubscribeResourceOutcome { uri: canonical })
+        // v5 lifecycle: bump the resource refcount so the policy can
+        // drive Owned -> Observed transitions.
+        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
+        let sub_id = self
+            .open_lane_if_wired(canonical.clone(), parsed_kind, parsed_id)
+            .await?;
+        Ok(SubscribeResourceOutcome {
+            uri: canonical,
+            sub_id,
+        })
+    }
+
+    async fn open_lane_if_wired(
+        &self,
+        canonical: String,
+        kind: ResourceKind,
+        resource_id: String,
+    ) -> Result<Option<SubId>, DomainError> {
+        match self.lane.as_ref() {
+            Some(lane) => {
+                let policy = LanePolicy::default();
+                let sub_id = lane.open(canonical, kind, resource_id, policy).await?;
+                Ok(Some(sub_id))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -451,6 +548,10 @@ mod tests {
         #[cfg(feature = "port_forward")]
         let forwards = Arc::new(DashMapForwardRepo::new());
         let registry = Arc::new(RecordingRegistry::default());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
         #[cfg(feature = "port_forward")]
         let uc = SubscribeResourceUseCase::new(
             Arc::clone(&shells),
@@ -459,6 +560,7 @@ mod tests {
             Arc::clone(&sessions),
             Arc::clone(&forwards),
             Arc::clone(&registry),
+            lifecycle,
         );
         #[cfg(not(feature = "port_forward"))]
         let uc = SubscribeResourceUseCase::new(
@@ -467,6 +569,7 @@ mod tests {
             Arc::clone(&transfers),
             Arc::clone(&sessions),
             Arc::clone(&registry),
+            lifecycle,
         );
         Harness {
             uc,
@@ -667,5 +770,69 @@ mod tests {
         assert_eq!(outcome.uri, "shell://sh-1/output");
         let calls = h.registry.calls();
         assert_eq!(calls[0].2, "shell://sh-1/output");
+    }
+
+    // --- v5 Phase 2 lane wiring ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_outcome_sub_id_is_none_when_lane_not_wired() {
+        // Default constructor leaves the lane handle unset — outcome
+        // mirrors v4 behaviour with a None SubId.
+        let h = build_harness();
+        seed_shell(&h.shells, "sh-1").await;
+        let outcome =
+            h.uc.execute(req("shell://sh-1/output", "peer-1"))
+                .await
+                .expect("execute");
+        assert!(outcome.sub_id.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_with_lane_returns_sub_id_on_outcome() {
+        use crate::adapters::id_generator::uuid::UuidIds;
+        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+
+        let shells = Arc::new(DashMapShellRepo::new());
+        let commands = Arc::new(DashMapCommandRepo::new());
+        let transfers = Arc::new(DashMapTransferRepo::new());
+        let sessions = Arc::new(DashMapSessionRepo::new());
+        #[cfg(feature = "port_forward")]
+        let forwards = Arc::new(DashMapForwardRepo::new());
+        let registry = Arc::new(RecordingRegistry::default());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> =
+            SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+        #[cfg(feature = "port_forward")]
+        let uc = SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&forwards),
+            Arc::clone(&registry),
+            lifecycle,
+        )
+        .with_subscriber_lane(lane);
+        #[cfg(not(feature = "port_forward"))]
+        let uc = SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&registry),
+            lifecycle,
+        )
+        .with_subscriber_lane(lane);
+
+        seed_shell(&shells, "sh-1").await;
+        let outcome = uc
+            .execute(req("shell://sh-1/output", "peer-1"))
+            .await
+            .expect("execute");
+        let sub_id = outcome.sub_id.expect("sub_id must be set when lane wired");
+        assert!(!sub_id.as_str().is_empty());
     }
 }

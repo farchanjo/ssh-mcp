@@ -10,13 +10,13 @@ use super::traits::AuthStrategy;
 ///
 /// Uses username/password credentials to authenticate with the SSH
 /// server.
-pub(crate) struct PasswordAuth {
+pub struct PasswordAuth {
     password: String,
 }
 
 impl PasswordAuth {
     /// Create a new password authentication strategy.
-    pub(crate) fn new(password: impl Into<String>) -> Self {
+    pub fn new(password: impl Into<String>) -> Self {
         Self {
             password: password.into(),
         }
@@ -36,21 +36,11 @@ impl AuthStrategy for PasswordAuth {
 
         Ok(result.success())
     }
-
-    fn name(&self) -> &'static str {
-        "password"
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthStrategy, PasswordAuth};
-
-    #[test]
-    fn name_is_password() {
-        let auth = PasswordAuth::new("secret");
-        assert_eq!(auth.name(), "password");
-    }
+    use super::PasswordAuth;
 
     #[test]
     fn stores_password_verbatim() {
@@ -68,7 +58,6 @@ mod tests {
     fn empty_password_is_allowed() {
         let auth = PasswordAuth::new("");
         assert_eq!(auth.password, "");
-        assert_eq!(auth.name(), "password");
     }
 
     #[test]
@@ -124,13 +113,6 @@ mod tests {
     fn auth_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PasswordAuth>();
-    }
-
-    #[test]
-    fn name_is_static_str() {
-        let auth = PasswordAuth::new("secret");
-        let n: &'static str = auth.name();
-        assert_eq!(n, "password");
     }
 
     #[test]

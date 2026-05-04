@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
+use crate::domain::session::SessionEntity;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
@@ -196,10 +197,7 @@ where
     /// agent secondary index when an agent id is bound. Done *before* the
     /// SSH-side disconnect so a transport failure cannot strand a half-dead
     /// entry.
-    async fn purge_session_entry(
-        &self,
-        session: &crate::domain::session::SessionEntity,
-    ) -> Result<(), DomainError> {
+    async fn purge_session_entry(&self, session: &SessionEntity) -> Result<(), DomainError> {
         if let Some(agent_id) = session.agent_id.as_ref() {
             self.sessions
                 .unregister_agent(agent_id, &session.id)

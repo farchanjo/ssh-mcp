@@ -1,215 +1,237 @@
+<div align="center">
+
 # ssh-mcp
 
-[![Version](https://img.shields.io/badge/version-4.8.1-blue.svg)]()
-[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![MCP](https://img.shields.io/badge/MCP-2025--06--18-purple.svg)]()
-[![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
-[![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
-[![Tests](https://img.shields.io/badge/lib%20tests-1172%20passing-brightgreen.svg)]()
+**Subscribe-first SSH server for the Model Context Protocol.**
 
-> [!CAUTION]
-> This is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). Rewritten from scratch — different SSH library (`russh` 0.55), different MCP transport (`rmcp` 1.6), different threading model, lock-free hot-path state, full Hexagonal (Ports + Adapters) layout.
+Drive remote shells, async commands, and SFTP transfers from any MCP-capable LLM host. Push notifications stream the moment SSH bytes arrive — your model reacts to the world instead of polling it.
 
-A Rust MCP server that exposes SSH as Model Context Protocol tools. LLMs connect to remote hosts, run commands, drive interactive PTY shells with realtime resource subscriptions, transfer files via SFTP, and forward TCP ports — over `rmcp` 1.6 Streamable HTTP (axum-hosted) or stdio. Built for small LLMs (27B-30B class): every tool advertises a typed `output_schema` (v4.8), a `structured_content` JSON twin sits next to the Markdown body, and inter-tool conversation hints (`NEXT:`, `HINT:`, prompts catalog) chain workflows without external docs.
+[![Version](https://img.shields.io/badge/version-5.0.0--rc1-1f6feb?style=flat-square)]()
+[![Rust](https://img.shields.io/badge/rust-2024%20%E2%80%94%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](Cargo.toml)
+[![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)]()
+[![Architecture](https://img.shields.io/badge/architecture-hexagonal-a371f7?style=flat-square)]()
+[![Lock-free](https://img.shields.io/badge/hot--path-lock--free-238636?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/lib%20tests-1378%2B-238636?style=flat-square)]()
 
-## Quick start
-
-```bash
-git clone https://github.com/farchanjo/ssh-mcp.git && cd ssh-mcp
-cargo build --release
-sudo cp target/release/ssh-mcp{,-stdio} /usr/local/bin/
-```
-
-Then run one of the two transports:
-
-```bash
-ssh-mcp-stdio                              # stdio transport (recommended for local MCP hosts)
-ssh-mcp                                    # HTTP transport on 0.0.0.0:8000/
-```
-
-## Highlights (v4.8.1)
-
-| Surface | Count | Notes |
-|:---|:---:|:---|
-| MCP tools | **21** (20 without `port_forward`) | Connection / Commands / Shell / SFTP / Network |
-| Tools advertising `output_schema` | **21 / 21** | v4.8 lifted coverage from 9 to full (additive on `tools/list`) |
-| Resource subscribe streams | **5** | `shell://`, `command://`, `transfer://`, `session://`, `forward://` |
-| `prompts/list` workflows | **5** | `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent` |
-| RFC 6570 resource templates | **4** (5 with `port_forward`) | Advertised on `resources/templates/list` |
-| Mutating tools wrapped by idempotency cache | **15** | Dedup via `_meta.idempotency_key` |
-| Wire error tags | **14 + 1** | All live as of v4.6, plus v4.7 `IDEMPOTENCY_KEY_TOO_LONG` |
-| Lib tests | **1172** | Plus 2 integration, 11 v4.7 pytest suites, v4.8.1 transfer-progress integration, 4 stress scripts |
-
-The text channel is byte-identical to v3.0.0 / v4.0.x / v4.5 / v4.6 / v4.7. The v4.7 `structured_content` JSON channel sits next to it. v4.8 adds typed schema *advertisement* on every tool's `tools/list` metadata — runtime payloads unchanged. Hosts walking the Markdown body keep working without modification.
-
-## Architecture
+</div>
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
-    LLM["LLM / MCP host"]
-    subgraph SshMcp["ssh-mcp (Rust 2024, hexagonal)"]
-        direction TB
-        Infra["infra/mcp<br/>21 tools + 5 resources<br/>+ prompts + templates<br/>+ idempotency"]
-        App["application<br/>22 use cases"]
-        Ports["ports<br/>trait skeletons"]
-        Adapters["adapters<br/>russh / russh-sftp<br/>+ DashMap repos<br/>+ MemoryRegistry"]
-        Comp["composition<br/>root wiring"]
-        Infra --> App
-        App --> Ports
-        Adapters --> Ports
-        Comp --> Adapters
-        Comp --> App
-    end
-    Russh["russh 0.55<br/>(SSH + SFTP)"]
-    Remote["sshd / SFTP / agent"]
+    LLM(["LLM host"])
+    SM["ssh-mcp"]
+    REM(["Remote SSH host"])
 
-    LLM <-->|"rmcp 1.6<br/>(HTTP / stdio)"| Infra
-    Adapters <--> Russh
-    Russh <--> Remote
+    LLM <-->|MCP tools and push streams| SM
+    SM <-->|encrypted SSH 2.0 + SFTP| REM
+
+    classDef host fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef core fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef remote fill:#21262d,color:#8b949e,stroke:#30363d
+    class LLM host
+    class SM core
+    class REM remote
 ```
 
-The full layer-by-layer module map, the subscribe pipeline, and the lock-free invariants live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+---
 
-## MCP tools
+## Why ssh-mcp
 
-Every tool advertises a typed `output_schema` on `tools/list` (v4.8). The Markdown body and the parallel `structured_content` JSON twin are byte-stable from v4.7.
+- **Push, not poll.** Subscribers receive coalesced push events the moment SSH bytes arrive. The model reacts to real output instead of burning tokens on empty reads.
+- **Self-cleaning.** Resources opt into `release_when_no_subs`; when the last subscriber leaves, a grace timer arms and the remote process is cancelled and channels closed automatically. No zombie sessions.
+- **Lock-free hot path.** Atomics, `ArcSwap`, `mpsc`, and `Notify` carry every long-running primitive. Zero `Mutex` on the data path, enforced by clippy denials and 16 loom invariant tests.
+- **Three transports, one core.** HTTP, stdio, and an NDJSON daemon all share the same hexagonal use cases. Pick what your host supports.
+- **Designed for 27B-class models.** Required-next-step hints, push-first ordering, ready-made prompts, and golden-rule preludes mean small open-source models drive it correctly first try.
+- **Strict by default, tunable when needed.** Production preset out of the box; everything is an env var.
+- **Additive across versions.** v3 / v4 hosts on the legacy 21-tool catalogue work unchanged against v5.
 
-| Group | Tool | Purpose | `output_schema` |
-|:---|:---|:---|:---:|
-| Connection | `ssh_connect` | Open SSH session (typed `ReusePolicy`) | yes |
-| Connection | `ssh_disconnect` | Close one session | yes |
-| Connection | `ssh_disconnect_many` *(v4.7)* | Best-effort batch (1..=64 ids) | yes |
-| Connection | `ssh_list_sessions` | List live sessions (filter by `agent_id`) | yes |
-| Connection | `ssh_disconnect_agent` | Bulk-cleanup all sessions owned by an agent | yes |
-| Commands | `ssh_execute` | Async command (optional `pty=true`) | yes |
-| Commands | `ssh_execute_batch` *(v4.7)* | Sequential 1..=16 commands, stop-on-failure | yes |
-| Commands | `ssh_run` *(v4.7)* | One-shot connect + execute + optional disconnect | yes |
-| Commands | `ssh_get_command_output` | Poll or long-poll (`wait`, `wait_timeout_secs`) | yes |
-| Commands | `ssh_list_commands` | List commands (typed `CommandStatus`) | yes |
-| Commands | `ssh_cancel_command` | Cancel an in-flight command | yes |
-| Shell | `ssh_shell_open` | Open PTY (carries optional `INITIAL_BUFFER:` line) | yes |
-| Shell | `ssh_shell_write` | Send raw bytes to PTY | yes |
-| Shell | `ssh_shell_send_key` | Semantic keystrokes + modifiers + repeat | yes |
-| Shell | `ssh_shell_read` | Snapshot or long-poll (`wait`, `min_bytes`) | yes |
-| Shell | `ssh_shell_wait_for` | Multi-pattern gate | yes |
-| Shell | `ssh_shell_close` | Close PTY | yes |
-| SFTP | `ssh_upload` | Streaming upload (`transfer://` push) | yes |
-| SFTP | `ssh_download` | Streaming download | yes |
-| SFTP | `ssh_get_transfer_progress` | Poll or long-poll progress | yes |
-| Network | `ssh_forward` *(feature `port_forward`)* | Local TCP port forward | yes |
+See the [LLM Guide](docs/LLM_GUIDE.md) for the full design philosophy and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layer map.
 
-Per-tool input schema, response shape, and structured payload: [docs/API.md](docs/API.md).
+## Use cases
 
-## Resource streams
+| Scenario | Why ssh-mcp fits |
+|---|---|
+| Driving remote builds from an IDE LLM | Streams stdout in real time so the model reacts as logs arrive instead of waiting for the build to finish. |
+| Watching long-running services | `tail -f /var/log/app.log` over a subscription survives transient lag without losing the latest tail. |
+| Multi-step interactive sessions | Drive `top`, `vim`, `htop`, `psql` with key-by-key precision through PTY-backed shells. |
+| Bulk operations across many hosts | `agent_id` groups sessions; one tool call tears them all down atomically. |
+| Operations LLM in a Unix pipeline | Pipe NDJSON ops in, NDJSON push events out — perfect for `jq`, `vector`, `fluent-bit`, or a custom audit script. |
+| Hosts that lack `resources/subscribe` | The daemon binary exposes push events on its own stdout for any consumer to read. |
 
-5 subscribe-friendly URI schemes. Subscribe via `resources/subscribe`; the server pushes `notifications/resources/updated` (SSE on HTTP, stdout on stdio); pull deltas via `resources/read?cursor=auto`.
+## Install
 
-| URI scheme | Pushes | Cursor | MIME |
-|:---|:---|:---:|:---|
-| `shell://<shell-id>/output` | PTY output stream | yes | `text/plain` |
-| `command://<command-id>/output` | Async command stdout/stderr | yes | `text/plain` |
-| `transfer://<transfer-id>/progress` | SFTP point-in-time progress | no | `application/json` |
-| `session://<session-id>/health` | Session health snapshot | no | `application/json` |
-| `forward://<forward-id>/events` *(feature `port_forward`)* | Port-forward event log | yes | `application/json` |
+```bash
+git clone https://github.com/farchanjo/ssh-mcp.git
+cd ssh-mcp
+cargo build --release
+sudo install -m 0755 target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
+```
 
-Producer events coalesce on `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms), force-flush after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1000 ms), and keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). Each event carries a sequence number for gap detection; lagged subscribers auto-recover by reading from the snapshot buffer. Full contract: [docs/RESOURCES.md](docs/RESOURCES.md). Token-efficient subscribe-first patterns: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
+Three binaries land in `/usr/local/bin`. Pick the one your MCP host expects: `ssh-mcp-stdio` for local hosts (mcp-inspector, IDE plugins, Cline) is the recommended default; `ssh-mcp` exposes the same surface over HTTP for browser- or service-based hosts; `ssh-mcp-tail daemon` is the NDJSON pipeline mode for hosts that cannot consume MCP push notifications natively.
+
+If your host needs the smallest possible binary, build with `--no-default-features` to drop the optional `port_forward` feature (29 tools instead of 30). Transport behaviour is identical across all three binaries — they share the same hexagonal core. Operational details and op/event schemas live in [docs/DAEMON.md](docs/DAEMON.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## How it works
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph Inbound["Inbound transports"]
+        HTTP["axum HTTP"]
+        STDIO["rmcp stdio"]
+        TAIL["NDJSON daemon"]
+    end
+
+    subgraph Core["Hexagonal core"]
+        UC["Use cases"]
+        DOM["Domain"]
+        PORTS["Ports"]
+        ADAP["Adapters"]
+    end
+
+    subgraph V5["v5 layers"]
+        LIFE["Lifecycle binding"]
+        SUB["Channel mux"]
+        EMBED["Embed transport"]
+    end
+
+    SSH(["Remote SSH host"])
+
+    HTTP --> UC
+    STDIO --> UC
+    TAIL --> EMBED
+    EMBED --> UC
+    UC --> PORTS
+    PORTS --> ADAP
+    UC --> DOM
+    ADAP --> LIFE
+    LIFE --> SUB
+    ADAP --> SSH
+
+    classDef inb fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef core fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef out fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef rem fill:#21262d,color:#8b949e,stroke:#30363d
+    class HTTP,STDIO,TAIL inb
+    class UC,DOM,PORTS,ADAP core
+    class LIFE,SUB,EMBED out
+    class SSH rem
+```
+
+Three v5 layers sit on top of the v4.1 hexagonal base: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) wraps every long-lived resource in a CAS state machine and refcount; the channel mux ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) gives each subscription its own bounded lane and lag policy; the embed transport ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md)) hosts an in-process MCP client and server across `tokio::io::duplex` so the daemon binary speaks real push without IPC. Per-module map and sequence diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Performance
+
+The data path is engineered for sub-millisecond latency between SSH stdout and MCP push delivery on local hosts.
+
+| Scenario | Behaviour |
+|---|---|
+| Subscribe to first push (warm session) | Under 5 ms p50; 50 ms debounce dominates after the first chunk. |
+| Lane full and snapshot recovery | Sub-ms with the default 1 MB ring buffer. |
+| Round-robin mux fairness | Under 1 % drift between adjacent lanes under burst. |
+| Session reaper vs active resources | Refcount supersedes the inactivity TTL — active resources are never reaped. |
+| Lock-free hot path | Zero `Mutex` on shell, command, or transfer state — enforced by clippy. |
+| Loom invariants | 16 tests across CAS state, mux fairness, ring buffer monotonicity, cascade. |
+
+The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.clippy]` block in [`Cargo.toml`](Cargo.toml). Detailed invariants: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#lock-free-invariants).
+
+## How it compares
+
+| Approach | Push to LLM? | Self-cleaning? | Lock-free? | Hosts without subscribe | Operational scope |
+|---|:---:|:---:|:---:|:---:|---|
+| Raw `ssh` from a shell tool | no | no | n/a | manual | one-off |
+| `paramiko` or `asyncssh` glue | no (poll) | no | varies | manual | one host at a time |
+| Other MCP SSH wrappers | usually no | usually no | varies | usually no | tool-only |
+| **ssh-mcp v5.0** | **yes** | **yes** | **yes** | **NDJSON daemon** | **multi-session, multi-host, agent-grouped** |
+
+## Tool catalogue
+
+v5.0 ships **30 MCP tools** across 5 push-resource schemes and 10 ready-made prompts (29 tools without the `port_forward` feature). Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Per-tool inputs, outputs, structured-content payloads, error codes, and resource semantics: [docs/API.md](docs/API.md) and [docs/RESOURCES.md](docs/RESOURCES.md).
 
 ## Configuration
 
-Three-tier resolution: **Parameter > Environment Variable > Built-in default**. The full env-var table (25+ vars including broadcast caps, debouncer timing, peer GC, idempotency cache) lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Most-used vars:
-
-| Variable | Default | Description |
-|:---|:---|:---|
-| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | HTTP transport bind |
-| `MCP_HTTP_PATH` | `/` | HTTP mount path |
-| `RUST_LOG` | `info` | Tracing filter |
-| `SSH_CONNECT_TIMEOUT` | `30` (s) | SSH handshake timeout |
-| `SSH_COMMAND_TIMEOUT` | `180` (s) | Default per-command timeout |
-| `SSH_INACTIVITY_TIMEOUT` | `300` (s) | Session idle timeout (disabled when `persistent=true`) |
-| `SSH_SHELL_INACTIVITY_TTL` | `600` (s) | Shell auto-close on idle |
-| `SSH_SHELL_MAX_BUFFER_SIZE` | `10m` | Shell output buffer cap (`b`/`k`/`m`/`g`/`t`) |
-| `SSH_NOTIFY_DEBOUNCE_MS` | `50` | Subscribe debounce window |
-| `SSH_IDEMPOTENCY_TTL_SECS` | `300` | Idempotency cache TTL (v4.7) |
-
-## Versioning and compatibility
-
-| Surface | v3.0 | v4.0 | v4.5 | v4.6 | v4.7 | **v4.8** |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Markdown response body | byte-stable | byte-stable | byte-stable | byte-stable* | byte-stable | byte-stable |
-| Tool count | 18 | 18 | 18 | 18 | 21 | **21** |
-| Tools with `output_schema` | 0 | 0 | 0 | 0 | 9 | **21** |
-| `structured_content` channel | — | — | — | — | added | unchanged |
-| `prompts/list` | — | — | — | — | added | unchanged |
-| `resources/templates/list` | — | — | — | — | added | unchanged |
-| `notifications/progress` | — | — | — | — | added | unchanged |
-| Idempotency cache | — | — | — | — | added | unchanged |
-| Hexagonal layout | — | added | — | — | — | unchanged |
-
-*v4.6 narrow rename: wire key `AGENT:` -> `AGENT_ID:`. Generic key/value parsers unaffected.
-
-v4.8 is **strictly additive** on the `tools/list` metadata: it advertises the typed schema for the 12 tools that previously emitted free-form structured payloads (and consolidates the v4.7 ad-hoc `output_schema` advertisements on the other 9 into the same path). Wire shape, env vars, error codes, runtime behaviour — all unchanged from v4.7.1.
-
-Contributor migration guide: [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md). Historical client guide v2 -> v3: [docs/MIGRATION_v2_to_v3.md](docs/MIGRATION_v2_to_v3.md).
+Three-tier resolution: **parameter, then environment variable, then built-in default**. Defaults are tuned for production. The full env-var table (33+ vars across lifecycle, mux, lane, daemon, retry, broadcast caps) lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Development
 
 ```bash
-cargo build --release                                                    # both binaries
-cargo build --release --bin ssh-mcp                                      # HTTP only
-cargo build --release --bin ssh-mcp-stdio                                # stdio only
-cargo build --release --no-default-features                              # without port_forward
-cargo test --lib --quiet                                                 # 1168 unit tests
-cargo test --tests --quiet                                               # 2 integration tests
-cargo test --features test-fixtures                                      # use cases against in-memory adapters
+cargo build --release
+cargo test --lib --quiet
 cargo fmt --all -- --check
-cargo clippy --all-features --all-targets --workspace -- -D warnings
+cargo clippy --release --all-features -- -D warnings
 ```
 
-Python integration suites (require a reachable sshd):
+These four gates must stay green on every commit. The clippy gate is production-only — the strict `forbid(unwrap_used)` policy is structurally incompatible with the `#[tokio::test]` macro expansion, so test targets are gated separately. Rationale and lock-free invariants: [CLAUDE.md](CLAUDE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-```bash
-python3 scripts/test_http.py                # HTTP transport — all 21 tools + resources
-python3 scripts/test_stdio.py               # stdio transport — all 21 tools + resources
-python3 scripts/test_send_key.py            # ssh_shell_send_key
-python3 scripts/test_wait_for.py            # ssh_shell_wait_for
-python3 scripts/test_resources.py           # 5 schemes + subscribe + cursor
-python3 scripts/stress_subscribe.py         # subscribe burst
-python3 scripts/stress_concurrent_writes.py # writer-task ownership
-python3 scripts/stress_lagged_sub.py        # lagged-subscriber recovery
-python3 scripts/stress_locks.py             # lock-free hot-path
-```
+## Documentation map
 
-For changes touching shell / command / transfer hot-path state, read [docs/LOCKS.md](docs/LOCKS.md) before introducing any `Mutex`. For changes spanning multiple layers, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) shows where each layer's responsibility lies.
+| Document | Purpose |
+|---|---|
+| [docs/](docs/README.md) | Directory index — start here for the per-doc decision tree. |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout, v5 layers, per-module map, sequence diagrams. |
+| [docs/API.md](docs/API.md) | All 30 MCP tools — inputs, outputs, structured content, error codes. |
+| [docs/RESOURCES.md](docs/RESOURCES.md) | Five resource schemes, cursor and sequence semantics, `_meta` envelope. |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles. |
+| [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) | LLM canonical — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 38-code error handbook. |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Symptom → cure runbook, wire-format error envelope, per-tool error catalogue, recovery flows. |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build / clippy gates, lock-free invariants, hot-path sequence diagrams. |
+| [docs/DAEMON.md](docs/DAEMON.md) | `ssh-mcp-tail` NDJSON op and event schema. |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | All migration paths — v2 → v3 (client), v3 → v4 (contributor), v4 → v5 (host). |
+| [docs/adr/](docs/adr/) | Eight architecture decision records covering rmcp, hexagonal, lifecycle, mux, LLM UX, backpressure, errors, and the daemon protocol. |
 
-### Documentation map
+## FAQ
 
-| Document | Description |
-|:---|:---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout, layer-by-layer module map, dependency graph, sequence diagrams |
-| [docs/API.md](docs/API.md) | All 21 MCP tools (inputs, outputs, structured_content, errors) |
-| [docs/RESOURCES.md](docs/RESOURCES.md) | 5 resource schemes, cursor / sequence semantics, `_meta` envelope |
-| [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) | Token-efficient subscribe-first patterns for LLM hosts |
-| [docs/FLOWS.md](docs/FLOWS.md) | Sequence diagrams for connect / execute / shell / SFTP / subscribe |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full env-var table (25+ vars, floors and caps, tuning profiles) |
-| [docs/ERRORS.md](docs/ERRORS.md) | Error code catalogue (REASON codes + recovery hints) |
-| [docs/LOCKS.md](docs/LOCKS.md) | Lock-free invariants per layer + Clippy enforcement |
-| [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) | Contributor migration guide (v4.1 deep-decouple addendum) |
-| [docs/MIGRATION_v2_to_v3.md](docs/MIGRATION_v2_to_v3.md) | Historical client upgrade guide |
-| [docs/adr/0001-migrate-to-rmcp.md](docs/adr/0001-migrate-to-rmcp.md) | Decision: poem-mcpserver -> rmcp 1.6 (v3) |
-| [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md) | Decision: adopt Hexagonal layout (v4) |
+**Is this wire-compatible with my existing v4 host?**
+Yes. The 21 carry-over tools keep their exact response shape, env vars, and error codes; the 9 new tools are additive. New optional parameters default to v4 behaviour. Details: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
+
+**My LLM host doesn't surface push notifications. Can I still use the subscribe model?**
+Yes. Run the NDJSON daemon as a subprocess and read push events directly from its stdout. See [docs/DAEMON.md](docs/DAEMON.md).
+
+**Why a separate daemon binary instead of a flag on the stdio binary?**
+The daemon hosts an in-process MCP client and server pair with a different runtime shape. Keeping them separate prevents subtle behavioural drift and lets distros ship only the transport they need.
+
+**How do I avoid leaking shells when my host crashes mid-task?**
+Pass `release_when_no_subs=true` on shell, command, and transfer tools. The peer GC detects the dropped transport and the lifecycle grace timer cleans up automatically.
+
+**What does "subscribe-first" mean for token cost?**
+Polling burns tokens on every call even when there is no new data. Push delivery means the model only spends tokens when there is real output. For long-running commands the saving is order-of-magnitude.
+
+**Is the lock-free claim real?**
+Yes — enforced by `clippy::await_holding_lock`, `mutex_atomic`, `significant_drop_tightening`, and `mutex_integer` denials in [`Cargo.toml`](Cargo.toml), plus 16 loom tests. Production builds pass `-D warnings` exit-zero on every commit.
+
+**Can I run only the legacy 21 tools and skip v5 features?**
+Yes. v5 features are entirely opt-in. If you never call the subscribe tools and never pass `release_when_no_subs=true`, behaviour is identical to v4.
+
+## Contributing
+
+Contributions are welcome. Before opening a PR, please verify:
+
+- The four development gates (build, lib tests, fmt, clippy) all exit zero.
+- New tests ship in the same commit as the feature.
+- Hot-path changes touching atomics or `ArcSwap` ship with a loom invariant.
+- New env vars get a row in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and a floor / cap in `src/adapters/config/internal/mod.rs`.
+
+Architecture invariants live in [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md). Read it once before touching layer boundaries. Issues: <https://github.com/farchanjo/ssh-mcp/issues>.
 
 ## License
 
-MIT — declared via `license = "MIT"` in `Cargo.toml`.
+MIT. Declared via `license = "MIT"` in [`Cargo.toml`](Cargo.toml).
 
-## Author and links
+---
 
-- Author: Fabricio Archanjo (<fabricio@archanjo.com>)
-- Issues: <https://github.com/farchanjo/ssh-mcp/issues>
-- Releases: <https://github.com/farchanjo/ssh-mcp/releases>
-- Original concept: [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)
-- SSH library: [russh](https://github.com/warp-tech/russh) — SFTP via [russh-sftp](https://github.com/AspectUnk/russh-sftp)
-- MCP framework: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) (official Anthropic Rust SDK)
-- HTTP host: [axum](https://github.com/tokio-rs/axum) + [tower](https://github.com/tower-rs/tower)
-- Lock-free primitives: [arc-swap](https://github.com/vorner/arc-swap), [dashmap](https://github.com/xacrimon/dashmap)
+### About this fork
+
+This repository is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). It started from the same initial concept and was rewritten on `russh` 0.55 plus `rmcp` 1.6 with a strict hexagonal layout, lock-free hot path, lifecycle binding, channel mux, and a third NDJSON daemon binary. v5.0 stays wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+
+### Author and links
+
+- **Author:** Fabricio Archanjo · <fabricio@archanjo.com>
+- **Repository:** <https://github.com/farchanjo/ssh-mcp>
+- **Issues:** <https://github.com/farchanjo/ssh-mcp/issues>
+- **Releases:** <https://github.com/farchanjo/ssh-mcp/releases>
+- **SSH library:** [russh](https://github.com/warp-tech/russh) — SFTP via [russh-sftp](https://github.com/AspectUnk/russh-sftp)
+- **MCP framework:** [rmcp](https://github.com/modelcontextprotocol/rust-sdk) (official Rust SDK)
+- **HTTP host:** [axum](https://github.com/tokio-rs/axum) plus [tower](https://github.com/tower-rs/tower)
+- **Lock-free primitives:** [arc-swap](https://github.com/vorner/arc-swap), [dashmap](https://github.com/xacrimon/dashmap)
+- **Original concept:** [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)

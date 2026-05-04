@@ -64,7 +64,7 @@ const FAKE_SHELL_DEFAULT_BUFFER_BYTES: u64 = 10_u64.saturating_mul(1024).saturat
 
 /// Default inactivity TTL handed back by [`FakeSshClient::open_shell`].
 /// Mirrors the production default of 300 seconds (`SSH_INACTIVITY_TIMEOUT`).
-const FAKE_SHELL_DEFAULT_INACTIVITY_TTL: Duration = Duration::from_secs(300);
+const FAKE_SHELL_DEFAULT_INACTIVITY_TTL: Duration = Duration::from_mins(5);
 
 /// Single recorded interaction for assertion purposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,8 +538,8 @@ impl SshClientPort for FakeSshClient {
 
     async fn execute(&self, request: CommandRequest) -> Result<CommandOutcome, DomainError> {
         self.record(FakeSshCall::Execute {
-            session_id: request.session_id.clone(),
-            command: request.command.clone(),
+            session_id: request.session_id,
+            command: request.command,
         });
         // The H10 use case routes liveness through `health_check`; if a future
         // use case scripts `execute` we can extend the queues. Default to a

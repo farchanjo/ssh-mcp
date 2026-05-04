@@ -11,7 +11,7 @@ use crate::domain::ids::{ForwardId, SessionId};
 
 /// Forward repository port.
 #[trait_variant::make(ForwardRepository: Send)]
-pub trait LocalForwardRepository: Send + Sync {
+pub trait LocalForwardRepository: Sync {
     /// Insert a forwarder entity.
     ///
     /// # Errors

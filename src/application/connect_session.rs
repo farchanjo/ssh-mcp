@@ -38,6 +38,7 @@
 //! await points. The `connect`/`health_check` ports return owned values so
 //! no shard-spanning borrows escape.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -193,14 +194,14 @@ where
     /// (chiefly `ConnectFailed`, `Auth`, `Storage`).
     pub async fn execute(&self, req: ConnectRequest) -> Result<ConnectOutcome, DomainError> {
         let inactivity_timeout = self.config.inactivity_timeout();
-        if let Some(sid) = req.explicit_session_id.clone() {
-            if let Some(reused) = self.try_explicit_reuse(&sid).await? {
-                return Ok(ConnectOutcome::Reused {
-                    session: reused,
-                    persistent: req.persistent,
-                    inactivity_timeout,
-                });
-            }
+        if let Some(sid) = req.explicit_session_id.clone()
+            && let Some(reused) = self.try_explicit_reuse(&sid).await?
+        {
+            return Ok(ConnectOutcome::Reused {
+                session: reused,
+                persistent: req.persistent,
+                inactivity_timeout,
+            });
         }
         let probed = self.probe_for_policy(&req).await?;
         if let Some(short_circuit) =
@@ -258,10 +259,10 @@ where
     /// fall through to a fresh connect.
     async fn purge_dead_session(&self, sid: &SessionId) {
         let _ = self.ssh.disconnect(sid).await;
-        if let Ok(Some(removed)) = self.sessions.remove(sid).await {
-            if let Some(agent_id) = removed.agent_id.as_ref() {
-                let _ = self.sessions.unregister_agent(agent_id, sid).await;
-            }
+        if let Ok(Some(removed)) = self.sessions.remove(sid).await
+            && let Some(agent_id) = removed.agent_id.as_ref()
+        {
+            let _ = self.sessions.unregister_agent(agent_id, sid).await;
         }
     }
 
@@ -291,7 +292,7 @@ where
         }
         // Newest first matches the v3 `evaluate_identity_matches` ordering
         // so `Auto` returns the most recently connected session.
-        healthy.sort_by_key(|entry| std::cmp::Reverse(entry.connected_at));
+        healthy.sort_by_key(|entry| Reverse(entry.connected_at));
         Ok(IdentityMatches { healthy, replaced })
     }
 

@@ -116,13 +116,13 @@ impl AuthChainAdapter {
 
     /// True iff no strategies have been appended.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.strategies.is_empty()
     }
 
     /// Number of configured strategies.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.strategies.len()
     }
 

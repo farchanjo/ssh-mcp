@@ -15,6 +15,7 @@ pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod id_generator;
+pub mod lifecycle;
 pub mod notifier;
 pub mod output_stream;
 pub mod repo;

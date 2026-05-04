@@ -76,7 +76,7 @@ use crate::adapters::ssh::internal::status_sink::{
     NoopShellStatusSink, SharedCommandRegistrationSink, SharedCommandStatusSink,
     SharedShellRegistrationSink, SharedShellStatusSink,
 };
-use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
+use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus};
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
@@ -118,10 +118,10 @@ pub struct RusshAdapterConfig {
 impl Default for RusshAdapterConfig {
     fn default() -> Self {
         Self {
-            default_command_timeout: Duration::from_secs(180),
+            default_command_timeout: Duration::from_mins(3),
             max_retries: 3,
             retry_delay: Duration::from_secs(1),
-            inactivity_timeout: Duration::from_secs(300),
+            inactivity_timeout: Duration::from_mins(5),
             compression_enabled: true,
             persistent: false,
             health_probe_timeout: Duration::from_secs(10),
@@ -337,7 +337,7 @@ impl RusshAdapter {
 
     /// Wire a bridge that registers / unregisters async commands in the
     /// domain `CommandRepository` as the adapter binds them in / removes
-    /// them from its private DashMap. v4.3 fix: closes the race window
+    /// them from its private `DashMap`. v4.3 fix: closes the race window
     /// where `resources/subscribe command://X/output` could observe an
     /// adapter row but no repo row.
     #[must_use]
@@ -794,7 +794,7 @@ impl RusshAdapter {
     /// Mint a deterministic-shape shell id derived from the session id
     /// and the adapter-side counter. Lives here (outside the trait
     /// impl) so the function can stay short and self-explanatory.
-    fn mint_shell_id(&self, session_id: &SessionId) -> ShellId {
+    fn mint_shell_id(session_id: &SessionId) -> ShellId {
         // Use a UUIDv4 suffix so concurrent `ssh_shell_open` calls on the
         // same session never mint colliding ids. The previous `len()`-based
         // counter was racy: multiple callers could observe the same length
@@ -915,24 +915,22 @@ impl RusshAdapter {
             running,
         };
         self.register_async_command(&command_id, record)?;
-        let entity = CommandEntity::new(
-            command_id.clone(),
-            session_id.clone(),
-            command.clone(),
-            started_at,
-        );
-        // v4.3 fix: register the row in the domain `CommandRepository`
-        // immediately so resource subscribers can observe the live
-        // command without waiting for the use-case-side `insert`. The
-        // sink swallows duplicate-id errors so a use case that already
-        // inserted is still happy. Spawned because `do_execute_async`
-        // stays synchronous (the background driver is fired-and-forget).
-        let sink = Arc::clone(&self.command_registration_sink);
-        let entity_for_sink = entity.clone();
-        tokio::spawn(async move {
-            sink.register(entity_for_sink).await;
-        });
+        let entity = CommandEntity::new(command_id, session_id, command, started_at);
+        self.spawn_command_registration(entity.clone());
         Ok(CommandHandle { entity })
+    }
+
+    /// v4.3 fix: register the row in the domain `CommandRepository`
+    /// immediately so resource subscribers can observe the live command
+    /// without waiting for the use-case-side `insert`. The sink swallows
+    /// duplicate-id errors so a use case that already inserted is still
+    /// happy. Spawned because `do_execute_async` stays synchronous (the
+    /// background driver is fired-and-forget).
+    fn spawn_command_registration(&self, entity: CommandEntity) {
+        let sink = Arc::clone(&self.command_registration_sink);
+        tokio::spawn(async move {
+            sink.register(entity).await;
+        });
     }
 
     /// Spawn both the russh driver and the status watcher for a freshly
@@ -979,7 +977,7 @@ impl RusshAdapter {
         )
         .await
         .map_err(|e| DomainError::Transport(format!("CHANNEL_FAILED: {e}")))?;
-        let shell_id = self.mint_shell_id(session_id);
+        let shell_id = Self::mint_shell_id(session_id);
         // v4.7.1 fix (BUG #1): honour the per-call buffer-size override on
         // both the persisted entity AND the runtime ring buffer. The
         // reader task reads the cap from `RunningShell.max_buffer_size`,
@@ -994,7 +992,7 @@ impl RusshAdapter {
             self.config.inactivity_timeout,
             buffer_cap,
         );
-        self.bind_shell(&shell_id, session_id, &terminal, channel, buffer_cap)?;
+        self.bind_shell(&shell_id, session_id, channel, buffer_cap)?;
         // v4.3 fix: bridge the row into the domain `ShellRepository` as
         // a defensive cleanup safety net. The use case (`open_shell`) is
         // the canonical writer of this row — the sink only fires for
@@ -1024,19 +1022,13 @@ impl RusshAdapter {
         &self,
         shell_id: &ShellId,
         session_id: &SessionId,
-        terminal: &ShellTerminal,
         channel: Channel<Msg>,
         buffer_cap: u64,
     ) -> Result<(), DomainError> {
         let (read_half, write_half) = channel.split();
         let (input_tx, input_rx) = mpsc::channel::<WriteRequest>(SHELL_INPUT_CHANNEL_CAP);
         let cancel_token = CancellationToken::new();
-        let running = Arc::new(RunningShell::new(
-            build_shell_info(shell_id, session_id, terminal),
-            cancel_token.clone(),
-            input_tx.clone(),
-            buffer_cap,
-        ));
+        let running = Arc::new(RunningShell::new(cancel_token.clone(), buffer_cap));
 
         spawn_shell_writer_task(write_half, input_rx, cancel_token.clone());
         spawn_shell_reader_task(read_half, &running);
@@ -1275,22 +1267,6 @@ fn build_async_command_info(
         command: command.to_string(),
         status: AsyncCommandStatus::Running,
         started_at: started_at.to_rfc3339(),
-    }
-}
-
-/// Build a [`ShellInfo`] payload for the lock-free shell record.
-fn build_shell_info(
-    shell_id: &ShellId,
-    session_id: &SessionId,
-    terminal: &ShellTerminal,
-) -> ShellInfo {
-    ShellInfo {
-        shell_id: shell_id.as_str().to_string(),
-        session_id: session_id.as_str().to_string(),
-        term_type: terminal.term_type.clone(),
-        cols: terminal.cols,
-        rows: terminal.rows,
-        opened_at: Utc::now().to_rfc3339(),
     }
 }
 

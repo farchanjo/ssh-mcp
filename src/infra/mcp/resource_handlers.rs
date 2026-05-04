@@ -26,13 +26,18 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use super::helpers::nonce::generate_nonce;
 use super::helpers::output::render_output_block;
 
+use crate::adapters::lifecycle::leak_watcher::{
+    LeakRiskAlert, LeakRiskSeverity, LeakWatcherProbe, alert_canonical_uri,
+};
 use crate::application::list_resources::{
     ListResourcesRequest, ListResourcesUseCase, ResourceListing,
 };
 use crate::application::read_resource::{
     ReadResourceOutcome, ReadResourceRequest, ReadResourceUseCase,
 };
-use crate::application::subscribe_resource::{SubscribeResourceRequest, SubscribeResourceUseCase};
+use crate::application::subscribe_resource::{
+    SubscribeResourceOutcome, SubscribeResourceRequest, SubscribeResourceUseCase,
+};
 use crate::application::unsubscribe_resource::{
     UnsubscribeResourceRequest, UnsubscribeResourceUseCase,
 };
@@ -44,24 +49,54 @@ use crate::ports::notifier::PeerHandle;
 use crate::ports::output_stream::OutputStreamPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
-use crate::ports::subscriber_registry::{SubscriberRegistryAsync, SubscriberRegistryPort};
+use crate::ports::subscriber_registry::{
+    ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort,
+};
 use crate::ports::transfer_repo::TransferRepository;
 
 use super::peer_handle::{PeerTable, RmcpPeerHandle};
 
 /// Map a [`DomainError`] onto an [`McpError`] for resource handlers.
 ///
-/// The mapping mirrors v3 conventions: validation/parse errors become
-/// `invalid_params`, not-found errors become `resource_not_found`,
-/// everything else becomes `internal_error`.
-fn map_resource_error(err: DomainError) -> McpError {
+/// The mapping mirrors v3 conventions: validation / parse errors
+/// become `invalid_params`, not-found errors become
+/// `resource_not_found`, everything else becomes `internal_error`.
+fn map_resource_error(err: &DomainError) -> McpError {
+    let message = err.to_string();
+    match resource_error_category(err) {
+        ResourceErrorCategory::InvalidParams => McpError::invalid_params(message, None),
+        ResourceErrorCategory::NotFound => McpError::resource_not_found(message, None),
+        ResourceErrorCategory::Internal => McpError::internal_error(message, None),
+    }
+}
+
+/// Classify a [`DomainError`] for resource-handler rendering.
+///
+/// Split out of [`map_resource_error`] so the dispatcher stays under
+/// the 30-line clippy threshold while keeping every variant under
+/// compile-time scrutiny.
+enum ResourceErrorCategory {
+    InvalidParams,
+    NotFound,
+    Internal,
+}
+
+const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
     match err {
-        DomainError::InvalidArgument(reason) => McpError::invalid_params(reason, None),
+        DomainError::InvalidArgument(_)
+        | DomainError::InvalidLagPolicy(_)
+        | DomainError::InvalidLifetime(_) => ResourceErrorCategory::InvalidParams,
+        // `ResourceGone` is semantically a not-found that documents
+        // the closed-then-attached race so the caller can stop
+        // polling. Folded into the same arm as the `*NotFound`
+        // variants to keep the wire mapping consistent.
         DomainError::SessionNotFound(_)
         | DomainError::ShellNotFound(_)
         | DomainError::CommandNotFound(_)
         | DomainError::TransferNotFound(_)
-        | DomainError::ForwardNotFound(_) => McpError::resource_not_found(err.to_string(), None),
+        | DomainError::ForwardNotFound(_)
+        | DomainError::ResourceGone(_)
+        | DomainError::SubNotFound(_) => ResourceErrorCategory::NotFound,
         DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
         | DomainError::Transport(_)
@@ -72,9 +107,14 @@ fn map_resource_error(err: DomainError) -> McpError {
         | DomainError::Internal(_)
         | DomainError::MaxCommandsExceeded { .. }
         | DomainError::MaxShellsExceeded { .. }
-        | DomainError::MaxTransfersExceeded { .. } => {
-            McpError::internal_error(err.to_string(), None)
-        }
+        | DomainError::MaxTransfersExceeded { .. }
+        | DomainError::LifecycleStateConflict { .. }
+        | DomainError::SessionRefcountUnderflow(_)
+        | DomainError::MaxSubsPerUriExceeded { .. }
+        | DomainError::MaxSubsTotalExceeded { .. }
+        | DomainError::LaneBufferFull { .. }
+        | DomainError::LagDetected { .. }
+        | DomainError::MuxBackpressure => ResourceErrorCategory::Internal,
     }
 }
 
@@ -87,6 +127,7 @@ fn map_resource_error(err: DomainError) -> McpError {
 #[cfg(not(feature = "port_forward"))]
 pub async fn list_resources_impl<SR, CR, ShR, TR>(
     use_case: &ListResourcesUseCase<SR, CR, ShR, TR>,
+    leak_probe: Option<&Arc<dyn LeakWatcherProbe>>,
 ) -> Result<ListResourcesResult, McpError>
 where
     SR: SessionRepository + Send + Sync,
@@ -97,9 +138,10 @@ where
     let outcome = use_case
         .execute(ListResourcesRequest)
         .await
-        .map_err(map_resource_error)?;
-    Ok(ListResourcesResult::with_all_items(
-        outcome.resources.iter().map(make_resource).collect(),
+        .map_err(|e| map_resource_error(&e))?;
+    Ok(attach_leak_warnings(
+        ListResourcesResult::with_all_items(outcome.resources.iter().map(make_resource).collect()),
+        leak_probe,
     ))
 }
 
@@ -111,6 +153,7 @@ where
 #[cfg(feature = "port_forward")]
 pub async fn list_resources_impl<SR, CR, ShR, TR, FR>(
     use_case: &ListResourcesUseCase<SR, CR, ShR, TR, FR>,
+    leak_probe: Option<&Arc<dyn LeakWatcherProbe>>,
 ) -> Result<ListResourcesResult, McpError>
 where
     SR: SessionRepository + Send + Sync,
@@ -122,10 +165,84 @@ where
     let outcome = use_case
         .execute(ListResourcesRequest)
         .await
-        .map_err(map_resource_error)?;
-    Ok(ListResourcesResult::with_all_items(
-        outcome.resources.iter().map(make_resource).collect(),
+        .map_err(|e| map_resource_error(&e))?;
+    Ok(attach_leak_warnings(
+        ListResourcesResult::with_all_items(outcome.resources.iter().map(make_resource).collect()),
+        leak_probe,
     ))
+}
+
+/// Attach a `_meta.warnings` array describing every in-effect
+/// `SUB_LEAK_RISK` alert. Pure helper so the cfg-gated list helpers
+/// share one implementation.
+///
+/// The MCP spec leaves `_meta` open-ended; we use `warnings` as a
+/// stable namespaced key MCP clients can branch on. Empty alert lists
+/// produce no `_meta` entry.
+fn attach_leak_warnings(
+    mut result: ListResourcesResult,
+    leak_probe: Option<&Arc<dyn LeakWatcherProbe>>,
+) -> ListResourcesResult {
+    let alerts = leak_probe.map_or_else(Vec::new, |p| p.current_alerts());
+    if alerts.is_empty() {
+        return result;
+    }
+    let mut meta = result.meta.unwrap_or_default();
+    meta.0
+        .insert("warnings".to_string(), build_warnings_meta(&alerts));
+    result.meta = Some(meta);
+    result
+}
+
+fn build_warnings_meta(alerts: &[LeakRiskAlert]) -> JsonValue {
+    let entries: Vec<JsonValue> = alerts.iter().map(alert_to_json).collect();
+    JsonValue::Array(entries)
+}
+
+/// Encode a single [`LeakRiskAlert`] as the per-warning JSON object the
+/// MCP `_meta.warnings` payload exposes. Pulled out so the parent
+/// helper stays under the 30-line cognitive threshold.
+fn alert_to_json(alert: &LeakRiskAlert) -> JsonValue {
+    let mut obj = JsonMap::new();
+    obj.insert(
+        "code".to_string(),
+        JsonValue::String("SUB_LEAK_RISK".to_string()),
+    );
+    obj.insert(
+        "resource".to_string(),
+        JsonValue::String(alert_canonical_uri(alert)),
+    );
+    obj.insert("age_ms".to_string(), JsonValue::Number(alert.age_ms.into()));
+    obj.insert(
+        "severity".to_string(),
+        JsonValue::String(severity_label(alert.severity).to_string()),
+    );
+    obj.insert(
+        "msg".to_string(),
+        JsonValue::String(format!(
+            "{} {} stayed Owned past the SUB_LEAK_RISK_WARN threshold",
+            kind_label(alert.kind),
+            alert.resource_id,
+        )),
+    );
+    JsonValue::Object(obj)
+}
+
+const fn severity_label(s: LeakRiskSeverity) -> &'static str {
+    match s {
+        LeakRiskSeverity::Warn => "warn",
+        LeakRiskSeverity::Kill => "kill",
+    }
+}
+
+const fn kind_label(k: ResourceKind) -> &'static str {
+    match k {
+        ResourceKind::Shell => "shell",
+        ResourceKind::Command => "command",
+        ResourceKind::Transfer => "transfer",
+        ResourceKind::Session => "session",
+        ResourceKind::Forward => "forward",
+    }
 }
 
 /// Render a single [`ResourceListing`] entry as an rmcp [`Resource`].
@@ -262,7 +379,10 @@ where
         uri: request.uri,
         peer_id: handle.id(),
     };
-    let outcome = use_case.execute(req).await.map_err(map_resource_error)?;
+    let outcome = use_case
+        .execute(req)
+        .await
+        .map_err(|e| map_resource_error(&e))?;
     Ok(ReadResourceResult::new(vec![render_outcome(outcome)]))
 }
 
@@ -292,7 +412,10 @@ where
         uri: request.uri,
         peer_id: handle.id(),
     };
-    let outcome = use_case.execute(req).await.map_err(map_resource_error)?;
+    let outcome = use_case
+        .execute(req)
+        .await
+        .map_err(|e| map_resource_error(&e))?;
     Ok(ReadResourceResult::new(vec![render_outcome(outcome)]))
 }
 
@@ -480,14 +603,15 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    use_case
+    let outcome = use_case
         .execute(SubscribeResourceRequest {
             uri: request.uri,
             peer: handle,
         })
         .await
-        .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))?;
+    log_subscribe_outcome(&outcome);
+    Ok(())
 }
 
 /// Handle `resources/subscribe` for the v4 server (with `port_forward`).
@@ -511,14 +635,29 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    use_case
+    let outcome = use_case
         .execute(SubscribeResourceRequest {
             uri: request.uri,
             peer: handle,
         })
         .await
-        .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))?;
+    log_subscribe_outcome(&outcome);
+    Ok(())
+}
+
+/// v5 Phase 2: log the synthesised `SubId` so operators can
+/// correlate subscriptions across logs. Phase 3 introduces a
+/// dedicated `ssh_subscribe` tool that returns the `SubId` in the
+/// response body.
+fn log_subscribe_outcome(outcome: &SubscribeResourceOutcome) {
+    if let Some(sub_id) = outcome.sub_id.as_ref() {
+        tracing::info!(
+            uri = %outcome.uri,
+            sub_id = %sub_id,
+            "resources/subscribe: SubId synthesised"
+        );
+    }
 }
 
 /// Handle `resources/unsubscribe` for the v4 server.
@@ -547,10 +686,16 @@ where
         .execute(UnsubscribeResourceRequest {
             uri: request.uri,
             peer_id,
+            // v5 Phase 2: the rmcp `resources/unsubscribe` schema
+            // does not carry a `sub_id` yet — Phase 3 introduces
+            // dedicated `ssh_sub_*` tools that pass it explicitly.
+            // For now the use case skips the lane close-by-id path
+            // when the protocol cannot supply the sub_id.
+            sub_id: None,
         })
         .await
         .map(|_outcome| ())
-        .map_err(map_resource_error)
+        .map_err(|e| map_resource_error(&e))
 }
 
 #[cfg(test)]
@@ -563,13 +708,13 @@ mod tests {
 
     #[test]
     fn invalid_argument_maps_to_invalid_params() {
-        let err = map_resource_error(DomainError::InvalidArgument("x".to_string()));
+        let err = map_resource_error(&DomainError::InvalidArgument("x".to_string()));
         assert!(err.message.contains('x'));
     }
 
     #[test]
     fn transport_error_maps_to_internal_error() {
-        let err = map_resource_error(DomainError::Transport("boom".to_string()));
+        let err = map_resource_error(&DomainError::Transport("boom".to_string()));
         assert!(err.message.contains("boom"));
     }
 
@@ -678,6 +823,92 @@ mod tests {
             }
             other => panic!("unexpected contents variant: {other:?}"),
         }
+    }
+
+    // -- v5 Phase 3 — list_resources WARN injection ------------------------
+
+    use super::attach_leak_warnings;
+    use crate::adapters::lifecycle::leak_watcher::{
+        LeakRiskAlert, LeakRiskSeverity, LeakWatcherProbe,
+    };
+    use crate::ports::subscriber_registry::ResourceKind;
+    use rmcp::model::ListResourcesResult;
+    use std::sync::Arc;
+
+    /// Test-only fake probe returning a fixed list.
+    #[derive(Debug)]
+    struct StubProbe {
+        alerts: Vec<LeakRiskAlert>,
+    }
+
+    impl LeakWatcherProbe for StubProbe {
+        fn current_alerts(&self) -> Vec<LeakRiskAlert> {
+            self.alerts.clone()
+        }
+        fn alert_for(&self, kind: ResourceKind, resource_id: &str) -> Option<LeakRiskAlert> {
+            self.alerts
+                .iter()
+                .find(|a| a.kind == kind && a.resource_id == resource_id)
+                .cloned()
+        }
+        fn alert_for_uri(&self, _uri: &str) -> Option<LeakRiskAlert> {
+            None
+        }
+    }
+
+    fn warn_alert(kind: ResourceKind, id: &str, age_ms: u64) -> LeakRiskAlert {
+        LeakRiskAlert {
+            kind,
+            resource_id: id.to_string(),
+            age_ms,
+            severity: LeakRiskSeverity::Warn,
+        }
+    }
+
+    #[test]
+    fn attach_leak_warnings_with_no_probe_keeps_meta_unset() {
+        let result = ListResourcesResult::with_all_items(vec![]);
+        let attached = attach_leak_warnings(result, None);
+        assert!(
+            attached.meta.is_none(),
+            "missing probe must leave _meta untouched"
+        );
+    }
+
+    #[test]
+    fn attach_leak_warnings_with_empty_alerts_keeps_meta_unset() {
+        let probe: Arc<dyn LeakWatcherProbe> = Arc::new(StubProbe { alerts: vec![] });
+        let result = ListResourcesResult::with_all_items(vec![]);
+        let attached = attach_leak_warnings(result, Some(&probe));
+        assert!(
+            attached.meta.is_none(),
+            "empty alerts must leave _meta untouched"
+        );
+    }
+
+    #[test]
+    fn attach_leak_warnings_populates_meta_with_alert_entries() {
+        let alerts = vec![
+            warn_alert(ResourceKind::Shell, "leaky-shell", 2_500),
+            warn_alert(ResourceKind::Command, "leaky-cmd", 4_000),
+        ];
+        let probe: Arc<dyn LeakWatcherProbe> = Arc::new(StubProbe { alerts });
+        let result = ListResourcesResult::with_all_items(vec![]);
+        let attached = attach_leak_warnings(result, Some(&probe));
+        let meta = attached.meta.expect("meta must be populated");
+        let warnings = meta.0.get("warnings").expect("warnings key present");
+        let arr = warnings.as_array().expect("warnings is array");
+        assert_eq!(arr.len(), 2);
+        let first = &arr[0];
+        assert_eq!(
+            first.get("code").and_then(|v| v.as_str()),
+            Some("SUB_LEAK_RISK")
+        );
+        assert_eq!(
+            first.get("resource").and_then(|v| v.as_str()),
+            Some("shell://leaky-shell/output")
+        );
+        assert_eq!(first.get("severity").and_then(|v| v.as_str()), Some("warn"));
     }
 }
 

@@ -6,15 +6,12 @@
 //! `crate::adapters::{ssh,sftp}::internal::*` (relocated in H17.6 P1) — they
 //! are adapter-side runtime state, not domain values.
 
-#[allow(
+#![allow(
     clippy::pub_use,
     reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the adapter boundary"
 )]
+
 pub use crate::adapters::ssh::internal::async_command::OutputBuffer;
-#[allow(
-    clippy::pub_use,
-    reason = "intentional re-export of v3 leaf value objects so domain code can refer to them without crossing the adapter boundary"
-)]
 pub use crate::adapters::ssh::internal::shell::RingBuffer;
 
 #[cfg(test)]

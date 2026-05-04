@@ -5,6 +5,67 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0-rc1] — 2026-05-04
+
+In flight on `feat/v5-foundation`. Phase 1 (lifecycle binding) and Phase 2 (channel mux + sub_id) merged; Phase 3 (LLM UX overhaul) and Phase 4 (NDJSON daemon) running in parallel by other agents, will land before the rc1 tag. Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). Design narrative: ADRs at [docs/adr/0001..0008.md](docs/adr/).
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    P1["Phase 1<br/>Lifecycle binding<br/>ADR 0003"]
+    P2["Phase 2<br/>Channel mux + sub_id<br/>ADR 0004"]
+    P3["Phase 3<br/>LLM UX overhaul<br/>ADR 0005 / 0007"]
+    P4["Phase 4<br/>NDJSON daemon<br/>ADR 0008"]
+
+    P1 --> P2 --> P3 --> P4
+
+    style P1 fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style P2 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style P3 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P4 fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+```
+
+### Highlights
+
+- **Subscribe-first architecture** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). `ResourceLifecycle` CAS state machine (`Owned → Observed → Releasing → Closed`) + per-session cascade refcount; grace timer arms when last subscriber detaches; new subscribes within the window cancel it; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` opts in. Default preserves v4 semantics.
+- **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)). Cursor key shifts from `(PeerId, Uri)` to `(SubId, Uri)` (UUIDv7); each subscribe call gets its own bounded `mpsc::channel(N)`, `LagPolicy` (default `Snapshot`), filter pipeline, replay window, and `SubscriberStats` (8 atomics). `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy hosts get a synthesised `sub_id`.
+- **LLM UX overhaul** (Phase 3 — in flight; [ADR 0005](docs/adr/0005-llm-ux-priorities.md), [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md)). 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher (default `SSH_SUB_LEAK_RISK_WARN_S = 2 s`).
+- **NDJSON daemon binary** (Phase 4 — in flight; [ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), [docs/DAEMON.md](docs/DAEMON.md)). `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds in-process rmcp client + server across `tokio::io::duplex`; stdin NDJSON ops, stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable. For tier-2 / tier-3 hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model.
+- **38-code error taxonomy** ([ADR 0007](docs/adr/0007-error-taxonomy.md), [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook)). 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics; centralised one-sentence DETAIL phrasing.
+- **Lock-free invariants extended** ([docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants)). New atomics for lifecycle (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker) and lane / mux (per-lane mpsc, cursor, pause flag, 8 stats atomics, mux_waker). Loom coverage 8 → 16 (Phase 1 + Phase 2 each add 4). Production clippy gate stays exit-0.
+- **MSRV bumped to Rust 1.95** (Rust 2024 edition baseline + AFIT).
+
+### Added
+
+- **Domain**: `src/domain/lifecycle.rs` (`LifecycleState`, `LifecyclePolicy`, `LifecycleSnapshot`, `SessionPolicy`, `DEFAULT_GRACE_MS`); `src/domain/subscription.rs` (`SubId` UUIDv7 wrapper, `LagPolicy`, `LogLevel`, `FilterRule`, `SubscriptionLifetime`, `SubscriberStats`).
+- **Ports**: `src/ports/{lifecycle_policy,channel_mux,subscriber_lane}.rs` — each with sync + async slice; `subscriber_lane.rs` also ships a `LaneAdmin` dyn-safe shim.
+- **Adapters**: `src/adapters/lifecycle/{mod,refcount,grace_timer,cascade}.rs` (Phase 1); `src/adapters/subscription/{subscriber_lane,channel_mux,filter,replay}.rs` (Phase 2).
+- **Domain errors**: `ResourceGone`, `LifecycleStateConflict`, `SessionRefcountUnderflow`, `SubNotFound`, `SubMaxPerUriExceeded`, `SubMaxTotalExceeded`, `LaneBufferFull`, `LagBackpressure`, `RingBufferOverflow`, `MuxBackpressure`, `GraceTimerExpired`.
+- **Env vars** (defaults preserve v4 behaviour) — full table in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Highlights: `SSH_LIFECYCLE_GRACE_MS=2000`, `SSH_SESSION_IDLE_GRACE_MS=5000`, `SSH_LAG_POLICY_DEFAULT=snapshot`, `SSH_LANE_BUFFER=1024`, `SSH_MUX_BUFFER=8192`, `SSH_BP_BLOCK_TIMEOUT_MS=5000`, `SSH_MAX_SUBS_PER_URI=16`, `SSH_MAX_SUBS_TOTAL=1024`, `SSH_SUB_LEAK_RISK_WARN_S=2`, `SSH_NDJSON_LINE_MAX=1m`, `SSH_HEARTBEAT_INTERVAL_S=30`, `SSH_DAEMON_STATS_INTERVAL_S=60`, `SSH_GRACE_HARD_TIMEOUT_S=30`.
+- **ADRs**: 0003 (lifecycle binding), 0004 (channel mux fairness), 0005 (LLM UX priorities), 0006 (backpressure policies), 0007 (error taxonomy), 0008 (NDJSON daemon protocol).
+- **Docs**: `docs/MIGRATION.md` (consolidated v2 → v3, v3 → v4, v4 → v5), `docs/DAEMON.md` (renamed from `INSTRUCTIONS_DAEMON.md`), `docs/OPERATIONS.md` (consolidates `TROUBLESHOOTING.md` + `ERRORS.md` + recovery flows from `FLOWS.md`), `docs/DEVELOPMENT.md` (consolidates `LOCKS.md` + hot-path flows + dev gates), `docs/LLM_GUIDE.md` (single canonical LLM doc — absorbs all of `docs/llm-ux/` + the prior `LLM_GUIDE.md`).
+- **Loom invariants**: 8 new interleavings in `tests/lockfree_invariants.rs` (Phase 1 and Phase 2 each add 4). Total: 16.
+
+### Changed
+
+- **Cursor key**: `(PeerId, Uri)` → `(SubId, Uri)` internally; legacy hosts get a synthesised `sub_id` per `(PeerId, Uri)` pair. Cursor advance, gap detection, and replay all key on `SubId` going forward.
+- **Default lane LagPolicy**: implicit broadcast `RecvError::Lagged` recovery (v4) → per-lane `Snapshot` (drop backlog + ring-buffer rebuild). Behaviour matches v4 semantics for slow subscribers; tunable via `SSH_LAG_POLICY_DEFAULT`.
+- **Session reaper** now consults `SessionLifecycle.active_refs > 0` before honouring inactivity TTL — refcount supersedes TTL.
+- **MSRV** 1.85 → 1.95.
+- **Subscription registry** adds `(SubId, Uri)` cursor index alongside the existing `(PeerId, Uri)` index (commit `4ccbca3`); both coexist while the lane fan-out runs against the SubId index.
+
+### Migrated
+
+Zero breaking changes on the wire; every delta is a new optional argument or env var with a v4-preserving default. v3 / v4 hosts pointed at v5 servers see no behavioural change unless they opt in. Full host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
+
+### Documentation
+
+- **Reorganised `docs/`** from 28 files (8990 lines) to 10 top-level files + 8 ADRs. Files: `README.md` (directory index, new), `LLM_GUIDE.md` (canonical LLM reference — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 38-code error handbook — absorbs all of `docs/llm-ux/`), `OPERATIONS.md` (operator runbook — symptom → cure tree, per-tool error catalogue, recovery flows — merges `TROUBLESHOOTING.md` + `ERRORS.md` + parts of `FLOWS.md`), `DEVELOPMENT.md` (build / clippy gates, lock-free invariants, hot-path sequence diagrams — merges `LOCKS.md` + parts of `FLOWS.md`), `DAEMON.md` (renamed from `INSTRUCTIONS_DAEMON.md`), `MIGRATION.md` (consolidated v2 → v3, v3 → v4, v4 → v5 from three separate files), plus the kept `ARCHITECTURE.md` / `API.md` / `RESOURCES.md` / `CONFIGURATION.md`. The 8 ADRs at `docs/adr/` are unchanged. Every Mermaid diagram preserved; cross-links updated.
+
+### Pre-existing flake noted
+
+`env_config_returns_v3_defaults_with_unset_env` lib test occasionally trips when running `cargo test` in parallel (env-var contention with sibling tests). Single-process runs are stable. Tracked for resolution before rc1 tags.
+
 ## [4.8.1] — 2026-05-04
 
 ### Highlights

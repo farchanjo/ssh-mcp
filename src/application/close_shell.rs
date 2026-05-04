@@ -29,8 +29,10 @@ use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::ShellId;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_registry::ResourceKind;
 
 /// Inbound DTO. Built by the rmcp tool wrapper (etapa H16).
 #[derive(Debug, Clone)]
@@ -61,6 +63,10 @@ where
 {
     ssh: Arc<S>,
     shells: Arc<ShR>,
+    /// v5 lifecycle: force-close the lifecycle entry so the cascade
+    /// coordinator decrements the owning session's active-resource
+    /// count.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<S, ShR> CloseShellUseCase<S, ShR>
@@ -70,8 +76,16 @@ where
 {
     /// Wire the use case from already-shared adapter handles.
     #[must_use]
-    pub const fn new(ssh: Arc<S>, shells: Arc<ShR>) -> Self {
-        Self { ssh, shells }
+    pub const fn new(
+        ssh: Arc<S>,
+        shells: Arc<ShR>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+    ) -> Self {
+        Self {
+            ssh,
+            shells,
+            lifecycle,
+        }
     }
 
     /// Drive the close orchestration. See module-level docs for the
@@ -92,6 +106,10 @@ where
         }
         self.ssh.close_shell(&shell_id).await?;
         self.shells.remove(&shell_id).await?;
+        // v5 lifecycle: drive the resource into the Closed state so
+        // the cascade coordinator can debit the session refcount.
+        self.lifecycle
+            .force_close(ResourceKind::Shell, shell_id.as_str())?;
         Ok(CloseShellOutcome { shell_id })
     }
 }
@@ -99,11 +117,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::{CloseShellRequest, CloseShellUseCase};
+    use crate::adapters::clock::system::SystemClock;
+    use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+    use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
     use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
     use crate::adapters::ssh::fake::{FakeSshCall, FakeSshClient};
     use crate::domain::error::DomainError;
     use crate::domain::ids::{SessionId, ShellId};
     use crate::domain::shell::{ShellEntity, ShellTerminal};
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::ports::shell_repo::ShellRepository;
     use chrono::Utc;
     use std::sync::Arc;
@@ -120,7 +142,11 @@ mod tests {
     fn build_wired() -> Wired {
         let ssh = Arc::new(FakeSshClient::new());
         let shells = Arc::new(DashMapShellRepo::new());
-        let uc = CloseShellUseCase::new(Arc::clone(&ssh), Arc::clone(&shells));
+        let cascade = CascadeCoordinator::new();
+        let clock = Arc::new(SystemClock);
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            RefcountedLifecycleAdapter::new(cascade, clock);
+        let uc = CloseShellUseCase::new(Arc::clone(&ssh), Arc::clone(&shells), lifecycle);
         Wired { uc, ssh, shells }
     }
 

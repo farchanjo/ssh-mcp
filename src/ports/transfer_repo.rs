@@ -6,7 +6,7 @@ use crate::domain::transfer::TransferEntity;
 
 /// Transfer repository port.
 #[trait_variant::make(TransferRepository: Send)]
-pub trait LocalTransferRepository: Send + Sync {
+pub trait LocalTransferRepository: Sync {
     /// Insert a transfer entity.
     ///
     /// # Errors

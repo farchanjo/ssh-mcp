@@ -44,10 +44,13 @@ use tokio::fs;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, TransferId};
+use crate::domain::lifecycle::LifecyclePolicy;
+use crate::domain::session::SessionEntity;
 use crate::domain::transfer::TransferEntity;
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::lifecycle_policy::{LifecyclePolicyPort, NoopLifecycle};
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::sftp_client::{SftpClientPort, UploadRequest as PortUploadRequest};
 use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryPort};
@@ -64,6 +67,8 @@ pub struct UploadRequest {
     pub local_path: String,
     /// Remote destination path.
     pub remote_path: String,
+    /// v5 Phase 3 — optional lifecycle policy override.
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
@@ -110,6 +115,9 @@ where
     ids: Arc<I>,
     config: Arc<Cfg>,
     subscribers: Arc<Sub>,
+    /// v5 lifecycle: tracks the freshly minted transfer so the
+    /// registry can drive refcount-aware close paths.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<F, SR, TR, C, I, Cfg, Sub> UploadFileUseCase<F, SR, TR, C, I, Cfg, Sub>
@@ -122,9 +130,12 @@ where
     Cfg: ConfigPort + Send + Sync,
     Sub: SubscriberRegistryPort + Send + Sync,
 {
-    /// Wire the use case from already-shared adapter handles.
+    /// Wire the use case from already-shared adapter handles. Use
+    /// [`Self::with_lifecycle`] to bind the v5 lifecycle adapter post
+    /// construction so the constructor stays under the
+    /// `too_many_arguments` clippy threshold.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         sftp: Arc<F>,
         sessions: Arc<SR>,
         transfers: Arc<TR>,
@@ -141,7 +152,15 @@ where
             ids,
             config,
             subscribers,
+            lifecycle: Arc::new(NoopLifecycle),
         }
+    }
+
+    /// Builder helper that swaps in the production v5 lifecycle adapter.
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: Arc<dyn LifecyclePolicyPort>) -> Self {
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// Drive the upload orchestration. See module-level docs for the
@@ -178,6 +197,16 @@ where
         let started_at = entity.started_at;
 
         self.persist_or_rollback(&transfer_id, entity).await?;
+        // v5 lifecycle binding: register the freshly spawned upload.
+        // The policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
+        self.lifecycle.track_resource(
+            ResourceKind::Transfer,
+            transfer_id.as_str(),
+            &req.session_id,
+            req.lifecycle_policy.unwrap_or_default(),
+        );
         self.subscribers
             .poke(ResourceKind::Transfer, transfer_id.as_str());
         // Touching the clock keeps the port plumbed even though the
@@ -218,10 +247,7 @@ where
 
     /// Resolve the session entity, mapping `Ok(None)` to
     /// [`DomainError::SessionNotFound`].
-    async fn lookup_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<crate::domain::session::SessionEntity, DomainError> {
+    async fn lookup_session(&self, session_id: &SessionId) -> Result<SessionEntity, DomainError> {
         self.sessions
             .get(session_id)
             .await?
@@ -401,6 +427,12 @@ mod tests {
         let ids = Arc::new(SequentialIds::default());
         let cfg = Arc::new(config);
         let registry = Arc::new(RecordingRegistry::new());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(
+                cascade,
+                Arc::clone(&clock),
+            );
         let uc = UploadFileUseCase::new(
             Arc::clone(&sftp),
             Arc::clone(&sessions),
@@ -409,7 +441,8 @@ mod tests {
             Arc::clone(&ids),
             Arc::clone(&cfg),
             Arc::clone(&registry),
-        );
+        )
+        .with_lifecycle(lifecycle);
         Wired {
             uc,
             sftp,
@@ -507,6 +540,7 @@ mod tests {
             session_id,
             local_path: seed_local_file("base"),
             remote_path: "/srv/dest.bin".to_string(),
+            lifecycle_policy: None,
         }
     }
 
