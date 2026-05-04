@@ -26,4 +26,5 @@
 
 pub mod cascade;
 pub mod grace_timer;
+pub mod leak_watcher;
 pub mod refcount;

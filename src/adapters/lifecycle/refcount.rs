@@ -36,7 +36,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -53,6 +53,27 @@ use crate::ports::subscriber_registry::ResourceKind;
 
 /// Composite key used by the lifecycle store.
 type ResourceKey = (ResourceKind, String);
+
+/// Read-only entry returned by [`RefcountedLifecycleAdapter::scan`].
+///
+/// Used by the `SUB_LEAK_RISK` leak watcher (v5 Phase 3) to surface
+/// resources that have stayed `Owned` past the warn threshold without
+/// `release_when_no_subs=true`.
+#[derive(Debug, Clone)]
+pub struct LifecycleScanEntry {
+    /// Resource scheme.
+    pub kind: ResourceKind,
+    /// Resource id portion of the URI.
+    pub resource_id: String,
+    /// Current lifecycle state.
+    pub state: LifecycleState,
+    /// Live subscriber count.
+    pub sub_count: usize,
+    /// Age of the resource in milliseconds (now − `created_at_ms`).
+    pub age_ms: u64,
+    /// Policy in effect.
+    pub policy: LifecyclePolicy,
+}
 
 /// Per-resource state record.
 ///
@@ -77,6 +98,10 @@ pub struct ResourceLifecycle {
     /// Owning session — used by the cascade coordinator to debit the
     /// session refcount on close.
     session_id: SessionId,
+    /// Creation time in Unix-millis. Stamped at construction; the
+    /// `SUB_LEAK_RISK` leak watcher (Phase 3) reads it to flag resources
+    /// that have stayed `Owned` past the warn threshold.
+    created_at_ms: AtomicU64,
 }
 
 impl fmt::Debug for ResourceLifecycle {
@@ -96,7 +121,7 @@ impl fmt::Debug for ResourceLifecycle {
 
 impl ResourceLifecycle {
     /// Build a fresh entry in [`LifecycleState::Owned`].
-    fn new(session_id: SessionId, policy: LifecyclePolicy) -> Arc<Self> {
+    fn new(session_id: SessionId, policy: LifecyclePolicy, now_ms: u64) -> Arc<Self> {
         Arc::new(Self {
             state: AtomicU8::new(LifecycleState::Owned.as_u8()),
             sub_count: AtomicUsize::new(0),
@@ -104,7 +129,16 @@ impl ResourceLifecycle {
             policy: ArcSwap::new(Arc::new(policy)),
             waker: Arc::new(Notify::new()),
             session_id,
+            created_at_ms: AtomicU64::new(now_ms),
         })
+    }
+
+    /// Read the resource creation time (Unix-millis).
+    ///
+    /// Stamped on `track_resource` and never mutated thereafter.
+    #[must_use]
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at_ms.load(Ordering::Acquire)
     }
 
     /// Decode the current state. Falls back to
@@ -112,7 +146,8 @@ impl ResourceLifecycle {
     /// this branch is unreachable in practice (only [`Self::cas_state`]
     /// writes the byte) but the strict lint baseline forbids `panic!`.
     pub fn current_state(&self) -> LifecycleState {
-        LifecycleState::from_u8(self.state.load(Ordering::Acquire)).unwrap_or(LifecycleState::Closed)
+        LifecycleState::from_u8(self.state.load(Ordering::Acquire))
+            .unwrap_or(LifecycleState::Closed)
     }
 
     /// Read the current subscriber count.
@@ -247,6 +282,37 @@ impl<C: ClockPort> RefcountedLifecycleAdapter<C> {
         self.get(kind, resource_id)
     }
 
+    /// Scan every tracked resource.
+    ///
+    /// Returns a [`LifecycleScanEntry`] per active entry — used by the
+    /// v5 Phase 3 `SUB_LEAK_RISK` leak watcher. Skips closed resources
+    /// so the watcher never warns on lanes that are already in their
+    /// cleanup window.
+    #[must_use]
+    pub fn scan(&self) -> Vec<LifecycleScanEntry> {
+        let now = self.now_ms();
+        self.resources
+            .iter()
+            .filter_map(|entry| {
+                let lc = entry.value();
+                let state = lc.current_state();
+                if state == LifecycleState::Closed {
+                    return None;
+                }
+                let created_at = lc.created_at_ms();
+                let age_ms = now.saturating_sub(created_at);
+                Some(LifecycleScanEntry {
+                    kind: entry.key().0,
+                    resource_id: entry.key().1.clone(),
+                    state,
+                    sub_count: lc.sub_count(),
+                    age_ms,
+                    policy: lc.policy(),
+                })
+            })
+            .collect()
+    }
+
     /// Drive `Owned -> Observed` or `Releasing -> Observed`. Returns
     /// the post-transition state so callers can branch on whether a
     /// grace timer needs to be cancelled.
@@ -319,7 +385,8 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
             existing.policy.store(Arc::new(policy));
             return;
         }
-        let entry = ResourceLifecycle::new(session_clone, policy);
+        let now_ms = self.now_ms();
+        let entry = ResourceLifecycle::new(session_clone, policy, now_ms);
         self.resources.insert(key, entry);
         // First-time tracking debits the session refcount so the
         // cascade coordinator knows the session has at least one
@@ -677,7 +744,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         let snap = a.snapshot(ResourceKind::Shell, "sh-1").expect("snap");
-        assert_eq!(snap.sub_count, 0, "counter must be restored after underflow");
+        assert_eq!(
+            snap.sub_count, 0,
+            "counter must be restored after underflow"
+        );
     }
 
     #[test]
@@ -847,9 +917,7 @@ mod tests {
         a.on_subscribe(ResourceKind::Shell, "sh-1").expect("sub");
         a.on_unsubscribe(ResourceKind::Shell, "sh-1").expect("uns");
         a.cancel_grace_timer(ResourceKind::Shell, "sh-1").await;
-        let entry = a
-            .entry(ResourceKind::Shell, "sh-1")
-            .expect("entry present");
+        let entry = a.entry(ResourceKind::Shell, "sh-1").expect("entry present");
         assert_eq!(entry.grace_until_ms(), 0);
     }
 
