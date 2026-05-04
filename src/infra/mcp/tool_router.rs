@@ -3185,150 +3185,52 @@ fn server_capabilities() -> ServerCapabilities {
         .build()
 }
 
-/// Few-shot bootstrap text for the `port_forward` build (v5.0 — 21
-/// legacy + 9 sub_* + 1 forward = 30 tools / 5 streams). Embeds the
-/// 70B-class root prompt from `docs/llm-ux/INSTRUCTIONS_70B.md`.
-///
-/// Subscribe-first: every long-running resource MUST have an active
-/// observer between creation and close. Five layered escalations
-/// (golden rules, push-first happy paths, fallbacks, tradeoff guide,
-/// cleanup checklist) so a 27B-class model still picks up the
-/// invariants even when it stops reading after the first 200 tokens.
+/// Few-shot bootstrap text for the `port_forward` build (21 tools / 5
+/// streams). Three canonical workflows steer 27B-class models away from
+/// the most common failure modes (forgetting `wait=true`, leaking
+/// sessions, polling instead of subscribing). v4.7 adds `ssh_run` +
+/// batches and the `structured_content` channel.
 #[cfg(feature = "port_forward")]
-const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP v5.0. Subscribe-first. 30 \
-tools (21 v4-compat + 8 sub operations + ssh_forward). All responses: \
-KEY: value markdown + typed JSON in structured_content. IDs end in _ID. \
-NEXT: line lists successor tools push-first.\n\
+const INSTRUCTIONS_WITH_FORWARD: &str = "SSH MCP. 21 tools, 5 push streams \
+(shell://, command://, transfer://, session://, forward://). All tools return \
+block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
+structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
-GOLDEN RULES:\n\
- 1. Every long-running resource (shell://, command://, transfer://, \
-forward://) MUST have >=1 active subscriber between creation and close. \
-If you cannot guarantee a subscriber, set release_when_no_subs=true at \
-creation time so the server self-cleans after grace_ms.\n\
- 2. Track every sub_id from ssh_subscribe. Call ssh_unsubscribe(sub_id) \
-before the workflow ends. Forgotten subs leak lanes until peer GC fires.\n\
- 3. After every nontrivial workflow query ssh_sub_stats. lagged_drops>0? \
-Pick lag_policy=snapshot (default, ring-buffer rebuild) or block_slow \
-(zero loss, producer blocks; SSH_BP_BLOCK_TIMEOUT_MS).\n\
- 4. On any error path call ssh_disconnect_agent(agent_id). Idempotent, \
-cascades through every owned session and resource. Pass a stable \
-agent_id at ssh_connect so cleanup is unambiguous.\n\
- 5. Never poll ssh_shell_read in a loop. Use ssh_subscribe and consume \
-notifications/resources/updated events; resources/read?cursor=auto to \
-drain the delta.\n\
+Happy paths:\n\
+1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
+2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
+ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
+3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. \
+Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
+resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
+4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
 \n\
-PUSH-FIRST HAPPY PATHS:\n\
-1) Async cmd:\n\
-   ssh_connect(agent_id, reuse=Auto)\n\
-   -> ssh_execute(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=command://<cid>/output, lifetime=auto-close, \
-lag_policy=snapshot)\n\
-   -> drain push events until ev=completed (carries exit code).\n\
-2) Interactive shell:\n\
-   ssh_connect -> ssh_shell_open(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=shell://<sid>/output, lifetime=auto-close)\n\
-   -> ssh_shell_write or ssh_shell_send_key\n\
-   -> ssh_shell_wait_for(pattern) to synchronise.\n\
-3) Upload + progress:\n\
-   ssh_upload(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=transfer://<tid>/progress, lifetime=auto-close)\n\
-   -> consume bytes_transferred until completion event.\n\
-\n\
-FALLBACK PATHS (only when host has no subscribe support):\n\
-4) ssh_run(address, username, command [, disconnect_after=true]) returns \
-exit_code in one call.\n\
-5) ssh_execute -> ssh_get_command_output(wait=true, wait_timeout_secs=30).\n\
-\n\
-TRADEOFF GUIDE:\n\
-lifetime: manual (explicit unsubscribe) | auto-close (last-sub triggers \
-grace; default for new code) | lease (bounded TTL).\n\
-lag_policy: snapshot (default; ring-buffer rebuild on overflow) | \
-block_slow (zero loss; producer awaits; SSH_BP_BLOCK_TIMEOUT_MS) | \
-drop_oldest / drop_newest (explicit gap markers; rare).\n\
-\n\
-CLEANUP CHECKLIST (run at every workflow boundary):\n\
-- ssh_unsubscribe every sub_id (or rely on lifetime=auto-close).\n\
-- ssh_shell_close / ssh_cancel_command for resources without auto-close.\n\
-- ssh_disconnect_agent(agent_id) on any error path.\n\
-- ssh_disconnect for graceful single-session close.\n\
-\n\
-WIRE CONTRACT:\n\
-- HINT: REQUIRED NEXT STEP: ... -> mandatory follow-up.\n\
-- HINT: RECOMMENDED: ...        -> soft suggestion.\n\
-- NEXT: <tool> | <tool> | ...   -> push-first ordered successors.\n\
-- _meta.idempotency_key on mutating tools dedupes retries (TTL: \
-SSH_IDEMPOTENCY_TTL_SECS, default 300s).\n\
-- WARN: SUB_LEAK_RISK on a list response = a Phase-1 lifecycle hint \
-that one of your resources has 0 subs and no auto-cleanup.\n\
-\n\
-ERROR TAXONOMY (full handbook in docs/llm-ux/ERROR_HANDBOOK.md):\n\
-AUTH never retry. TRANSPORT exponential backoff (cap 10s). REMOTE LLM \
-judges exit_code. RESOURCE never retry; recreate. POLICY retry after \
-policy change. STATE retry only with fresh _meta.idempotency_key. \
-INTERNAL never retry; collect logs + report. DETAIL on every error \
-carries a one-sentence cure tuned for direct LLM consumption.";
+Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
+lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 /// Few-shot bootstrap text for the build without `port_forward`
-/// (v5.0 — 21 v4-compat + 8 sub_* = 29 tools / 4 streams).
-/// Identical workflows minus the `forward://` stream and ssh_forward.
+/// (20 tools / 4 streams). Identical workflows minus the `forward://`
+/// stream; the catalogue claim is dropped so callers do not look for
+/// `ssh_forward`.
 #[cfg(not(feature = "port_forward"))]
-const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP v5.0. Subscribe-first. 29 \
-tools (20 v4-compat + 8 sub operations + ssh_run). All responses: \
-KEY: value markdown + typed JSON in structured_content. IDs end in _ID. \
-NEXT: line lists successor tools push-first.\n\
+const INSTRUCTIONS_WITHOUT_FORWARD: &str = "SSH MCP. 20 tools, 4 push streams \
+(shell://, command://, transfer://, session://). All tools return block \
+markdown (KEY: value, --- name [nonce] ---) + a typed JSON in \
+structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\
 \n\
-GOLDEN RULES:\n\
- 1. Every long-running resource (shell://, command://, transfer://) MUST \
-have >=1 active subscriber between creation and close. If you cannot \
-guarantee a subscriber, set release_when_no_subs=true at creation time \
-so the server self-cleans after grace_ms.\n\
- 2. Track every sub_id from ssh_subscribe. Call ssh_unsubscribe(sub_id) \
-before the workflow ends. Forgotten subs leak lanes until peer GC fires.\n\
- 3. After every nontrivial workflow query ssh_sub_stats. lagged_drops>0? \
-Pick lag_policy=snapshot (default) or block_slow (zero loss, producer \
-blocks; SSH_BP_BLOCK_TIMEOUT_MS).\n\
- 4. On any error path call ssh_disconnect_agent(agent_id). Idempotent, \
-cascades through every owned session and resource.\n\
- 5. Never poll ssh_shell_read in a loop. Use ssh_subscribe and consume \
-notifications/resources/updated events.\n\
+Happy paths:\n\
+1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n\
+2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then \
+ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n\
+3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if \
+prompt arrives within 100ms). Then resources/subscribe shell://<SHELL_ID>/output. \
+Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via \
+resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n\
+4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\
 \n\
-PUSH-FIRST HAPPY PATHS:\n\
-1) Async cmd:\n\
-   ssh_connect -> ssh_execute(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=command://<cid>/output, lifetime=auto-close)\n\
-   -> drain events until ev=completed.\n\
-2) Interactive shell:\n\
-   ssh_connect -> ssh_shell_open(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=shell://<sid>/output, lifetime=auto-close)\n\
-   -> ssh_shell_write / ssh_shell_send_key.\n\
-3) Upload + progress:\n\
-   ssh_upload(release_when_no_subs=true)\n\
-   -> ssh_subscribe(uri=transfer://<tid>/progress, lifetime=auto-close).\n\
-\n\
-FALLBACK PATHS (no subscribe support):\n\
-4) ssh_run(address, username, command [, disconnect_after=true]).\n\
-5) ssh_execute -> ssh_get_command_output(wait=true, wait_timeout_secs=30).\n\
-\n\
-TRADEOFF GUIDE:\n\
-lifetime: manual | auto-close (default for new code) | lease.\n\
-lag_policy: snapshot (default) | block_slow | drop_oldest | drop_newest.\n\
-\n\
-CLEANUP CHECKLIST:\n\
-- ssh_unsubscribe every sub_id (or lifetime=auto-close).\n\
-- ssh_shell_close / ssh_cancel_command without auto-close.\n\
-- ssh_disconnect_agent(agent_id) on error.\n\
-- ssh_disconnect for graceful single-session close.\n\
-\n\
-WIRE CONTRACT:\n\
-- HINT: REQUIRED NEXT STEP -> mandatory. RECOMMENDED -> soft.\n\
-- NEXT: <tool> | <tool> -> push-first successors.\n\
-- _meta.idempotency_key dedupes mutating retries.\n\
-- WARN: SUB_LEAK_RISK = lifecycle hint of a resource with 0 subs.\n\
-\n\
-ERROR TAXONOMY (docs/llm-ux/ERROR_HANDBOOK.md):\n\
-AUTH/RESOURCE/INTERNAL never retry. TRANSPORT exponential backoff. \
-POLICY retry conditional. STATE retry only with idem key. \
-DETAIL carries the one-sentence cure.";
+Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT \
+lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 // ---------------------------------------------------------------------------
 // `#[tool_handler]` impl
