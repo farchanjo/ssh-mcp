@@ -96,13 +96,13 @@ mutex_atomic                    = "deny"
 mutex_integer                   = "deny"
 ```
 
-The lock-free state carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`) keep zero `Mutex` fields. The new `adapters::repo::dashmap::*` repositories follow the v3 snapshot-then-drop-guard pattern. See [LOCKS.md](../LOCKS.md) for the v4 acquisition order, channel-capacity table, and decision tree.
+The lock-free state carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`) keep zero `Mutex` fields. The new `adapters::repo::dashmap::*` repositories follow the v3 snapshot-then-drop-guard pattern. See [DEVELOPMENT.md → Lock-free invariants](../DEVELOPMENT.md#lock-free-invariants) for the v4 acquisition order, channel-capacity table, and decision tree.
 
 ### Public MCP API unchanged
 
 Same 18 tools. Same 5 resource schemes. Same response markdown shape. Same env vars. Same capability handshake (`V_2025_06_18`, `tools.listChanged=true`, `resources.{subscribe,listChanged}=true`). Same default ports. A v3 host pointed at a v4 server sees no observable difference.
 
-See [MIGRATION_v3_to_v4.md](../MIGRATION_v3_to_v4.md) for the contributor-facing change log.
+See [MIGRATION.md → v3 → v4](../MIGRATION.md#v3--v4) for the contributor-facing change log.
 
 ## Alternatives considered
 
@@ -178,5 +178,5 @@ Rejected at the time. H17.6 (foundational decoupling — absorb the surviving `s
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — full layer breakdown and module map.
 - [LOCKS.md](../LOCKS.md) — lock-free invariants under the new layout.
-- [MIGRATION_v3_to_v4.md](../MIGRATION_v3_to_v4.md) — contributor-facing migration guide.
+- [MIGRATION.md → v3 → v4](../MIGRATION.md#v3--v4) — contributor-facing migration guide.
 - [adr/0001-migrate-to-rmcp.md](./0001-migrate-to-rmcp.md) — v3 transport choice (still in force).

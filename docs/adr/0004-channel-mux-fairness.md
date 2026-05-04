@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation tracked under Phase 2 of the v5 roadmap. Depends on ADR 0003 (Lifecycle Binding).
+Accepted. Implemented in v5.0 (Phase 2 of the v5 roadmap, commit `30fbdd9`); carried forward unchanged into v6.0. Depends on ADR 0003 (Lifecycle Binding).
 
 ## Context
 
@@ -180,4 +180,4 @@ Critically, the **resource policy is set by the resource's creator (open_shell /
 - [ADR 0006 — Backpressure Policies](./0006-backpressure-policies.md) — defines LagPolicy semantics in detail.
 - [ADR 0008 — NDJSON Daemon Protocol](./0008-ndjson-daemon-protocol.md) — primary consumer of the channel mux.
 - [docs/RESOURCES.md](../RESOURCES.md) — resource scheme contract.
-- [docs/LOCKS.md](../LOCKS.md) — lock-free invariants.
+- [docs/DEVELOPMENT.md → Lock-free invariants](../DEVELOPMENT.md#lock-free-invariants) — lock-free invariants.

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.2.0). Implemented end-to-end on `master`.
+Accepted. Implemented end-to-end in v5.2.0; carried forward unchanged into v6.0 (with the v6.0 tool-name normalisation: `serial_*` eixo).
 
 ## Context
 

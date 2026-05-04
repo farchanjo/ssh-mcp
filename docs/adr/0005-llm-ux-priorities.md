@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (v5.0.0). Implementation tracked under Phase 3 of the v5 roadmap. Depends on ADR 0003 (Lifecycle Binding) and ADR 0004 (Channel Mux).
+Accepted. Implemented in v5.0 (Phase 3 of the v5 roadmap); carried forward unchanged into v6.0. Depends on ADR 0003 (Lifecycle Binding) and ADR 0004 (Channel Mux).
 
 ## Context
 
@@ -216,7 +216,7 @@ The full taxonomy lives in ADR 0007.
 ### Negative
 
 - **Larger response bodies.** The added `Hygiene:`, `WARN:`, and richer `HINT` lines grow the per-tool response by ~80 bytes on average. Negligible at the daemon level but worth noting at high throughput. The structured-content channel (JSON) is unchanged in size.
-- **Documentation surface to maintain.** Three new directories (`docs/llm-ux/`) plus per-tool description rewrites mean docs/code drift is an active risk. Phase 6 commits CLAUDE.md, README, INSTRUCTIONS_*.md, ANTIPATTERNS.md, ERROR_HANDBOOK.md, GOLDEN_RULES.md to align everything; CI lint catches drift.
+- **Documentation surface to maintain.** Per-tool description rewrites mean docs/code drift is an active risk. The `docs/` reorganisation collapsed the original `docs/llm-ux/` tree into a single canonical [docs/LLM_GUIDE.md](../LLM_GUIDE.md) (golden rules + anti-patterns + error handbook); CLAUDE.md, README, MIGRATION align with that single doc; CI lint catches drift.
 
 ### Neutral
 
@@ -228,6 +228,4 @@ The full taxonomy lives in ADR 0007.
 - [ADR 0003 — Lifecycle Binding](./0003-lifecycle-binding.md) — surfaces the `release_when_no_subs` flag this ADR exposes.
 - [ADR 0004 — Channel Mux](./0004-channel-mux-fairness.md) — provides the sub_id / lag policy / filter primitives.
 - [ADR 0007 — Error Taxonomy](./0007-error-taxonomy.md) — code-by-code DETAIL definitions.
-- [docs/llm-ux/GOLDEN_RULES.md](../llm-ux/GOLDEN_RULES.md) (forthcoming).
-- [docs/llm-ux/ANTIPATTERNS.md](../llm-ux/ANTIPATTERNS.md) (forthcoming).
-- [docs/llm-ux/ERROR_HANDBOOK.md](../llm-ux/ERROR_HANDBOOK.md) (forthcoming).
+- [docs/LLM_GUIDE.md](../LLM_GUIDE.md) — single canonical LLM doc (golden rules, anti-patterns, error handbook). Absorbed the original `docs/llm-ux/{GOLDEN_RULES,ANTIPATTERNS,ERROR_HANDBOOK}.md` files.

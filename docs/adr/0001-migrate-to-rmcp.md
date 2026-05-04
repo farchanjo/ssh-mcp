@@ -80,7 +80,7 @@ mutex_atomic                    = "deny"
 mutex_integer                   = "deny"
 ```
 
-`RunningShell`, `RunningCommand`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, and `SubscriptionRegistry` are entirely lock-free in production paths (`Arc<ArcSwap<T>>`, atomics, `OnceCell`, broadcast / mpsc channels, `DashMap`). See [LOCKS.md](../LOCKS.md) for the full pattern catalogue.
+`RunningShell`, `RunningCommand`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, and `SubscriptionRegistry` are entirely lock-free in production paths (`Arc<ArcSwap<T>>`, atomics, `OnceCell`, broadcast / mpsc channels, `DashMap`). See [DEVELOPMENT.md → Lock-free invariants](../DEVELOPMENT.md#lock-free-invariants) for the full pattern catalogue.
 
 ## Alternatives considered
 
