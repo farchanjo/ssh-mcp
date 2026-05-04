@@ -149,8 +149,8 @@ fn build_get_command_output_head(
 /// updates or long-poll the same tool.
 fn next_hint_for_running_command(command_id: &str) -> String {
     format!(
-        "resources/subscribe command://{command_id}/output | \
-         ssh_get_command_output(command_id={command_id}, wait=true)"
+        "ssh_subscribe uri=command://{command_id}/output (preferred) | \
+         ssh_get_command_output(command_id={command_id}, wait=true) (poll fallback)"
     )
 }
 
@@ -208,7 +208,28 @@ pub fn list_commands_render_with_warnings(
         append_command_item(&mut out, c);
     }
     append_sub_leak_risk_warnings(&mut out, alerts);
+    append_next_for_running(&mut out, &commands);
     out
+}
+
+/// Append a `NEXT:` line steering toward `ssh_subscribe` (preferred) for
+/// the first running command in a list. Honours v5 narrative closure:
+/// discovery flows terminate in a push lane, with poll listed as fallback.
+fn append_next_for_running(out: &mut String, commands: &[CommandEntity]) {
+    if let Some(running) = commands
+        .iter()
+        .find(|c| matches!(c.status, CommandStatus::Running))
+    {
+        let id = running.id.as_str();
+        append_next_line(
+            out,
+            &format!(
+                "ssh_subscribe uri=command://{id}/output (preferred for running entries) | \
+                 ssh_get_command_output(command_id={id}, wait=true) (poll fallback) | \
+                 ssh_cancel_command(command_id={id})"
+            ),
+        );
+    }
 }
 
 fn append_command_item(out: &mut String, c: &CommandEntity) {
