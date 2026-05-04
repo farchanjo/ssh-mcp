@@ -118,10 +118,10 @@ pub struct RusshAdapterConfig {
 impl Default for RusshAdapterConfig {
     fn default() -> Self {
         Self {
-            default_command_timeout: Duration::from_secs(180),
+            default_command_timeout: Duration::from_mins(3),
             max_retries: 3,
             retry_delay: Duration::from_secs(1),
-            inactivity_timeout: Duration::from_secs(300),
+            inactivity_timeout: Duration::from_mins(5),
             compression_enabled: true,
             persistent: false,
             health_probe_timeout: Duration::from_secs(10),
@@ -337,7 +337,7 @@ impl RusshAdapter {
 
     /// Wire a bridge that registers / unregisters async commands in the
     /// domain `CommandRepository` as the adapter binds them in / removes
-    /// them from its private DashMap. v4.3 fix: closes the race window
+    /// them from its private `DashMap`. v4.3 fix: closes the race window
     /// where `resources/subscribe command://X/output` could observe an
     /// adapter row but no repo row.
     #[must_use]
@@ -794,7 +794,7 @@ impl RusshAdapter {
     /// Mint a deterministic-shape shell id derived from the session id
     /// and the adapter-side counter. Lives here (outside the trait
     /// impl) so the function can stay short and self-explanatory.
-    fn mint_shell_id(&self, session_id: &SessionId) -> ShellId {
+    fn mint_shell_id(session_id: &SessionId) -> ShellId {
         // Use a UUIDv4 suffix so concurrent `ssh_shell_open` calls on the
         // same session never mint colliding ids. The previous `len()`-based
         // counter was racy: multiple callers could observe the same length
@@ -915,24 +915,22 @@ impl RusshAdapter {
             running,
         };
         self.register_async_command(&command_id, record)?;
-        let entity = CommandEntity::new(
-            command_id.clone(),
-            session_id.clone(),
-            command.clone(),
-            started_at,
-        );
-        // v4.3 fix: register the row in the domain `CommandRepository`
-        // immediately so resource subscribers can observe the live
-        // command without waiting for the use-case-side `insert`. The
-        // sink swallows duplicate-id errors so a use case that already
-        // inserted is still happy. Spawned because `do_execute_async`
-        // stays synchronous (the background driver is fired-and-forget).
-        let sink = Arc::clone(&self.command_registration_sink);
-        let entity_for_sink = entity.clone();
-        tokio::spawn(async move {
-            sink.register(entity_for_sink).await;
-        });
+        let entity = CommandEntity::new(command_id, session_id, command, started_at);
+        self.spawn_command_registration(entity.clone());
         Ok(CommandHandle { entity })
+    }
+
+    /// v4.3 fix: register the row in the domain `CommandRepository`
+    /// immediately so resource subscribers can observe the live command
+    /// without waiting for the use-case-side `insert`. The sink swallows
+    /// duplicate-id errors so a use case that already inserted is still
+    /// happy. Spawned because `do_execute_async` stays synchronous (the
+    /// background driver is fired-and-forget).
+    fn spawn_command_registration(&self, entity: CommandEntity) {
+        let sink = Arc::clone(&self.command_registration_sink);
+        tokio::spawn(async move {
+            sink.register(entity).await;
+        });
     }
 
     /// Spawn both the russh driver and the status watcher for a freshly
@@ -979,7 +977,7 @@ impl RusshAdapter {
         )
         .await
         .map_err(|e| DomainError::Transport(format!("CHANNEL_FAILED: {e}")))?;
-        let shell_id = self.mint_shell_id(session_id);
+        let shell_id = Self::mint_shell_id(session_id);
         // v4.7.1 fix (BUG #1): honour the per-call buffer-size override on
         // both the persisted entity AND the runtime ring buffer. The
         // reader task reads the cap from `RunningShell.max_buffer_size`,
