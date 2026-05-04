@@ -1,8 +1,8 @@
-# SSH MCP API Reference (v4.8.0)
+# SSH MCP API Reference (v6.0)
 
-Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.8.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 / v4.7.x; the v4.7 `structured_content` payload sits next to it. v4.8 lifts typed `output_schema` advertisement to **all 21 tools** (was 9 in v4.7). v4.7 added three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_exec_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4).
+Complete API reference for the **36 MCP tools** (or 35 without `port_forward`) split across three semantic eixos — **`ssh_*`** (21), **`sub_*`** (9), **`serial_*`** (6) — the **6 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v6.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), and v6.0 only renames tool strings (resource URIs / push narrative / error taxonomy / structured content payloads carry forward unchanged). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v5 → v6](./MIGRATION.md#v5--v6).
 
-> **v4.8 — full `output_schema` coverage.** Every tool now publishes a typed JSON Schema on `tools/list[].outputSchema` mirroring its `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can validate every tool response against the published shape without hard-coding any field names. Strictly additive on the `tools/list` metadata; the Markdown body and `structured_content` JSON shape are byte-identical to v4.7.1. Reference: `src/infra/mcp/results.rs` (21 typed structs).
+> **v6.0 — wire-breaking on tool name strings only.** Resource URI schemes, `_meta` envelope, structured-content schemas, error taxonomy (38 codes), and env vars are byte-identical to v5.3.x. Apply the sed snippet in [MIGRATION.md → v5 → v6](./MIGRATION.md#v5--v6) and ship.
 
 > **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). v4.8 expanded `output_schema` advertisement from 9 / 21 to 21 / 21 tools. Errors render as `{ tool, status: "error", code, reason, detail }` on the structured channel. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
@@ -10,7 +10,7 @@ Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 
 
 > **v4.6 wire change** — `AGENT:` -> `AGENT_ID:` (7 render sites). Hosts that grep `^AGENT:` literally must update; generic key-value parsers unaffected.
 
-> **Subscribe-first** — prefer `resources/subscribe <scheme>://<id>/<sub-path>` over long-poll `wait=true`. v4.6 `HINT:` + `NEXT:` lines reinforce this on every async-spawn response. See [LLM_GUIDE.md](./LLM_GUIDE.md).
+> **Subscribe-first** — prefer `sub_open uri=<scheme>://<id>/<sub-path>` over long-poll `wait=true`. The legacy `resources/subscribe` JSON-RPC method still works (v3 → v6 wire-compatible) but `sub_open` returns a `SUB_ID` you can drive (`sub_pause`, `sub_filter`, `sub_replay`, `sub_close`). `HINT:` + `NEXT:` lines reinforce this on every async-spawn response. See [LLM_GUIDE.md](./LLM_GUIDE.md).
 
 [[_TOC_]]
 
@@ -278,6 +278,8 @@ Execute a shell command asynchronously. Returns immediately with a `COMMAND_ID`.
 | `command` | `string` | — | Shell command to run on the remote host. |
 | `timeout_secs` | `u64?` | `180` | Command timeout (env `SSH_COMMAND_TIMEOUT`). |
 | `pty` | `bool?` | `false` | Allocate a PTY for the command (e.g. `sudo`, `top`). All output merges to stdout in PTY mode. |
+| `release_when_no_subs` | `bool?` | `false` | v5 lifecycle: when `true`, the `command://<id>/output` resource auto-closes after the last `sub_close` ([ADR 0003](./adr/0003-lifecycle-binding.md)). Default `false` preserves v4 manual-cancel semantics. |
+| `grace_ms` | `u32?` | `2000` | v5 lifecycle: grace window (ms) between last `sub_close` and `Closed` when `release_when_no_subs=true`. Per-call only — no env-var override. |
 
 Limits: up to 100 concurrent multiplexed commands per session.
 
@@ -334,7 +336,7 @@ COMMAND_ID: 7d4c8e2a-...
 --- stdout [a3f2b1d7] (partial) ---
 ... bytes so far ...
 --- stderr [a3f2b1d7] (empty) ---
-NEXT: resources/subscribe command://7d4c8e2a-.../output | ssh_exec_output(command_id=7d4c8e2a-..., wait=true)
+NEXT: sub_open uri=command://7d4c8e2a-.../output (PREFERRED — push-first) | ssh_exec_output(command_id=7d4c8e2a-..., wait=true)
 ```
 
 The v4.6 `NEXT:` on `RUNNING` steers toward subscribe-first push or a single long-poll instead of a tight polling loop.
@@ -491,6 +493,8 @@ Open an interactive PTY shell on a session.
 | `rows` | `u32?` | `24` | Terminal height. |
 | `inactivity_ttl` | `u64?` | `600` | Auto-close after N seconds of no activity (env `SSH_SHELL_INACTIVITY_TTL`). |
 | `max_buffer_size` | `string?` | `"10m"` | Output buffer cap (`b/k/m/g/t` suffixes; env `SSH_SHELL_MAX_BUFFER_SIZE`). |
+| `release_when_no_subs` | `bool?` | `false` | v5 lifecycle: when `true`, the `shell://<id>/output` resource auto-closes after the last `sub_close` ([ADR 0003](./adr/0003-lifecycle-binding.md)). Default `false` preserves v4 manual-close semantics. |
+| `grace_ms` | `u32?` | `2000` | v5 lifecycle: grace window (ms) between last `sub_close` and `Closed` when `release_when_no_subs=true`. Per-call only — no env-var override. |
 
 Limits: up to 10 shells per session (`MAX_SHELLS_PER_SESSION`).
 
@@ -505,7 +509,7 @@ TERM: xterm 80x24
 AGENT_ID: claude-code-instance-abc123
 INITIAL_BUFFER: Last login: Sat May  3 14:22:01 2026 from 10.0.0.4\r\n$ 
 HINT: subscribe to shell://4b9c8e2a-.../output for realtime output (preferred over polling)
-NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_shell_press
+NEXT: sub_open uri=shell://4b9c8e2a-.../output (PREFERRED — push-first) | ssh_shell_write | ssh_shell_press
 ```
 
 `TERM` carries the terminal type and the geometry on a single line (`<term> <cols>x<rows>`). `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when no agent owns the session. The v4.6 `HINT:` steers toward push notifications; `NEXT:` names the three successor calls.
@@ -705,6 +709,8 @@ Upload a local file to a remote path via SFTP. Streams in 32 KiB chunks.
 | `session_id` | `string` | — | `SESSION_ID`. |
 | `local_path` | `string` | — | Local file. Relative paths resolve against `$HOME`. |
 | `remote_path` | `string` | — | Remote destination. |
+| `release_when_no_subs` | `bool?` | `false` | v5 lifecycle: when `true`, the `transfer://<id>/progress` resource auto-closes after the last `sub_close` ([ADR 0003](./adr/0003-lifecycle-binding.md)). |
+| `grace_ms` | `u32?` | `2000` | v5 lifecycle: grace window (ms) before auto-release fires. Per-call only — no env-var override. |
 
 Limits: up to 10 concurrent transfers per session.
 
@@ -741,6 +747,8 @@ Download a remote file to a local path via SFTP. Streams in 32 KiB chunks.
 | `session_id` | `string` | — | `SESSION_ID`. |
 | `remote_path` | `string` | — | Remote source. |
 | `local_path` | `string` | — | Local destination. Relative paths resolve against `$HOME`. |
+| `release_when_no_subs` | `bool?` | `false` | v5 lifecycle: when `true`, the `transfer://<id>/progress` resource auto-closes after the last `sub_close` ([ADR 0003](./adr/0003-lifecycle-binding.md)). |
+| `grace_ms` | `u32?` | `2000` | v5 lifecycle: grace window (ms) before auto-release fires. Per-call only — no env-var override. |
 
 **Response**:
 ```
@@ -783,7 +791,7 @@ SSH_TRANSFER_PROGRESS: RUNNING
 TRANSFER_ID: 8f7e6d5c-...
 DIRECTION: UPLOAD
 PROGRESS: 47% (1153024/2412544 bytes)
-NEXT: resources/subscribe transfer://8f7e6d5c-.../progress | ssh_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
+NEXT: sub_open uri=transfer://8f7e6d5c-.../progress (PREFERRED — push-first) | ssh_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 ```
 
 **Response — COMPLETED**:
@@ -891,6 +899,123 @@ Snapshot every serial port currently held by this process. Returns `SERIAL_ID`, 
 **Status values:** OK.
 **Cost:** O(N) over the per-process registry.
 
+## Subscription administration (9, v5 — ADR 0004 / 0005)
+
+The 9 `sub_*` tools manage per-`SubId` lanes (Channel Mux v5 Phase 2). They work cross-resource: any of the six push schemes (`shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://`) can be opened, paused, filtered, replayed, listed, or statted through the same verb-uniform surface. Wire idempotent for retries via `_meta.idempotency_key` (mutating tools only — `sub_list` / `sub_stats` / `sub_stats_all` are pure reads).
+
+### sub_open
+
+Open a Channel Mux lane for a resource URI. Returns `SUB_ID` (UUIDv7) + the bound URI.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `uri` | string | — | Resource URI (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events`, `serial://<id>/output`). |
+| `lifetime` | enum (`manual` / `auto_close` / `lease`) | `manual` | `manual` keeps the lane until explicit `sub_close`; `auto_close` releases after `grace_ms` of consumer inactivity; `lease` enforces a hard `ttl_secs` cap regardless of activity. |
+| `grace_ms` | `u32?` | `2000` | Honoured only when `lifetime=auto_close`. Grace window after consumer inactivity before the lane releases. |
+| `ttl_secs` | `u32?` | — | Honoured only when `lifetime=lease`. Hard TTL on the lane regardless of activity. |
+| `lag_policy` | enum (`block_slow` / `drop_oldest` / `drop_newest` / `snapshot`) | env `SSH_LAG_POLICY_DEFAULT` (`snapshot`) | Lane backpressure policy. |
+| `filter` | string? | `null` | Optional regex string compiled at subscribe time; empty / absent means no filter. Char cap: `SSH_FILTER_REGEX_MAX` (default 1024). |
+
+**Response**:
+```
+SUB_OPEN: OK
+SUB_ID: <uuidv7>
+URI: <uri>
+LIFETIME: manual|auto_close|lease
+LAG_POLICY: block_slow|drop_oldest|drop_newest|snapshot
+HINT: REQUIRED: track this SUB_ID; sub_close when done.
+NEXT: sub_close sub_id=<uuidv7> | sub_stats sub_id=<uuidv7>
+```
+
+**Errors**: `RESOURCE_GONE`, `LANE_LIMIT_PER_URI`, `LANE_LIMIT_TOTAL`, `FILTER_INVALID`, `INVALID_ARGUMENT`.
+
+**Cost**: O(1) lane open + per-event mpsc thereafter. **Idempotency**: `_meta.idempotency_key` supported.
+
+### sub_close
+
+Close a lane by `SUB_ID`. Triggers grace timer if last subscriber and `release_when_no_subs=true`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | string | `SUB_ID` from `sub_open`. |
+
+**Response**: `SUB_CLOSE: OK` or `SUB_CLOSE: NOT_FOUND` (idempotent).
+
+**Errors**: `INVALID_ARGUMENT` (malformed `sub_id`).
+
+**Idempotency**: closing a non-existent lane returns `NOT_FOUND` instead of an error.
+
+### sub_pause
+
+Suspend the lane drain loop. Producer keeps emitting; the mpsc fills under the lane's lag policy.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | string | Target lane. |
+
+**Response**: `SUB_PAUSE: OK`. **Errors**: `SUB_NOT_FOUND`.
+
+### sub_resume
+
+Resume the drain loop after `sub_pause`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | string | Target lane. |
+
+**Response**: `SUB_RESUME: OK`. **Errors**: `SUB_NOT_FOUND`.
+
+### sub_filter
+
+Hot-reload the lane's regex filter. Empty string clears the filter (forwards every event).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | string | Target lane. |
+| `regex` | string | New regex pattern. Empty string clears the filter. Char cap: `SSH_FILTER_REGEX_MAX` (default 1024). |
+
+**Response**: `SUB_FILTER: OK`. **Errors**: `SUB_NOT_FOUND`, `FILTER_INVALID`.
+
+### sub_replay
+
+Replay events from a cursor (byte offset) within the lane's ring-buffer window.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sub_id` | string | — | Target lane. |
+| `from_cursor` | `u64?` | `0` | Cursor (byte offset) to replay from. `0` replays from the start of the available ring-buffer window. |
+
+**Response**: `SUB_REPLAY: OK\nBYTES: <N>`. **Errors**: `SUB_NOT_FOUND`, `RING_BUFFER_OVERFLOW`.
+
+### sub_list
+
+List every lane in scope. Optional URI prefix and peer-id filters (peer-id reserved for forward-compat).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `uri_prefix` | string? | `null` | Filter to lanes whose canonical URI starts with this prefix. |
+| `peer_id` | string? | `null` | Reserved — currently a no-op placeholder. |
+
+**Response**: `SUB_LIST: OK` plus per-lane rows (`SUB_ID`, `URI`, `LIFETIME`, `LAG_POLICY`, `events_sent`, `bytes_sent`). **Cost**: O(N) over the lane registry.
+
+### sub_stats
+
+Per-lane atomic counter snapshot.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | string | Target lane. |
+
+**Response**: `SUB_STATS: OK` with `events_sent`, `bytes_sent`, `lag_drops`, `queue_depth`, `last_event_at`. **Errors**: `SUB_NOT_FOUND`.
+
+### sub_stats_all
+
+Aggregate counters across every lane in scope. No arguments today (the schema reserves a `_reserved` field for forward-compat).
+
+**Response**: `SUB_STATS_ALL: OK` with totals (`lanes_total`, `events_sent`, `bytes_sent`, `lag_drops`, `queue_depth_max`).
+
+---
+
 ## Forward (1)
 
 ### ssh_forward
@@ -913,7 +1038,7 @@ LOCAL: 0.0.0.0:8080
 REMOTE: 10.0.0.1:3306
 ACTIVE: true
 HINT: subscribe to forward://fwd-1/events for realtime event log
-NEXT: resources/subscribe forward://fwd-1/events
+NEXT: sub_open uri=forward://fwd-1/events (PREFERRED — push-first)
 ```
 
 `FORWARD_ID` + `SESSION_ID` (added in v4.5) let callers construct the `forward://<FORWARD_ID>/events` URI without round-tripping `resources/list`. v4.6 `HINT:` and `NEXT:` reinforce subscribe-first.
@@ -988,15 +1113,15 @@ Returned by `get_info()`:
     "tools": { "listChanged": true },
     "resources": { "subscribe": true, "listChanged": true }
   },
-  "instructions": "SSH MCP. 21 tools, 5 push streams (shell://, command://, transfer://, session://, forward://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. Then sub_open command://<id>/output for push. sub_close when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. Drive with ssh_shell_write or ssh_shell_press. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then ssh_transfer_progress wait=true.\n4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_exec calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
+  "instructions": "SSH MCP. 36 tools, 6 push streams (shell://, command://, transfer://, session://, forward://, serial://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. Then sub_open command://<id>/output for push. sub_close when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then sub_open shell://<id>/output. Drive with ssh_shell_write or ssh_shell_press. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then sub_open transfer://<id>/progress, OR ssh_transfer_progress wait=true.\n4) Local serial (no SSH): serial_open path=/dev/ttyUSB0 baud_rate=115200. Then sub_open serial://<id>/output for push. Drive with serial_write or serial_press. serial_close when done.\n5) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_exec calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
 }
 ```
 
-The build without `port_forward` advertises `20 tools, 4 push streams (shell://, command://, transfer://, session://)` instead.
+The build without `port_forward` advertises `35 tools, 5 push streams (shell://, command://, transfer://, session://, serial://)` instead.
 
-`Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description when the asset is unreachable. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
+`Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). Source: `assets/icon.svg`. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
 
-Each of the 21 tools (or 20 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (5 entries) and `resources/templates/list` (4 / 5 entries depending on `port_forward`).
+Each of the 36 tools (or 35 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (10 entries — 5 v4 carry-overs + 5 v5 push-first per ADR 0005) and `resources/templates/list` (5 / 6 entries depending on `port_forward`).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline-v5-layered-view) for the producer → debouncer → notification pipeline and [DEVELOPMENT.md → Hot-path sequence diagrams](./DEVELOPMENT.md#hot-path-sequence-diagrams) for end-to-end sequence diagrams.
 

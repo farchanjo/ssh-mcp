@@ -1,8 +1,8 @@
-# Resources Reference (v4.8.0)
+# Resources Reference (v6.0)
 
-Source of truth for the MCP `resources/*` family in ssh-mcp: 5 subscribe-friendly URI schemes, URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)).
+Source of truth for the MCP `resources/*` family in ssh-mcp: 6 subscribe-friendly URI schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial`), URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)); v5.2 added the `serial://` scheme ([ADR 0009](./adr/0009-serial-transport.md)); v6.0 split the tool catalogue across `ssh_*` / `sub_*` / `serial_*` eixos but kept resource URI schemes byte-identical.
 
-> **v4.8 — no resource changes.** Strictly additive on `tools/list[].outputSchema`; everything below carries forward byte-identical to v4.7.1.
+> **v6.0 — no resource changes.** Wire-breaking on tool name strings only; resource URI schemes / push narrative / `_meta` envelope / cursor semantics are byte-identical to v5.3.x.
 
 Cross-refs: [API.md](./API.md) (tool reference) · [LLM_GUIDE.md](./LLM_GUIDE.md) (subscribe vs poll decision table) · [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants) (lock-free patterns underpinning the broadcast / cursor layer).
 
@@ -227,28 +227,33 @@ sequenceDiagram
     participant Reg as SubscriptionRegistry
     participant Deb as Debouncer task
 
-    Peer->>Server: resources/subscribe shell://abc/output
-    Server->>Reg: subscribe(kind, id, uri, peer_id, peer)
+    Peer->>Server: sub_open uri=shell://abc/output (or resources/subscribe)
+    Server->>Reg: ensure_debouncer(kind, id) + subscribe / register lane
     alt First subscriber on (kind, id)
-        Reg->>Deb: spawn debouncer_task
+        Reg->>Deb: spawn debouncer_task<br/>(waker + flush_now + bytes_counter)
     end
     Reg-->>Server: ok
-    Server-->>Peer: ack
+    Server-->>Peer: ack (SUB_ID)
 
     loop Producer activity
-        Note over Server: shell/command/transfer/session/forward producer pokes the registry.
-        Server->>Reg: poke(kind, id) (notify_one)
+        Note over Server: shell / command / transfer / session / forward / serial producer pokes the registry.
+        Server->>Reg: poke(kind, id) (waker.notify_one)
+        Server->>Reg: record_bytes(kind, id, n) (bytes_counter.fetch_add)
+        alt bytes_counter ≥ SSH_NOTIFY_FLUSH_BYTES
+            Reg->>Deb: flush_now.notify_one (byte-threshold flush, ADR 0006 Amendment 1)
+        end
         Reg->>Deb: wakeup
-        Deb->>Deb: sleep(debounce_ms)
-        Deb->>Server: notify_resource_updated(uri)
+        Deb->>Deb: select! (waker | flush_now | force_flush_tick | keepalive_tick)
+        Deb->>Server: notify_resource_updated(uri); reset bytes_counter
         Server->>Peer: notifications/resources/updated
     end
 
-    Note over Deb: Force-flush ticker emits even without pokes (every SSH_NOTIFY_FORCE_FLUSH_MS).
-    Note over Deb: Keepalive ticker fires every SSH_NOTIFY_KEEPALIVE_S.
+    Note over Deb: Force-flush ticker fires even without pokes (every SSH_NOTIFY_FORCE_FLUSH_MS, default 1 s).
+    Note over Deb: Keepalive ticker fires every SSH_NOTIFY_KEEPALIVE_S (default 30 s).
+    Note over Deb: Byte-threshold flush bypasses the debounce window when bytes_counter crosses SSH_NOTIFY_FLUSH_BYTES (default 64 KiB).
 
-    Peer->>Server: resources/unsubscribe shell://abc/output
-    Server->>Reg: unsubscribe(peer_id, uri)
+    Peer->>Server: sub_close sub_id=... (or resources/unsubscribe)
+    Server->>Reg: unsubscribe / lane_admin.close(sub_id)
     alt Last subscriber leaves
         Reg->>Deb: abort()
     end
