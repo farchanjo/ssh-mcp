@@ -1368,7 +1368,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
+        description = "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nOverlap guidance:\n- Sessions share an AGENT_ID (group cleanup): use this tool — single round-trip filter.\n- Ad-hoc list of unrelated SESSION_IDs: prefer ssh_disconnect_many (up to 64 explicit ids).\n- Single session: prefer ssh_disconnect.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
         output_schema = schema_for_type::<SshDisconnectAgentResult>()
     )]
     async fn ssh_disconnect_agent(
@@ -1411,7 +1411,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and polling its output via ssh_get_command_output.\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: passed to ssh_get_command_output, ssh_cancel_command.\n\nWorkflow:\n1. Call ssh_execute with the SESSION_ID and command line.\n2. Use ssh_get_command_output to fetch progress / completion.\n3. Optional ssh_cancel_command to interrupt.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+        description = "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and observing its output. Prefer subscribing to `command://<COMMAND_ID>/output` over polling (see ssh_subscribe).\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: target of ssh_subscribe `command://<COMMAND_ID>/output` (push, preferred) or ssh_get_command_output (poll fallback). Also accepted by ssh_cancel_command.\n\nWorkflow (push-first, recommended):\n1. Call ssh_execute with the SESSION_ID and command line.\n2. ssh_subscribe uri=command://<COMMAND_ID>/output to stream stdout/stderr without polling.\n3. ssh_unsubscribe sub_id=... when the command terminates (or set release_when_no_subs=true).\n4. Optional ssh_cancel_command to interrupt.\n\nWorkflow (poll fallback):\n1. ssh_execute, then ssh_get_command_output wait=true in a loop.\n\nOverlap guidance:\n- For atomic short commands (single round-trip), prefer ssh_run.\n- For >=3 sequential commands on the same session, prefer ssh_execute_batch (saves ~70% wire vs N x ssh_execute).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
         output_schema = schema_for_type::<SshExecuteResult>()
     )]
     async fn ssh_execute(
@@ -1457,7 +1457,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nWhen to use:\n- Polling stdout/stderr for a command spawned with ssh_execute.\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
+        description = "Fetch the current output of an asynchronous command. Polling fallback path; prefer ssh_subscribe `command://<COMMAND_ID>/output` for streaming output without poll loops.\n\nWhen to use:\n- One-shot status check on a spawned command without opening a subscription.\n- Hosts that lack `resources/subscribe` capability (subscribe is the canonical path otherwise).\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_execute.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
         output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
@@ -1758,7 +1758,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n- Prefer subscribing to `shell://<shell_id>/output` for realtime push.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
+        description = "Block until a substring pattern appears in the shell output.\n\nWhen to use:\n- Single-shot prompt gating before issuing the next command (e.g. wait for `\"$ \"`).\n- Up to 16 patterns (≤1024 bytes each); first match wins.\n\nOverlap guidance:\n- 1-shot pattern (this tool): cheapest for one-time prompt gates.\n- Streaming / repeated pattern matches: prefer ssh_subscribe `shell://<shell_id>/output` with `filter=<pattern>` — single lane, every match pushed.\n- Realtime push without filter: ssh_subscribe `shell://<shell_id>/output`.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
         output_schema = schema_for_type::<SshShellWaitForResult>()
     )]
     async fn ssh_shell_wait_for(
@@ -1939,7 +1939,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nWhen to use:\n- Polling progress for an upload/download.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
+        description = "Snapshot the progress of an SFTP transfer. Polling fallback path; prefer ssh_subscribe `transfer://<TRANSFER_ID>/progress` for live progress events.\n\nWhen to use:\n- One-shot status check on an upload/download without opening a subscription.\n- Hosts that lack `resources/subscribe` capability.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
         output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
@@ -1982,7 +1982,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Connect, execute a short command synchronously, and (by default) disconnect — all in one call.\n\nWhen to use:\n- Short atomic commands (uptime, hostname, cat /etc/release).\n- Smaller LLMs that prefer not to choreograph connect -> execute -> wait by hand.\n\nWorkflow:\n1. ssh_run mints (or reuses) a session via reuse=auto.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
+        description = "Connect, execute a short command synchronously, and (by default) disconnect — all in one call.\n\nWhen to use:\n- Short atomic commands (uptime, hostname, cat /etc/release).\n- Smaller LLMs that prefer not to choreograph connect -> execute -> wait by hand.\n\nOverlap guidance:\n- For >1 command on the same host, prefer ssh_connect (reuse=auto) + ssh_execute (subscribe-first) — saves N-1 SSH handshakes vs N x ssh_run.\n- For a fixed pipeline of >=3 sequential commands, prefer ssh_execute_batch — single round-trip, ~70% wire savings.\n- For long-running output, ssh_execute + ssh_subscribe `command://<id>/output` streams without poll loops.\n\nWorkflow:\n1. ssh_run mints (or reuses) a session via reuse=auto.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
         output_schema = schema_for_type::<SshRunResult>()
     )]
     async fn ssh_run(
@@ -2016,7 +2016,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_execute per command dominates.\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
+        description = "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_execute per command dominates. Saves ~70% wire vs N x ssh_execute when N>=3.\n\nOverlap guidance:\n- Atomic single command across new session: prefer ssh_run.\n- Long-running streaming command: prefer ssh_execute + ssh_subscribe `command://<id>/output`.\n- Truly parallel commands: open multiple ssh_execute (this batch is serial by design).\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
         output_schema = schema_for_type::<SshExecuteBatchResult>()
     )]
     async fn ssh_execute_batch(
@@ -2048,7 +2048,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Best-effort bulk disconnect of up to 64 sessions in a single call.\n\nWhen to use:\n- Cleaning up a fan-out of sessions when bulk-by-agent is not appropriate.\n- Per-id failures are reported in the response and do not abort the remaining disconnects.\n\nWorkflow:\n1. Pass the list of SESSION_IDs returned from prior ssh_connect calls.\n2. Inspect the per-id `results` array for any `error` entries.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (empty / >64 ids).\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
+        description = "Best-effort bulk disconnect of up to 64 sessions in a single call.\n\nWhen to use:\n- Cleaning up a fan-out of unrelated SESSION_IDs (no shared AGENT_ID).\n- Per-id failures are reported in the response and do not abort the remaining disconnects.\n\nOverlap guidance:\n- Sessions share an AGENT_ID: prefer ssh_disconnect_agent — server-side filter, no id list needed.\n- Single session: prefer ssh_disconnect.\n- This tool: ad-hoc explicit list (mixed agents or no agent_id).\n\nWorkflow:\n1. Pass the list of SESSION_IDs returned from prior ssh_connect calls.\n2. Inspect the per-id `results` array for any `error` entries.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (empty / >64 ids).\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
         output_schema = schema_for_type::<SshDisconnectManyResult>()
     )]
     async fn ssh_disconnect_many(
@@ -2511,7 +2511,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+        description = "Spawn an asynchronous command on an SSH session. Prefer subscribing to `command://<COMMAND_ID>/output` (push) over polling via ssh_get_command_output.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
         output_schema = schema_for_type::<SshExecuteResult>()
     )]
     async fn ssh_execute(
@@ -2557,7 +2557,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Fetch the current output of an asynchronous command.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
+        description = "Fetch the current output of an asynchronous command. Polling fallback path; prefer ssh_subscribe `command://<COMMAND_ID>/output` for streaming.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
         output_schema = schema_for_type::<SshGetCommandOutputResult>()
     )]
     async fn ssh_get_command_output(
@@ -2823,7 +2823,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Read the buffered output of a PTY shell.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs.",
+        description = "Read the buffered output of a PTY shell. Polling fallback path; prefer ssh_subscribe `shell://<SHELL_ID>/output` for streaming.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.",
         output_schema = schema_for_type::<SshShellReadResult>()
     )]
     async fn ssh_shell_read(
@@ -2858,7 +2858,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Block until a substring pattern appears in the shell output.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
+        description = "Block until a substring pattern appears in the shell output.\n\nOverlap: 1-shot pattern gate (cheapest here). For streaming pattern matches, prefer ssh_subscribe `shell://<SHELL_ID>/output` with `filter=<pattern>`.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
         output_schema = schema_for_type::<SshShellWaitForResult>()
     )]
     async fn ssh_shell_wait_for(
@@ -3039,7 +3039,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the progress of an SFTP transfer.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
+        description = "Snapshot the progress of an SFTP transfer. Polling fallback path; prefer ssh_subscribe `transfer://<TRANSFER_ID>/progress` for live progress events.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
         output_schema = schema_for_type::<SshGetTransferProgressResult>()
     )]
     async fn ssh_get_transfer_progress(
