@@ -326,28 +326,31 @@ Each tool also carries `Tool.title` plus `ToolAnnotations.{read_only_hint, destr
 
 ### Few-shot `instructions`
 
-The server's `instructions` field ships three canonical workflows verbatim. Models trained to read MCP capability handshakes pick them up automatically. The text below is the **runtime body** as of v4.7 (the count line still claims 18 / 17 because `instructions` was last cut on v4.6; the actual tool list returned by `tools/list` carries the v4.7 catalogue of 21 / 20 plus the new `ssh_run` / `ssh_execute_batch` / `ssh_disconnect_many` entries — they all appear under `tools/list` regardless of the `instructions` claim).
+The server's `instructions` field ships four canonical workflows verbatim (refreshed in v4.7 to cover the v4.7 catalogue of 21 / 20 tools — `ssh_run` / `ssh_execute_batch` / `ssh_disconnect_many` are now first-class workflows in the few-shot text). Models trained to read MCP capability handshakes pick them up automatically. The text below is the **runtime body** as of v4.7+:
 
 ```
-SSH MCP. 18 tools, 5 push streams (shell://, command://, transfer://,
-session://, forward://). All tools return block markdown: first line
-TOOL: STATUS, then KEY: value pairs. Output blocks delimited by
---- name [nonce] ---. IDs end in _ID.
+SSH MCP. 21 tools, 5 push streams (shell://, command://, transfer://,
+session://, forward://). All tools return block markdown
+(KEY: value, --- name [nonce] ---) + a typed JSON in structured_content.
+IDs end in _ID. NEXT: line lists successor tools.
 
 Happy paths:
-1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute.
-   Then ssh_get_command_output wait=true.
-2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe
-   shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key.
-   Read deltas via resources/read?cursor=auto on each notification.
-   ssh_shell_close, ssh_disconnect.
-3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.
+1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.
+2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then
+   ssh_get_command_output wait=true (subscribe command://<id>/output for push).
+3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if
+   the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output.
+   Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via
+   resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.
+4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.
 
-Cleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close.
-Watch for HINT lines and EXPIRES_AT.
+Cleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT
+lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.
 ```
 
-For the v4.7 tool count (21 / 20), prefer `tools/list` and `prompts/list` on initialize — both reflect the runtime catalogue exactly. The `prompts/list` catalog (see [section M](#m-prompts-catalog-v47)) covers the v4.7 short-circuit recipes (`run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`).
+The build without `port_forward` advertises `20 tools, 4 push streams` and drops the `forward://` mention; the four happy-path workflows are otherwise identical. Reference: `src/infra/mcp/tool_router.rs::INSTRUCTIONS_WITH_FORWARD` / `INSTRUCTIONS_WITHOUT_FORWARD`.
+
+For the live tool catalogue, prefer `tools/list` and `prompts/list` on initialize — both reflect the runtime exactly. The `prompts/list` catalog (see [section M](#m-prompts-catalog-v47)) covers the v4.7 short-circuit recipes (`run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`).
 
 ## D. Smaller-LLM cookbook
 
