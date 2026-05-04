@@ -3,7 +3,7 @@
 //! Mirrors v3 `src/mcp/tools/shell.rs::Ssh*Args` exactly.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::keys::ShellKey;
 
@@ -119,7 +119,7 @@ const fn default_lifecycle_grace_ms() -> Option<u32> {
 }
 
 /// Arguments for the `ssh_shell_open` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellOpenArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
@@ -161,7 +161,7 @@ pub struct SshShellOpenArgs {
 }
 
 /// Arguments for the `ssh_shell_write` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellWriteArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
@@ -173,7 +173,7 @@ pub struct SshShellWriteArgs {
 }
 
 /// Arguments for the `ssh_shell_send_key` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellSendKeyArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
@@ -222,7 +222,7 @@ pub struct SshShellSendKeyArgs {
 }
 
 /// Arguments for the `ssh_shell_read` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellReadArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
@@ -258,7 +258,7 @@ pub struct SshShellReadArgs {
 }
 
 /// Arguments for the `ssh_shell_wait_for` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellWaitForArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
@@ -290,7 +290,7 @@ pub struct SshShellWaitForArgs {
 }
 
 /// Arguments for the `ssh_shell_close` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshShellCloseArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,

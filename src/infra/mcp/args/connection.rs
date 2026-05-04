@@ -4,7 +4,7 @@
 //! MCP clients see the same JSON schema after the v4 swap.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 
@@ -17,7 +17,7 @@ use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 /// so MCP clients see the valid values; v4 keeps the surface unchanged
 /// and maps it onto the domain [`crate::domain::policy::ReusePolicy`] at
 /// the use case boundary.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReusePolicy {
     /// Default. Return a `SUGGESTED` response listing the matching
@@ -101,7 +101,7 @@ const fn default_max_items() -> Option<usize> {
 }
 
 /// Arguments for the `ssh_connect` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshConnectArgs {
     /// Optional `SESSION_ID` returned by a previous `ssh_connect`. When
     /// provided and the session is still alive (health-check `echo 1`),
@@ -165,14 +165,14 @@ pub struct SshConnectArgs {
 }
 
 /// Arguments for the `ssh_disconnect` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshDisconnectArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
 }
 
 /// Arguments for the `ssh_list_sessions` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshListSessionsArgs {
     /// `AGENT_ID` returned from `ssh_connect`. Optional filter; when
     /// omitted returns sessions from every agent on this server.
@@ -185,7 +185,7 @@ pub struct SshListSessionsArgs {
 }
 
 /// Arguments for the `ssh_disconnect_agent` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshDisconnectAgentArgs {
     /// `AGENT_ID` returned from `ssh_connect`. All sessions owned by
     /// this agent are disconnected; sessions owned by other agents are
@@ -195,7 +195,7 @@ pub struct SshDisconnectAgentArgs {
 
 /// Arguments for the `ssh_disconnect_many` MCP tool — best-effort
 /// bulk disconnect of multiple sessions in a single call.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshDisconnectManyArgs {
     /// 1..=64 `SESSION_ID`s to disconnect. Per-id failures are
     /// reported in the response and do not abort the remaining

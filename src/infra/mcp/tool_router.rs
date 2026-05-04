@@ -76,7 +76,8 @@ use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::idempotency::{
-    IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, KeyOutcome, extract_idempotency_key, replay,
+    IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, IdempotencyOutcome, KeyOutcome,
+    extract_idempotency_key, fingerprint_args, replay,
 };
 use crate::infra::mcp::leak_warn_bridge::{LeakWarnBridgeHandle, spawn_bridge};
 use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
@@ -349,26 +350,43 @@ pub fn noop_id_lister() -> Arc<dyn IdLister> {
 /// Drive a mutating tool call under the v4.7-step5 idempotency cache.
 ///
 /// When the request supplies `_meta.idempotency_key`:
-///  * Lookup the `(tool, key)` entry; on a hit replay the cached
-///    response verbatim.
-///  * Otherwise drive the use case `f` and cache the rendered response
-///    if it was a success path. Errors are intentionally NOT cached
-///    (the LLM should be able to retry after fixing the input).
+///  * Lookup the `(tool, key)` entry comparing the supplied
+///    `args_fingerprint`. On a [`IdempotencyOutcome::Hit`] replay the
+///    cached response verbatim. On a [`IdempotencyOutcome::Mismatch`]
+///    surface `IDEMPOTENCY_KEY_MISMATCH` and skip the use case.
+///  * On a [`IdempotencyOutcome::Miss`] drive the use case `f` and
+///    cache the rendered response if it was a success path. Errors are
+///    intentionally NOT cached (the LLM should be able to retry after
+///    fixing the input).
 ///
 /// When the request omits the key the use case is driven directly.
 /// When the key is too long, return `IDEMPOTENCY_KEY_TOO_LONG` as an
 /// `INVALID_ARGUMENT` error and skip the use case.
+///
+/// Callers compute `args_fingerprint` via
+/// [`crate::infra::mcp::idempotency::fingerprint_args`] BEFORE
+/// invoking this helper so the per-tool args struct can be moved into
+/// the use case closure without competing with the borrow used to
+/// build the digest.
 async fn with_idempotency<F, Fut>(
     cache: &IdempotencyCache,
     ctx: &RequestContext<RoleServer>,
     tool: &str,
+    args_fingerprint: String,
     f: F,
 ) -> Result<CallToolResult, McpError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CallToolResult, McpError>>,
 {
-    with_idempotency_keyed(cache, extract_idempotency_key(ctx), tool, f).await
+    with_idempotency_keyed(
+        cache,
+        extract_idempotency_key(ctx),
+        tool,
+        args_fingerprint,
+        f,
+    )
+    .await
 }
 
 /// Inner driver shared with the unit-test path. Splitting this out lets
@@ -381,38 +399,76 @@ async fn with_idempotency_keyed<F, Fut>(
     cache: &IdempotencyCache,
     outcome: KeyOutcome,
     tool: &str,
+    args_fingerprint: String,
     f: F,
 ) -> Result<CallToolResult, McpError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CallToolResult, McpError>>,
 {
-    let key = match outcome {
-        KeyOutcome::Absent => return f().await,
-        KeyOutcome::TooLong => {
-            return Ok(render_tool_error(
-                tool,
-                &DomainError::InvalidArgument(format!(
-                    "IDEMPOTENCY_KEY_TOO_LONG: idempotency_key exceeds {IDEMPOTENCY_KEY_MAX_BYTES} bytes"
-                )),
-            ));
-        }
-        KeyOutcome::Present(k) => k,
+    let key = match resolve_key(outcome, tool) {
+        KeyResolution::Run => return f().await,
+        KeyResolution::Reject(error) => return Ok(error),
+        KeyResolution::Use(k) => k,
     };
-    if let Some(cached) = cache.get(tool, &key) {
-        return Ok(replay(&cached));
+    match cache.get_with_fingerprint(tool, &key, &args_fingerprint) {
+        IdempotencyOutcome::Hit(cached) => return Ok(replay(&cached)),
+        IdempotencyOutcome::Mismatch => return Ok(render_mismatch(tool, &key)),
+        IdempotencyOutcome::Miss => {}
     }
     let response = f().await?;
     if response.is_error != Some(true) {
-        cache_success(cache, tool, &key, &response);
+        cache_success(cache, tool, &key, args_fingerprint, &response);
     }
     Ok(response)
+}
+
+/// Outcome of normalising the inbound idempotency key. Returned by
+/// [`resolve_key`] so [`with_idempotency_keyed`] stays under the 30
+/// line ceiling without touching public surface.
+enum KeyResolution {
+    /// `_meta.idempotency_key` is absent — the use case must run
+    /// without caching.
+    Run,
+    /// `_meta.idempotency_key` failed validation — render an
+    /// `INVALID_ARGUMENT` response and skip the use case.
+    Reject(CallToolResult),
+    /// Key validated; carries the trimmed value for the cache lookup.
+    Use(String),
+}
+
+fn resolve_key(outcome: KeyOutcome, tool: &str) -> KeyResolution {
+    match outcome {
+        KeyOutcome::Absent => KeyResolution::Run,
+        KeyOutcome::TooLong => KeyResolution::Reject(render_tool_error(
+            tool,
+            &DomainError::InvalidArgument(format!(
+                "IDEMPOTENCY_KEY_TOO_LONG: idempotency_key exceeds {IDEMPOTENCY_KEY_MAX_BYTES} bytes"
+            )),
+        )),
+        KeyOutcome::Present(k) => KeyResolution::Use(k),
+    }
+}
+
+fn render_mismatch(tool: &str, key: &str) -> CallToolResult {
+    render_tool_error(
+        tool,
+        &DomainError::InvalidArgument(format!(
+            "IDEMPOTENCY_KEY_MISMATCH: idempotency_key '{key}' was previously used with different arguments"
+        )),
+    )
 }
 
 /// Persist a successful response into the idempotency cache. Pulled
 /// out so the [`with_idempotency`] body stays small and so we can swap
 /// in a no-op stub later if the rendering shape changes.
-fn cache_success(cache: &IdempotencyCache, tool: &str, key: &str, response: &CallToolResult) {
+fn cache_success(
+    cache: &IdempotencyCache,
+    tool: &str,
+    key: &str,
+    fingerprint: String,
+    response: &CallToolResult,
+) {
     let body = response
         .content
         .first()
@@ -422,7 +478,7 @@ fn cache_success(cache: &IdempotencyCache, tool: &str, key: &str, response: &Cal
         .structured_content
         .clone()
         .unwrap_or(serde_json::Value::Null);
-    cache.put(tool, key, body, structured);
+    cache.put_with_fingerprint(tool, key, fingerprint, body, structured);
 }
 
 /// Tags surfaced through [`DomainError::InvalidArgument`] messages. Each
@@ -1207,9 +1263,13 @@ where
         Parameters(args): Parameters<SshConnectArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_connect", || async {
-            run_connect(self.use_cases.connect.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_connect",
+            fingerprint_args(&args),
+            || async { run_connect(self.use_cases.connect.as_ref(), args).await },
+        )
         .await
     }
 
@@ -1228,28 +1288,34 @@ where
         Parameters(args): Parameters<SshDisconnectArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect", || async {
-            match self
-                .use_cases
-                .disconnect
-                .execute(DisconnectRequest {
-                    session_id: SessionId::new(args.session_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::connection::disconnect_structured(&outcome);
-                    let body = render::connection::disconnect_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_DISCONNECT", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .disconnect
+                    .execute(DisconnectRequest {
+                        session_id: SessionId::new(args.session_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::connection::disconnect_structured(&outcome);
+                        let body = render::connection::disconnect_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_DISCONNECT",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1310,23 +1376,29 @@ where
         Parameters(args): Parameters<SshDisconnectAgentArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect_agent", || async {
-            match self
-                .use_cases
-                .disconnect_agent
-                .execute(DisconnectAgentRequest {
-                    agent_id: AgentId::new(args.agent_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::connection::disconnect_agent_structured(&outcome);
-                    let body = render::connection::disconnect_agent_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect_agent",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .disconnect_agent
+                    .execute(DisconnectAgentRequest {
+                        agent_id: AgentId::new(args.agent_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::connection::disconnect_agent_structured(&outcome);
+                        let body = render::connection::disconnect_agent_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
                 }
-                Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1347,25 +1419,34 @@ where
         Parameters(args): Parameters<SshExecuteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_execute", || async {
-            let req = ExecuteRequest {
-                session_id: SessionId::new(args.session_id),
-                command: args.command,
-                timeout: args.timeout_secs.map(Duration::from_secs),
-                use_pty: args.pty.unwrap_or(false),
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.execute.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::execute::execute_structured(&outcome);
-                    let body = render::execute::execute_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_execute",
+            fingerprint_args(&args),
+            || async {
+                let req = ExecuteRequest {
+                    session_id: SessionId::new(args.session_id),
+                    command: args.command,
+                    timeout: args.timeout_secs.map(Duration::from_secs),
+                    use_pty: args.pty.unwrap_or(false),
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.execute.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::execute::execute_structured(&outcome);
+                        let body = render::execute::execute_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_EXECUTE", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(render_tool_error_smart("SSH_EXECUTE", &err, self.id_lister.as_ref()).await)
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1463,25 +1544,31 @@ where
         Parameters(args): Parameters<SshCancelCommandArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_cancel_command", || async {
-            let req = CancelCommandRequest {
-                command_id: CommandId::new(args.command_id),
-                max_output_bytes: args.max_output_bytes,
-            };
-            match self.use_cases.cancel_command.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::execute::cancel_command_structured(&outcome);
-                    let body = render::execute::cancel_command_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_cancel_command",
+            fingerprint_args(&args),
+            || async {
+                let req = CancelCommandRequest {
+                    command_id: CommandId::new(args.command_id),
+                    max_output_bytes: args.max_output_bytes,
+                };
+                match self.use_cases.cancel_command.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::execute::cancel_command_structured(&outcome);
+                        let body = render::execute::cancel_command_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_CANCEL_COMMAND",
+                        &err,
+                        self.id_lister.as_ref(),
+                    )
+                    .await),
                 }
-                Err(err) => Ok(render_tool_error_smart(
-                    "SSH_CANCEL_COMMAND",
-                    &err,
-                    self.id_lister.as_ref(),
-                )
-                .await),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1502,34 +1589,42 @@ where
         Parameters(args): Parameters<SshShellOpenArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_open", || async {
-            let req = OpenShellRequest {
-                session_id: SessionId::new(args.session_id),
-                term: args.term,
-                cols: args.cols,
-                rows: args.rows,
-                inactivity_ttl_secs: args.inactivity_ttl,
-                max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.open_shell.execute(req).await {
-                Ok(outcome) => {
-                    let streams = self.use_cases.read_shell.streams();
-                    let peek = peek_initial_shell_buffer(streams.as_ref(), &outcome.shell.id).await;
-                    let bytes_ref = peek.as_ref().map(|p| p.bytes.as_slice());
-                    let structured =
-                        render::shell::shell_open_structured_with_initial(&outcome, bytes_ref);
-                    let body = render::shell::shell_open_render_with_initial(outcome, bytes_ref);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_OPEN", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_open",
+            fingerprint_args(&args),
+            || async {
+                let req = OpenShellRequest {
+                    session_id: SessionId::new(args.session_id),
+                    term: args.term,
+                    cols: args.cols,
+                    rows: args.rows,
+                    inactivity_ttl_secs: args.inactivity_ttl,
+                    max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.open_shell.execute(req).await {
+                    Ok(outcome) => {
+                        let streams = self.use_cases.read_shell.streams();
+                        let peek =
+                            peek_initial_shell_buffer(streams.as_ref(), &outcome.shell.id).await;
+                        let bytes_ref = peek.as_ref().map(|p| p.bytes.as_slice());
+                        let structured =
+                            render::shell::shell_open_structured_with_initial(&outcome, bytes_ref);
+                        let body =
+                            render::shell::shell_open_render_with_initial(outcome, bytes_ref);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_OPEN",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1548,25 +1643,31 @@ where
         Parameters(args): Parameters<SshShellWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_write", || async {
-            let req = WriteShellRequest {
-                shell_id: ShellId::new(args.shell_id),
-                bytes: Bytes::from(args.input.into_bytes()),
-            };
-            match self.use_cases.write_shell.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_write_structured(&outcome);
-                    let body = render::shell::shell_write_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_WRITE", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_write",
+            fingerprint_args(&args),
+            || async {
+                let req = WriteShellRequest {
+                    shell_id: ShellId::new(args.shell_id),
+                    bytes: Bytes::from(args.input.into_bytes()),
+                };
+                match self.use_cases.write_shell.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_write_structured(&outcome);
+                        let body = render::shell::shell_write_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_WRITE",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1585,27 +1686,33 @@ where
         Parameters(args): Parameters<SshShellSendKeyArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_send_key", || async {
-            let req = SendKeyRequest {
-                shell_id: ShellId::new(args.shell_id),
-                key: args.key,
-                modifiers: pick_modifiers(args.shift, args.alt, args.ctrl),
-                repeat: args.repeat.unwrap_or(1),
-            };
-            match self.use_cases.send_key.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_send_key_structured(&outcome);
-                    let body = render::shell::shell_send_key_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_send_key",
+            fingerprint_args(&args),
+            || async {
+                let req = SendKeyRequest {
+                    shell_id: ShellId::new(args.shell_id),
+                    key: args.key,
+                    modifiers: pick_modifiers(args.shift, args.alt, args.ctrl),
+                    repeat: args.repeat.unwrap_or(1),
+                };
+                match self.use_cases.send_key.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_send_key_structured(&outcome);
+                        let body = render::shell::shell_send_key_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_SEND_KEY",
+                        &err,
+                        self.id_lister.as_ref(),
+                    )
+                    .await),
                 }
-                Err(err) => Ok(render_tool_error_smart(
-                    "SSH_SHELL_SEND_KEY",
-                    &err,
-                    self.id_lister.as_ref(),
-                )
-                .await),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1702,28 +1809,34 @@ where
         Parameters(args): Parameters<SshShellCloseArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_close", || async {
-            match self
-                .use_cases
-                .close_shell
-                .execute(CloseShellRequest {
-                    shell_id: ShellId::new(args.shell_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_close_structured(&outcome);
-                    let body = render::shell::shell_close_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_CLOSE", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_close",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .close_shell
+                    .execute(CloseShellRequest {
+                        shell_id: ShellId::new(args.shell_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_close_structured(&outcome);
+                        let body = render::shell::shell_close_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_CLOSE",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1744,24 +1857,33 @@ where
         Parameters(args): Parameters<SshUploadArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_upload", || async {
-            let req = UploadRequest {
-                session_id: SessionId::new(args.session_id),
-                local_path: args.local_path,
-                remote_path: args.remote_path,
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.upload_file.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::sftp::upload_structured(&outcome);
-                    let body = render::sftp::upload_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_upload",
+            fingerprint_args(&args),
+            || async {
+                let req = UploadRequest {
+                    session_id: SessionId::new(args.session_id),
+                    local_path: args.local_path,
+                    remote_path: args.remote_path,
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.upload_file.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::sftp::upload_structured(&outcome);
+                        let body = render::sftp::upload_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_UPLOAD", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(render_tool_error_smart("SSH_UPLOAD", &err, self.id_lister.as_ref()).await)
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1780,27 +1902,33 @@ where
         Parameters(args): Parameters<SshDownloadArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_download", || async {
-            let req = DownloadRequest {
-                session_id: SessionId::new(args.session_id),
-                remote_path: args.remote_path,
-                local_path: args.local_path,
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.download_file.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::sftp::download_structured(&outcome);
-                    let body = render::sftp::download_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_download",
+            fingerprint_args(&args),
+            || async {
+                let req = DownloadRequest {
+                    session_id: SessionId::new(args.session_id),
+                    remote_path: args.remote_path,
+                    local_path: args.local_path,
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.download_file.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::sftp::download_structured(&outcome);
+                        let body = render::sftp::download_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_DOWNLOAD", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_DOWNLOAD", &err, self.id_lister.as_ref())
-                            .await,
-                    )
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1862,16 +1990,22 @@ where
         Parameters(args): Parameters<SshRunArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_run", || async {
-            run_one_shot(
-                self.use_cases.connect.as_ref(),
-                self.use_cases.execute.as_ref(),
-                self.use_cases.get_command_output.as_ref(),
-                self.use_cases.disconnect.as_ref(),
-                args,
-            )
-            .await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_run",
+            fingerprint_args(&args),
+            || async {
+                run_one_shot(
+                    self.use_cases.connect.as_ref(),
+                    self.use_cases.execute.as_ref(),
+                    self.use_cases.get_command_output.as_ref(),
+                    self.use_cases.disconnect.as_ref(),
+                    args,
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -1890,14 +2024,20 @@ where
         Parameters(args): Parameters<SshExecuteBatchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_execute_batch", || async {
-            run_execute_batch(
-                self.use_cases.execute.as_ref(),
-                self.use_cases.get_command_output.as_ref(),
-                args,
-            )
-            .await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_execute_batch",
+            fingerprint_args(&args),
+            || async {
+                run_execute_batch(
+                    self.use_cases.execute.as_ref(),
+                    self.use_cases.get_command_output.as_ref(),
+                    args,
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -1916,9 +2056,13 @@ where
         Parameters(args): Parameters<SshDisconnectManyArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect_many", || async {
-            run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect_many",
+            fingerprint_args(&args),
+            || async { run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await },
+        )
         .await
     }
 
@@ -1939,24 +2083,33 @@ where
         Parameters(args): Parameters<SshForwardArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_forward", || async {
-            let req = ForwardPortRequest {
-                session_id: SessionId::new(args.session_id),
-                local_port: args.local_port,
-                remote_address: args.remote_address,
-                remote_port: args.remote_port,
-            };
-            match self.use_cases.forward_port.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::forward::forward_structured(&outcome);
-                    let body = render::forward::forward_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_forward",
+            fingerprint_args(&args),
+            || async {
+                let req = ForwardPortRequest {
+                    session_id: SessionId::new(args.session_id),
+                    local_port: args.local_port,
+                    remote_address: args.remote_address,
+                    remote_port: args.remote_port,
+                };
+                match self.use_cases.forward_port.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::forward::forward_structured(&outcome);
+                        let body = render::forward::forward_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_FORWARD", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(render_tool_error_smart("SSH_FORWARD", &err, self.id_lister.as_ref()).await)
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1976,9 +2129,13 @@ where
         Parameters(args): Parameters<SshSubscribeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_subscribe", || async {
-            run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_subscribe",
+            fingerprint_args(&args),
+            || async { run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await },
+        )
         .await
     }
 
@@ -1996,9 +2153,13 @@ where
         Parameters(args): Parameters<SshUnsubscribeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_unsubscribe", || async {
-            run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_unsubscribe",
+            fingerprint_args(&args),
+            || async { run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2016,9 +2177,13 @@ where
         Parameters(args): Parameters<SshSubPauseArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_pause", || async {
-            run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_pause",
+            fingerprint_args(&args),
+            || async { run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2036,9 +2201,13 @@ where
         Parameters(args): Parameters<SshSubResumeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_resume", || async {
-            run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_resume",
+            fingerprint_args(&args),
+            || async { run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2056,9 +2225,13 @@ where
         Parameters(args): Parameters<SshSubFilterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_filter", || async {
-            run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_filter",
+            fingerprint_args(&args),
+            || async { run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2076,9 +2249,13 @@ where
         Parameters(args): Parameters<SshSubReplayArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_replay", || async {
-            run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_replay",
+            fingerprint_args(&args),
+            || async { run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2186,9 +2363,13 @@ where
         Parameters(args): Parameters<SshConnectArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_connect", || async {
-            run_connect(self.use_cases.connect.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_connect",
+            fingerprint_args(&args),
+            || async { run_connect(self.use_cases.connect.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2207,28 +2388,34 @@ where
         Parameters(args): Parameters<SshDisconnectArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect", || async {
-            match self
-                .use_cases
-                .disconnect
-                .execute(DisconnectRequest {
-                    session_id: SessionId::new(args.session_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::connection::disconnect_structured(&outcome);
-                    let body = render::connection::disconnect_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_DISCONNECT", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .disconnect
+                    .execute(DisconnectRequest {
+                        session_id: SessionId::new(args.session_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::connection::disconnect_structured(&outcome);
+                        let body = render::connection::disconnect_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_DISCONNECT",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2289,23 +2476,29 @@ where
         Parameters(args): Parameters<SshDisconnectAgentArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect_agent", || async {
-            match self
-                .use_cases
-                .disconnect_agent
-                .execute(DisconnectAgentRequest {
-                    agent_id: AgentId::new(args.agent_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::connection::disconnect_agent_structured(&outcome);
-                    let body = render::connection::disconnect_agent_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect_agent",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .disconnect_agent
+                    .execute(DisconnectAgentRequest {
+                        agent_id: AgentId::new(args.agent_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::connection::disconnect_agent_structured(&outcome);
+                        let body = render::connection::disconnect_agent_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
                 }
-                Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2326,25 +2519,34 @@ where
         Parameters(args): Parameters<SshExecuteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_execute", || async {
-            let req = ExecuteRequest {
-                session_id: SessionId::new(args.session_id),
-                command: args.command,
-                timeout: args.timeout_secs.map(Duration::from_secs),
-                use_pty: args.pty.unwrap_or(false),
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.execute.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::execute::execute_structured(&outcome);
-                    let body = render::execute::execute_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_execute",
+            fingerprint_args(&args),
+            || async {
+                let req = ExecuteRequest {
+                    session_id: SessionId::new(args.session_id),
+                    command: args.command,
+                    timeout: args.timeout_secs.map(Duration::from_secs),
+                    use_pty: args.pty.unwrap_or(false),
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.execute.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::execute::execute_structured(&outcome);
+                        let body = render::execute::execute_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_EXECUTE", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(render_tool_error_smart("SSH_EXECUTE", &err, self.id_lister.as_ref()).await)
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2442,25 +2644,31 @@ where
         Parameters(args): Parameters<SshCancelCommandArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_cancel_command", || async {
-            let req = CancelCommandRequest {
-                command_id: CommandId::new(args.command_id),
-                max_output_bytes: args.max_output_bytes,
-            };
-            match self.use_cases.cancel_command.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::execute::cancel_command_structured(&outcome);
-                    let body = render::execute::cancel_command_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_cancel_command",
+            fingerprint_args(&args),
+            || async {
+                let req = CancelCommandRequest {
+                    command_id: CommandId::new(args.command_id),
+                    max_output_bytes: args.max_output_bytes,
+                };
+                match self.use_cases.cancel_command.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::execute::cancel_command_structured(&outcome);
+                        let body = render::execute::cancel_command_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_CANCEL_COMMAND",
+                        &err,
+                        self.id_lister.as_ref(),
+                    )
+                    .await),
                 }
-                Err(err) => Ok(render_tool_error_smart(
-                    "SSH_CANCEL_COMMAND",
-                    &err,
-                    self.id_lister.as_ref(),
-                )
-                .await),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2481,34 +2689,42 @@ where
         Parameters(args): Parameters<SshShellOpenArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_open", || async {
-            let req = OpenShellRequest {
-                session_id: SessionId::new(args.session_id),
-                term: args.term,
-                cols: args.cols,
-                rows: args.rows,
-                inactivity_ttl_secs: args.inactivity_ttl,
-                max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.open_shell.execute(req).await {
-                Ok(outcome) => {
-                    let streams = self.use_cases.read_shell.streams();
-                    let peek = peek_initial_shell_buffer(streams.as_ref(), &outcome.shell.id).await;
-                    let bytes_ref = peek.as_ref().map(|p| p.bytes.as_slice());
-                    let structured =
-                        render::shell::shell_open_structured_with_initial(&outcome, bytes_ref);
-                    let body = render::shell::shell_open_render_with_initial(outcome, bytes_ref);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_OPEN", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_open",
+            fingerprint_args(&args),
+            || async {
+                let req = OpenShellRequest {
+                    session_id: SessionId::new(args.session_id),
+                    term: args.term,
+                    cols: args.cols,
+                    rows: args.rows,
+                    inactivity_ttl_secs: args.inactivity_ttl,
+                    max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.open_shell.execute(req).await {
+                    Ok(outcome) => {
+                        let streams = self.use_cases.read_shell.streams();
+                        let peek =
+                            peek_initial_shell_buffer(streams.as_ref(), &outcome.shell.id).await;
+                        let bytes_ref = peek.as_ref().map(|p| p.bytes.as_slice());
+                        let structured =
+                            render::shell::shell_open_structured_with_initial(&outcome, bytes_ref);
+                        let body =
+                            render::shell::shell_open_render_with_initial(outcome, bytes_ref);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_OPEN",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2527,25 +2743,31 @@ where
         Parameters(args): Parameters<SshShellWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_write", || async {
-            let req = WriteShellRequest {
-                shell_id: ShellId::new(args.shell_id),
-                bytes: Bytes::from(args.input.into_bytes()),
-            };
-            match self.use_cases.write_shell.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_write_structured(&outcome);
-                    let body = render::shell::shell_write_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_WRITE", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_write",
+            fingerprint_args(&args),
+            || async {
+                let req = WriteShellRequest {
+                    shell_id: ShellId::new(args.shell_id),
+                    bytes: Bytes::from(args.input.into_bytes()),
+                };
+                match self.use_cases.write_shell.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_write_structured(&outcome);
+                        let body = render::shell::shell_write_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_WRITE",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2564,27 +2786,33 @@ where
         Parameters(args): Parameters<SshShellSendKeyArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_send_key", || async {
-            let req = SendKeyRequest {
-                shell_id: ShellId::new(args.shell_id),
-                key: args.key,
-                modifiers: pick_modifiers(args.shift, args.alt, args.ctrl),
-                repeat: args.repeat.unwrap_or(1),
-            };
-            match self.use_cases.send_key.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_send_key_structured(&outcome);
-                    let body = render::shell::shell_send_key_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_send_key",
+            fingerprint_args(&args),
+            || async {
+                let req = SendKeyRequest {
+                    shell_id: ShellId::new(args.shell_id),
+                    key: args.key,
+                    modifiers: pick_modifiers(args.shift, args.alt, args.ctrl),
+                    repeat: args.repeat.unwrap_or(1),
+                };
+                match self.use_cases.send_key.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_send_key_structured(&outcome);
+                        let body = render::shell::shell_send_key_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_SEND_KEY",
+                        &err,
+                        self.id_lister.as_ref(),
+                    )
+                    .await),
                 }
-                Err(err) => Ok(render_tool_error_smart(
-                    "SSH_SHELL_SEND_KEY",
-                    &err,
-                    self.id_lister.as_ref(),
-                )
-                .await),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2681,28 +2909,34 @@ where
         Parameters(args): Parameters<SshShellCloseArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_shell_close", || async {
-            match self
-                .use_cases
-                .close_shell
-                .execute(CloseShellRequest {
-                    shell_id: ShellId::new(args.shell_id),
-                })
-                .await
-            {
-                Ok(outcome) => {
-                    let structured = render::shell::shell_close_structured(&outcome);
-                    let body = render::shell::shell_close_render(&outcome);
-                    Ok(ok_text_and_structured(body, structured))
-                }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_SHELL_CLOSE", &err, self.id_lister.as_ref())
-                            .await,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_shell_close",
+            fingerprint_args(&args),
+            || async {
+                match self
+                    .use_cases
+                    .close_shell
+                    .execute(CloseShellRequest {
+                        shell_id: ShellId::new(args.shell_id),
+                    })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let structured = render::shell::shell_close_structured(&outcome);
+                        let body = render::shell::shell_close_render(&outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => Ok(render_tool_error_smart(
+                        "SSH_SHELL_CLOSE",
+                        &err,
+                        self.id_lister.as_ref(),
                     )
+                    .await),
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2723,24 +2957,33 @@ where
         Parameters(args): Parameters<SshUploadArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_upload", || async {
-            let req = UploadRequest {
-                session_id: SessionId::new(args.session_id),
-                local_path: args.local_path,
-                remote_path: args.remote_path,
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.upload_file.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::sftp::upload_structured(&outcome);
-                    let body = render::sftp::upload_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_upload",
+            fingerprint_args(&args),
+            || async {
+                let req = UploadRequest {
+                    session_id: SessionId::new(args.session_id),
+                    local_path: args.local_path,
+                    remote_path: args.remote_path,
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.upload_file.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::sftp::upload_structured(&outcome);
+                        let body = render::sftp::upload_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_UPLOAD", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(render_tool_error_smart("SSH_UPLOAD", &err, self.id_lister.as_ref()).await)
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2759,27 +3002,33 @@ where
         Parameters(args): Parameters<SshDownloadArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_download", || async {
-            let req = DownloadRequest {
-                session_id: SessionId::new(args.session_id),
-                remote_path: args.remote_path,
-                local_path: args.local_path,
-                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-            };
-            match self.use_cases.download_file.execute(req).await {
-                Ok(outcome) => {
-                    let structured = render::sftp::download_structured(&outcome);
-                    let body = render::sftp::download_render(outcome);
-                    Ok(ok_text_and_structured(body, structured))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_download",
+            fingerprint_args(&args),
+            || async {
+                let req = DownloadRequest {
+                    session_id: SessionId::new(args.session_id),
+                    remote_path: args.remote_path,
+                    local_path: args.local_path,
+                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                };
+                match self.use_cases.download_file.execute(req).await {
+                    Ok(outcome) => {
+                        let structured = render::sftp::download_structured(&outcome);
+                        let body = render::sftp::download_render(outcome);
+                        Ok(ok_text_and_structured(body, structured))
+                    }
+                    Err(err) => {
+                        Ok(
+                            render_tool_error_smart("SSH_DOWNLOAD", &err, self.id_lister.as_ref())
+                                .await,
+                        )
+                    }
                 }
-                Err(err) => {
-                    Ok(
-                        render_tool_error_smart("SSH_DOWNLOAD", &err, self.id_lister.as_ref())
-                            .await,
-                    )
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2841,16 +3090,22 @@ where
         Parameters(args): Parameters<SshRunArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_run", || async {
-            run_one_shot(
-                self.use_cases.connect.as_ref(),
-                self.use_cases.execute.as_ref(),
-                self.use_cases.get_command_output.as_ref(),
-                self.use_cases.disconnect.as_ref(),
-                args,
-            )
-            .await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_run",
+            fingerprint_args(&args),
+            || async {
+                run_one_shot(
+                    self.use_cases.connect.as_ref(),
+                    self.use_cases.execute.as_ref(),
+                    self.use_cases.get_command_output.as_ref(),
+                    self.use_cases.disconnect.as_ref(),
+                    args,
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -2869,14 +3124,20 @@ where
         Parameters(args): Parameters<SshExecuteBatchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_execute_batch", || async {
-            run_execute_batch(
-                self.use_cases.execute.as_ref(),
-                self.use_cases.get_command_output.as_ref(),
-                args,
-            )
-            .await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_execute_batch",
+            fingerprint_args(&args),
+            || async {
+                run_execute_batch(
+                    self.use_cases.execute.as_ref(),
+                    self.use_cases.get_command_output.as_ref(),
+                    args,
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -2895,9 +3156,13 @@ where
         Parameters(args): Parameters<SshDisconnectManyArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_disconnect_many", || async {
-            run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_disconnect_many",
+            fingerprint_args(&args),
+            || async { run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2917,9 +3182,13 @@ where
         Parameters(args): Parameters<SshSubscribeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_subscribe", || async {
-            run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_subscribe",
+            fingerprint_args(&args),
+            || async { run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2937,9 +3206,13 @@ where
         Parameters(args): Parameters<SshUnsubscribeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_unsubscribe", || async {
-            run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_unsubscribe",
+            fingerprint_args(&args),
+            || async { run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2957,9 +3230,13 @@ where
         Parameters(args): Parameters<SshSubPauseArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_pause", || async {
-            run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_pause",
+            fingerprint_args(&args),
+            || async { run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2977,9 +3254,13 @@ where
         Parameters(args): Parameters<SshSubResumeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_resume", || async {
-            run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_resume",
+            fingerprint_args(&args),
+            || async { run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await },
+        )
         .await
     }
 
@@ -2997,9 +3278,13 @@ where
         Parameters(args): Parameters<SshSubFilterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_filter", || async {
-            run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_filter",
+            fingerprint_args(&args),
+            || async { run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await },
+        )
         .await
     }
 
@@ -3017,9 +3302,13 @@ where
         Parameters(args): Parameters<SshSubReplayArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        with_idempotency(&self.idempotency, &ctx, "ssh_sub_replay", || async {
-            run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await
-        })
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_sub_replay",
+            fingerprint_args(&args),
+            || async { run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await },
+        )
         .await
     }
 
@@ -4697,6 +4986,7 @@ mod tests {
                 &cache,
                 KeyOutcome::Present(key.to_string()),
                 "ssh_test",
+                String::new(),
                 || make_body(Arc::clone(&calls1)),
             ))
             .expect("first call");
@@ -4712,6 +5002,7 @@ mod tests {
                 &cache,
                 KeyOutcome::Present(key.to_string()),
                 "ssh_test",
+                String::new(),
                 || make_body(Arc::clone(&calls2)),
             ))
             .expect("second call");
@@ -4751,6 +5042,7 @@ mod tests {
                     &cache,
                     KeyOutcome::Absent,
                     "ssh_test",
+                    String::new(),
                     || async move {
                         calls_inner.fetch_add(1, Ordering::SeqCst);
                         Ok::<_, McpError>(CallToolResult::success(vec![Content::text("x")]))
@@ -4791,6 +5083,7 @@ mod tests {
                     &cache,
                     KeyOutcome::Present(key.to_string()),
                     "ssh_test",
+                    String::new(),
                     || async move {
                         calls_inner.fetch_add(1, Ordering::SeqCst);
                         let mut r = CallToolResult::success(vec![Content::text("nope")]);
