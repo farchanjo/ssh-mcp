@@ -268,7 +268,10 @@ pub fn build_use_cases() -> ProdWiring {
 
     let peer_table = new_peer_table();
     let notifier = Arc::new(RmcpNotifier::new(Arc::clone(&peer_table)));
-    let subscribers = MemoryRegistry::<RmcpNotifier>::new(Arc::clone(&notifier));
+    // v5: enforce SSH_MAX_SUBS_PER_URI / SSH_MAX_SUBS_TOTAL on the
+    // legacy v4-compat subscribe path so callers that bypass the
+    // SubscriberLane layer still hit the documented caps.
+    let subscribers = MemoryRegistry::<RmcpNotifier>::from_env(Arc::clone(&notifier));
 
     let auth = Arc::new(AuthChainAdapter::default_chain());
     let output = Arc::new(RusshOutputAdapter::new(&ssh));

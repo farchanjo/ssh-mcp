@@ -44,7 +44,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::adapters::config::internal::{
-    resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
+    resolve_max_subs_per_uri, resolve_max_subs_total, resolve_notify_debounce_ms,
+    resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
@@ -124,6 +125,15 @@ pub struct MemoryRegistry<N> {
     wakers: DashMap<ResourceKey, Arc<Notify>>,
     /// Notifier the debouncer fans out over.
     notifier: Arc<N>,
+    /// Per-URI subscriber cap (`SSH_MAX_SUBS_PER_URI`). When the cap
+    /// is exceeded the next [`Self::insert_subscriber`] returns
+    /// [`DomainError::MaxSubsPerUriExceeded`] without mutating any
+    /// shared state.
+    max_per_uri: u16,
+    /// Process-wide subscriber cap (`SSH_MAX_SUBS_TOTAL`). Same
+    /// semantics — refused inserts surface
+    /// [`DomainError::MaxSubsTotalExceeded`].
+    max_total: u16,
     /// Self-reference used by the debouncer task so the async port impl
     /// can still spawn it from `&self`. Set once at construction via
     /// [`Arc::new_cyclic`] and never overwritten.
@@ -144,13 +154,40 @@ impl<N> MemoryRegistry<N>
 where
     N: NotifierPort + Send + Sync + 'static,
 {
-    /// Build a fresh empty registry that fans out via `notifier`.
+    /// Build a fresh empty registry with caps disabled (every cap set
+    /// to [`u16::MAX`]). Convenience used by tests and adapters that
+    /// rely on a different bookkeeping layer to enforce capacity.
     ///
     /// The returned [`Arc`] is the only valid handle — the registry
     /// captures a [`Weak`] back-reference to itself so the async port
     /// impl can spawn the debouncer task from `&self`.
     #[must_use]
     pub fn new(notifier: Arc<N>) -> Arc<Self> {
+        Self::with_caps(notifier, u16::MAX, u16::MAX)
+    }
+
+    /// Build a fresh registry resolving the per-URI / total caps from
+    /// the production env vars (`SSH_MAX_SUBS_PER_URI`,
+    /// `SSH_MAX_SUBS_TOTAL`). Used by the composition root so the
+    /// v4-compat subscribe surface enforces the same caps the v5
+    /// subscriber-lane adapter does.
+    #[must_use]
+    pub fn from_env(notifier: Arc<N>) -> Arc<Self> {
+        Self::with_caps(
+            notifier,
+            resolve_max_subs_per_uri(),
+            resolve_max_subs_total(),
+        )
+    }
+
+    /// Build a fresh registry with explicit caps. `max_per_uri` is the
+    /// per-URI ceiling; `max_total` is the process-wide ceiling. Both
+    /// are zero-clamped to `1` so a misconfigured env never accidentally
+    /// blocks every subscribe.
+    #[must_use]
+    pub fn with_caps(notifier: Arc<N>, max_per_uri: u16, max_total: u16) -> Arc<Self> {
+        let per_uri = max_per_uri.max(1);
+        let total = max_total.max(1);
         Arc::new_cyclic(|weak| Self {
             subscribers: DashMap::new(),
             peer_progress: DashMap::new(),
@@ -159,6 +196,8 @@ where
             sequence_counters: DashMap::new(),
             wakers: DashMap::new(),
             notifier,
+            max_per_uri: per_uri,
+            max_total: total,
             self_ref: Weak::clone(weak),
         })
     }
@@ -323,9 +362,10 @@ where
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok` — the result is wrapped in
-    /// [`Result`] to match the async port surface so future Phase 3
-    /// validation can plug in without a breaking change.
+    /// - [`DomainError::MaxSubsPerUriExceeded`] when the per-URI cap is
+    ///   exhausted (already at `SSH_MAX_SUBS_PER_URI`).
+    /// - [`DomainError::MaxSubsTotalExceeded`] when the global cap is
+    ///   exhausted (already at `SSH_MAX_SUBS_TOTAL`).
     pub fn subscribe_with_sub_id(
         &self,
         kind: ResourceKind,
@@ -334,18 +374,70 @@ where
         peer: Arc<dyn PeerHandle>,
         sub_id: SubId,
     ) -> Result<SubId, DomainError> {
-        let first = self.insert_subscriber(kind, resource_id, uri, peer, sub_id.clone());
+        let first = self.insert_subscriber(kind, resource_id, uri, peer, sub_id.clone())?;
         if first {
             self.ensure_debouncer(kind, resource_id);
         }
         Ok(sub_id)
     }
 
-    /// Sync flavour of `subscribe`. Returns `true` when this call
+    /// Total live subscribers across every URI. Used by the global
+    /// cap check and exposed on the public API for tests / metrics.
+    #[must_use]
+    pub fn total_subscribers(&self) -> usize {
+        self.subscribers.iter().map(|e| e.value().len()).sum()
+    }
+
+    /// Live subscribers on `uri`. `0` for unknown URIs.
+    #[must_use]
+    pub fn subscribers_for_uri(&self, uri: &str) -> usize {
+        self.subscribers
+            .get(uri)
+            .map_or(0, |entry| entry.value().len())
+    }
+
+    /// Pre-check the per-URI / total caps for a peer that wants to
+    /// attach to `uri`. Returns `Ok` when the peer already has a slot
+    /// on the URI (re-subscribe is idempotent — refresh-in-place
+    /// preserves the slot count).
+    fn check_capacity(&self, uri: &str, peer_id: &PeerId) -> Result<(), DomainError> {
+        let max_per_uri = usize::from(self.max_per_uri);
+        let max_total = usize::from(self.max_total);
+        let entry = self.subscribers.get(uri);
+        let already_has_slot = entry
+            .as_ref()
+            .is_some_and(|e| e.value().iter().any(|s| &s.peer_id == peer_id));
+        let uri_count = entry.as_ref().map_or(0, |e| e.value().len());
+        drop(entry);
+        // Re-subscribe by an existing peer is allowed — it refreshes
+        // the live `Peer` handle without growing the subscriber list.
+        if already_has_slot {
+            return Ok(());
+        }
+        if uri_count >= max_per_uri {
+            return Err(DomainError::MaxSubsPerUriExceeded {
+                uri: uri.to_string(),
+                limit: self.max_per_uri,
+            });
+        }
+        if self.total_subscribers() >= max_total {
+            return Err(DomainError::MaxSubsTotalExceeded {
+                limit: self.max_total,
+            });
+        }
+        Ok(())
+    }
+
+    /// Sync flavour of `subscribe`. Returns `Ok(true)` when this call
     /// attached the very first subscriber for `(kind, resource_id)`
     /// (i.e. the caller must spawn the debouncer). `sub_id` is the
     /// per-call subscriber id surfaced via `_meta.sub_id` on the
     /// legacy `resources/subscribe` path (Phase 2).
+    ///
+    /// Returns the spec'd cap errors when the configured ceilings are
+    /// exhausted; capacity is checked atomically against the live
+    /// `subscribers` snapshot before any state mutates so a refused
+    /// subscribe leaves zero side effects.
     fn insert_subscriber(
         &self,
         kind: ResourceKind,
@@ -353,8 +445,9 @@ where
         uri: &str,
         peer: Arc<dyn PeerHandle>,
         sub_id: SubId,
-    ) -> bool {
+    ) -> Result<bool, DomainError> {
         let peer_id = peer.id();
+        self.check_capacity(uri, &peer_id)?;
         let sub = Subscriber {
             peer_id: peer_id.clone(),
             sub_id: sub_id.clone(),
@@ -379,7 +472,7 @@ where
         self.sub_progress
             .entry((sub_id, uri.to_string()))
             .or_insert_with(|| Arc::new(PeerProgress::default()));
-        first
+        Ok(first)
     }
 }
 
@@ -491,7 +584,7 @@ where
         // `_meta.sub_id` channel get a stable handle; legacy hosts
         // that ignore it observe identical v4 behaviour.
         let sub_id = SubId::new(Uuid::now_v7().to_string());
-        let first = self.insert_subscriber(kind, &resource_id, &uri, peer, sub_id);
+        let first = self.insert_subscriber(kind, &resource_id, &uri, peer, sub_id)?;
         if first {
             // First subscriber for this resource — spawn the debouncer.
             // The task itself runs against an `Arc<Self>` upgraded from
@@ -1035,5 +1128,225 @@ mod tests {
         let v = reg.advance_peer_byte_cursor(&peer_id, "shell://abc/output", 64);
         assert_eq!(v, 64);
         assert_eq!(reg.peer_byte_cursor(&peer_id, "shell://abc/output"), 64);
+    }
+
+    // ---- v5 SSH_MAX_SUBS_PER_URI / SSH_MAX_SUBS_TOTAL caps -----------
+
+    fn capped_registry(max_per_uri: u16, max_total: u16) -> Arc<MemoryRegistry<RecordingNotifier>> {
+        let notifier = Arc::new(RecordingNotifier::default());
+        MemoryRegistry::with_caps(notifier, max_per_uri, max_total)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_succeeds_at_per_uri_cap() {
+        let reg = capped_registry(2, 32);
+        let uri = "shell://capped/output";
+        let p1: Arc<dyn PeerHandle> = StubPeer::new("p-1");
+        let p2: Arc<dyn PeerHandle> = StubPeer::new("p-2");
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "capped".to_string(),
+            uri.to_string(),
+            p1,
+        )
+        .await
+        .unwrap();
+        // Second peer fills the cap exactly — must succeed.
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "capped".to_string(),
+            uri.to_string(),
+            p2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.subscribers_for_uri(uri), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_one_over_per_uri_cap_returns_typed_error() {
+        let reg = capped_registry(2, 32);
+        let uri = "shell://overflow/output";
+        for i in 0..2 {
+            let peer: Arc<dyn PeerHandle> = StubPeer::new(&format!("p-{i}"));
+            SubscriberRegistryAsync::subscribe(
+                reg.as_ref(),
+                ResourceKind::Shell,
+                "overflow".to_string(),
+                uri.to_string(),
+                peer,
+            )
+            .await
+            .unwrap();
+        }
+        let extra: Arc<dyn PeerHandle> = StubPeer::new("p-extra");
+        let err = SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "overflow".to_string(),
+            uri.to_string(),
+            extra,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            DomainError::MaxSubsPerUriExceeded { uri: u, limit } => {
+                assert_eq!(u, uri);
+                assert_eq!(limit, 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Refused subscribe must not have leaked any state into the
+        // registry — the snapshot still shows exactly 2 subscribers.
+        assert_eq!(reg.subscribers_for_uri(uri), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_uri_cap_does_not_affect_other_uris() {
+        let reg = capped_registry(1, 32);
+        let p1: Arc<dyn PeerHandle> = StubPeer::new("p-1");
+        let p2: Arc<dyn PeerHandle> = StubPeer::new("p-2");
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "a".to_string(),
+            "shell://a/output".to_string(),
+            p1,
+        )
+        .await
+        .unwrap();
+        // A different URI gets its own slot under the per-URI cap.
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "b".to_string(),
+            "shell://b/output".to_string(),
+            p2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.subscribers_for_uri("shell://a/output"), 1);
+        assert_eq!(reg.subscribers_for_uri("shell://b/output"), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn total_cap_blocks_subscribe_across_uris() {
+        let reg = capped_registry(16, 1);
+        let p1: Arc<dyn PeerHandle> = StubPeer::new("p-1");
+        let p2: Arc<dyn PeerHandle> = StubPeer::new("p-2");
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "a".to_string(),
+            "shell://a/output".to_string(),
+            p1,
+        )
+        .await
+        .unwrap();
+        // Different URI — but the global cap is 1, so this fails.
+        let err = SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "b".to_string(),
+            "shell://b/output".to_string(),
+            p2,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DomainError::MaxSubsTotalExceeded { limit: 1 }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_frees_slot_for_next_subscribe() {
+        let reg = capped_registry(1, 32);
+        let p1: Arc<dyn PeerHandle> = StubPeer::new("p-1");
+        let p1_id = PeerId::new("p-1".to_string());
+        let p2: Arc<dyn PeerHandle> = StubPeer::new("p-2");
+        let uri = "shell://recycle/output";
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "recycle".to_string(),
+            uri.to_string(),
+            p1,
+        )
+        .await
+        .unwrap();
+        // Cap of 1 — second peer fails.
+        let extra: Arc<dyn PeerHandle> = StubPeer::new("p-extra");
+        let err = SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "recycle".to_string(),
+            uri.to_string(),
+            extra,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DomainError::MaxSubsPerUriExceeded { .. }));
+        // Drop the first peer; second peer can now attach.
+        SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &p1_id, uri).await;
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "recycle".to_string(),
+            uri.to_string(),
+            p2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.subscribers_for_uri(uri), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn re_subscribe_by_same_peer_does_not_consume_extra_slot() {
+        // The legacy registry path replaces the live `Peer` handle on
+        // re-subscribe — capacity check must mirror that and NOT
+        // refuse a refresh from a peer that already has a slot.
+        let reg = capped_registry(1, 32);
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("p-A");
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "x".to_string(),
+            "shell://x/output".to_string(),
+            Arc::clone(&peer),
+        )
+        .await
+        .unwrap();
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "x".to_string(),
+            "shell://x/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+        // Still exactly one slot — the refresh did not double-count.
+        assert_eq!(reg.subscribers_for_uri("shell://x/output"), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_caps_zero_clamps_to_one() {
+        // A misconfigured env (cap = 0) clamps to 1 so subscribe still
+        // works — the floor matches the lane adapter's behaviour.
+        let reg = capped_registry(0, 0);
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("p-1");
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "x".to_string(),
+            "shell://x/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.subscribers_for_uri("shell://x/output"), 1);
     }
 }
