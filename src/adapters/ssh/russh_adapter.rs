@@ -423,6 +423,24 @@ impl RusshAdapter {
         &self.shells
     }
 
+    /// Tear down every forward bound to `session_id`. Cancels the
+    /// listener accept-loop + aborts in-flight per-conn tasks so the
+    /// local port releases immediately on session disconnect.
+    fn close_session_forwards(&self, session_id: &SessionId) {
+        let stale: Vec<u16> = self
+            .forwards
+            .iter()
+            .filter(|entry| entry.value().session_id == *session_id)
+            .map(|entry| *entry.key())
+            .collect();
+        for port in stale {
+            if let Some((_, record)) = self.forwards.remove(&port) {
+                record.cancel.cancel();
+                record.accept_handle.abort();
+            }
+        }
+    }
+
     /// Internal: clone the russh handle for a given session id without
     /// holding the shard guard across `.await`.
     fn lookup_handle(&self, session_id: &SessionId) -> Result<SshHandle, DomainError> {
@@ -664,6 +682,9 @@ impl SshClientPort for RusshAdapter {
         // Drain the SFTP-shared registry so future SFTP lookups for this
         // session id return `SessionNotFound` instead of stale handles.
         let _stale = self.sftp_handle_registry.unregister(session_id);
+        // Tear down every forward bound to this session so the local
+        // listener releases the port and in-flight per-conn tasks abort.
+        self.close_session_forwards(session_id);
         let SessionRecord { handle, .. } = record;
         let result = handle
             .disconnect(Disconnect::ByApplication, "Session closed by client", "en")
@@ -841,6 +862,7 @@ impl SshClientPort for RusshAdapter {
             ForwardRecord {
                 cancel,
                 accept_handle: task,
+                session_id: session_id.clone(),
             },
         );
         Ok(ForwardHandle { bound_addr })
@@ -861,6 +883,7 @@ impl SshClientPort for RusshAdapter {
 struct ForwardRecord {
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
+    session_id: SessionId,
 }
 
 /// Listener loop that accepts local TCP connections and spawns a
