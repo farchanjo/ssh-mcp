@@ -21,6 +21,7 @@ use crate::domain::error::DomainError;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
+use crate::ports::notifier::{DebouncerActivator, PeerHandle};
 use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy, SubSummary};
 use crate::ports::subscriber_registry::ResourceKind;
 
@@ -39,6 +40,10 @@ pub struct SubscribeRequest {
     pub lag_policy: LagPolicy,
     /// Filter rule (regex / level / none).
     pub filter: FilterRule,
+    /// Optional rmcp peer to receive `notifications/resources/updated`
+    /// events. `None` for transports without a peer concept (NDJSON
+    /// daemon).
+    pub peer: Option<Arc<dyn PeerHandle>>,
 }
 
 /// Outbound DTO for `ssh_subscribe`.
@@ -60,13 +65,34 @@ pub struct SubscribeOutcome {
 #[derive(Debug, Clone)]
 pub struct SubscribeUseCase {
     lane: Arc<dyn LaneAdmin>,
+    activator: Option<Arc<dyn DebouncerActivator>>,
 }
 
 impl SubscribeUseCase {
-    /// Build the use case with the supplied lane handle.
+    /// Build the use case with the supplied lane handle. No debouncer
+    /// activator — used by tests / fixtures that bypass the full
+    /// production wiring.
     #[must_use]
     pub const fn new(lane: Arc<dyn LaneAdmin>) -> Self {
-        Self { lane }
+        Self {
+            lane,
+            activator: None,
+        }
+    }
+
+    /// Build the use case with both the lane handle and the debouncer
+    /// activator port. Production composition uses this constructor so
+    /// the `ssh_subscribe`-only flow wakes the same per-resource
+    /// debouncer the legacy `resources/subscribe` path uses.
+    #[must_use]
+    pub const fn with_activator(
+        lane: Arc<dyn LaneAdmin>,
+        activator: Arc<dyn DebouncerActivator>,
+    ) -> Self {
+        Self {
+            lane,
+            activator: Some(activator),
+        }
     }
 
     /// Drive the orchestration.
@@ -86,11 +112,15 @@ impl SubscribeUseCase {
             lifetime: req.lifetime,
             filter: req.filter,
             buffer_size: 0,
+            peer: req.peer,
         };
         let sub_id = self
             .lane
             .open(canonical.clone(), parsed.kind, parsed.id, policy)
             .await?;
+        if let Some(activator) = self.activator.as_ref() {
+            activator.ensure_for_uri(&canonical);
+        }
         Ok(SubscribeOutcome {
             sub_id,
             uri: canonical,
@@ -583,7 +613,7 @@ mod tests {
                 uri: "shell://sh-1/output?cursor=auto".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -603,6 +633,7 @@ mod tests {
                 lifetime: SubscriptionLifetime::AutoClose { grace_ms: 5_000 },
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -617,7 +648,7 @@ mod tests {
                 uri: "ftp://x/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap_err();
@@ -632,7 +663,7 @@ mod tests {
                 uri: "shell://x/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::Regex("([".to_string()),
+                filter: FilterRule::Regex("([".to_string()), peer: None,
             })
             .await
             .unwrap_err();
@@ -960,6 +991,7 @@ mod tests {
                 lifetime: SubscriptionLifetime::Lease { ttl_secs: 60 },
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -974,7 +1006,7 @@ mod tests {
                 uri: "shell://o/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::DropOldest,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -989,7 +1021,7 @@ mod tests {
                 uri: "shell://b/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::BlockSlow,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1004,7 +1036,7 @@ mod tests {
                 uri: "shell://q/output?cursor=auto".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1019,7 +1051,7 @@ mod tests {
                 uri: "command://c/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1034,7 +1066,7 @@ mod tests {
                 uri: "transfer://t/progress".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1049,7 +1081,7 @@ mod tests {
                 uri: "session://s/health".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1064,7 +1096,7 @@ mod tests {
                 uri: "forward://f/events".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1082,7 +1114,7 @@ mod tests {
                 uri: "shell://x1/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1091,7 +1123,7 @@ mod tests {
                 uri: "shell://x2/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1100,7 +1132,7 @@ mod tests {
                 uri: "shell://x3/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap_err();
@@ -1117,7 +1149,7 @@ mod tests {
                 uri: "shell://same/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap();
@@ -1126,7 +1158,7 @@ mod tests {
                 uri: "shell://same/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None,
+                filter: FilterRule::None, peer: None,
             })
             .await
             .unwrap_err();
@@ -1199,7 +1231,7 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERR".to_string()),
-                    buffer_size: 16,
+                    buffer_size: 16, peer: None,
                 },
             )
             .await
