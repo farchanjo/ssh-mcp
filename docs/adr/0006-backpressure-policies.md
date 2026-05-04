@@ -6,6 +6,26 @@ Proposed (v5.0.0). Implementation tracked under Phase 2 of the v5 roadmap. Depen
 
 ## Context
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    F1["1. russh recv<br/>TCP window"]
+    F2["2. ring buffer<br/>head-drop"]
+    F3["3. debouncer<br/>50ms coalesce"]
+    F4["4. lane mpsc<br/>(per sub_id)<br/>LagPolicy"]
+    F5["5. mux mpsc<br/>(global)<br/>SSH_MUX_BUFFER"]
+    F6["6. stdout writer<br/>OS pipe / SIGPIPE"]
+
+    F1 --> F2 --> F3 --> F4 --> F5 --> F6
+
+    classDef ext fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef ours fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef hot fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    class F1,F6 ext
+    class F2,F3,F5 ours
+    class F4 hot
+```
+
 ssh-mcp v4 surfaces backpressure at six points in the data path:
 
 1. **russh recv** — TCP window flow control on the underlying socket. Out of our control; bounded by kernel.
@@ -68,6 +88,24 @@ pub enum LagPolicy {
 - The ring buffer already holds the live tail (`max_buffer_size` per shell / cmd).
 - Rebuild is O(buf_size); typically <1 MB, so the worst-case latency is sub-ms on local memory.
 - The consumer sees a strictly-monotonic sequence number; it can detect that a gap was bridged and update its UI accordingly.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+stateDiagram-v2
+    [*] --> Draining: subscribe (Snapshot)
+    Draining --> Draining: try_send OK
+    Draining --> Overflow: mpsc full
+    Overflow --> Rebuilding: drop backlog<br/>read_resource(uri, cursor)
+    Rebuilding --> Draining: emit snapshot event<br/>cursor advanced
+    Draining --> [*]: unsubscribe
+
+    classDef ok fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef warn fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef active fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    class Draining ok
+    class Overflow warn
+    class Rebuilding active
+```
 
 ### Per-fronteira behaviour matrix
 

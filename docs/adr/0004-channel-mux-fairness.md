@@ -32,7 +32,37 @@ Replace the `(PeerId, Uri)` cursor key with `(SubId, Uri)`. Each subscription no
 - Its own `LifecycleHandle` (Phase 1 ResourceLifecycle).
 - Its own `SubscriberStats` (events_sent, bytes_sent, lag_drops, queue_depth, …).
 
-A new `ChannelMux` task owns a `DashMap<SubId, MultiplexLane>` plus an `AtomicUsize` round-robin cursor. Drain loop:
+A new `ChannelMux` task owns a `DashMap<SubId, MultiplexLane>` plus an `AtomicUsize` round-robin cursor.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    DB[debouncer<br/>per-resource]
+    subgraph Lanes["per-(SubId, Uri) lanes"]
+        L1["sub_id=A<br/>mpsc + cursor + filter"]
+        L2["sub_id=B<br/>mpsc + cursor + filter"]
+        L3["sub_id=C<br/>mpsc + cursor + filter"]
+    end
+    MUX{{"ChannelMux<br/>round-robin<br/>AtomicUsize cursor"}}
+    OUT["outbound writer<br/>(rmcp peer or<br/>NDJSON formatter)"]
+
+    DB --> L1
+    DB --> L2
+    DB --> L3
+    L1 --> MUX
+    L2 --> MUX
+    L3 --> MUX
+    MUX --> OUT
+
+    classDef sub fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef active fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef writer fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class L1,L2,L3 sub
+    class MUX active
+    class OUT writer
+```
+
+Drain loop:
 
 1. Snapshot the active lanes via the DashMap iterator.
 2. Park on `Notify` if no lanes are active.
@@ -50,6 +80,34 @@ Fairness invariant: between any two adjacent lanes A and B that both have backlo
 | `DropOldest` | Pop oldest event, push new. Emit `{"ev":"lagged","sub_id":...,"dropped":N}` marker. | Monitoring with gap tolerance. |
 | `DropNewest` | Ignore new event. Emit lagged marker. | Rare; prefer historical context. |
 | `Snapshot` (default) | Drop the lane's mpsc backlog. Next event triggers a `read_resource(uri, cursor=current_seq)` rebuild that returns the live snapshot from the ring buffer. Emit `{"ev":"snapshot","sub_id":...,"cursor":N,"delta":<bytes>}`. Zero loss as long as the ring buffer covers the gap. | Default — best tradeoff. |
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    Q{{"Lane mpsc full?"}}
+    NEED{{"Zero-loss<br/>required?"}}
+    GAP{{"Tolerates<br/>gap markers?"}}
+    BS["BlockSlow<br/>producer .awaits<br/>(forensic / audit)"]
+    SN["Snapshot<br/>drop backlog +<br/>rebuild from ring buffer<br/>(default)"]
+    DO["DropOldest<br/>pop oldest +<br/>emit lagged marker"]
+    DN["DropNewest<br/>ignore new +<br/>emit lagged marker"]
+
+    Q -->|no| OK[deliver normally]
+    Q -->|yes| NEED
+    NEED -->|yes| BS
+    NEED -->|no| GAP
+    GAP -->|no| SN
+    GAP -->|yes, prefer fresh| DO
+    GAP -->|yes, prefer old| DN
+
+    classDef warn fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef ok fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef active fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    class BS warn
+    class SN active
+    class DO,DN warn
+    class OK ok
+```
 
 ### Stats surface
 

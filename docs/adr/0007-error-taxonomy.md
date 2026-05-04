@@ -43,6 +43,46 @@ Group every code into one of seven categories with explicit retry semantics. Eac
 | `STATE` | Never retry without `_meta.idempotency_key`. | `INVALID_ARGUMENT`, `INVALID_REPEAT`, `INVALID_LIFETIME`, `IDEMPOTENCY_KEY_MISMATCH` |
 | `INTERNAL` | Never retry; report bug. | `STORAGE_ERROR`, `INTERNAL_ERROR`, `LIFECYCLE_STATE_CONFLICT`, `SESSION_REFCOUNT_UNDERFLOW` |
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    E["error received"]
+    CAT{"category?"}
+    AUTH["AUTH<br/>never retry<br/>fix credentials"]
+    TR["TRANSPORT<br/>retry w/ backoff<br/>cap 10s"]
+    REM{"REMOTE<br/>exit code OK?"}
+    RES["RESOURCE<br/>never retry<br/>recreate via open/exec"]
+    POL{"POLICY<br/>policy change<br/>possible?"}
+    ST{"STATE<br/>have fresh<br/>idem_key?"}
+    INT["INTERNAL<br/>never retry<br/>file bug"]
+    OK["consume<br/>continue"]
+    GIVE["surface error<br/>do not retry"]
+
+    E --> CAT
+    CAT -->|AUTH| AUTH
+    CAT -->|TRANSPORT| TR
+    CAT -->|REMOTE| REM
+    CAT -->|RESOURCE| RES
+    CAT -->|POLICY| POL
+    CAT -->|STATE| ST
+    CAT -->|INTERNAL| INT
+    REM -->|yes| OK
+    REM -->|no| GIVE
+    POL -->|yes| TR
+    POL -->|no| GIVE
+    ST -->|yes| TR
+    ST -->|no| GIVE
+
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef warn fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef ok fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef active fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    class AUTH,RES,INT,GIVE bad
+    class TR,POL,ST warn
+    class OK ok
+    class CAT,REM active
+```
+
 ### Code list (38 codes total)
 
 For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 codes carry over with their existing semantics. The full list is in `docs/llm-ux/ERROR_HANDBOOK.md`.

@@ -32,29 +32,58 @@ Introduce a **lifecycle binding** layer that tracks each long-running resource t
 
 ### State machine
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+stateDiagram-v2
+    [*] --> Owned: create
+    Owned --> Observed: first subscribe<br/>(sub_count = 1)
+    Observed --> Observed: subscribe / unsubscribe<br/>(sub_count >= 1)
+    Observed --> Releasing: last unsubscribe<br/>(sub_count = 0)
+    Releasing --> Observed: new subscribe<br/>within grace<br/>(cancel timer)
+    Releasing --> Closed: grace timer fires
+    Owned --> Closed: explicit close
+    Observed --> Closed: explicit close
+    Closed --> [*]
+
+    classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef releasing fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef closed fill:#cf222e,color:#f0f6fc,stroke:#f85149
+
+    class Owned owned
+    class Observed observed
+    class Releasing releasing
+    class Closed closed
+```
+
+<details>
+<summary>ASCII fallback (screen-reader friendly)</summary>
+
 ```
        subscribe (sub_count++)
-     ┌────────────────────────┐
-     │                        │
-     ▼                        │
-┌──────────────┐      ┌───────┴────────┐
-│    Owned     │ ───▶ │   Observed     │
-│ (sub_count=0)│ first│ (sub_count>=1) │
-└──────┬───────┘ sub  └────────┬───────┘
-       │                       │
-       │ explicit close        │ last unsubscribe
-       ▼                       ▼
-┌──────────────┐      ┌────────────────┐
-│    Closed    │ ◀─── │   Releasing    │
-│ (released)   │grace │ (sub_count=0,  │
-└──────────────┘timer │  timer armed)  │
-       ▲      fires   └────────┬───────┘
-       │                       │
-       │                       │ new subscribe
-       └───────────────────────┘  within grace
-                                  ─▶ Observed
+     +------------------------+
+     |                        |
+     v                        |
++--------------+      +-------+--------+
+|    Owned     | ---> |   Observed     |
+| (sub_count=0)| first| (sub_count>=1) |
++------+-------+ sub  +--------+-------+
+       |                       |
+       | explicit close        | last unsubscribe
+       v                       v
++--------------+      +----------------+
+|    Closed    | <--- |   Releasing    |
+| (released)   |grace | (sub_count=0,  |
++--------------+timer |  timer armed)  |
+       ^      fires   +--------+-------+
+       |                       |
+       |                       | new subscribe
+       +-----------------------+  within grace
+                                  -> Observed
                                   (cancel timer)
 ```
+
+</details>
 
 Invariants:
 
@@ -97,6 +126,30 @@ Each session carries an analogous refcount aggregator:
 4. If `active_refs == 0` AND `!session.policy.persistent` AND not already `Releasing`, arm the session-level grace timer.
 
 This wires cleanly into the existing `SessionReaper` task: the reaper now consults `SessionLifecycle.active_refs` before deciding to disconnect, which means a session with active resources will never be reaped even if its inactivity TTL fires (correct behaviour — refcount supersedes TTL).
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    autonumber
+    participant Sub as Subscriber
+    participant Res as ResourceLifecycle
+    participant Sess as SessionLifecycle
+    participant Reaper as SessionReaper
+
+    Sub->>Res: unsubscribe (last sub)
+    Res->>Res: CAS Observed -> Releasing<br/>arm grace timer
+    Note over Res: timer fires after grace_ms
+    Res->>Res: CAS Releasing -> Closed
+    Res->>Sess: active_refs.fetch_sub(1, AcqRel)
+    alt active_refs == 0 AND not persistent
+        Sess->>Sess: arm idle_grace_ms timer
+        Reaper->>Sess: read active_refs
+        Sess-->>Reaper: 0 -> proceed disconnect
+    else active_refs > 0
+        Reaper->>Sess: read active_refs
+        Sess-->>Reaper: > 0 -> skip
+    end
+```
 
 ### Defaults
 
