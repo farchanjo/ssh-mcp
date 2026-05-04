@@ -1,4 +1,4 @@
-//! Typed Rust output structs for the v4.7 `output_schema` advertisement.
+//! Typed Rust output structs for the v4.8 `output_schema` advertisement.
 //!
 //! Each struct mirrors the runtime `structured_content` payload of the
 //! associated tool's success path. Wired through the rmcp `#[tool]`
@@ -9,22 +9,53 @@
 //!
 //! ## Coverage
 //!
-//! v4.7 ships typed schemas only for the six most-used tools — connect,
-//! execute, get-command-output, shell-open, shell-read,
-//! get-transfer-progress. The remaining 12 tools still emit a full
-//! structured payload, but their `output_schema` is not advertised; the
-//! payload shape is documented in the per-render `*_structured` doc
-//! comments under [`super::render`]. Lifting the remaining tools is a
-//! mechanical follow-up tracked in v4.8.
+//! v4.8 lifts schema coverage to **all 21 MCP tools** (or 20 without the
+//! `port_forward` Cargo feature). v4.7 shipped only six (`ssh_connect`,
+//! `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`,
+//! `ssh_shell_read`, `ssh_get_transfer_progress`) plus the three
+//! v4.7-step3 additions (`ssh_run`, `ssh_execute_batch`,
+//! `ssh_disconnect_many`); the remaining 12 tools now advertise typed
+//! schemas mirroring their `structured_content` payload byte-for-byte.
+//! The Markdown body is unchanged.
 //!
 //! ## Stability
 //!
 //! Every struct is `#[non_exhaustive]` so callers cannot match
 //! exhaustively across versions; new optional fields can be added
-//! without bumping the major version.
+//! without bumping the major version. Optional fields use
+//! `#[serde(skip_serializing_if = "Option::is_none")]` so absent values
+//! are not surfaced as JSON `null` on the wire.
 
 use schemars::JsonSchema;
 use serde::Serialize;
+
+/// One per-session entry surfaced in `ssh_list_sessions` (and embedded
+/// in [`SshConnectResult`] when `status = "suggested"`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SessionEntry {
+    /// Stable session id.
+    pub session_id: String,
+    /// Resolved host portion of the SSH endpoint.
+    pub host: String,
+    /// Resolved port (defaults to 22).
+    pub port: u16,
+    /// SSH login user.
+    pub username: String,
+    /// Optional grouping identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Optional caller-supplied display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// RFC 3339 timestamp of when the session was first established.
+    pub connected_at: String,
+    /// Last health-check verdict; `null` until the first check fires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub healthy: Option<bool>,
+    /// Whether SSH zlib compression was negotiated.
+    pub compression_enabled: bool,
+}
 
 /// Successful `ssh_connect` payload (covers `ok`, `reused`, `suggested`).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -51,6 +82,9 @@ pub struct SshConnectResult {
     /// `ssh_disconnect_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Optional caller-supplied display name echoed from the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Number of retry attempts consumed during the handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
@@ -64,9 +98,86 @@ pub struct SshConnectResult {
     /// inactivity timeout is zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Number of stale duplicate sessions evicted on the connect path
+    /// (only emitted on `status = "ok"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<usize>,
+    /// Match list surfaced when `status = "suggested"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<SessionEntry>>,
+    /// Count of entries in [`Self::matches`] (only set on `"suggested"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
     /// Successor tool calls advertised to the LLM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<Vec<String>>,
+}
+
+/// `ssh_disconnect` payload — single-session teardown summary.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshDisconnectResult {
+    /// Discriminator: always `"ssh_disconnect"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed session id.
+    pub session_id: String,
+    /// Number of async commands cancelled by the disconnect.
+    pub commands_cancelled: usize,
+    /// Number of interactive shells closed by the disconnect.
+    pub shells_closed: usize,
+    /// Number of in-flight transfers aborted by the disconnect.
+    pub transfers_aborted: usize,
+}
+
+/// `ssh_list_sessions` payload — current healthy sessions plus an
+/// optional bulk-cleanup hint.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshListSessionsResult {
+    /// Discriminator: always `"ssh_list_sessions"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed `agent_id` filter (`None` when the caller did not narrow
+    /// the request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id_filter: Option<String>,
+    /// Healthy sessions, ordered by the repository's natural order.
+    pub sessions: Vec<SessionEntry>,
+    /// Number of entries in [`Self::sessions`].
+    pub count: usize,
+    /// Total session count before the request `max_items` cap was
+    /// applied (may exceed `count`).
+    pub total: usize,
+    /// Anti-leak nudge surfaced when one agent owns more than the
+    /// configured threshold of sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Successor tool calls advertised to the LLM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<Vec<String>>,
+}
+
+/// `ssh_disconnect_agent` payload — bulk-by-agent teardown summary.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshDisconnectAgentResult {
+    /// Discriminator: always `"ssh_disconnect_agent"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed agent id.
+    pub agent_id: String,
+    /// Number of sessions closed.
+    pub sessions_closed: usize,
+    /// Number of async commands cancelled.
+    pub commands_cancelled: usize,
+    /// Number of interactive shells closed.
+    pub shells_closed: usize,
+    /// Number of in-flight transfers aborted.
+    pub transfers_aborted: usize,
 }
 
 /// `ssh_execute` started payload.
@@ -123,6 +234,75 @@ pub struct SshGetCommandOutputResult {
     pub next: Option<Vec<String>>,
 }
 
+/// One per-command entry surfaced by [`SshListCommandsResult`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct CommandEntry {
+    /// Stable command id.
+    pub command_id: String,
+    /// Owning session id.
+    pub session_id: String,
+    /// Verbatim command line.
+    pub command: String,
+    /// One of `"running"`, `"completed"`, `"cancelled"`, `"failed"`.
+    pub status: String,
+    /// RFC 3339 timestamp of when the command was spawned.
+    pub started_at: String,
+}
+
+/// `ssh_list_commands` payload — async command inventory snapshot.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshListCommandsResult {
+    /// Discriminator: always `"ssh_list_commands"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Tracked commands matching the optional filters.
+    pub commands: Vec<CommandEntry>,
+    /// Number of entries in [`Self::commands`].
+    pub count: usize,
+    /// Total count before the request `max_items` cap was applied
+    /// (may exceed `count`).
+    pub total: usize,
+}
+
+/// `ssh_cancel_command` payload — covers both the `ok` path
+/// (cancelled with partial stdout/stderr capture) and the `noop` path
+/// (command already terminal).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshCancelCommandResult {
+    /// Discriminator: always `"ssh_cancel_command"`.
+    pub tool: String,
+    /// `"ok"` when the command was running and got cancelled, `"noop"`
+    /// when the command had already reached a terminal state.
+    pub status: String,
+    /// Echoed command id.
+    pub command_id: String,
+    /// Stdout snapshot at cancellation time (head-truncated). Absent on
+    /// the `"noop"` branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    /// Stderr snapshot at cancellation time (head-truncated). Absent on
+    /// the `"noop"` branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    /// `true` when the stdout snapshot dropped trailing bytes. Absent on
+    /// the `"noop"` branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_truncated: Option<bool>,
+    /// `true` when the stderr snapshot dropped trailing bytes. Absent on
+    /// the `"noop"` branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated: Option<bool>,
+    /// Status of the command at the moment the cancel arrived; only set
+    /// on the `"noop"` branch (one of `"running"`, `"completed"`,
+    /// `"cancelled"`, `"failed"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// `ssh_shell_open` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
@@ -144,6 +324,50 @@ pub struct SshShellOpenResult {
     /// Inherited grouping id, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// UTF-8 lossy snapshot of any stdout the PTY emitted within the
+    /// initial peek budget. Omitted when the peek returned empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_buffer: Option<String>,
+    /// Successor tool calls advertised to the LLM.
+    pub next: Vec<String>,
+}
+
+/// `ssh_shell_write` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshShellWriteResult {
+    /// Discriminator: always `"ssh_shell_write"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed shell id.
+    pub shell_id: String,
+    /// Number of bytes written to the PTY.
+    pub bytes_sent: usize,
+    /// Successor tool calls advertised to the LLM.
+    pub next: Vec<String>,
+}
+
+/// `ssh_shell_send_key` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshShellSendKeyResult {
+    /// Discriminator: always `"ssh_shell_send_key"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed shell id.
+    pub shell_id: String,
+    /// Canonical name of the key sent (e.g. `"arrow_up"`, `"enter"`).
+    pub key: String,
+    /// Modifier list parsed from the request (`"shift"`, `"alt"`,
+    /// `"ctrl"`); empty when no modifier was requested.
+    pub modifiers: Vec<String>,
+    /// Repeat count applied to the keystroke (1..=64).
+    pub repeat: u8,
+    /// Number of bytes written to the PTY for the entire (modifiers +
+    /// key + repeat) expansion.
+    pub bytes_sent: usize,
     /// Successor tool calls advertised to the LLM.
     pub next: Vec<String>,
 }
@@ -168,6 +392,92 @@ pub struct SshShellReadResult {
     pub cleared: bool,
     /// `true` when the snapshot dropped leading bytes.
     pub truncated: bool,
+}
+
+/// `ssh_shell_wait_for` payload — pattern-gated PTY snapshot.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshShellWaitForResult {
+    /// Discriminator: always `"ssh_shell_wait_for"`.
+    pub tool: String,
+    /// One of `"matched"`, `"timeout"`, `"closed"`.
+    pub status: String,
+    /// Echoed shell id.
+    pub shell_id: String,
+    /// Pattern that matched (only set on `"matched"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_pattern: Option<String>,
+    /// Buffer slice rendered into the response (head-truncated to 16
+    /// KiB).
+    pub stdout: String,
+    /// Number of bytes returned in [`Self::stdout`].
+    pub bytes_returned: usize,
+    /// Successor tool calls advertised to the LLM (only set on
+    /// `"matched"` / `"timeout"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<Vec<String>>,
+}
+
+/// `ssh_shell_close` payload.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshShellCloseResult {
+    /// Discriminator: always `"ssh_shell_close"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Echoed shell id.
+    pub shell_id: String,
+}
+
+/// `ssh_upload` payload — SFTP upload `STARTED` snapshot.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshUploadResult {
+    /// Discriminator: always `"ssh_upload"`.
+    pub tool: String,
+    /// Lifecycle status; `"started"` for the async transfer path.
+    pub status: String,
+    /// Newly-minted transfer id.
+    pub transfer_id: String,
+    /// Owning session.
+    pub session_id: String,
+    /// Inherited grouping id, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Source path (local for upload).
+    pub from: String,
+    /// Destination path (remote for upload).
+    pub to: String,
+    /// Total payload size in bytes.
+    pub size_bytes: u64,
+    /// Successor tool calls advertised to the LLM.
+    pub next: Vec<String>,
+}
+
+/// `ssh_download` payload — SFTP download `STARTED` snapshot.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshDownloadResult {
+    /// Discriminator: always `"ssh_download"`.
+    pub tool: String,
+    /// Lifecycle status; `"started"` for the async transfer path.
+    pub status: String,
+    /// Newly-minted transfer id.
+    pub transfer_id: String,
+    /// Owning session.
+    pub session_id: String,
+    /// Inherited grouping id, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Source path (remote for download).
+    pub from: String,
+    /// Destination path (local for download).
+    pub to: String,
+    /// Total payload size in bytes.
+    pub size_bytes: u64,
+    /// Successor tool calls advertised to the LLM.
+    pub next: Vec<String>,
 }
 
 /// `ssh_get_transfer_progress` payload.
@@ -195,6 +505,31 @@ pub struct SshGetTransferProgressResult {
     /// `status = "running"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<Vec<String>>,
+}
+
+/// `ssh_forward` payload — TCP port-forward `OK` snapshot. Only emitted
+/// when the `port_forward` Cargo feature is enabled.
+#[cfg(feature = "port_forward")]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[non_exhaustive]
+pub struct SshForwardResult {
+    /// Discriminator: always `"ssh_forward"`.
+    pub tool: String,
+    /// Always `"ok"` on the success path.
+    pub status: String,
+    /// Newly-minted forward id.
+    pub forward_id: String,
+    /// Owning session.
+    pub session_id: String,
+    /// Local listener address (e.g. `"0.0.0.0:8080"`).
+    pub local: String,
+    /// Remote endpoint (e.g. `"example.com:3306"`).
+    pub remote: String,
+    /// Always `true` on the success path; the value is included so the
+    /// schema documents the field shape.
+    pub active: bool,
+    /// Successor tool calls advertised to the LLM.
+    pub next: Vec<String>,
 }
 
 /// `ssh_run` payload — surfaces the resolved session id, the captured
