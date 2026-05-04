@@ -25,7 +25,7 @@ use super::traits::AuthStrategy;
 /// behind `Box<dyn AuthStrategy>`. This enum keeps the chain free of
 /// dynamic dispatch (and therefore free of `async-trait`) while still
 /// supporting every authentication method the v3 chain offered.
-pub(crate) enum Strategy {
+pub enum Strategy {
     /// Password handshake.
     Password(PasswordAuth),
     /// Private key file handshake.
@@ -73,13 +73,13 @@ impl Strategy {
 ///
 /// let result = chain.authenticate(&mut handle, "username").await?;
 /// ```
-pub(crate) struct AuthChain {
+pub struct AuthChain {
     strategies: Vec<Strategy>,
 }
 
 impl AuthChain {
     /// Create a new empty authentication chain.
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             strategies: Vec::new(),
         }
@@ -87,7 +87,7 @@ impl AuthChain {
 
     /// Add password authentication to the chain.
     #[must_use]
-    pub(crate) fn with_password(mut self, password: impl Into<String>) -> Self {
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.strategies
             .push(Strategy::Password(PasswordAuth::new(password)));
         self
@@ -95,27 +95,27 @@ impl AuthChain {
 
     /// Add key-based authentication to the chain.
     #[must_use]
-    pub(crate) fn with_key(mut self, key_path: impl Into<PathBuf>) -> Self {
+    pub fn with_key(mut self, key_path: impl Into<PathBuf>) -> Self {
         self.strategies.push(Strategy::Key(KeyAuth::new(key_path)));
         self
     }
 
     /// Add SSH agent authentication to the chain.
     #[must_use]
-    pub(crate) fn with_agent(mut self) -> Self {
+    pub fn with_agent(mut self) -> Self {
         self.strategies.push(Strategy::Agent(AgentAuth::new()));
         self
     }
 
     /// Check if the chain has any authentication strategies.
     #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.strategies.is_empty()
     }
 
     /// Get the number of strategies in the chain.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.strategies.len()
     }
 }
@@ -123,6 +123,44 @@ impl AuthChain {
 impl Default for AuthChain {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl AuthChain {
+    /// Run a single strategy from the chain, logging the outcome and
+    /// returning `Some(Ok(true))` on success, `Some(Err(msg))` to short-
+    /// circuit, or `None` to continue with the next strategy (recording
+    /// the failure on `last_error`).
+    async fn try_strategy(
+        strategy: &Strategy,
+        handle: &mut client::Handle<SshClientHandler>,
+        username: &str,
+        last_error: &mut Option<String>,
+    ) -> Option<Result<bool, String>> {
+        debug!("Trying authentication strategy: {}", strategy.name());
+        match strategy.authenticate(handle, username).await {
+            Ok(true) => {
+                debug!(
+                    "Authentication succeeded with strategy: {}",
+                    strategy.name()
+                );
+                Some(Ok(true))
+            }
+            Ok(false) => {
+                debug!("Authentication failed with strategy: {}", strategy.name());
+                *last_error = Some(format!("{} authentication rejected", strategy.name()));
+                None
+            }
+            Err(e) => {
+                debug!(
+                    "Authentication error with strategy {}: {}",
+                    strategy.name(),
+                    e
+                );
+                *last_error = Some(e);
+                None
+            }
+        }
     }
 }
 
@@ -135,35 +173,14 @@ impl AuthStrategy for AuthChain {
         if self.strategies.is_empty() {
             return Err("No authentication strategies configured".to_string());
         }
-
         let mut last_error = None;
-
         for strategy in &self.strategies {
-            debug!("Trying authentication strategy: {}", strategy.name());
-
-            match strategy.authenticate(handle, username).await {
-                Ok(true) => {
-                    debug!(
-                        "Authentication succeeded with strategy: {}",
-                        strategy.name()
-                    );
-                    return Ok(true);
-                }
-                Ok(false) => {
-                    debug!("Authentication failed with strategy: {}", strategy.name());
-                    last_error = Some(format!("{} authentication rejected", strategy.name()));
-                }
-                Err(e) => {
-                    debug!(
-                        "Authentication error with strategy {}: {}",
-                        strategy.name(),
-                        e
-                    );
-                    last_error = Some(e);
-                }
+            if let Some(result) =
+                Self::try_strategy(strategy, handle, username, &mut last_error).await
+            {
+                return result;
             }
         }
-
         Err(last_error.unwrap_or_else(|| "All authentication methods failed".to_string()))
     }
 }

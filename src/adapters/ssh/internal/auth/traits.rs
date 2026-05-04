@@ -21,7 +21,7 @@ use crate::adapters::ssh::internal::session::SshClientHandler;
 /// inside a `tokio::spawn`-ed task. Each strategy represents a
 /// different authentication method (password, key file, SSH agent,
 /// ...).
-pub(crate) trait AuthStrategy: Send + Sync {
+pub trait AuthStrategy: Send + Sync {
     /// Attempt to authenticate against the SSH server.
     ///
     /// # Arguments

@@ -15,7 +15,7 @@ use super::traits::AuthStrategy;
 ///
 /// Loads a private key from a file and uses it for public key
 /// authentication. Currently supports passphrase-less keys.
-pub(crate) struct KeyAuth {
+pub struct KeyAuth {
     key_path: PathBuf,
 }
 
@@ -25,7 +25,7 @@ impl KeyAuth {
     /// # Arguments
     ///
     /// * `key_path` - Path to the private key file.
-    pub(crate) fn new(key_path: impl Into<PathBuf>) -> Self {
+    pub fn new(key_path: impl Into<PathBuf>) -> Self {
         let raw: PathBuf = key_path.into();
         let expanded = expand_tilde(&raw.to_string_lossy());
         Self {
