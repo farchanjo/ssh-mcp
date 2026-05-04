@@ -23,7 +23,7 @@ async fn chaos04_slow_consumer_drop_oldest_keeps_producer_running() {
         lag_policy: LagPolicy::DropOldest,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4,
+        buffer_size: 4, peer: None,
     };
     let sub_id = adapter
         .open_lane(

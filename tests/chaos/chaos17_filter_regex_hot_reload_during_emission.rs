@@ -25,7 +25,7 @@ async fn chaos17_filter_hot_reload_during_emission_is_atomic() {
         lag_policy: LagPolicy::DropOldest,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 8,
+        buffer_size: 8, peer: None,
     };
     let sub_id = adapter
         .open_lane(

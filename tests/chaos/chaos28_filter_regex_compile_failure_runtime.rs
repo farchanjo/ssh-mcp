@@ -23,7 +23,7 @@ async fn chaos28_invalid_regex_keeps_previous_filter_intact() {
         lifetime: SubscriptionLifetime::Manual,
         // Initial filter forwards only ERROR lines.
         filter: FilterRule::Regex("ERROR.*".to_string()),
-        buffer_size: 4,
+        buffer_size: 4, peer: None,
     };
     let sub_id = adapter
         .open_lane(

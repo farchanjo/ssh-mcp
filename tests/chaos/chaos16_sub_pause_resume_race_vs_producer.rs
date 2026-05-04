@@ -24,7 +24,7 @@ async fn chaos16_pause_resume_race_keeps_counters_consistent() {
         lag_policy: LagPolicy::DropOldest,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 8,
+        buffer_size: 8, peer: None,
     };
     let sub_id = adapter
         .open_lane(
