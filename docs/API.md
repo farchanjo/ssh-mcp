@@ -907,11 +907,11 @@ Returned by `get_info()`:
     "tools": { "listChanged": true },
     "resources": { "subscribe": true, "listChanged": true }
   },
-  "instructions": "SSH MCP. 18 tools, 5 push streams (shell://, command://, transfer://, session://, forward://). All tools return block markdown: first line TOOL: STATUS, then KEY: value pairs. Output blocks delimited by --- name [nonce] ---. IDs end in _ID.\n\nHappy paths:\n1) Run command: ssh_connect (set agent_id, reuse=Auto). Then ssh_execute. Then ssh_get_command_output wait=true.\n2) Interactive shell: ssh_connect, ssh_shell_open. Then resources/subscribe shell://<SHELL_ID>/output. Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\nCleanup: pass agent_id on connect, then ssh_disconnect_agent to bulk-close. Watch for HINT lines and EXPIRES_AT."
+  "instructions": "SSH MCP. 21 tools, 5 push streams (shell://, command://, transfer://, session://, forward://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths:\n1) One-shot: ssh_run(address, username, command). Returns exit_code in one call.\n2) Run async: ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then ssh_get_command_output wait=true (subscribe command://<id>/output for push).\n3) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n4) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
 }
 ```
 
-The build without `port_forward` advertises `17 tools, 4 push streams (shell://, command://, transfer://, session://)` instead.
+The build without `port_forward` advertises `20 tools, 4 push streams (shell://, command://, transfer://, session://)` instead.
 
 `Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). The URL only resolves after the v4.6 push to `origin/master` lands; clients gracefully fall back to the title + description when the asset is unreachable. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
 
