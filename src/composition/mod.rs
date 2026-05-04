@@ -59,6 +59,7 @@ use crate::ports::config::ConfigPort;
 #[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 use crate::ports::id_generator::IdGeneratorPort;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::notifier::NotifierPort;
 use crate::ports::output_stream::OutputStreamPort;
 use crate::ports::session_repo::SessionRepository;
@@ -157,6 +158,11 @@ where
     /// construction time. Recorded here for the same reason as
     /// [`Self::auth`].
     pub notifier: Arc<N>,
+
+    /// v5 lifecycle adapter handle. Held as `Arc<dyn>` so the use case
+    /// container does not need a generic parameter for the lifecycle
+    /// port — the trait is dyn-safe by design.
+    pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
 }
 
 /// Generic container for every use case the v4 server exposes (with
@@ -234,4 +240,8 @@ where
     /// `NotifierPort` is wired into the subscription registry at
     /// construction time. Kept here for the same reason as [`Self::auth`].
     pub notifier: Arc<N>,
+    /// v5 lifecycle adapter handle. Held as `Arc<dyn>` so the use case
+    /// container does not need a generic parameter for the lifecycle
+    /// port — the trait is dyn-safe by design.
+    pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
 }

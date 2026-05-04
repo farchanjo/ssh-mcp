@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::subscriber_registry::SubscriberRegistryAsync;
 
 /// Inbound DTO.
@@ -47,6 +48,7 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<Sub> UnsubscribeResourceUseCase<Sub>
@@ -55,8 +57,11 @@ where
 {
     /// Wire the use case from an already-shared adapter handle.
     #[must_use]
-    pub const fn new(subscribers: Arc<Sub>) -> Self {
-        Self { subscribers }
+    pub const fn new(subscribers: Arc<Sub>, lifecycle: Arc<dyn LifecyclePolicyPort>) -> Self {
+        Self {
+            subscribers,
+            lifecycle,
+        }
     }
 
     /// Drive the unsubscribe orchestration. See module-level docs.
@@ -74,6 +79,14 @@ where
             parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
         self.subscribers.unsubscribe(&req.peer_id, &canonical).await;
+        // v5 lifecycle: debit the resource refcount. Errors here are
+        // bug-class (underflow on a never-tracked resource); surface
+        // them so the caller can report the regression rather than
+        // silently swallow it. The legacy registry tolerates unknown
+        // (peer, uri) pairs, but the lifecycle adapter is permissive
+        // for unknown resources too — see
+        // `RefcountedLifecycleAdapter::on_unsubscribe`.
+        self.lifecycle.on_unsubscribe(parsed.kind, &parsed.id)?;
         Ok(UnsubscribeResourceOutcome { uri: canonical })
     }
 }
@@ -154,7 +167,11 @@ mod tests {
         Arc<RecordingRegistry>,
     ) {
         let registry = Arc::new(RecordingRegistry::default());
-        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry));
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle);
         (uc, registry)
     }
 

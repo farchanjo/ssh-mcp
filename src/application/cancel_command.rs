@@ -62,8 +62,10 @@ use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::ids::CommandId;
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::output_stream::{OutputSnapshot, OutputStreamPort};
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_registry::ResourceKind;
 
 /// Maximum amount of time the use case waits for the SSH cancellation to
 /// flip the repository entry out of [`CommandStatus::Running`]. Mirrors the
@@ -135,6 +137,10 @@ where
     ssh: Arc<S>,
     commands: Arc<CR>,
     output: Arc<OS>,
+    /// v5 lifecycle: force-close the lifecycle entry as part of the
+    /// cancel orchestration so the cascade coordinator decrements the
+    /// owning session's active-resource count.
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 impl<S, CR, OS> CancelCommandUseCase<S, CR, OS>
@@ -145,11 +151,17 @@ where
 {
     /// Wire the use case from already-shared adapter handles.
     #[must_use]
-    pub const fn new(ssh: Arc<S>, commands: Arc<CR>, output: Arc<OS>) -> Self {
+    pub const fn new(
+        ssh: Arc<S>,
+        commands: Arc<CR>,
+        output: Arc<OS>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+    ) -> Self {
         Self {
             ssh,
             commands,
             output,
+            lifecycle,
         }
     }
 
@@ -179,39 +191,44 @@ where
                 status: snapshot.status,
             });
         }
-        // Take the output snapshot *before* requesting cancellation:
-        // [`SshClientPort::cancel`] tears the SSH-internal command
-        // record down, which makes a subsequent
-        // [`OutputStreamPort::snapshot_command`] return
-        // `CommandNotFound`. The "captured up to the moment of
-        // cancellation" semantics is satisfied either way, and a
-        // pre-cancel snapshot is the only source-of-truth we can read
-        // without coupling the cancel UC to the adapter's internal
-        // bookkeeping order. v4.2 fix.
-        let pre_snap = self.output.snapshot_command(&req.command_id).await.ok();
-        // Best-effort: a transport-level failure on the cancel call does
-        // not abort the operation. The SSH adapter may still drive the
-        // status transition through other paths (e.g. a process exit
-        // racing the cancel) and the caller is interested in the final
-        // snapshot regardless.
-        let _ = self.ssh.cancel(&req.command_id).await;
-        self.wait_for_status_transition(&req.command_id).await;
-        sleep(POST_DRAIN_SLEEP).await;
-        // Try to re-snapshot in case the adapter kept the record alive
-        // (test fakes, future adapters that defer tear-down). Fall back
-        // to the pre-snapshot when the SSH-internal record is gone.
-        let snap = self
-            .output
-            .snapshot_command(&req.command_id)
-            .await
-            .unwrap_or_else(|_| pre_snap.unwrap_or_else(empty_snapshot));
+        let snap = self.drive_cancel_and_snapshot(&req.command_id).await;
         let stdout = truncate_head(snap.stdout, req.max_output_bytes);
         let stderr = truncate_head(snap.stderr, req.max_output_bytes);
+        // v5 lifecycle: drive the resource into Closed so the cascade
+        // coordinator debits the session refcount.
+        self.lifecycle
+            .force_close(ResourceKind::Command, req.command_id.as_str())?;
         Ok(CancelCommandOutcome::Cancelled {
             command_id: req.command_id,
             stdout,
             stderr,
         })
+    }
+
+    /// Pre-cancel snapshot + best-effort cancel + post-drain sleep + final
+    /// snapshot. Extracted from [`Self::execute`] so the orchestrator
+    /// stays under the project's 30-line method threshold after the v5
+    /// lifecycle hook landed.
+    ///
+    /// # Snapshot ordering rationale
+    ///
+    /// [`SshClientPort::cancel`] tears the SSH-internal command record
+    /// down, which makes a subsequent
+    /// [`OutputStreamPort::snapshot_command`] return `CommandNotFound`.
+    /// We therefore capture the pre-cancel buffer first and fall back
+    /// to it if the post-drain snapshot fails. v4.2 fix.
+    async fn drive_cancel_and_snapshot(&self, command_id: &CommandId) -> OutputSnapshot {
+        let pre_snap = self.output.snapshot_command(command_id).await.ok();
+        // Best-effort: a transport-level failure on the cancel call
+        // does not abort the operation. The SSH adapter may drive the
+        // status transition through other paths.
+        let _ = self.ssh.cancel(command_id).await;
+        self.wait_for_status_transition(command_id).await;
+        sleep(POST_DRAIN_SLEEP).await;
+        self.output
+            .snapshot_command(command_id)
+            .await
+            .unwrap_or_else(|_| pre_snap.unwrap_or_else(empty_snapshot))
     }
 
     /// Poll the repository at [`STATUS_POLL_INTERVAL`] until either the
@@ -496,8 +513,16 @@ mod tests {
         let ssh = CancellingSsh::new();
         let commands = Arc::new(DashMapCommandRepo::new());
         let output = ScriptedOutput::new();
-        let uc =
-            CancelCommandUseCase::new(Arc::clone(&ssh), Arc::clone(&commands), Arc::clone(&output));
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let uc = CancelCommandUseCase::new(
+            Arc::clone(&ssh),
+            Arc::clone(&commands),
+            Arc::clone(&output),
+            lifecycle,
+        );
         Harness {
             uc,
             ssh,

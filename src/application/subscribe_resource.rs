@@ -27,6 +27,7 @@ use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::notifier::PeerHandle;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
@@ -70,6 +71,7 @@ where
     transfers: Arc<TR>,
     sessions: Arc<SR>,
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 /// Subscribe-resource use case with the `port_forward` feature enabled.
@@ -90,6 +92,7 @@ where
     sessions: Arc<SR>,
     forwards: Arc<FR>,
     subscribers: Arc<Sub>,
+    lifecycle: Arc<dyn LifecyclePolicyPort>,
 }
 
 #[cfg(not(feature = "port_forward"))]
@@ -109,6 +112,7 @@ where
         transfers: Arc<TR>,
         sessions: Arc<SR>,
         subscribers: Arc<Sub>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
     ) -> Self {
         Self {
             shells,
@@ -116,6 +120,7 @@ where
             transfers,
             sessions,
             subscribers,
+            lifecycle,
         }
     }
 
@@ -143,9 +148,14 @@ where
         )
         .await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
+        let parsed_kind = parsed.kind;
+        let parsed_id = parsed.id.clone();
         self.subscribers
             .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
             .await?;
+        // v5 lifecycle: bump the resource refcount so the policy can
+        // drive Owned -> Observed transitions.
+        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
         Ok(SubscribeResourceOutcome { uri: canonical })
     }
 }
@@ -169,6 +179,7 @@ where
         sessions: Arc<SR>,
         forwards: Arc<FR>,
         subscribers: Arc<Sub>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
     ) -> Self {
         Self {
             shells,
@@ -177,6 +188,7 @@ where
             sessions,
             forwards,
             subscribers,
+            lifecycle,
         }
     }
 
@@ -206,9 +218,14 @@ where
         )
         .await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
+        let parsed_kind = parsed.kind;
+        let parsed_id = parsed.id.clone();
         self.subscribers
             .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
             .await?;
+        // v5 lifecycle: bump the resource refcount so the policy can
+        // drive Owned -> Observed transitions.
+        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
         Ok(SubscribeResourceOutcome { uri: canonical })
     }
 }
@@ -451,6 +468,10 @@ mod tests {
         #[cfg(feature = "port_forward")]
         let forwards = Arc::new(DashMapForwardRepo::new());
         let registry = Arc::new(RecordingRegistry::default());
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
         #[cfg(feature = "port_forward")]
         let uc = SubscribeResourceUseCase::new(
             Arc::clone(&shells),
@@ -459,6 +480,7 @@ mod tests {
             Arc::clone(&sessions),
             Arc::clone(&forwards),
             Arc::clone(&registry),
+            lifecycle,
         );
         #[cfg(not(feature = "port_forward"))]
         let uc = SubscribeResourceUseCase::new(
@@ -467,6 +489,7 @@ mod tests {
             Arc::clone(&transfers),
             Arc::clone(&sessions),
             Arc::clone(&registry),
+            lifecycle,
         );
         Harness {
             uc,
