@@ -24,7 +24,8 @@ async fn chaos19_list_subs_during_churn_observes_consistent_state() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4, peer: None,
+        buffer_size: 4,
+        peer: None,
     };
 
     // Tracks "opened but not yet closed". The list_subs len must be

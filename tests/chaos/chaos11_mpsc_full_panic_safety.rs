@@ -18,7 +18,8 @@ async fn drive_policy(uri: &str, lag_policy: LagPolicy) {
         lag_policy,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 2, peer: None,
+        buffer_size: 2,
+        peer: None,
     };
     let _ = adapter
         .open_lane(
@@ -62,7 +63,8 @@ async fn chaos11_block_slow_does_not_panic_when_consumer_drains_async() {
         lag_policy: LagPolicy::BlockSlow,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4, peer: None,
+        buffer_size: 4,
+        peer: None,
     };
     let _ = adapter
         .open_lane(

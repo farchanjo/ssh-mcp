@@ -25,7 +25,8 @@ async fn chaos20_stats_read_during_writes_is_monotonic() {
         lag_policy: LagPolicy::DropOldest,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: CAPACITY, peer: None,
+        buffer_size: CAPACITY,
+        peer: None,
     };
     let sub_id = adapter
         .open_lane(

@@ -44,7 +44,8 @@ async fn chaos29_replay_beyond_window_returns_invalid_argument() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: 4, peer: None,
+        buffer_size: 4,
+        peer: None,
     };
     let sub_id = adapter
         .open_lane(

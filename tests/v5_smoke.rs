@@ -90,7 +90,8 @@ async fn t05_subscribe_returns_sub_id() {
             uri: "shell://sh-1/output".to_string(),
             lifetime: SubscriptionLifetime::Manual,
             lag_policy: LagPolicy::Snapshot,
-            filter: FilterRule::None, peer: None,
+            filter: FilterRule::None,
+            peer: None,
         })
         .await
         .unwrap();
@@ -102,12 +103,7 @@ async fn t05_subscribe_returns_sub_id() {
 fn t06_release_when_no_subs_grace() {
     // The four args structs advertise both new fields.
     let server = build_server();
-    let names = [
-        "ssh_shell_open",
-        "ssh_exec",
-        "ssh_upload",
-        "ssh_download",
-    ];
+    let names = ["ssh_shell_open", "ssh_exec", "ssh_upload", "ssh_download"];
     for name in names {
         let tool = server
             .get_tool(name)
@@ -135,7 +131,8 @@ async fn t07_lag_policy_snapshot_recovery() {
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
         // Buffer of 2 so the third Data triggers the recovery.
-        buffer_size: 2, peer: None,
+        buffer_size: 2,
+        peer: None,
     };
     let sub_id = adapter
         .open_lane(
@@ -182,7 +179,8 @@ async fn t08_filter_regex_drops_match() {
         lag_policy: LagPolicy::Snapshot,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::Regex("KEEP".to_string()),
-        buffer_size: 16, peer: None,
+        buffer_size: 16,
+        peer: None,
     };
     let _sub_id = adapter
         .open_lane(

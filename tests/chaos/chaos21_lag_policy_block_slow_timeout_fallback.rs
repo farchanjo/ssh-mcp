@@ -25,7 +25,8 @@ async fn chaos21_block_slow_falls_back_to_snapshot_on_full() {
         lag_policy: LagPolicy::BlockSlow,
         lifetime: SubscriptionLifetime::Manual,
         filter: FilterRule::None,
-        buffer_size: CAPACITY, peer: None,
+        buffer_size: CAPACITY,
+        peer: None,
     };
     let sub_id = adapter
         .open_lane(
