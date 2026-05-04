@@ -5,6 +5,34 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.1] — 2026-05-04
+
+LLM UX patch — closes the v5 narrative arc so every push-capable resource is `ssh_subscribe`-first across tool descriptions, NEXT chains, HINT lines, and discovery surfaces. No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
+
+### Bidirectional-first narrative closure
+
+- `ssh_execute`, `ssh_get_command_output`, `ssh_shell_read`, `ssh_shell_wait_for`, `ssh_get_transfer_progress` descriptions now lead with `ssh_subscribe` as the preferred path; polling tools labelled `(poll fallback)` consistently across both server variants (port_forward on/off).
+- `next_hint_for_shell_drive` (post-write/send_key): `ssh_subscribe` listed FIRST so drive ops honour the subscribe contract opened by `ssh_shell_open`. Cursor poll and `ssh_shell_read` demoted to explicit `(poll fallback)` markers.
+- `next_hint_for_running_command` and `next_hint_for_in_flight_transfer`: explicit `(preferred)` and `(poll fallback)` labels — eliminates the self-loop where a polling tool would re-recommend itself.
+- `next_hint_for_wait_for` (Timeout branch): subscribe FIRST, poll fallback last.
+- `next_hint_for_session` (post-connect): trailing reminder `(each spawn returns an ID that ssh_subscribe streams as push)` so the LLM learns the bidirectional contract on call #1; adds `ssh_upload` to the spawn list for completeness.
+- `next_hint_for_list_sessions`: `ssh_subscribe session://<id>/health` now leads, with `ssh_disconnect_agent` / `ssh_disconnect` as cleanup fallbacks. Discovery flows terminate in a push lane, not in teardown.
+- `list_commands_render_with_warnings`: surfaces `ssh_subscribe command://<id>/output` for the first RUNNING entry — discovery → push, not discovery → poll.
+
+### Overlap surfacing (zero-cookbook tool selection)
+
+- `ssh_run` description: when-each guidance vs `ssh_connect` + `ssh_execute` (>1 command) and vs `ssh_execute_batch` (>=3 sequential).
+- `ssh_execute_batch` description: cites ~70% wire savings over `N x ssh_execute` for `N >= 3`; cross-references `ssh_run` (single) and parallel `ssh_execute` patterns.
+- `ssh_disconnect_agent` vs `ssh_disconnect_many`: when-each matrix surfaced in both descriptions so the LLM picks the cheapest bulk-cleanup call without round-trips.
+- `ssh_shell_wait_for` description: surfaces overlap with `ssh_subscribe` + `filter` for streaming pattern matches; 1-shot pattern gating remains the local sweet spot.
+
+### Verified gates
+
+- `cargo build --release` exit 0 (3 binaries).
+- `cargo clippy --release --all-features -- -D warnings` exit 0.
+- `cargo test --lib --quiet` — **1633 passed**.
+- macOS codesign with Apple Development certificate (TeamIdentifier `MYT54AW7PD`, hardened runtime); `codesign --verify --verbose=2` exit 0 on all three installed binaries.
+
 ## [5.0.0] — 2026-05-04
 
 Stable release. All 7 phases merged on `master` plus 3 follow-up hook closures (idempotency args fingerprint, `MAX_SUBS_PER_URI` / `MAX_SUBS_TOTAL` enforcement, UUIDv7 across every id type). Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). Design narrative: ADRs at [docs/adr/0001..0008.md](docs/adr/).
