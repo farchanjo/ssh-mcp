@@ -18,6 +18,7 @@
 
 pub mod channel_mux;
 pub mod filter;
+pub mod lane_bridge;
 pub mod legacy;
 pub mod memory_registry;
 pub mod replay;
