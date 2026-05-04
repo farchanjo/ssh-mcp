@@ -23,6 +23,8 @@
 use std::env;
 use std::time::Duration;
 
+use crate::domain::subscription::LagPolicy;
+
 /// Default SSH connection timeout
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -152,6 +154,52 @@ pub const NOTIFY_KEEPALIVE_S_MIN: u64 = 5;
 /// Cap for the keepalive interval.
 pub const NOTIFY_KEEPALIVE_S_MAX: u64 = 300;
 
+/// v5 Phase 2 — default per-`SubId` lane mpsc capacity.
+pub const DEFAULT_LANE_BUFFER: usize = 1024;
+/// v5 Phase 2 — floor for the lane mpsc capacity.
+pub const LANE_BUFFER_MIN: usize = 16;
+/// v5 Phase 2 — cap for the lane mpsc capacity.
+pub const LANE_BUFFER_MAX: usize = 65_536;
+
+/// v5 Phase 2 — default `ChannelMux` outbound mpsc capacity.
+pub const DEFAULT_MUX_BUFFER: usize = 8_192;
+/// v5 Phase 2 — floor for the `ChannelMux` outbound mpsc capacity.
+pub const MUX_BUFFER_MIN: usize = 64;
+/// v5 Phase 2 — cap for the `ChannelMux` outbound mpsc capacity.
+pub const MUX_BUFFER_MAX: usize = 1_048_576;
+
+/// v5 Phase 2 — default per-URI subscription cap.
+pub const DEFAULT_MAX_SUBS_PER_URI: u16 = 16;
+/// v5 Phase 2 — minimum per-URI subscription cap.
+pub const MAX_SUBS_PER_URI_MIN: u16 = 1;
+
+/// v5 Phase 2 — default global subscription cap.
+pub const DEFAULT_MAX_SUBS_TOTAL: u16 = 1_024;
+/// v5 Phase 2 — minimum global subscription cap.
+pub const MAX_SUBS_TOTAL_MIN: u16 = 1;
+
+/// v5 Phase 2 — default `BlockSlow` timeout (milliseconds).
+pub const DEFAULT_BP_BLOCK_TIMEOUT_MS: u64 = 5_000;
+/// v5 Phase 2 — floor for the `BlockSlow` timeout.
+pub const BP_BLOCK_TIMEOUT_MS_MIN: u64 = 100;
+/// v5 Phase 2 — cap for the `BlockSlow` timeout.
+pub const BP_BLOCK_TIMEOUT_MS_MAX: u64 = 600_000;
+
+/// v5 Phase 2 — default filter regex char-length cap.
+pub const DEFAULT_FILTER_REGEX_MAX: usize = 1_024;
+/// v5 Phase 2 — minimum filter regex cap (must allow at least the
+/// shortest sensible pattern).
+pub const FILTER_REGEX_MAX_MIN: usize = 16;
+/// v5 Phase 2 — cap for the filter regex char-length.
+pub const FILTER_REGEX_MAX_CAP: usize = 65_536;
+
+/// v5 Phase 2 — default replay window (bytes) for `ssh_sub_replay`.
+pub const DEFAULT_REPLAY_WINDOW_BYTES: usize = 1_048_576;
+/// v5 Phase 2 — floor for the replay window (bytes).
+pub const REPLAY_WINDOW_BYTES_MIN: usize = 4_096;
+/// v5 Phase 2 — cap for the replay window (bytes).
+pub const REPLAY_WINDOW_BYTES_MAX: usize = 64 * 1_048_576;
+
 /// Default interval (seconds) at which the binary scans the subscription
 /// registry for peers whose transport has closed.
 pub const DEFAULT_PEER_GC_INTERVAL_S: u64 = 30;
@@ -168,6 +216,23 @@ pub const NOTIFY_FORCE_FLUSH_MS_ENV_VAR: &str = "SSH_NOTIFY_FORCE_FLUSH_MS";
 pub const NOTIFY_KEEPALIVE_S_ENV_VAR: &str = "SSH_NOTIFY_KEEPALIVE_S";
 /// Environment variable name for the binary peer-GC scan interval.
 pub const PEER_GC_INTERVAL_S_ENV_VAR: &str = "SSH_MCP_PEER_GC_INTERVAL_S";
+
+/// v5 Phase 2 — env var for the per-`SubId` lane mpsc capacity.
+pub const LANE_BUFFER_ENV_VAR: &str = "SSH_LANE_BUFFER";
+/// v5 Phase 2 — env var for the `ChannelMux` outbound mpsc capacity.
+pub const MUX_BUFFER_ENV_VAR: &str = "SSH_MUX_BUFFER";
+/// v5 Phase 2 — env var for the per-URI subscription cap.
+pub const MAX_SUBS_PER_URI_ENV_VAR: &str = "SSH_MAX_SUBS_PER_URI";
+/// v5 Phase 2 — env var for the global subscription cap.
+pub const MAX_SUBS_TOTAL_ENV_VAR: &str = "SSH_MAX_SUBS_TOTAL";
+/// v5 Phase 2 — env var for the default lag policy.
+pub const LAG_POLICY_DEFAULT_ENV_VAR: &str = "SSH_LAG_POLICY_DEFAULT";
+/// v5 Phase 2 — env var for the `BlockSlow` timeout.
+pub const BP_BLOCK_TIMEOUT_MS_ENV_VAR: &str = "SSH_BP_BLOCK_TIMEOUT_MS";
+/// v5 Phase 2 — env var for the filter regex char cap.
+pub const FILTER_REGEX_MAX_ENV_VAR: &str = "SSH_FILTER_REGEX_MAX";
+/// v5 Phase 2 — env var for the replay window (bytes).
+pub const REPLAY_WINDOW_BYTES_ENV_VAR: &str = "SSH_REPLAY_WINDOW_BYTES";
 
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
@@ -610,6 +675,92 @@ pub fn resolve_peer_gc_interval_s() -> u64 {
     raw.clamp(PEER_GC_INTERVAL_S_MIN, PEER_GC_INTERVAL_S_MAX)
 }
 
+// ---------------------------------------------------------------------------
+// v5 Phase 2 — Channel Mux + SubId resolvers
+// ---------------------------------------------------------------------------
+
+/// Resolve the per-`SubId` lane mpsc capacity (`SSH_LANE_BUFFER`).
+#[must_use]
+pub fn resolve_lane_buffer() -> usize {
+    env::var(LANE_BUFFER_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LANE_BUFFER)
+        .clamp(LANE_BUFFER_MIN, LANE_BUFFER_MAX)
+}
+
+/// Resolve the `ChannelMux` outbound mpsc capacity (`SSH_MUX_BUFFER`).
+#[must_use]
+pub fn resolve_mux_buffer() -> usize {
+    env::var(MUX_BUFFER_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MUX_BUFFER)
+        .clamp(MUX_BUFFER_MIN, MUX_BUFFER_MAX)
+}
+
+/// Resolve the per-URI subscription cap (`SSH_MAX_SUBS_PER_URI`).
+#[must_use]
+pub fn resolve_max_subs_per_uri() -> u16 {
+    env::var(MAX_SUBS_PER_URI_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_MAX_SUBS_PER_URI)
+        .max(MAX_SUBS_PER_URI_MIN)
+}
+
+/// Resolve the global subscription cap (`SSH_MAX_SUBS_TOTAL`).
+#[must_use]
+pub fn resolve_max_subs_total() -> u16 {
+    env::var(MAX_SUBS_TOTAL_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_MAX_SUBS_TOTAL)
+        .max(MAX_SUBS_TOTAL_MIN)
+}
+
+/// Resolve the default per-`SubId` lag policy
+/// (`SSH_LAG_POLICY_DEFAULT`). Falls back to
+/// [`crate::domain::subscription::LagPolicy::Snapshot`] when unset
+/// or unparseable.
+#[must_use]
+pub fn resolve_lag_policy_default() -> LagPolicy {
+    env::var(LAG_POLICY_DEFAULT_ENV_VAR)
+        .ok()
+        .and_then(|v| LagPolicy::from_str_opt(&v))
+        .unwrap_or_default()
+}
+
+/// Resolve the `BlockSlow` producer timeout (`SSH_BP_BLOCK_TIMEOUT_MS`).
+#[must_use]
+pub fn resolve_bp_block_timeout_ms() -> u64 {
+    env::var(BP_BLOCK_TIMEOUT_MS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BP_BLOCK_TIMEOUT_MS)
+        .clamp(BP_BLOCK_TIMEOUT_MS_MIN, BP_BLOCK_TIMEOUT_MS_MAX)
+}
+
+/// Resolve the filter regex char-length cap (`SSH_FILTER_REGEX_MAX`).
+#[must_use]
+pub fn resolve_filter_regex_max() -> usize {
+    env::var(FILTER_REGEX_MAX_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FILTER_REGEX_MAX)
+        .clamp(FILTER_REGEX_MAX_MIN, FILTER_REGEX_MAX_CAP)
+}
+
+/// Resolve the replay window byte cap (`SSH_REPLAY_WINDOW_BYTES`).
+#[must_use]
+pub fn resolve_replay_window_bytes() -> usize {
+    env::var(REPLAY_WINDOW_BYTES_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_REPLAY_WINDOW_BYTES)
+        .clamp(REPLAY_WINDOW_BYTES_MIN, REPLAY_WINDOW_BYTES_MAX)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -640,6 +791,150 @@ mod tests {
     unsafe fn remove_env(key: &str) {
         // SAFETY: Caller ensures ENV_TEST_MUTEX is held
         unsafe { env::remove_var(key) };
+    }
+
+    // --- v5 Phase 2 resolvers ---------------------------------------
+
+    mod v5_phase_2 {
+        use super::*;
+        use crate::domain::subscription::LagPolicy;
+
+        #[test]
+        fn lane_buffer_defaults_to_1024() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(LANE_BUFFER_ENV_VAR) };
+            assert_eq!(resolve_lane_buffer(), DEFAULT_LANE_BUFFER);
+        }
+
+        #[test]
+        fn lane_buffer_clamps_below_floor() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LANE_BUFFER_ENV_VAR, "1") };
+            assert_eq!(resolve_lane_buffer(), LANE_BUFFER_MIN);
+            unsafe { remove_env(LANE_BUFFER_ENV_VAR) };
+        }
+
+        #[test]
+        fn lane_buffer_clamps_above_cap() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LANE_BUFFER_ENV_VAR, "9999999") };
+            assert_eq!(resolve_lane_buffer(), LANE_BUFFER_MAX);
+            unsafe { remove_env(LANE_BUFFER_ENV_VAR) };
+        }
+
+        #[test]
+        fn mux_buffer_defaults_to_8192() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(MUX_BUFFER_ENV_VAR) };
+            assert_eq!(resolve_mux_buffer(), DEFAULT_MUX_BUFFER);
+        }
+
+        #[test]
+        fn max_subs_per_uri_defaults_to_16() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(MAX_SUBS_PER_URI_ENV_VAR) };
+            assert_eq!(resolve_max_subs_per_uri(), DEFAULT_MAX_SUBS_PER_URI);
+        }
+
+        #[test]
+        fn max_subs_per_uri_floors_at_one() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(MAX_SUBS_PER_URI_ENV_VAR, "0") };
+            assert_eq!(resolve_max_subs_per_uri(), MAX_SUBS_PER_URI_MIN);
+            unsafe { remove_env(MAX_SUBS_PER_URI_ENV_VAR) };
+        }
+
+        #[test]
+        fn max_subs_total_defaults_to_1024() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(MAX_SUBS_TOTAL_ENV_VAR) };
+            assert_eq!(resolve_max_subs_total(), DEFAULT_MAX_SUBS_TOTAL);
+        }
+
+        #[test]
+        fn max_subs_total_floors_at_one() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(MAX_SUBS_TOTAL_ENV_VAR, "0") };
+            assert_eq!(resolve_max_subs_total(), MAX_SUBS_TOTAL_MIN);
+            unsafe { remove_env(MAX_SUBS_TOTAL_ENV_VAR) };
+        }
+
+        #[test]
+        fn lag_policy_default_is_snapshot() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(LAG_POLICY_DEFAULT_ENV_VAR) };
+            assert_eq!(resolve_lag_policy_default(), LagPolicy::Snapshot);
+        }
+
+        #[test]
+        fn lag_policy_default_parses_block_slow() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LAG_POLICY_DEFAULT_ENV_VAR, "block_slow") };
+            assert_eq!(resolve_lag_policy_default(), LagPolicy::BlockSlow);
+            unsafe { remove_env(LAG_POLICY_DEFAULT_ENV_VAR) };
+        }
+
+        #[test]
+        fn lag_policy_default_parses_drop_oldest() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LAG_POLICY_DEFAULT_ENV_VAR, "drop_oldest") };
+            assert_eq!(resolve_lag_policy_default(), LagPolicy::DropOldest);
+            unsafe { remove_env(LAG_POLICY_DEFAULT_ENV_VAR) };
+        }
+
+        #[test]
+        fn lag_policy_default_parses_drop_newest() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LAG_POLICY_DEFAULT_ENV_VAR, "drop_newest") };
+            assert_eq!(resolve_lag_policy_default(), LagPolicy::DropNewest);
+            unsafe { remove_env(LAG_POLICY_DEFAULT_ENV_VAR) };
+        }
+
+        #[test]
+        fn lag_policy_default_falls_back_on_unknown() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(LAG_POLICY_DEFAULT_ENV_VAR, "BlockSlow") };
+            // Wire form is snake_case — UpperCamelCase parses as None.
+            assert_eq!(resolve_lag_policy_default(), LagPolicy::Snapshot);
+            unsafe { remove_env(LAG_POLICY_DEFAULT_ENV_VAR) };
+        }
+
+        #[test]
+        fn bp_block_timeout_defaults_to_5000() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(BP_BLOCK_TIMEOUT_MS_ENV_VAR) };
+            assert_eq!(resolve_bp_block_timeout_ms(), DEFAULT_BP_BLOCK_TIMEOUT_MS);
+        }
+
+        #[test]
+        fn bp_block_timeout_clamps_to_floor() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(BP_BLOCK_TIMEOUT_MS_ENV_VAR, "1") };
+            assert_eq!(resolve_bp_block_timeout_ms(), BP_BLOCK_TIMEOUT_MS_MIN);
+            unsafe { remove_env(BP_BLOCK_TIMEOUT_MS_ENV_VAR) };
+        }
+
+        #[test]
+        fn filter_regex_max_defaults_to_1024() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(FILTER_REGEX_MAX_ENV_VAR) };
+            assert_eq!(resolve_filter_regex_max(), DEFAULT_FILTER_REGEX_MAX);
+        }
+
+        #[test]
+        fn replay_window_bytes_defaults_to_1mib() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { remove_env(REPLAY_WINDOW_BYTES_ENV_VAR) };
+            assert_eq!(resolve_replay_window_bytes(), DEFAULT_REPLAY_WINDOW_BYTES);
+        }
+
+        #[test]
+        fn replay_window_bytes_clamps_to_floor() {
+            let _g = ENV_TEST_MUTEX.lock().unwrap();
+            unsafe { set_env(REPLAY_WINDOW_BYTES_ENV_VAR, "1") };
+            assert_eq!(resolve_replay_window_bytes(), REPLAY_WINDOW_BYTES_MIN);
+            unsafe { remove_env(REPLAY_WINDOW_BYTES_ENV_VAR) };
+        }
     }
 
     mod config_resolution {
