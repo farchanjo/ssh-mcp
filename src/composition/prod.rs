@@ -32,7 +32,12 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::adapters::auth::chain::AuthChainAdapter;
 use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::env::EnvConfig;
-use crate::adapters::config::internal::resolve_peer_gc_interval_s;
+use tokio::sync::mpsc;
+
+use crate::adapters::config::internal::{
+    resolve_lane_buffer, resolve_max_subs_per_uri, resolve_max_subs_total, resolve_mux_buffer,
+    resolve_peer_gc_interval_s,
+};
 use crate::adapters::id_generator::uuid::UuidIds;
 use crate::adapters::lifecycle::cascade::CascadeCoordinator;
 use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
@@ -46,8 +51,10 @@ use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
 use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
 use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegistry};
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
+use crate::adapters::subscription::channel_mux::ChannelMuxAdapter;
 use crate::adapters::subscription::legacy::spawn_peer_gc;
 use crate::adapters::subscription::memory_registry::MemoryRegistry;
+use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
 use crate::application::cancel_command::CancelCommandUseCase;
 use crate::application::close_shell::CloseShellUseCase;
 use crate::application::connect_session::ConnectSessionUseCase;
@@ -83,6 +90,7 @@ use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 use crate::infra::mcp::tool_router::IdLister;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+use crate::ports::subscriber_lane::LaneAdmin;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
 /// as the legacy v3 `RuntimeError` so binaries do not need to change.
@@ -267,6 +275,32 @@ pub fn build_use_cases() -> ProdWiring {
     let lifecycle: Arc<dyn LifecyclePolicyPort> =
         RefcountedLifecycleAdapter::new(Arc::clone(&cascade), Arc::clone(&clock));
 
+    // v5 Phase 2: SubscriberLane + ChannelMux. The lane adapter
+    // mints per-`SubId` UUIDv7 ids through the same id generator
+    // used elsewhere in the wiring. The mux installs an outbound
+    // sink (Phase 4 wires the NDJSON daemon writer); Phase 2 keeps
+    // the sink open so receivers stay drainable but no consumer is
+    // attached yet.
+    let subscriber_lane_adapter =
+        SubscriberLaneAdapter::new(
+            Arc::clone(&ids),
+            resolve_lane_buffer(),
+            resolve_max_subs_per_uri(),
+            resolve_max_subs_total(),
+        );
+    let channel_mux = ChannelMuxAdapter::new();
+    let mux_for_sink = Arc::clone(&channel_mux);
+    subscriber_lane_adapter.install_rx_sink(Box::new(move |sub_id, rx| {
+        mux_for_sink.register_lane(sub_id, rx);
+    }));
+    let (mux_outbound_tx, _mux_outbound_rx) = mpsc::channel(resolve_mux_buffer());
+    channel_mux.install_outbound(mux_outbound_tx);
+    let lane_admin: Arc<dyn LaneAdmin> = lane_admin_from(&subscriber_lane_adapter);
+    // Phase 4 will wire the drain task to the NDJSON daemon stdout
+    // writer. Phase 2 keeps the receiver alive on the composition
+    // root so the mpsc never reports `Closed` and the outbound sink
+    // never blocks.
+
     let connect = Arc::new(ConnectSessionUseCase::new(
         Arc::clone(&ssh),
         Arc::clone(&sessions),
@@ -432,29 +466,35 @@ pub fn build_use_cases() -> ProdWiring {
     ));
 
     #[cfg(feature = "port_forward")]
-    let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
-        Arc::clone(&shells),
-        Arc::clone(&commands),
-        Arc::clone(&transfers),
-        Arc::clone(&sessions),
-        Arc::clone(&forwards),
-        Arc::clone(&subscribers),
-        Arc::clone(&lifecycle),
-    ));
+    let subscribe_resource = Arc::new(
+        SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&forwards),
+            Arc::clone(&subscribers),
+            Arc::clone(&lifecycle),
+        )
+        .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
     #[cfg(not(feature = "port_forward"))]
-    let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
-        Arc::clone(&shells),
-        Arc::clone(&commands),
-        Arc::clone(&transfers),
-        Arc::clone(&sessions),
-        Arc::clone(&subscribers),
-        Arc::clone(&lifecycle),
-    ));
+    let subscribe_resource = Arc::new(
+        SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&subscribers),
+            Arc::clone(&lifecycle),
+        )
+        .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
 
-    let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(
-        Arc::clone(&subscribers),
-        Arc::clone(&lifecycle),
-    ));
+    let unsubscribe_resource = Arc::new(
+        UnsubscribeResourceUseCase::new(Arc::clone(&subscribers), Arc::clone(&lifecycle))
+            .with_subscriber_lane(Arc::clone(&lane_admin)),
+    );
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
 
     let idempotency = Arc::new(IdempotencyCache::from_env());
@@ -506,6 +546,15 @@ pub fn build_use_cases() -> ProdWiring {
     });
 
     (use_cases, peer_table, idempotency, id_lister)
+}
+
+/// Erase the concrete [`SubscriberLaneAdapter`] handle behind a
+/// [`LaneAdmin`] dyn pointer. The conversion uses the implicit
+/// `Arc<T>` -> `Arc<dyn Trait>` coercion so the `as_conversions`
+/// lint stays happy.
+fn lane_admin_from(adapter: &Arc<SubscriberLaneAdapter<UuidIds>>) -> Arc<dyn LaneAdmin> {
+    let cloned: Arc<SubscriberLaneAdapter<UuidIds>> = Arc::clone(adapter);
+    cloned
 }
 
 /// Build a fresh [`McpSshServer`] backed by the production wiring.
