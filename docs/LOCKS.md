@@ -35,6 +35,85 @@ H17.5a deleted the v3 monolith. v4.1 H17.6 finished the foundational decouple: t
 
 The repository adapters (`src/adapters/repo/dashmap/{session,command,shell,transfer,forward}.rs`) and the subscription registry (`src/adapters/subscription/memory_registry.rs`) remain the port surface for use cases.
 
+### Primitives map
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    subgraph LIFE["lifecycle adapter"]
+        RL["ResourceLifecycle"]
+        SL["SessionLifecycle"]
+    end
+    subgraph MUX["subscription mux"]
+        ML["MultiplexLane"]
+        CM["ChannelMux"]
+    end
+    subgraph CASCADE["cascade refcount"]
+        AR["active_refs"]
+    end
+    subgraph RING["ring buffer"]
+        RB["RingBuffer"]
+    end
+
+    A1["AtomicU8 state"]
+    A2["AtomicUsize sub_count"]
+    A3["AtomicU64 grace_until_ms"]
+    A4["ArcSwap LifecyclePolicy"]
+    A5["Notify waker"]
+
+    A6["AtomicU64 byte_cursor"]
+    A7["mpsc Sender / Receiver"]
+    A8["ArcSwap FilterRule"]
+    A9["AtomicBool pause_flag"]
+    A10["8 stats atomics"]
+
+    A11["DashMap lanes"]
+    A12["AtomicUsize cursor_lane"]
+    A13["Notify mux_waker"]
+    A14["mpsc mux_tx"]
+
+    A15["AtomicUsize active_refs"]
+    A16["AtomicU64 idle_until_ms"]
+    A17["ArcSwap SessionPolicy"]
+
+    A18["ArcSwap RingBuffer"]
+    A19["broadcast Sender"]
+
+    RL --> A1
+    RL --> A2
+    RL --> A3
+    RL --> A4
+    RL --> A5
+    SL --> A15
+    SL --> A16
+    SL --> A17
+
+    ML --> A6
+    ML --> A7
+    ML --> A8
+    ML --> A9
+    ML --> A10
+    CM --> A11
+    CM --> A12
+    CM --> A13
+    CM --> A14
+
+    AR --> A15
+    RB --> A18
+    RB --> A19
+
+    style LIFE fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style MUX fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style CASCADE fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style RING fill:#161b22,color:#f0f6fc,stroke:#30363d
+    style RL fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style SL fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style ML fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style CM fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style AR fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style RB fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
+
 ## Lock-free invariants enforced
 
 The following clippy lints are denied at the workspace level (`Cargo.toml` `[lints.clippy]`):
@@ -89,6 +168,32 @@ ADR: [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md). Per-resou
 ```
 
 CAS edges are explicit: `compare_exchange(current_state, new_state, Acquire, Acquire)`. Invalid transitions return `LifecycleStateConflict` (a defensive `INTERNAL` class error per [ADR 0007](./adr/0007-error-taxonomy.md) — should never occur in correct code).
+
+### CAS state-transition diagram
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+stateDiagram-v2
+    [*] --> Owned: track_resource<br/>(state init = Owned)
+    Owned --> Observed: compare_exchange<br/>Acquire / Acquire<br/>(first on_subscribe)
+    Observed --> Observed: fetch_add(AcqRel)<br/>fetch_sub(AcqRel)<br/>(sub_count flux)
+    Observed --> Releasing: compare_exchange<br/>Acquire / Acquire<br/>(last unsubscribe<br/>+ release_when_no_subs)
+    Releasing --> Observed: compare_exchange<br/>Acquire / Acquire<br/>(re-subscribe within grace)
+    Releasing --> Closed: compare_exchange<br/>AcqRel / Acquire<br/>(timer fires)
+    Owned --> Closed: compare_exchange<br/>AcqRel / Acquire<br/>(explicit close)
+    Observed --> Closed: compare_exchange<br/>AcqRel / Acquire<br/>(explicit close)
+    Closed --> [*]: cascade<br/>fetch_sub(AcqRel)
+
+    classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef releasing fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef closed fill:#cf222e,color:#f0f6fc,stroke:#f85149
+
+    class Owned owned
+    class Observed observed
+    class Releasing releasing
+    class Closed closed
+```
 
 ### Why `await_holding_lock = "deny"` still holds
 
@@ -265,6 +370,37 @@ The current code base touches at most three shards in one critical section (Phas
 | `RunningShell.input_tx` (mpsc) | hard-coded | 64 | Backpressure on the producer; no Lagged path. |
 | **`MultiplexLane.tx`** (v5 mpsc, per `SubId`) | `SSH_LANE_BUFFER` | 1024 | Per-lane `LagPolicy`: `BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot` (default — drop backlog + ring-buffer rebuild). [ADR 0006](./adr/0006-backpressure-policies.md). |
 | **`ChannelMux.mux_tx`** (v5 mpsc, global outbound) | `SSH_MUX_BUFFER` | 8192 | `try_send` failure -> lane producer follows its lag policy. |
+
+### Backpressure fronteira flow
+
+Six fronteiras between the russh receiver and the host stdout / socket. Each carries a distinct lag-recovery story.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    F0["russh recv<br/>tcp / pty"]
+    F1["F1<br/>broadcast Sender<br/>SSH_SHELL_BROADCAST_CAP=1024<br/>lag = snapshot via ArcSwap"]
+    F2["F2<br/>per-resource debouncer<br/>50 ms / 1 s flush"]
+    F3["F3<br/>per-(SubId, Uri) lane<br/>SSH_LANE_BUFFER=1024<br/>LagPolicy: BlockSlow / DropOldest /<br/>DropNewest / Snapshot"]
+    F4["F4<br/>ChannelMux mux_tx<br/>SSH_MUX_BUFFER=8192<br/>round-robin try_recv"]
+    F5["F5<br/>rmcp Peer / NDJSON writer<br/>tokio io"]
+    F6["F6<br/>stdout / socket"]
+
+    F0 --> F1
+    F1 --> F2
+    F2 --> F3
+    F3 --> F4
+    F4 --> F5
+    F5 --> F6
+
+    style F0 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style F1 fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style F2 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style F3 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style F4 fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style F5 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style F6 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
 
 ## Loom invariants
 
