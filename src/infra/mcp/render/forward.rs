@@ -60,7 +60,10 @@ fn append_forward_advisories(out: &mut String, forward: &str) {
             "RECOMMENDED: ssh_subscribe uri=forward://{forward}/events. Falls back gracefully if you skip (no polling alternative)."
         ),
     );
-    append_next_line(out, &format!("ssh_subscribe uri=forward://{forward}/events"));
+    append_next_line(
+        out,
+        &format!("ssh_subscribe uri=forward://{forward}/events"),
+    );
 }
 
 /// Append a single `NEXT: <hint>` advisory line listing concrete tool

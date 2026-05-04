@@ -583,9 +583,9 @@ impl<I: IdGeneratorPort + fmt::Debug> LaneAdmin for SubscriberLaneAdapter<I> {
         sub_id: &'a SubId,
         filter: FilterRule,
     ) -> LaneFuture<'a, Result<(), DomainError>> {
-        Box::pin(async move {
-            <Self as SubscriberLaneAsync>::set_filter(self, sub_id, filter).await
-        })
+        Box::pin(
+            async move { <Self as SubscriberLaneAsync>::set_filter(self, sub_id, filter).await },
+        )
     }
 
     fn replay<'a>(

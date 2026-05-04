@@ -163,8 +163,7 @@ impl ChannelMuxAdapter {
             let (sub_id, lane) = &lanes[idx];
             if let Some(msg) = lane_try_recv(lane).await {
                 self.forward(sub_id.clone(), msg).await;
-                self.cursor_lane
-                    .store((idx + 1) % len, Ordering::Relaxed);
+                self.cursor_lane.store((idx + 1) % len, Ordering::Relaxed);
                 produced_any = true;
             }
         }
@@ -229,7 +228,12 @@ mod tests {
     use crate::domain::subscription::SubId;
     use crate::ports::channel_mux::ChannelMuxPort;
 
-    fn build_lane(capacity: usize) -> (tokio::sync::mpsc::Sender<LaneMsg>, tokio::sync::mpsc::Receiver<LaneMsg>) {
+    fn build_lane(
+        capacity: usize,
+    ) -> (
+        tokio::sync::mpsc::Sender<LaneMsg>,
+        tokio::sync::mpsc::Receiver<LaneMsg>,
+    ) {
         tokio::sync::mpsc::channel(capacity)
     }
 
@@ -298,8 +302,14 @@ mod tests {
             }
         }
         // Both lanes must have made progress (no starvation).
-        assert!(received.iter().any(|s| s == "a"), "lane a starved: {received:?}");
-        assert!(received.iter().any(|s| s == "b"), "lane b starved: {received:?}");
+        assert!(
+            received.iter().any(|s| s == "a"),
+            "lane a starved: {received:?}"
+        );
+        assert!(
+            received.iter().any(|s| s == "b"),
+            "lane b starved: {received:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

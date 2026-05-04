@@ -216,10 +216,7 @@ impl PauseSubUseCase {
     /// # Errors
     ///
     /// [`DomainError::SubNotFound`] for unknown lanes.
-    pub async fn execute(
-        &self,
-        req: SubToggleRequest,
-    ) -> Result<SubToggleOutcome, DomainError> {
+    pub async fn execute(&self, req: SubToggleRequest) -> Result<SubToggleOutcome, DomainError> {
         self.lane.pause(&req.sub_id).await?;
         Ok(SubToggleOutcome {
             sub_id: req.sub_id,
@@ -246,10 +243,7 @@ impl ResumeSubUseCase {
     /// # Errors
     ///
     /// [`DomainError::SubNotFound`] for unknown lanes.
-    pub async fn execute(
-        &self,
-        req: SubToggleRequest,
-    ) -> Result<SubToggleOutcome, DomainError> {
+    pub async fn execute(&self, req: SubToggleRequest) -> Result<SubToggleOutcome, DomainError> {
         self.lane.resume(&req.sub_id).await?;
         Ok(SubToggleOutcome {
             sub_id: req.sub_id,
@@ -301,7 +295,9 @@ impl SetFilterUseCase {
     /// - [`DomainError::InvalidArgument`] when the regex fails to
     ///   compile.
     pub async fn execute(&self, req: SetFilterRequest) -> Result<SetFilterOutcome, DomainError> {
-        self.lane.set_filter(&req.sub_id, req.filter.clone()).await?;
+        self.lane
+            .set_filter(&req.sub_id, req.filter.clone())
+            .await?;
         Ok(SetFilterOutcome {
             sub_id: req.sub_id,
             filter: req.filter,
@@ -510,8 +506,12 @@ impl DaemonStatsUseCase {
             ..DaemonStatsOutcome::default()
         };
         for summary in summaries {
-            out.events_sent_total = out.events_sent_total.saturating_add(summary.stats.events_sent);
-            out.bytes_sent_total = out.bytes_sent_total.saturating_add(summary.stats.bytes_sent);
+            out.events_sent_total = out
+                .events_sent_total
+                .saturating_add(summary.stats.events_sent);
+            out.bytes_sent_total = out
+                .bytes_sent_total
+                .saturating_add(summary.stats.bytes_sent);
             out.lagged_drops_total = out
                 .lagged_drops_total
                 .saturating_add(summary.stats.lagged_drops);
@@ -558,9 +558,7 @@ mod tests {
     use crate::adapters::id_generator::uuid::UuidIds;
     use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
     use crate::domain::error::DomainError;
-    use crate::domain::subscription::{
-        FilterRule, LagPolicy, SubId, SubscriptionLifetime,
-    };
+    use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
     use crate::ports::subscriber_lane::{
         LaneAdmin, LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
     };
@@ -880,12 +878,7 @@ mod tests {
             (ResourceKind::Command, "command://c/output", "c"),
         ] {
             adapter
-                .open_lane(
-                    uri.to_string(),
-                    kind,
-                    id.to_string(),
-                    LanePolicy::default(),
-                )
+                .open_lane(uri.to_string(), kind, id.to_string(), LanePolicy::default())
                 .await
                 .unwrap();
         }

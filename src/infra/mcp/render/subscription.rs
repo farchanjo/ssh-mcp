@@ -377,7 +377,10 @@ pub fn sub_stats_render(outcome: &SubStatsOutcome) -> String {
     out.push_str(&outcome.stats.queue_high_watermark.to_string());
     out.push_str("\nBLOCK_TOTAL_MS: ");
     out.push_str(&outcome.stats.block_total_ms.to_string());
-    append_next(&mut out, "ssh_sub_filter | ssh_sub_replay | ssh_unsubscribe");
+    append_next(
+        &mut out,
+        "ssh_sub_filter | ssh_sub_replay | ssh_unsubscribe",
+    );
     out
 }
 
@@ -711,7 +714,10 @@ mod tests {
 
     #[test]
     fn lifetime_label_covers_every_variant() {
-        assert_eq!(super::lifetime_label(SubscriptionLifetime::Manual), "manual");
+        assert_eq!(
+            super::lifetime_label(SubscriptionLifetime::Manual),
+            "manual"
+        );
         assert_eq!(
             super::lifetime_label(SubscriptionLifetime::AutoClose { grace_ms: 1 }),
             "auto_close"

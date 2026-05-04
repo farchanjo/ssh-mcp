@@ -108,7 +108,8 @@ where
         self.shells.remove(&shell_id).await?;
         // v5 lifecycle: drive the resource into the Closed state so
         // the cascade coordinator can debit the session refcount.
-        self.lifecycle.force_close(ResourceKind::Shell, shell_id.as_str())?;
+        self.lifecycle
+            .force_close(ResourceKind::Shell, shell_id.as_str())?;
         Ok(CloseShellOutcome { shell_id })
     }
 }
@@ -121,10 +122,10 @@ mod tests {
     use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
     use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
     use crate::adapters::ssh::fake::{FakeSshCall, FakeSshClient};
-    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::domain::error::DomainError;
     use crate::domain::ids::{SessionId, ShellId};
     use crate::domain::shell::{ShellEntity, ShellTerminal};
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::ports::shell_repo::ShellRepository;
     use chrono::Utc;
     use std::sync::Arc;

@@ -56,7 +56,9 @@ async fn t01_daemon_connect_exec_subscribe_drain() {
         reuse_policy: Some("force_new".to_string()),
         id: Some("c1".to_string()),
     };
-    let outcome = dispatch_one(handle.client(), &tx, connect_op).await.unwrap();
+    let outcome = dispatch_one(handle.client(), &tx, connect_op)
+        .await
+        .unwrap();
     assert_eq!(outcome, DispatchOutcome::Continue);
 
     // Drop the rest of the senders so rx eventually closes.
@@ -103,9 +105,7 @@ async fn t03_daemon_invalid_op_recovery() {
     // and continues. We exercise the parser directly here because the
     // dispatcher is unaware of stdin parsing — the daemon main loop
     // bridges the two.
-    let mut r = reader(
-        "{not-json}\n{\"op\":\"shutdown\",\"id\":\"after-bad\"}\n",
-    );
+    let mut r = reader("{not-json}\n{\"op\":\"shutdown\",\"id\":\"after-bad\"}\n");
     let invalid = r.next().await;
     assert!(matches!(invalid, ParseOutcome::Invalid(_)));
     let next = r.next().await;
