@@ -1,8 +1,8 @@
 # Error Handbook
 
-Canonical reference for the 38 wire codes defined by [ADR 0007](../adr/0007-error-taxonomy.md). One section per code, grouped into the seven categories. Every entry follows a uniform shape so an LLM can grep / jump to a single code without reading the rest.
+Canonical reference for the 38 wire codes defined by [ADR 0007](../adr/0007-error-taxonomy.md). One section per code, grouped into seven categories. Every entry has a uniform shape so an LLM can grep / jump to a single code without reading the rest.
 
-The wire format is unchanged from v4:
+Wire format (unchanged from v4) and structured JSON twin:
 
 ```text
 SSH_X: ERROR
@@ -10,23 +10,13 @@ REASON: [CODE] short human description
 DETAIL: action-oriented one-sentence cure (≤120 chars)
 ```
 
-The structured JSON channel mirrors the markdown:
-
 ```json
-{ "tool": "ssh_x", "status": "error", "code": "<CODE>",
-  "reason": "<DETAIL line>" }
+{ "tool": "ssh_x", "status": "error", "code": "<CODE>", "reason": "<DETAIL line>" }
 ```
 
-Retry policy semantics (one of):
+Retry policy semantics (one of): `no` (caller must change inputs or recreate the resource); `yes` (TRANSPORT class — exponential backoff, cap 10 s); `conditional` (retry after changing policy — lag, capacity, cleanup state); `recover` (server already absorbed the gap; consume the recovery event); `warn` (informational; observe and adjust); `idempotent-only` (retry only with a fresh `_meta.idempotency_key`).
 
-- `no` — never retry. Caller must change inputs (credentials, args) or recreate the resource.
-- `yes` — retry safe (typically TRANSPORT class) with exponential backoff capped at 10 s.
-- `conditional` — retry only after changing policy (lag, capacity, cleanup state).
-- `recover` — the server already absorbed the gap; consume the recovery event and continue.
-- `warn` — informational; no retry needed but the caller should observe the signal and adjust.
-- `idempotent-only` — retry only with a fresh `_meta.idempotency_key`.
-
-Cross-references: [`GOLDEN_RULES.md`](./GOLDEN_RULES.md), [`ANTIPATTERNS.md`](./ANTIPATTERNS.md), [ADR 0003](../adr/0003-lifecycle-binding.md), [ADR 0004](../adr/0004-channel-mux-fairness.md), [ADR 0006](../adr/0006-backpressure-policies.md), [ADR 0008](../adr/0008-ndjson-daemon-protocol.md).
+Cross-references: [GOLDEN_RULES.md](./GOLDEN_RULES.md), [ANTIPATTERNS.md](./ANTIPATTERNS.md), ADRs [0003](../adr/0003-lifecycle-binding.md), [0004](../adr/0004-channel-mux-fairness.md), [0006](../adr/0006-backpressure-policies.md), [0008](../adr/0008-ndjson-daemon-protocol.md).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -53,7 +43,7 @@ flowchart LR
 
 ## AUTH
 
-Never retry. The caller must update credentials. Retries with the same key produce identical failures.
+Never retry. Caller must update credentials.
 
 ### [AUTH_FAILED] Authentication rejected by remote host
 
@@ -93,7 +83,7 @@ Never retry. The caller must update credentials. Retries with the same key produ
 
 ## TRANSPORT
 
-Auto-retry with exponential backoff (cap 10 s). Transient failures fix themselves under reasonable retry budgets.
+Auto-retry with exponential backoff (cap 10 s). Transient failures self-heal.
 
 ### [CONNECTION_FAILED] TCP connect or handshake failed
 
@@ -150,7 +140,7 @@ Auto-retry with exponential backoff (cap 10 s). Transient failures fix themselve
 
 ## REMOTE
 
-Failures originating on the remote host. Retry decisions depend on the specific exit code or error string; the LLM judges.
+Failures from the remote host. Retry decision depends on exit code or error string — LLM judges.
 
 ### [SFTP_ERROR] Remote SFTP operation failed
 
@@ -190,7 +180,7 @@ Failures originating on the remote host. Retry decisions depend on the specific 
 
 ## RESOURCE
 
-Never retry. The resource is gone or never existed. The cure is to recreate it (when applicable) or use the closest-match suggestion in the DETAIL line.
+Never retry. The resource is gone or never existed. Cure: recreate (where applicable) or use the closest-match suggestion in the DETAIL line.
 
 ### [SESSION_NOT_FOUND] No session matches the supplied `session_id`
 
@@ -332,7 +322,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 ## POLICY
 
-Retry only after changing the operative policy (lag, capacity, cleanup state). The error is a hint that the current policy is incompatible with the workload.
+Retry only after changing the operative policy (lag, capacity, cleanup state). The error signals the current policy is incompatible with the workload.
 
 ### [MAX_SESSIONS_EXCEEDED] Per-tenant or global session cap reached
 
@@ -538,7 +528,7 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 
 ## STATE
 
-Argument validation and idempotency cache failures. Retry only after changing the offending input or minting a fresh idempotency key.
+Argument validation and idempotency cache failures. Retry only after changing the offending input or minting a fresh `_meta.idempotency_key`.
 
 ### [INVALID_ARGUMENT] Argument failed schema validation
 

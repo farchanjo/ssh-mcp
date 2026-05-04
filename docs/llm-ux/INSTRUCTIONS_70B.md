@@ -1,6 +1,6 @@
 # Root prompt — 70B-class models
 
-Detailed root prompt. Embedded verbatim into `Implementation.instructions` when the host signals a ≥70B-class model (Claude 3.5+, GPT-4-class, Llama 3.1 70B+, Qwen 2.5 72B). Larger budget allows full sentences and tradeoff guidance. Phase 3 wires the dispatch; for now the canonical text lives here. Source: [ADR 0005](../adr/0005-llm-ux-priorities.md). Compact 27B variant: [`INSTRUCTIONS_27B.md`](./INSTRUCTIONS_27B.md). Full rules: [`GOLDEN_RULES.md`](./GOLDEN_RULES.md).
+Detailed root prompt embedded verbatim into `Implementation.instructions` when the host signals a ≥70B-class model (Claude 3.5+, GPT-4-class, Llama 3.1 70B+, Qwen 2.5 72B). Phase 3 wires the dispatch; this file is the canonical text. Source: [ADR 0005](../adr/0005-llm-ux-priorities.md). Compact 27B variant: [INSTRUCTIONS_27B.md](./INSTRUCTIONS_27B.md). Full rationale per rule: [GOLDEN_RULES.md](./GOLDEN_RULES.md).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
