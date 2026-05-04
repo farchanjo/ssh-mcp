@@ -1369,8 +1369,8 @@ async fn drain_channel_until_close(channel: &mut Channel<Msg>) {
 mod tests {
     use super::{
         Address, ArcSwap, AtomicU64, Bytes, CommandId, CommandOutcome, Credentials, DomainError,
-        Notify, Ordering, RingBuffer, RusshAdapter, RusshAdapterConfig, SessionId, ShellId, broadcast,
-        drop_handle_quietly, flush_shell_buffer, map_connect_error, split_credentials,
+        Notify, Ordering, RingBuffer, RusshAdapter, RusshAdapterConfig, SessionId, ShellId,
+        broadcast, drop_handle_quietly, flush_shell_buffer, map_connect_error, split_credentials,
     };
     use crate::domain::auth::AuthError;
     use crate::ports::ssh_client::SshClientPort;
