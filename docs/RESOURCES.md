@@ -1,10 +1,10 @@
 # Resources Reference (v4.8.0)
 
-Source of truth for the MCP `resources/*` family in ssh-mcp: 5 subscribe-friendly URI schemes, URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)).
+Source of truth for the MCP `resources/*` family in ssh-mcp: 5 subscribe-friendly URI schemes, URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)).
 
 > **v4.8 — no resource changes.** Strictly additive on `tools/list[].outputSchema`; everything below carries forward byte-identical to v4.7.1.
 
-Cross-refs: [API.md](./API.md) (tool reference) · [LLM_GUIDE.md](./LLM_GUIDE.md) (subscribe vs poll decision table) · [LOCKS.md](./LOCKS.md) (lock-free patterns underpinning the broadcast / cursor layer).
+Cross-refs: [API.md](./API.md) (tool reference) · [LLM_GUIDE.md](./LLM_GUIDE.md) (subscribe vs poll decision table) · [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants) (lock-free patterns underpinning the broadcast / cursor layer).
 
 ## Capabilities advertised
 

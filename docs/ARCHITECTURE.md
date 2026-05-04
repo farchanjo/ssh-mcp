@@ -207,11 +207,11 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 | `server.rs` | `McpSshServer<UC>` — generic over the `UseCases<…>` container. |
 | `tool_router.rs` | `#[tool_router]` impl populating the 21 v4 + 9 v5 = 30 `#[tool]` entry points (29 without `port_forward`). Phase 3 (in flight) wires the 9 new tools and updates `HINT:` severity. |
 | `results.rs` | Typed Rust output structs for every tool's `structured_content` payload. |
-| `prompts.rs` | `prompts/list` + `prompts/get` catalog — 10 workflows in v5 (5 carry-overs + 5 push-first; Phase 3 in flight). See [docs/llm-ux/PROMPTS_CATALOG.md](./llm-ux/PROMPTS_CATALOG.md). |
+| `prompts.rs` | `prompts/list` + `prompts/get` catalog — 10 workflows in v5 (5 carry-overs + 5 push-first; Phase 3 in flight). See [LLM_GUIDE.md → Prompts catalogue](./LLM_GUIDE.md#prompts-catalogue). |
 | `idempotency.rs` | DashMap-backed LRU cache — dedup mutating tool calls by `_meta.idempotency_key`. |
 | `progress.rs` | `notifications/progress` emitter — best-effort, mid-flight on long async waits. |
 | `suggestions.rs` | NOT_FOUND closest-match picker (Levenshtein top-3, lock-free). |
-| `error_detail.rs` (v5) | Code-by-code `DETAIL:` line renderer aligned with [ADR 0007](./adr/0007-error-taxonomy.md) and [docs/llm-ux/ERROR_HANDBOOK.md](./llm-ux/ERROR_HANDBOOK.md). |
+| `error_detail.rs` (v5) | Code-by-code `DETAIL:` line renderer aligned with [ADR 0007](./adr/0007-error-taxonomy.md) and [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook). |
 | `resource_templates.rs` | `resources/templates/list` static catalogue (4 / 5 RFC 6570 URI shapes). |
 | `resource_handlers.rs` | Adapters between rmcp `resources/{list,read,subscribe,unsubscribe}` payloads and the matching `*_resource` use cases. |
 | `peer_handle.rs` | Type aliases (`PeerTable`, `RmcpPeerHandle`). |
@@ -346,7 +346,7 @@ SessionPolicy   { persistent: false, idle_grace_ms: 5_000 }
 
 `release_when_no_subs` is exposed on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` (Phase 3 surfaces it in the MCP tool schema). Phase 1 wired the layer with the v4-compat default; existing MCP hosts see no behaviour change.
 
-Loom coverage: 4 new interleavings in `tests/lockfree_invariants.rs` (subscribe / unsubscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity). Full lock-free invariants summary: [LOCKS.md](./LOCKS.md).
+Loom coverage: 4 new interleavings in `tests/lockfree_invariants.rs` (subscribe / unsubscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity). Full lock-free invariants summary: [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants).
 
 ## Phase 2 — Channel mux + sub_id (merged)
 
@@ -461,19 +461,19 @@ flowchart LR
     style SCHEMES fill:#161b22,color:#f0f6fc,stroke:#30363d
 ```
 
-Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(SubId, Uri)` lane atomics: [LOCKS.md](./LOCKS.md#subscription-mux-invariants-phase-2).
+Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(SubId, Uri)` lane atomics: [DEVELOPMENT.md → Subscription mux invariants](./DEVELOPMENT.md#subscription-mux-invariants-phase-2).
 
 ## Phase 3 — LLM UX surface (in flight)
 
 ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
 
-This document tracks names; canonical references are [docs/llm-ux/](./llm-ux/) — `PROMPTS_CATALOG.md`, `GOLDEN_RULES.md`, `ANTIPATTERNS.md`, `ERROR_HANDBOOK.md`.
+This document tracks names; the canonical LLM reference is [LLM_GUIDE.md](./LLM_GUIDE.md) (golden rules, prompts catalogue, anti-patterns, error handbook).
 
 ## Phase 4 — NDJSON daemon (in flight)
 
 ADR: [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md). Binary `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds an rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. Stdin reads NDJSON ops; stdout emits NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`).
 
-The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. Driving it as a subprocess gives the LLM real push delivery without host-level subscribe support. Full op + event schema: [docs/INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
+The daemon exists for tier-2 / tier-3 LLM hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model. Driving it as a subprocess gives the LLM real push delivery without host-level subscribe support. Full op + event schema: [DAEMON.md](./DAEMON.md).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -543,7 +543,7 @@ flowchart TB
 
 ## Lock-free invariants summary
 
-The full table — every atomic, every channel, every guard — lives in [LOCKS.md](./LOCKS.md). v5 adds three new categories:
+The full table — every atomic, every channel, every guard — lives in [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants). v5 adds three new categories:
 
 - **Lifecycle adapter atomics** (Phase 1): `state` AtomicU8, `sub_count` AtomicUsize, `grace_until_ms` AtomicU64, `policy` ArcSwap, `waker` Arc<Notify>.
 - **Subscription mux atomics** (Phase 2): per-lane mpsc, `cursor_lane` AtomicUsize, `pause_flag` AtomicBool, 8 stats atomics.
@@ -578,17 +578,14 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 
 | Doc | Purpose |
 |---|---|
-| [LOCKS.md](./LOCKS.md) | Lock-free patterns, acquisition order, channel sizing, loom invariants |
+| [DEVELOPMENT.md](./DEVELOPMENT.md) | Lock-free patterns, acquisition order, channel sizing, loom invariants, hot-path sequence diagrams |
 | [API.md](./API.md) | MCP tool reference (schemas, response shape) |
 | [RESOURCES.md](./RESOURCES.md) | `resources/*` contract, cursor semantics, `_meta` envelope |
-| [ERRORS.md](./ERRORS.md) | Wire-format error envelope (REASON + DETAIL) |
+| [OPERATIONS.md](./OPERATIONS.md) | Wire-format error envelope, per-tool error catalogue, symptom → cure runbook, recovery flows |
 | [CONFIGURATION.md](./CONFIGURATION.md) | Env-var table |
-| [FLOWS.md](./FLOWS.md) | End-to-end sequence diagrams |
-| [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md) | `ssh-mcp-tail daemon` NDJSON op + event schema |
-| [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | Symptom → cause → cure runbook |
-| [llm-ux/](./llm-ux/) | LLM UX kit (golden rules, prompts, anti-patterns, error handbook, 27B / 70B root prompts) |
-| [MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md) | Host migration guide |
-| [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) | Contributor migration (v4.1 deep-decouple addendum) |
+| [DAEMON.md](./DAEMON.md) | `ssh-mcp-tail daemon` NDJSON op + event schema |
+| [LLM_GUIDE.md](./LLM_GUIDE.md) | Golden rules, prompts, anti-patterns, error handbook, 27B / 70B root prompts |
+| [MIGRATION.md](./MIGRATION.md) | All migration paths (v2 → v3, v3 → v4, v4 → v5) |
 | [adr/](./adr/) | 0001 rmcp · 0002 hexagonal · 0003 lifecycle · 0004 mux+sub_id · 0005 LLM UX · 0006 LagPolicy · 0007 errors · 0008 daemon |
 
 ## Future work

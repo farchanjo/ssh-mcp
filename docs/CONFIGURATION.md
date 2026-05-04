@@ -1,6 +1,6 @@
 # SSH MCP Configuration Guide (v4.8.0)
 
-Every tunable on the v4.8.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x ([MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)).
+Every tunable on the v4.8.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x ([MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)).
 
 > **v4.8 — no env-var changes.** Strictly additive on `tools/list[].outputSchema`; everything below is byte-identical to v4.7.1.
 
@@ -186,7 +186,7 @@ export SSH_MCP_OUTPUT_MAX_BYTES_CAP=131072
 export SSH_MCP_LIST_MAX_ITEMS=100
 ```
 
-Expect more `Lagged` events under load; clients should detect gaps via `_meta.last_seq` and resync via `resources/read?cursor=0` (see [FLOWS.md scenario 10](./FLOWS.md#10-subscriber-lagged--auto-recovery)).
+Expect more `Lagged` events under load; clients should detect gaps via `_meta.last_seq` and resync via `resources/read?cursor=0` (see [OPERATIONS.md → Subscriber lagged + auto-recovery](./OPERATIONS.md#subscriber-lagged--auto-recovery)).
 
 ### Profile D — real-time interactive UX
 
@@ -213,4 +213,4 @@ A 20 ms debounce keeps p95 round-trip < 50 ms; a 10 s keepalive frequently warms
 
 - Tool reference: [API.md](./API.md)
 - Lock-free design and subscribe pipeline: [ARCHITECTURE.md](./ARCHITECTURE.md)
-- End-to-end workflows: [FLOWS.md](./FLOWS.md)
+- End-to-end workflows: [DEVELOPMENT.md → Hot-path sequence diagrams](./DEVELOPMENT.md#hot-path-sequence-diagrams) / [OPERATIONS.md → Recovery flows](./OPERATIONS.md#recovery-flows)

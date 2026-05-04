@@ -46,7 +46,7 @@ flowchart LR
 - **Strict by default, tunable when needed.** Production preset out of the box; everything is an env var.
 - **Additive across versions.** v3 / v4 hosts on the legacy 21-tool catalogue work unchanged against v5.
 
-See the [LLM UX kit](docs/llm-ux/) for the full design philosophy and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layer map.
+See the [LLM Guide](docs/LLM_GUIDE.md) for the full design philosophy and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layer map.
 
 ## Use cases
 
@@ -70,7 +70,7 @@ sudo install -m 0755 target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
 
 Three binaries land in `/usr/local/bin`. Pick the one your MCP host expects: `ssh-mcp-stdio` for local hosts (mcp-inspector, IDE plugins, Cline) is the recommended default; `ssh-mcp` exposes the same surface over HTTP for browser- or service-based hosts; `ssh-mcp-tail daemon` is the NDJSON pipeline mode for hosts that cannot consume MCP push notifications natively.
 
-If your host needs the smallest possible binary, build with `--no-default-features` to drop the optional `port_forward` feature (29 tools instead of 30). Transport behaviour is identical across all three binaries — they share the same hexagonal core. Operational details and op/event schemas live in [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+If your host needs the smallest possible binary, build with `--no-default-features` to drop the optional `port_forward` feature (29 tools instead of 30). Transport behaviour is identical across all three binaries — they share the same hexagonal core. Operational details and op/event schemas live in [docs/DAEMON.md](docs/DAEMON.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -134,7 +134,7 @@ The data path is engineered for sub-millisecond latency between SSH stdout and M
 | Lock-free hot path | Zero `Mutex` on shell, command, or transfer state — enforced by clippy. |
 | Loom invariants | 16 tests across CAS state, mux fairness, ring buffer monotonicity, cascade. |
 
-The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.clippy]` block in [`Cargo.toml`](Cargo.toml). Detailed invariants: [docs/LOCKS.md](docs/LOCKS.md).
+The strict baseline is encoded in [`clippy.toml`](clippy.toml) and the `[lints.clippy]` block in [`Cargo.toml`](Cargo.toml). Detailed invariants: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#lock-free-invariants).
 
 ## How it compares
 
@@ -162,34 +162,31 @@ cargo fmt --all -- --check
 cargo clippy --release --all-features -- -D warnings
 ```
 
-These four gates must stay green on every commit. The clippy gate is production-only — the strict `forbid(unwrap_used)` policy is structurally incompatible with the `#[tokio::test]` macro expansion, so test targets are gated separately. Rationale and lock-free invariants: [CLAUDE.md](CLAUDE.md), [docs/LOCKS.md](docs/LOCKS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+These four gates must stay green on every commit. The clippy gate is production-only — the strict `forbid(unwrap_used)` policy is structurally incompatible with the `#[tokio::test]` macro expansion, so test targets are gated separately. Rationale and lock-free invariants: [CLAUDE.md](CLAUDE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation map
 
 | Document | Purpose |
 |---|---|
+| [docs/](docs/README.md) | Directory index — start here for the per-doc decision tree. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout, v5 layers, per-module map, sequence diagrams. |
 | [docs/API.md](docs/API.md) | All 30 MCP tools — inputs, outputs, structured content, error codes. |
 | [docs/RESOURCES.md](docs/RESOURCES.md) | Five resource schemes, cursor and sequence semantics, `_meta` envelope. |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles. |
-| [docs/ERRORS.md](docs/ERRORS.md) | Wire-format error envelope and code taxonomy. |
-| [docs/LOCKS.md](docs/LOCKS.md) | Lock-free invariants per layer with clippy enforcement map. |
-| [docs/FLOWS.md](docs/FLOWS.md) | Sequence diagrams for connect, execute, shell, SFTP, subscribe. |
-| [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md) | NDJSON daemon op and event schema. |
-| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom, cause, and cure runbook. |
-| [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md) | v4.x to v5.0 host migration guide. |
-| [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) | Contributor migration guide with v4.1 deep-decouple addendum. |
-| [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) | High-level LLM-driving overview. |
-| [docs/llm-ux/](docs/llm-ux/) | LLM UX kit — golden rules, prompts catalogue, anti-patterns, error handbook, 27B / 70B root prompts. |
+| [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) | LLM canonical — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 38-code error handbook. |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Symptom → cure runbook, wire-format error envelope, per-tool error catalogue, recovery flows. |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build / clippy gates, lock-free invariants, hot-path sequence diagrams. |
+| [docs/DAEMON.md](docs/DAEMON.md) | `ssh-mcp-tail` NDJSON op and event schema. |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | All migration paths — v2 → v3 (client), v3 → v4 (contributor), v4 → v5 (host). |
 | [docs/adr/](docs/adr/) | Eight architecture decision records covering rmcp, hexagonal, lifecycle, mux, LLM UX, backpressure, errors, and the daemon protocol. |
 
 ## FAQ
 
 **Is this wire-compatible with my existing v4 host?**
-Yes. The 21 carry-over tools keep their exact response shape, env vars, and error codes; the 9 new tools are additive. New optional parameters default to v4 behaviour. Details: [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md).
+Yes. The 21 carry-over tools keep their exact response shape, env vars, and error codes; the 9 new tools are additive. New optional parameters default to v4 behaviour. Details: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
 
 **My LLM host doesn't surface push notifications. Can I still use the subscribe model?**
-Yes. Run the NDJSON daemon as a subprocess and read push events directly from its stdout. See [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md).
+Yes. Run the NDJSON daemon as a subprocess and read push events directly from its stdout. See [docs/DAEMON.md](docs/DAEMON.md).
 
 **Why a separate daemon binary instead of a flag on the stdio binary?**
 The daemon hosts an in-process MCP client and server pair with a different runtime shape. Keeping them separate prevents subtle behavioural drift and lets distros ship only the transport they need.
