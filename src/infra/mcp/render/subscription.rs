@@ -525,7 +525,7 @@ mod tests {
             )
         );
         assert!(body.contains("Do NOT use any MCP tool as a sleep"));
-        assert!(body.contains("Start-Sleep -Milliseconds 50"));
+        assert!(body.contains("Start-Sleep -Milliseconds 100"));
         assert!(body.contains("Cleanup: ssh_unsubscribe"));
         assert!(body.contains("Cost: O(1) lane open"));
         assert!(body.contains("Idempotency: Pass _meta.idempotency_key"));
