@@ -34,6 +34,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use arc_swap::ArcSwap;
+
+use crate::ports::notifier::ProducerForwarder;
+use crate::ports::subscriber_registry::ResourceKind as PortResourceKind;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -67,6 +72,20 @@ pub enum ResourceKind {
     Forward,
     /// `serial://<id>/output` — UART / TTY / COM (v5.2; ADR 0009).
     Serial,
+}
+
+/// Map the legacy module's [`ResourceKind`] onto the hexagonal port
+/// [`PortResourceKind`]. The two enums keep the same variants; the
+/// conversion is exhaustive.
+const fn legacy_kind_to_port(kind: ResourceKind) -> PortResourceKind {
+    match kind {
+        ResourceKind::Shell => PortResourceKind::Shell,
+        ResourceKind::Command => PortResourceKind::Command,
+        ResourceKind::Transfer => PortResourceKind::Transfer,
+        ResourceKind::Session => PortResourceKind::Session,
+        ResourceKind::Forward => PortResourceKind::Forward,
+        ResourceKind::Serial => PortResourceKind::Serial,
+    }
 }
 
 /// A single MCP peer's subscription to one resource URI.
@@ -139,6 +158,10 @@ pub struct SubscriptionRegistry {
     /// ADR 0006 Amendment 1 — process-wide count of byte-triggered
     /// broadcasts.
     byte_triggered_flushes: AtomicU64,
+    /// Optional forwarder to the hexagonal `MemoryRegistry`. Composition
+    /// root installs an impl so legacy producer pokes / byte deltas
+    /// also wake `ssh_subscribe` lanes via the lane-fanout bridge.
+    forwarder: ArcSwap<Option<Arc<dyn ProducerForwarder>>>,
 }
 
 impl SubscriptionRegistry {
@@ -155,7 +178,16 @@ impl SubscriptionRegistry {
             bytes_since_flush: DashMap::new(),
             flush_bytes_threshold: resolve_notify_flush_bytes(),
             byte_triggered_flushes: AtomicU64::new(0),
+            forwarder: ArcSwap::from_pointee(None),
         }
+    }
+
+    /// Install (or replace) the producer forwarder. Composition root
+    /// wires the hexagonal `MemoryRegistry` here so every legacy
+    /// `poke` / `record_bytes` also drives the lane-fanout bridge on
+    /// stdio/HTTP transports.
+    pub fn install_forwarder(&self, fwd: Arc<dyn ProducerForwarder>) {
+        self.forwarder.store(Arc::new(Some(fwd)));
     }
 
     /// Allocate the next sequence number for `(kind, id)`. Sequences start
@@ -182,6 +214,13 @@ impl SubscriptionRegistry {
     pub fn poke(&self, kind: ResourceKind, id: &str) {
         if let Some(entry) = self.wakers.get(&(kind, id.to_string())) {
             entry.notify_one();
+        }
+        // Forward to hexagonal registry so `ssh_subscribe` lanes also
+        // see producer pokes (the legacy debouncer fires the legacy
+        // peer fanout; the forwarder fires the hexagonal one).
+        let fwd = self.forwarder.load_full();
+        if let Some(forwarder) = fwd.as_ref() {
+            forwarder.forward_poke(legacy_kind_to_port(kind), id);
         }
     }
 
@@ -397,6 +436,13 @@ impl SubscriptionRegistry {
     /// `SSH_NOTIFY_FLUSH_BYTES`. Disabled (`0` threshold) /
     /// no-debouncer paths return immediately.
     pub fn record_bytes(&self, kind: ResourceKind, id: &str, bytes_added: usize) {
+        // Always forward to the hexagonal registry — bytes accumulate
+        // there independently so `ssh_subscribe` lane stats track the
+        // wire even when the legacy peer set is empty.
+        let fwd = self.forwarder.load_full();
+        if let Some(forwarder) = fwd.as_ref() {
+            forwarder.forward_record_bytes(legacy_kind_to_port(kind), id, bytes_added);
+        }
         if self.flush_bytes_threshold == 0 || bytes_added == 0 {
             return;
         }
