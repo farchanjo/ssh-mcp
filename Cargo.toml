@@ -2,7 +2,7 @@
 name = "ssh-mcp"
 version = "4.8.1"
 edition = "2024"
-rust-version = "1.85"   # Rust 2024 edition baseline + AFIT (async fn in traits) stable
+rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
 authors = ["farchanjo"]
 default-run = "ssh-mcp"
