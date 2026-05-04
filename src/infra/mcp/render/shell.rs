@@ -363,9 +363,10 @@ pub fn shell_write_structured(outcome: &WriteShellOutcome) -> Value {
         "shell_id":   outcome.shell_id.as_str(),
         "bytes_sent": outcome.bytes_written,
         "next": [
-            "resources/read shell://<shell_id>/output?cursor=auto",
-            "ssh_shell_wait_for",
-            "ssh_shell_read",
+            "ssh_subscribe uri=shell://<shell_id>/output (await push if not subscribed)",
+            "resources/read shell://<shell_id>/output?cursor=auto (drain delta on push)",
+            "ssh_shell_wait_for (only for regex prompt sync)",
+            "ssh_shell_read (poll fallback)",
         ],
     })
 }
@@ -387,9 +388,10 @@ pub fn shell_send_key_structured(outcome: &SendKeyOutcome) -> Value {
         "repeat":     outcome.repeat,
         "bytes_sent": outcome.bytes_sent,
         "next": [
-            "resources/read shell://<shell_id>/output?cursor=auto",
-            "ssh_shell_wait_for",
-            "ssh_shell_read",
+            "ssh_subscribe uri=shell://<shell_id>/output (await push if not subscribed)",
+            "resources/read shell://<shell_id>/output?cursor=auto (drain delta on push)",
+            "ssh_shell_wait_for (only for regex prompt sync)",
+            "ssh_shell_read (poll fallback)",
         ],
     })
 }
@@ -435,13 +437,15 @@ pub fn shell_wait_for_structured(outcome: &WaitForPatternOutcome) -> Value {
     let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
     let next = match outcome.status {
         WaitForPatternStatus::Matched => Some(json!([
+            "ssh_subscribe uri=shell://<shell_id>/output (await push for the next response)",
             "ssh_shell_write",
             "ssh_shell_send_key",
             "ssh_shell_close",
         ])),
         WaitForPatternStatus::Timeout => Some(json!([
-            "ssh_shell_wait_for",
-            "ssh_shell_read",
+            "ssh_subscribe uri=shell://<shell_id>/output (PREFERRED — push-first, no further wait_for chain)",
+            "ssh_shell_wait_for (only with explicit regex + bigger timeout)",
+            "ssh_shell_read (poll fallback)",
             "ssh_shell_close",
         ])),
         WaitForPatternStatus::Closed => None,
