@@ -13,11 +13,13 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
+use crate::ports::notifier::PeerHandle;
 use crate::ports::subscriber_registry::ResourceKind;
 
 /// Boxed future returned by [`LaneAdmin`] methods. Aliased so the
@@ -38,6 +40,9 @@ pub struct LanePolicy {
     pub filter: FilterRule,
     /// Per-lane mpsc capacity. `0` means "use the configured default".
     pub buffer_size: usize,
+    /// Optional rmcp peer the lane should notify on producer events.
+    /// `None` for transports without a peer concept (NDJSON daemon).
+    pub peer: Option<Arc<dyn PeerHandle>>,
 }
 
 /// Read-only summary for `ssh_sub_list` / `ssh_daemon_stats`.
