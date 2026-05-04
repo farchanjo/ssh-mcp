@@ -126,11 +126,12 @@ pub fn shell_write_render(outcome: WriteShellOutcome) -> String {
         bytes_written,
         last_activity_at: _,
     } = outcome;
-    let mut out = String::with_capacity(192);
+    let mut out = String::with_capacity(256);
     out.push_str("SSH_SHELL_WRITE: OK\nSHELL_ID: ");
     out.push_str(shell_id.as_str());
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_written.to_string());
+    append_subscribe_hint(&mut out, &shell_drive_await_push_hint(shell_id.as_str()));
     append_next_line(&mut out, &next_hint_for_shell_drive(shell_id.as_str()));
     out
 }
@@ -159,6 +160,7 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
     out.push_str(&repeat.to_string());
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_sent.to_string());
+    append_subscribe_hint(&mut out, &shell_drive_await_push_hint(shell_id.as_str()));
     append_next_line(&mut out, &next_hint_for_shell_drive(shell_id.as_str()));
     out
 }
@@ -168,14 +170,34 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
 ///
 /// v5 Phase 3 narrative closure: `ssh_subscribe` listed FIRST so the
 /// drive ops honour the subscribe-first contract established by
-/// `ssh_shell_open`. Polling alternatives (`resources/read` cursor,
-/// `ssh_shell_read`) appear last as fallbacks.
+/// `ssh_shell_open`. After a write, the response arrives via push on
+/// the existing subscription — the LLM should await
+/// `notifications/resources/updated` and then drain the delta via
+/// `resources/read?cursor=auto`, NOT actively poll with
+/// `ssh_shell_wait_for`. The wait-for tool is reserved for explicit
+/// regex prompt-gating; polling alternatives appear last as fallbacks.
 fn next_hint_for_shell_drive(shell_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=shell://{shell_id}/output | \
-         ssh_shell_wait_for | \
-         resources/read shell://{shell_id}/output?cursor=auto (poll fallback) | \
+        "ssh_subscribe uri=shell://{shell_id}/output (await push if not subscribed) | \
+         resources/read shell://{shell_id}/output?cursor=auto (drain delta on push) | \
+         ssh_shell_wait_for (only for regex prompt sync) | \
          ssh_shell_read (poll fallback)"
+    )
+}
+
+/// Steer the LLM toward passive push-await after a shell drive call.
+///
+/// 27B-class models routinely chain `ssh_shell_write` →
+/// `ssh_shell_wait_for` because the latter looks like a synchronous
+/// "now wait for output" primitive. It is not — it is a regex gate
+/// that polls and consumes a tool call. The right pattern after write
+/// is to wait for the push notification on the existing subscription
+/// and then drain via `resources/read?cursor=auto`. This hint nudges
+/// the model toward sleeping on the push channel instead of issuing a
+/// follow-up tool call.
+fn shell_drive_await_push_hint(shell_id: &str) -> String {
+    format!(
+        "RECOMMENDED: response arrives via push on shell://{shell_id}/output. Wait for notifications/resources/updated, then drain with resources/read?cursor=auto. Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex."
     )
 }
 
@@ -252,19 +274,23 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
     out
 }
 
-/// Successor advisory after `ssh_shell_wait_for`. `Matched` invites a
-/// write / send-key / close. `Timeout` invites another wait, a pull
-/// read, or close. `Closed` is terminal — no `NEXT`.
+/// Successor advisory after `ssh_shell_wait_for`. Every non-terminal
+/// state leads with `ssh_subscribe` so the LLM stops chaining
+/// poll-style `wait_for` calls back-to-back. After a `Matched`, the
+/// caller usually wants to drive the shell again — but the response
+/// to that drive should arrive via push, not via another `wait_for`.
+/// `Closed` is terminal — no `NEXT`.
 fn next_hint_for_wait_for(status: WaitForPatternStatus, shell_id: &str) -> Option<String> {
     match status {
         WaitForPatternStatus::Matched => Some(format!(
-            "ssh_shell_write(shell_id={shell_id}, ...) | \
+            "ssh_subscribe uri=shell://{shell_id}/output (await push for the next response) | \
+             ssh_shell_write(shell_id={shell_id}, ...) | \
              ssh_shell_send_key(shell_id={shell_id}, ...) | \
              ssh_shell_close(shell_id={shell_id})"
         )),
         WaitForPatternStatus::Timeout => Some(format!(
-            "ssh_subscribe uri=shell://{shell_id}/output | \
-             ssh_shell_wait_for(shell_id={shell_id}, ...) | \
+            "ssh_subscribe uri=shell://{shell_id}/output (PREFERRED — push-first, no further wait_for chain) | \
+             ssh_shell_wait_for(shell_id={shell_id}, ...) (only with explicit regex + bigger timeout) | \
              ssh_shell_read(shell_id={shell_id}) (poll fallback) | \
              ssh_shell_close(shell_id={shell_id})"
         )),
@@ -476,11 +502,87 @@ mod tests {
             "body: {m}"
         );
         assert!(
-            m.contains("\nNEXT: ssh_subscribe uri=shell://shell-1/output"),
+            m.contains("\nHINT: RECOMMENDED: response arrives via push on shell://shell-1/output"),
             "body: {m}"
         );
         assert!(
-            m.contains("resources/read shell://shell-1/output?cursor=auto (poll fallback)"),
+            m.contains(
+                "Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex"
+            ),
+            "body: {m}"
+        );
+        assert!(
+            m.contains(
+                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push if not subscribed)"
+            ),
+            "body: {m}"
+        );
+        assert!(
+            m.contains("resources/read shell://shell-1/output?cursor=auto (drain delta on push)"),
+            "body: {m}"
+        );
+        assert!(
+            m.contains("ssh_shell_wait_for (only for regex prompt sync)"),
+            "body: {m}"
+        );
+    }
+
+    #[test]
+    fn send_key_emits_await_push_hint_and_subscribe_first_next() {
+        let m = shell_send_key_render(SendKeyOutcome {
+            shell_id: ShellId::new("shell-1".to_string()),
+            key_label: "enter".to_string(),
+            modifier_label: None,
+            repeat: 1,
+            bytes_sent: 1,
+            sent_at: Utc::now(),
+        });
+        assert!(
+            m.contains("\nHINT: RECOMMENDED: response arrives via push on shell://shell-1/output"),
+            "body: {m}"
+        );
+        assert!(
+            m.contains(
+                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push if not subscribed)"
+            ),
+            "body: {m}"
+        );
+    }
+
+    #[test]
+    fn wait_for_matched_next_leads_with_subscribe() {
+        let m = shell_wait_for_render(&WaitForPatternOutcome {
+            shell_id: ShellId::new("shell-1".to_string()),
+            status: WaitForPatternStatus::Matched,
+            matched_pattern: Some("$ ".to_string()),
+            data: Bytes::from_static(b"login\nuser@host:~$ "),
+            last_seq: 0,
+        });
+        assert!(
+            m.contains(
+                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push for the next response)"
+            ),
+            "body: {m}"
+        );
+    }
+
+    #[test]
+    fn wait_for_timeout_next_leads_with_subscribe() {
+        let m = shell_wait_for_render(&WaitForPatternOutcome {
+            shell_id: ShellId::new("shell-1".to_string()),
+            status: WaitForPatternStatus::Timeout,
+            matched_pattern: None,
+            data: Bytes::from_static(b""),
+            last_seq: 0,
+        });
+        assert!(
+            m.contains(
+                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (PREFERRED — push-first"
+            ),
+            "body: {m}"
+        );
+        assert!(
+            m.contains("only with explicit regex + bigger timeout"),
             "body: {m}"
         );
     }
