@@ -356,12 +356,13 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&clock),
         Arc::clone(&config),
     ));
-    let disconnect_agent = Arc::new(DisconnectAgentUseCase::new(
+    let disconnect_agent = Arc::new(DisconnectAgentUseCase::with_lifecycle(
         Arc::clone(&ssh),
         Arc::clone(&sessions),
         Arc::clone(&commands),
         Arc::clone(&shells),
         Arc::clone(&transfers),
+        Arc::clone(&lifecycle),
     ));
 
     let execute = Arc::new(

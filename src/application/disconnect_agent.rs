@@ -50,9 +50,11 @@ use std::sync::Arc;
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId};
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::ssh_client::SshClientPort;
+use crate::ports::subscriber_registry::ResourceKind;
 use crate::ports::transfer_repo::TransferRepository;
 
 /// Inbound DTO. Built by the rmcp tool wrapper (etapa H16).
@@ -97,6 +99,11 @@ where
     commands: Arc<CR>,
     shells: Arc<ShR>,
     transfers: Arc<TR>,
+    /// v5.3 lifecycle cascade — closes child resource lifecycle
+    /// entries alongside the repo removal so `SUB_LEAK_RISK` warnings
+    /// clear on `ssh_disconnect_agent`. Optional so test fixtures can
+    /// construct without the full lifecycle adapter.
+    lifecycle: Option<Arc<dyn LifecyclePolicyPort>>,
 }
 
 impl<S, R, CR, ShR, TR> DisconnectAgentUseCase<S, R, CR, ShR, TR>
@@ -107,7 +114,9 @@ where
     ShR: ShellRepository + Send + Sync,
     TR: TransferRepository + Send + Sync,
 {
-    /// Wire the use case from already-shared adapter handles.
+    /// Wire the use case from already-shared adapter handles. No
+    /// lifecycle cascade — used by tests / fixtures that bypass the
+    /// full production wiring.
     #[must_use]
     pub const fn new(
         ssh: Arc<S>,
@@ -122,6 +131,30 @@ where
             commands,
             shells,
             transfers,
+            lifecycle: None,
+        }
+    }
+
+    /// Wire the use case with the lifecycle cascade installed —
+    /// production composition uses this so child resources transition
+    /// to `Closed` in the lifecycle adapter alongside the repo
+    /// removal.
+    #[must_use]
+    pub fn with_lifecycle(
+        ssh: Arc<S>,
+        sessions: Arc<R>,
+        commands: Arc<CR>,
+        shells: Arc<ShR>,
+        transfers: Arc<TR>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+    ) -> Self {
+        Self {
+            ssh,
+            sessions,
+            commands,
+            shells,
+            transfers,
+            lifecycle: Some(lifecycle),
         }
     }
 
@@ -186,6 +219,9 @@ where
             let _ = self.ssh.cancel(&entity.id).await;
             let cancelled = entity.clone().cancel();
             let _ = self.commands.update(cancelled).await;
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Command, entity.id.as_str());
+            }
             if matches!(self.commands.remove(&entity.id).await, Ok(Some(_))) {
                 count = count.saturating_add(1);
             }
@@ -206,6 +242,9 @@ where
         for entity in listed {
             let closed = entity.clone().close();
             let _ = self.shells.update(closed).await;
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Shell, entity.id.as_str());
+            }
             if matches!(self.shells.remove(&entity.id).await, Ok(Some(_))) {
                 count = count.saturating_add(1);
             }
@@ -225,6 +264,9 @@ where
         for entity in listed {
             let cancelled = entity.clone().cancel();
             let _ = self.transfers.update(cancelled).await;
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                let _ = lifecycle.force_close(ResourceKind::Transfer, entity.id.as_str());
+            }
             if matches!(self.transfers.remove(&entity.id).await, Ok(Some(_))) {
                 count = count.saturating_add(1);
             }
