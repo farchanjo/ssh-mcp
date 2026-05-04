@@ -134,7 +134,7 @@ pub const FORWARD_BROADCAST_CAP_MAX: usize = 4096;
 pub const FORWARD_BROADCAST_CAP_MIN: usize = 8;
 
 /// Default debounce window (milliseconds) for the subscription registry.
-pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 50;
+pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 200;
 /// Floor for the debounce window.
 pub const NOTIFY_DEBOUNCE_MS_MIN: u64 = 5;
 /// Cap for the debounce window.
@@ -664,7 +664,7 @@ pub fn resolve_forward_broadcast_cap() -> usize {
 
 /// Resolve the subscription debounce window (milliseconds).
 ///
-/// Reads `SSH_NOTIFY_DEBOUNCE_MS` (default 50) and clamps to
+/// Reads `SSH_NOTIFY_DEBOUNCE_MS` (default 200) and clamps to
 /// `[NOTIFY_DEBOUNCE_MS_MIN, NOTIFY_DEBOUNCE_MS_MAX]`.
 #[must_use]
 pub fn resolve_notify_debounce_ms() -> u64 {

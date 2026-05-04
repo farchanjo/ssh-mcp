@@ -74,8 +74,8 @@ Full notes: [CHANGELOG.md → 5.2.0](CHANGELOG.md#520--2026-05-04). Design ratio
 ADR 0006 Amendment 1 wired end-to-end — no wire-format changes, drop-in for any v3 / v4 / v5.0.x host.
 
 - **Byte-threshold debouncer flush** (`SSH_NOTIFY_FLUSH_BYTES`, default `64k`). The per-resource debouncer now flushes immediately whenever the bytes-since-last-broadcast counter crosses the threshold, even when the time window has not yet expired. Hooked on `command://*/output` (stdout / stderr per-chunk delta) and `transfer://*/progress` (per-SFTP-chunk delta). Set to `0` to disable and revert to v5.0 time-only behaviour. Accepts bare bytes (`65536`) or bytesize strings (`8k`, `64k`, `1m`, `1mib`).
-- **`ssh_subscribe` HINT line** now spells out both knobs: "Push fires on whichever fires first: ~50ms debounce window (`SSH_NOTIFY_DEBOUNCE_MS`) OR 64KiB accumulated bytes (`SSH_NOTIFY_FLUSH_BYTES`). 10-100ms local sleeps cover both budgets."
-- **Local-sleep guidance** — wire HINT explicitly steers the LLM to wait passively for `notifications/resources/updated` and use Unix `sleep 0.05` / PowerShell `Start-Sleep -Milliseconds 50` for any local idling. Never an MCP tool as a sleep primitive.
+- **`ssh_subscribe` HINT line** now spells out both knobs: "Push fires on whichever fires first: ~200ms debounce window (`SSH_NOTIFY_DEBOUNCE_MS`) OR 64KiB accumulated bytes (`SSH_NOTIFY_FLUSH_BYTES`). 50-200ms local sleeps cover both budgets."
+- **Local-sleep guidance** — wire HINT explicitly steers the LLM to wait passively for `notifications/resources/updated` and use Unix `sleep 0.1` / PowerShell `Start-Sleep -Milliseconds 100` for any local idling. Never an MCP tool as a sleep primitive.
 - **Inherits 5.0.2 LLM-UX nudges** — `ssh_run` reframed as `PENALIZED FALLBACK`, shell drive ops steered to await push instead of chaining `ssh_shell_wait_for`.
 
 Full notes: [CHANGELOG.md → 5.1.0](CHANGELOG.md#510--2026-05-04).
@@ -94,7 +94,7 @@ flowchart TB
     REACTOR["tokio reactor +<br/>work-stealing scheduler"]
     RUSSH["russh<br/>SSH 2.0 frame parser<br/>per-channel mpsc"]
     LIFECYCLE["Lifecycle adapter<br/>ArcSwap RingBuffer<br/>atomic CAS state"]
-    DEBOUNCE["Debouncer<br/>50 ms coalesce<br/>1 s force-flush"]
+    DEBOUNCE["Debouncer<br/>200 ms coalesce<br/>1 s force-flush"]
     LANE["Per-subscription lane<br/>tokio mpsc(N)<br/>filter · replay · lag policy"]
     MUX["ChannelMux<br/>AtomicUsize cursor<br/>round-robin fairness"]
     OUT["Outbound writer<br/>rmcp Peer<br/>or NDJSON stdout"]
@@ -139,7 +139,7 @@ SSH already supports many channels over one TCP connection — that's part of th
 For each long-lived resource (shell, command, transfer, forward), the server keeps an atomic state machine and a reference counter. No mutex on the hot path — only `AtomicU8`, `AtomicUsize`, `ArcSwap`, and `Notify`. When the last subscriber disconnects, a grace timer arms; if a new subscriber arrives within the window, the timer cancels. If not, the resource is released and the channel closed. No leaks, no zombies.
 
 **5. Debouncer.**
-A burst of one thousand tiny writes from the remote host could become one thousand notifications. Instead, the debouncer coalesces them into one push every 50 ms (force-flushed every 1 s for liveness). The model receives meaningful chunks, not a token-stream of fragments.
+A burst of one thousand tiny writes from the remote host could become one thousand notifications. Instead, the debouncer coalesces them into one push every 200 ms (force-flushed every 1 s for liveness). The model receives meaningful chunks, not a token-stream of fragments.
 
 **6. Per-subscription lanes (the multiplexing magic).**
 Every `ssh_subscribe` call gets its own bounded `tokio::sync::mpsc::channel` — its own queue, its own filter, its own replay buffer, its own lag policy. Three subscribers to the same shell are three independent lanes. A slow LLM does not slow down a fast one. Each lane chooses how to react to backpressure: drop the oldest event, send a snapshot and resume, or disconnect a misbehaving consumer.
@@ -148,7 +148,7 @@ Every `ssh_subscribe` call gets its own bounded `tokio::sync::mpsc::channel` —
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
     SRC["SSH stdout<br/>burst"]
-    DEB["debouncer<br/>50 ms window"]
+    DEB["debouncer<br/>200 ms window"]
     LA["Lane A<br/>filter='ERROR'<br/>policy=DropOldest"]
     LB["Lane B<br/>no filter<br/>policy=Snapshot"]
     LC["Lane C<br/>filter regex<br/>policy=Disconnect"]
@@ -234,7 +234,7 @@ Measurements taken on Apple M2 Pro, macOS 25.4, native arm64 build (`--release`)
 
 | Scenario | Behaviour |
 |---|---|
-| First push after `ssh_subscribe` (warm session) | Under 5 ms p50; the 50 ms debounce window dominates after the initial chunk. |
+| First push after `ssh_subscribe` (warm session) | Under 5 ms p50; the 200 ms debounce window dominates after the initial chunk. |
 | Lane full and `Snapshot` recovery | Sub-millisecond with the default 1 MB ring buffer. |
 | Round-robin mux fairness | Under 1 % drift between adjacent lanes under burst. |
 | Session reaper vs active resources | Refcount supersedes the inactivity TTL — active resources are never reaped. |
@@ -326,7 +326,7 @@ A few that matter most:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SSH_NOTIFY_DEBOUNCE_MS` | `50` | Coalesce window between pushes (lower → snappier, higher → fewer notifications). |
+| `SSH_NOTIFY_DEBOUNCE_MS` | `200` | Coalesce window between pushes (lower → snappier, higher → fewer notifications). |
 | `SSH_NOTIFY_FORCE_FLUSH_MS` | `1000` | Liveness flush even when the debouncer is still accumulating. |
 | `SSH_LANE_BUFFER` | `1024` | Bounded mpsc capacity per subscription lane. |
 | `SSH_GRACE_DEFAULT_MS` | `5000` | Grace window between last `unsubscribe` and resource release. |

@@ -307,7 +307,7 @@ The `ssh_daemon_stats` event surfaces the mux backlog and the debouncer pace.
 | Cause | Cure |
 |---|---|
 | Hot poll | Update the host's prompt to use `ssh_subscribe` instead of `ssh_shell_read` in a loop. Five golden rules: [LLM_GUIDE.md](./LLM_GUIDE.md#golden-rules). |
-| Debouncer storm | Increase `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms; try 100–200 ms for noisy resources). |
+| Debouncer storm | Increase `SSH_NOTIFY_DEBOUNCE_MS` (default 200 ms; try 500–1000 ms for very noisy resources). |
 | Mux loop spinning | File a bug; capture `tokio-console` profile and `ssh_daemon_stats`. |
 | Regex backtracking | Replace the filter with a simpler pattern; consider a level filter instead of regex. |
 
