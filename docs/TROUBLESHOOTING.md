@@ -4,6 +4,48 @@ This guide is **operator-facing**: if you run `ssh-mcp` (HTTP), `ssh-mcp-stdio`,
 
 This document is **forthcoming** for v5.0 sections that depend on Phase 2 / 3 / 4 of the v5 roadmap (the channel mux, the new tools, the daemon binary). The diagnosis steps for v4-equivalent symptoms work today on `master`; the v5-specific steps activate as the relevant phases land.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    S{"What's wrong?"}
+    A{"no push events<br/>arrive?"}
+    A1["host drops<br/>notifications"]
+    A2["lifecycle moved<br/>to Closed"]
+    A3["lane paused<br/>or filtered"]
+
+    B{"resource zombies<br/>after disconnect?"}
+    B1["release_when_no_subs<br/>= false (v4 default)"]
+    B2["no subscriber +<br/>no auto-cleanup"]
+
+    C{"lag_drops > 0?"}
+    C1["consumer slower<br/>than producer"]
+
+    CA["switch to<br/>ssh-mcp-tail daemon"]
+    CB["recreate via<br/>shell_open / execute"]
+    CC["ssh_sub_resume<br/>+ ssh_sub_filter"]
+    CD["ssh_shell_close +<br/>set release_when_no_subs"]
+    CE["set release_when_no_subs<br/>OR shorter inactivity TTL"]
+    CF["lag_policy=snapshot<br/>(default) or block_slow"]
+
+    S --> A
+    S --> B
+    S --> C
+    A -->|host issue| A1 --> CA
+    A -->|grace expired| A2 --> CB
+    A -->|lane state| A3 --> CC
+    B -->|one-time| B1 --> CD
+    B -->|recurrence| B2 --> CE
+    C -->|tune| C1 --> CF
+
+    classDef branch fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef warn fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef good fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class S,A,B,C branch
+    class A1,A2,A3,B1,B2,C1 bad
+    class CA,CB,CC,CD,CE,CF good
+```
+
 ## Table of contents
 
 1. [Subscriber receives no push events](#1-subscriber-receives-no-push-events)
