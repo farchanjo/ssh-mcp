@@ -45,6 +45,7 @@ use crate::adapters::lifecycle::leak_watcher::{
 };
 use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
+use crate::ports::notifier::{DebouncerActivator, ProducerForwarder};
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
 #[cfg(feature = "port_forward")]
@@ -55,7 +56,8 @@ use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
 use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegistry};
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
 use crate::adapters::subscription::channel_mux::ChannelMuxAdapter;
-use crate::adapters::subscription::legacy::spawn_peer_gc;
+use crate::adapters::subscription::lane_bridge::LaneFanoutBridge;
+use crate::adapters::subscription::legacy::{SUBSCRIPTION_REGISTRY, spawn_peer_gc};
 use crate::adapters::subscription::memory_registry::MemoryRegistry;
 use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
 use crate::application::cancel_command::CancelCommandUseCase;
@@ -321,6 +323,17 @@ pub fn build_use_cases() -> ProdWiring {
     // writer. Phase 2 keeps the receiver alive on the composition
     // root so the mpsc never reports `Closed` and the outbound sink
     // never blocks.
+    //
+    // v5.3 — install the lane-fanout bridge so the legacy
+    // [`MemoryRegistry::broadcast`] pipeline also delivers
+    // `notifications/resources/updated` to every `ssh_subscribe`
+    // lane bound to the broadcast URI. Lane stats (events_sent /
+    // bytes_sent) increment on each successful peer notify.
+    let lane_bridge = LaneFanoutBridge::new(
+        Arc::clone(&subscriber_lane_adapter),
+        Arc::clone(&notifier),
+    );
+    subscribers.install_lane_bridge(lane_bridge);
 
     let connect = Arc::new(ConnectSessionUseCase::new(
         Arc::clone(&ssh),
@@ -521,7 +534,19 @@ pub fn build_use_cases() -> ProdWiring {
     // v5 Phase 3 — subscription-administration use cases. All share the
     // same `Arc<dyn LaneAdmin>` handle so the channel-mux wiring stays
     // single-sourced.
-    let sub_subscribe = Arc::new(SubscribeUseCase::new(Arc::clone(&lane_admin)));
+    let activator: Arc<dyn DebouncerActivator> =
+        Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);
+    // Producer-side forwarder: legacy `SUBSCRIPTION_REGISTRY` mirrors
+    // every poke / record_bytes into the hexagonal `MemoryRegistry`
+    // so `ssh_subscribe` lanes track real producer events (not just
+    // the 1 s force-flush keepalive tick).
+    let forwarder: Arc<dyn ProducerForwarder> =
+        Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);
+    SUBSCRIPTION_REGISTRY.install_forwarder(forwarder);
+    let sub_subscribe = Arc::new(SubscribeUseCase::with_activator(
+        Arc::clone(&lane_admin),
+        activator,
+    ));
     let sub_unsubscribe = Arc::new(UnsubscribeUseCase::new(Arc::clone(&lane_admin)));
     let sub_pause = Arc::new(PauseSubUseCase::new(Arc::clone(&lane_admin)));
     let sub_resume = Arc::new(ResumeSubUseCase::new(Arc::clone(&lane_admin)));
