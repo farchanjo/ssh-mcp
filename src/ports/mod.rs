@@ -21,6 +21,7 @@ pub mod command_repo;
 pub mod config;
 pub mod forward_repo;
 pub mod id_generator;
+pub mod lifecycle_policy;
 pub mod notifier;
 pub mod output_stream;
 pub mod session_repo;
