@@ -449,6 +449,22 @@ mod tests {
                 "CancellingSsh::health_check unused".to_string(),
             ))
         }
+
+        async fn open_forward(
+            &self,
+            _session_id: &SessionId,
+            _local_port: u16,
+            _remote_address: String,
+            _remote_port: u16,
+        ) -> Result<crate::ports::ssh_client::ForwardHandle, DomainError> {
+            Err(DomainError::Internal(
+                "CancellingSsh::open_forward unused".to_string(),
+            ))
+        }
+
+        async fn close_forward(&self, _local_port: u16) -> Result<(), DomainError> {
+            Ok(())
+        }
     }
 
     /// Test [`OutputStreamPort`] adapter. Stores per-command snapshots in

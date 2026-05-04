@@ -44,10 +44,7 @@
 
 #![cfg(feature = "port_forward")]
 
-use std::io::ErrorKind;
 use std::sync::Arc;
-
-use tokio::net::TcpListener;
 
 use crate::domain::error::DomainError;
 use crate::domain::forward::ForwardEntity;
@@ -153,6 +150,10 @@ where
     ///   code instead of the collapsed `TRANSPORT_ERROR`.
     /// - [`DomainError::Storage`] when the forward repository rejects the
     ///   insert.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear orchestration: session check → adapter open → entity build → persist; helpers fragment the lifetime story"
+    )]
     pub async fn execute(
         &self,
         req: ForwardPortRequest,
@@ -160,7 +161,7 @@ where
         // Reserve the SSH/config/ids handles in local bindings up-front so
         // the orchestration body has no implicit borrow of `self.*` across
         // await points.
-        let _ssh_handle: Arc<S> = Arc::clone(&self.ssh);
+        let ssh_handle: Arc<S> = Arc::clone(&self.ssh);
         let _config_handle: Arc<Cfg> = Arc::clone(&self.config);
         // The session existence check is a guard rail — rmcp tool wrappers
         // typically validate the id before reaching this layer, but
@@ -170,14 +171,18 @@ where
             return Err(DomainError::SessionNotFound(req.session_id));
         }
 
-        // Best-effort pre-flight bind. Catches obvious failures (port
-        // already bound, permission denied) before the entity is persisted
-        // so a smaller LLM does not get a `forward://` resource for a
-        // listener that never came up. The probe is dropped immediately;
-        // a full TOCTOU race against the real SSH-side bind is out of
-        // scope (the production listener will fail again with the same
-        // error class and be reported through the `forward://` events).
-        Self::preflight_bind(req.local_port).await?;
+        // Hand off to the SSH adapter — the adapter binds the listener,
+        // spawns the accept loop, and pumps bytes both ways for every
+        // accepted connection. The use case keeps ownership of the
+        // domain entity + repository plumbing.
+        ssh_handle
+            .open_forward(
+                &req.session_id,
+                req.local_port,
+                req.remote_address.clone(),
+                req.remote_port,
+            )
+            .await?;
 
         let forward_id = self.ids.new_forward_id();
         let started_at = self.clock.utc_now();
@@ -200,26 +205,6 @@ where
         })
     }
 
-    /// Best-effort pre-flight bind on the requested local port. Maps
-    /// [`ErrorKind::AddrInUse`] to [`DomainError::PortInUse`] (already a
-    /// dedicated wire code) and every other I/O failure to
-    /// [`DomainError::Transport`] tagged `FORWARD_FAILED:` so the wire
-    /// classifier promotes it to the specific code instead of collapsing
-    /// onto `TRANSPORT_ERROR`.
-    async fn preflight_bind(local_port: u16) -> Result<(), DomainError> {
-        match TcpListener::bind(("0.0.0.0", local_port)).await {
-            Ok(listener) => {
-                drop(listener);
-                Ok(())
-            }
-            Err(err) if err.kind() == ErrorKind::AddrInUse => {
-                Err(DomainError::PortInUse(local_port))
-            }
-            Err(err) => Err(DomainError::Transport(format!(
-                "FORWARD_FAILED: bind 0.0.0.0:{local_port} failed: {err}"
-            ))),
-        }
-    }
 }
 
 #[cfg(test)]

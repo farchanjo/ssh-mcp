@@ -57,6 +57,14 @@ use russh::Disconnect;
 use russh::client::{self, Msg};
 use russh::{Channel, ChannelMsg};
 use tokio::sync::{Notify, broadcast, mpsc};
+use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
+use std::net::SocketAddr;
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -84,7 +92,7 @@ use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{CommandId, SessionId, ShellId};
 use crate::domain::session::SessionEntity;
 use crate::domain::shell::{ShellEntity, ShellTerminal};
-use crate::ports::ssh_client::{CommandHandle, CommandOutcome, SshClientPort};
+use crate::ports::ssh_client::{CommandHandle, CommandOutcome, ForwardHandle, SshClientPort};
 
 /// Type alias for the v3 SSH handle the adapter wraps.
 type SshHandle = Arc<client::Handle<SshClientHandler>>;
@@ -231,6 +239,10 @@ pub struct RusshAdapter {
     sessions: Arc<DashMap<SessionId, SessionRecord>>,
     commands: Arc<DashMap<CommandId, CommandRecord>>,
     shells: Arc<DashMap<ShellId, ShellRecord>>,
+    /// Per-`local_port` cancellation token + accept-loop join handle
+    /// so `close_forward` can stop the listener and drop in-flight
+    /// per-connection tasks.
+    forwards: Arc<DashMap<u16, ForwardRecord>>,
     /// Shared registry handed to the sibling
     /// [`crate::adapters::sftp::russh_sftp_adapter::RusshSftpAdapter`].
     /// Populated on `connect` and drained on `disconnect` so SFTP tools
@@ -265,6 +277,7 @@ impl fmt::Debug for RusshAdapter {
             .field("sessions", &self.sessions.len())
             .field("commands", &self.commands.len())
             .field("shells", &self.shells.len())
+            .field("forwards", &self.forwards.len())
             .field("sftp_handle_registry", &self.sftp_handle_registry)
             .field("command_status_sink", &"<dyn CommandStatusSink>")
             .field("shell_status_sink", &"<dyn ShellStatusSink>")
@@ -289,6 +302,7 @@ impl RusshAdapter {
             sessions: Arc::new(DashMap::new()),
             commands: Arc::new(DashMap::new()),
             shells: Arc::new(DashMap::new()),
+            forwards: Arc::new(DashMap::new()),
             sftp_handle_registry: SshHandleRegistry::new(),
             command_status_sink: Arc::new(NoopCommandStatusSink),
             shell_status_sink: Arc::new(NoopShellStatusSink),
@@ -787,6 +801,156 @@ impl SshClientPort for RusshAdapter {
             )));
         }
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear init: lookup → bind → spawn → register; helpers fragment the lifetime story without simplifying it"
+    )]
+    async fn open_forward(
+        &self,
+        session_id: &SessionId,
+        local_port: u16,
+        remote_address: String,
+        remote_port: u16,
+    ) -> Result<ForwardHandle, DomainError> {
+        let handle = self.lookup_handle(session_id)?;
+        let listener = TcpListener::bind(("0.0.0.0", local_port))
+            .await
+            .map_err(|err| {
+                if err.kind() == IoErrorKind::AddrInUse {
+                    DomainError::PortInUse(local_port)
+                } else {
+                    DomainError::Transport(format!(
+                        "FORWARD_FAILED: bind 0.0.0.0:{local_port} failed: {err}"
+                    ))
+                }
+            })?;
+        let bound_addr = listener
+            .local_addr()
+            .map_or_else(|_| format!("0.0.0.0:{local_port}"), |a| a.to_string());
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_handle = handle;
+        let task = tokio::spawn(async move {
+            run_forward_accept_loop(listener, task_handle, remote_address, remote_port, task_cancel)
+                .await;
+        });
+        self.forwards.insert(
+            local_port,
+            ForwardRecord {
+                cancel,
+                accept_handle: task,
+            },
+        );
+        Ok(ForwardHandle { bound_addr })
+    }
+
+    async fn close_forward(&self, local_port: u16) -> Result<(), DomainError> {
+        if let Some((_, record)) = self.forwards.remove(&local_port) {
+            record.cancel.cancel();
+            record.accept_handle.abort();
+        }
+        Ok(())
+    }
+}
+
+/// Per-forward bookkeeping so `close_forward` can shut the listener +
+/// abort in-flight per-connection tasks deterministically.
+#[derive(Debug)]
+struct ForwardRecord {
+    cancel: CancellationToken,
+    accept_handle: JoinHandle<()>,
+}
+
+/// Listener loop that accepts local TCP connections and spawns a
+/// per-connection direct-tcpip pump for each. Stops on `cancel`.
+async fn run_forward_accept_loop(
+    listener: TcpListener,
+    ssh_handle: SshHandle,
+    remote_address: String,
+    remote_port: u16,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            accepted = listener.accept() => {
+                handle_accept(accepted, &ssh_handle, &remote_address, remote_port, &cancel).await;
+            }
+        }
+    }
+}
+
+/// Per-iteration body of [`run_forward_accept_loop`] — split out so
+/// the loop body stays under the 30-line clippy threshold.
+async fn handle_accept(
+    accepted: IoResult<(TcpStream, SocketAddr)>,
+    ssh_handle: &SshHandle,
+    remote_address: &str,
+    remote_port: u16,
+    cancel: &CancellationToken,
+) {
+    match accepted {
+        Ok((stream, peer_addr)) => {
+            let conn_handle = Arc::clone(ssh_handle);
+            let remote_host = remote_address.to_string();
+            let conn_cancel = cancel.clone();
+            tokio::spawn(async move {
+                forward_one_connection(
+                    stream,
+                    peer_addr.to_string(),
+                    conn_handle,
+                    remote_host,
+                    remote_port,
+                    conn_cancel,
+                )
+                .await;
+            });
+        }
+        Err(err) => {
+            debug!("forward accept error: {err}");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// Open a direct-tcpip channel for `tcp_stream` and pump bytes both
+/// ways until either end closes. Cancellation drops both halves.
+async fn forward_one_connection(
+    mut tcp_stream: TcpStream,
+    originator: String,
+    ssh_handle: SshHandle,
+    remote_address: String,
+    remote_port: u16,
+    cancel: CancellationToken,
+) {
+    let channel = match ssh_handle
+        .channel_open_direct_tcpip(
+            remote_address,
+            u32::from(remote_port),
+            originator,
+            0_u32,
+        )
+        .await
+    {
+        Ok(ch) => ch,
+        Err(err) => {
+            debug!("forward direct-tcpip open failed: {err}");
+            let _ = tcp_stream.shutdown().await;
+            return;
+        }
+    };
+    let mut channel_stream = channel.into_stream();
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {},
+        result = copy_bidirectional(&mut tcp_stream, &mut channel_stream) => {
+            if let Err(err) = result {
+                debug!("forward bidirectional copy ended: {err}");
+            }
+        }
     }
 }
 
