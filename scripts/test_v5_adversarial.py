@@ -665,27 +665,28 @@ class TestSshSubscribeAdversarial:
     def test_max_subs_per_uri_exceeded_with_low_cap(
         self, ssh_mcp_stdio_bin: Path
     ) -> None:
-        """Drop the per-URI sub cap and overflow it to trigger ``MAX_SUBS_PER_URI_EXCEEDED``."""
+        """Drop the per-URI sub cap and overflow it to trigger ``MAX_SUBS_PER_URI_EXCEEDED``.
+
+        v5 wires ``SSH_MAX_SUBS_PER_URI`` through both the v4-compat
+        registry path (``MemoryRegistry::insert_subscriber``) and the
+        ``SubscriberLane`` adapter, so the cap is enforced strictly —
+        the third subscribe MUST surface the typed error.
+        """
         with stdio_session({
             "SSH_MAX_SUBS_PER_URI": "2",
             "SSH_MAX_SUBS_TOTAL": "32",
         }) as client:
             uri = "shell://overflow-test/output"
             ok = []
-            for i in range(2):
+            for _i in range(2):
                 ok.append(subscribe_uri(client, uri))
             rsp = call(client, "ssh_subscribe", {"uri": uri})
-            # Either the cap is enforced (preferred) or the daemon
-            # accepts a third sub (cap not wired in this build) — assert
-            # the wire shape is a valid response either way.
-            assert rsp.status in {"OK", "ERROR"}
-            if rsp.status == "ERROR":
-                assert rsp.reason_code == "MAX_SUBS_PER_URI_EXCEEDED"
-            for sub_id in ok:
-                call(client, "ssh_unsubscribe", {"sub_id": sub_id})
-            if rsp.parsed.get("sub_id"):
-                call(client, "ssh_unsubscribe",
-                     {"sub_id": rsp.parsed["sub_id"]})
+            try:
+                assert rsp.status == "ERROR", rsp.text
+                assert rsp.reason_code == "MAX_SUBS_PER_URI_EXCEEDED", rsp.text
+            finally:
+                for sub_id in ok:
+                    call(client, "ssh_unsubscribe", {"sub_id": sub_id})
 
     def test_subscribe_unsubscribe_concurrent_burst(
         self, ssh_mcp_stdio_bin: Path
