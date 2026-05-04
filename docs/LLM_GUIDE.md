@@ -1,6 +1,6 @@
 # LLM Guide
 
-Single canonical reference for LLM hosts driving ssh-mcp. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full 38-code error handbook. Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
+Single canonical reference for LLM hosts driving ssh-mcp. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full 38-code error handbook. Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md), [ADR 0009](./adr/0009-serial-transport.md).
 
 Cross references:
 
@@ -112,7 +112,7 @@ The `agent_id` parameter passed at `ssh_connect` time scopes ownership of every 
 **Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscriber its own debounced push lane (200 ms coalesce, 1 s force flush, 30 s keepalive). Server does the work once; LLM consumes events as conversation context; cursor advances exactly as fast as the consumer needs.
 
 **How to comply.**
-- Use `resources/subscribe` (or `sub_open` once Phase 3 lands) immediately after `ssh_shell_open`.
+- Use `resources/subscribe` (or `sub_open`) immediately after `ssh_shell_open`.
 - On each `notifications/resources/updated`, issue `resources/read?cursor=auto` and consume the delta.
 - Reserve `ssh_shell_read` for hosts that genuinely cannot subscribe; mark this in the agent's tool-selection logic.
 
@@ -123,7 +123,7 @@ The `agent_id` parameter passed at `ssh_connect` time scopes ownership of every 
 Compact root prompt embedded verbatim into `Implementation.instructions` when the host signals a 27B-class model (Gemma 3 27B IT, Mistral Small 3, Qwen 2.5 32B). Stop here for those models.
 
 ```text
-SSH MCP v5.0. Subscribe-first. 28 tools.
+SSH MCP v6.0. Subscribe-first. 36 tools (35 without port_forward).
 
 GOLDEN RULES:
  1. Long-running resource MUST have ≥1 subscriber.
@@ -212,8 +212,10 @@ flowchart TD
 ```
 
 ```text
-SSH MCP v5.0. Subscribe-first. 28 tools (20 without port_forward + 8 sub
-operations). All responses: KEY: value markdown + structured_content JSON.
+SSH MCP v6.0. Subscribe-first. 36 tools split across three eixos:
+ssh_* (21 ops over SSH), sub_* (9 lane management — cross-resource),
+serial_* (6 local UART/TTY/COM). 35 tools without port_forward. All
+responses: KEY: value markdown + structured_content JSON.
 
 GOLDEN RULES:
 1. Every long-running resource (shell://, command://, transfer://,
@@ -339,16 +341,17 @@ The single most important table. Pick the star-marked path whenever the host adv
 | -------------------------------------------------- | ------------------------------------------------------------- |
 | Run a one-shot remote command (host you may revisit) | `ssh_connect(reuse=auto)` -> `ssh_exec` -> `sub_open command://<id>/output` *  |
 | Run a one-shot remote command (single-touch host)  | `ssh_run` (PENALIZED: full handshake + teardown per call)     |
-| Open an interactive shell                          | `ssh_shell_open` + `resources/subscribe shell://<id>/output` * |
+| Open an interactive shell                          | `ssh_shell_open` + `sub_open uri=shell://<id>/output` *       |
 | Send `Ctrl+C`, arrows, function keys               | `ssh_shell_press`                                          |
 | Send raw text input                                | `ssh_shell_write`                                             |
-| Watch shell output realtime                        | `resources/subscribe` + `resources/read?cursor=auto` *        |
+| Watch shell output realtime                        | `sub_open` + `resources/read?cursor=auto` on each push *      |
 | Wait for a specific prompt (gate)                  | `ssh_shell_wait_for`                                          |
 | Read shell buffer once (snapshot)                  | `resources/read shell://<id>/output`                          |
-| Watch async command output realtime                | `resources/subscribe command://<id>/output` *                 |
-| Watch SFTP transfer progress realtime              | `resources/subscribe transfer://<id>/progress` *              |
-| Watch session health changes                       | `resources/subscribe session://<id>/health` *                 |
-| Watch port-forward events                          | `resources/subscribe forward://<id>/events` *                 |
+| Watch async command output realtime                | `sub_open uri=command://<id>/output` *                        |
+| Watch SFTP transfer progress realtime              | `sub_open uri=transfer://<id>/progress` *                     |
+| Watch session health changes                       | `sub_open uri=session://<id>/health` *                        |
+| Watch port-forward events                          | `sub_open uri=forward://<id>/events` *                        |
+| Watch local serial output                          | `sub_open uri=serial://<id>/output` *                         |
 | Upload / download a file                           | `ssh_upload` / `ssh_download`                                 |
 | Cancel a long-running command                      | `ssh_exec_cancel`                                          |
 | Forward a TCP port                                 | `ssh_forward` (feature-gated)                                 |
@@ -540,7 +543,7 @@ NEXT: ssh_exec(session_id=s-abc, command=...) | ssh_shell_open(session_id=s-abc)
 | `SSH_DISCONNECT: OK` / `SSH_DISCONNECT_AGENT: OK` | no (terminal) | — |
 | `SSH_EXEC: STARTED` | yes | `ssh_exec_output(wait=true)` / `ssh_exec_cancel` |
 | `SSH_EXEC: COMPLETED` | no (terminal) | — |
-| `SSH_EXEC_OUTPUT: RUNNING` | yes | `resources/subscribe command://<id>/output` / `ssh_exec_output(wait=true)` |
+| `SSH_EXEC_OUTPUT: RUNNING` | yes | `sub_open uri=command://<id>/output` / `ssh_exec_output(wait=true)` |
 | `SSH_EXEC_OUTPUT: COMPLETED` | no (terminal) | — |
 | `SSH_COMMANDS: OK` | no | — |
 | `SSH_EXEC_CANCEL: OK` / `NOOP` | no (terminal) | — |
@@ -720,7 +723,7 @@ flowchart LR
 
 ## Prompts catalogue
 
-10 workflows advertised via `prompts/list` — 5 v4 carryovers plus 5 v5 push-first additions. Source: [ADR 0005](./adr/0005-llm-ux-priorities.md). Phase 3 materialises these in `src/infra/mcp/prompts.rs`.
+10 workflows advertised via `prompts/list` — 5 v4 carryovers plus 5 v5 push-first additions. Source: [ADR 0005](./adr/0005-llm-ux-priorities.md). Materialised in `src/infra/mcp/prompts.rs`.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -892,7 +895,7 @@ flowchart LR
 
 **Symptom.** LLM emits `ssh_shell_read(shell_id, wait=true, wait_timeout_secs=1)` in a tight loop instead of subscribing once and consuming `notifications/resources/updated` events.
 **Why bad.** Token waste (every poll round-trips a markdown body and a structured JSON), increased latency (50 ms+ per poll regardless of activity), nontrivial CPU on the server (debouncer wakes per poll cycle even with no new bytes). Push pipeline already coalesces output every 200 ms; a 1-second poll loop converts a 5 Hz native event rate into a 1 Hz client view.
-**Fix.** `ssh_shell_open` -> `resources/subscribe shell://<sid>/output` -> on each push notification, `resources/read?cursor=auto`. Reserve `ssh_shell_read` for hosts that genuinely cannot subscribe.
+**Fix.** `ssh_shell_open` -> `sub_open uri=shell://<sid>/output` -> on each push notification, `resources/read?cursor=auto`. Reserve `ssh_shell_read` for hosts that genuinely cannot subscribe.
 **Detection.** Per-session call rate of `ssh_shell_read` > 1 Hz with no matching `subscribe` in the same session.
 
 ### #2 — Open then forget
@@ -928,7 +931,7 @@ flowchart LR
 **Symptom.** LLM calls `sub_close` and assumes the underlying resource is gone. Subsequent operations (`ssh_shell_write`, `ssh_exec_output`) hit a stale resource that still occupies channel concurrency.
 **Why bad.** Lifecycle confusion. v5 deliberately separates observability (subscription) from ownership (resource). Unsubscribing only closes the push channel — the remote PTY, async command, or in-flight transfer keeps running.
 **Fix.** When the workflow finishes, choose one of:
-- `release_when_no_subs=true` at resource creation -> last `sub_close` triggers grace timer (`LIFECYCLE_OWN_GRACE_MS`, default 2 s) -> resource auto-closes.
+- `release_when_no_subs=true` at resource creation -> last `sub_close` triggers grace timer (`LifecyclePolicy.grace_ms`, default 2 s — programmatic per-call, no env-var override) -> resource auto-closes.
 - Manual: `sub_close` AND `ssh_shell_close` / `ssh_exec_cancel`.
 - Workflow-scoped: `ssh_disconnect_agent(agent_id)` cascades through everything.
 **Detection.** `ssh_list_*` returns the resource as still active after the agent's workflow has completed. `WARN: SUB_LEAK_RISK` surfaces if the resource sits in `Owned` past the warn threshold.
@@ -971,7 +974,7 @@ For `RESOURCE_GONE` specifically: call the matching open/exec/upload tool, obser
 
 ## Error handbook
 
-Canonical reference for the 38 wire codes defined by [ADR 0007](./adr/0007-error-taxonomy.md). One section per code, grouped into the seven categories. Every entry follows a uniform shape so an LLM can grep / jump to a single code without reading the rest.
+Canonical reference for the 43+ wire codes defined by [ADR 0007](./adr/0007-error-taxonomy.md) and resolved by `src/infra/mcp/error_detail.rs`. One section per code, grouped into the seven categories. Every entry follows a uniform shape so an LLM can grep / jump to a single code without reading the rest. ADR 0007 baseline is 38 codes; v5.x added a handful of operational codes (`PORT_IN_USE`, `TIMEOUT`, `EMPTY_PATTERNS`, `PATTERN_TOO_LONG`, `TOO_MANY_PATTERNS`, `MODIFIER_NOT_ALLOWED`) covered below.
 
 The wire format is unchanged from v4:
 
@@ -1099,6 +1102,26 @@ Auto-retry with exponential backoff (cap 10 s). Transient failures fix themselve
 - **Cure:** Retry; the new connect re-establishes the channel.
 - **Prevention:** Monitor SSH session uptimes; alert on frequent resets per host.
 - **Related:** [CONNECTION_FAILED].
+
+#### [TIMEOUT] Operation deadline elapsed without completion
+
+- **Category:** TRANSPORT
+- **Retryable:** yes (with a longer deadline)
+- **When:** A long-poll (`wait=true`) on `ssh_exec_output`, `ssh_shell_read`, `ssh_shell_wait_for`, or `ssh_transfer_progress` exceeded its `wait_timeout_secs` budget.
+- **Why:** The remote operation is still running but produced no terminal event inside the budget.
+- **Cure:** Retry with a longer `wait_timeout_secs`, or switch to push-first (`sub_open` + drain).
+- **Prevention:** Use `sub_open` on long-running resources instead of long-poll fallbacks.
+- **Related:** [LAG_DETECTED].
+
+#### [PORT_IN_USE] Local TCP port already bound by another process
+
+- **Category:** TRANSPORT
+- **Retryable:** yes (after picking a different `local_port`)
+- **When:** `ssh_forward` could not bind the local listener — another process owns the port.
+- **Why:** TCP port collision (most often a stale forward from a prior run, or another tool listening on the same port).
+- **Cure:** Pick a different `local_port`, or `lsof -i :<port>` / `ss -tlnp | grep :<port>` to identify the holder and free the port.
+- **Prevention:** Pick high ports above 49152 (ephemeral range) for forwards.
+- **Related:** [FORWARD_NOT_FOUND].
 
 ---
 
@@ -1408,7 +1431,7 @@ Argument validation and idempotency cache failures. Retry only after changing th
 - **When:** The supplied `_meta.idempotency_key` is longer than `IDEMPOTENCY_KEY_MAX_BYTES` (256 bytes). The use case is NOT executed.
 - **Why:** Caller produced an oversized key. The cap is sized for UUID-style values (UUIDv4 is 36 bytes); larger payloads are rejected to bound the cache.
 - **Cure:** Trim the key client-side; standardise on UUIDv4/v7 (36 bytes) or a hash digest (e.g. SHA-256 hex = 64 bytes).
-- **Prevention:** Mint keys via `Uuid::new_v7()` or a short hash; never embed long human strings.
+- **Prevention:** Mint keys via `Uuid::now_v7()` (server uses the same — see `src/adapters/id_generator/uuid.rs`) or a short hash; never embed long human strings.
 - **Related:** [IDEMPOTENCY_KEY_MISMATCH].
 
 #### [INVALID_OP] NDJSON `op` not in the daemon enum
@@ -1418,8 +1441,58 @@ Argument validation and idempotency cache failures. Retry only after changing th
 - **When:** The NDJSON daemon received a line whose `op` field is not in `{connect, exec, subscribe, unsubscribe, shell_open, shell_write, shell_key, upload, cancel, disconnect, shutdown, ...}`.
 - **Why:** Typo in the consumer's NDJSON producer.
 - **Cure:** Inspect the DETAIL line for the supplied value; correct the producer.
-- **Prevention:** Validate ops client-side against the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` (Phase 4).
+- **Prevention:** Validate ops client-side against [DAEMON.md → NDJSON command schema](./DAEMON.md#ndjson-command-schema-stdin).
 - **Related:** [INVALID_ARGUMENT].
+
+#### [EMPTY_PATTERNS] `ssh_shell_wait_for` called with empty `patterns`
+
+- **Category:** STATE
+- **Retryable:** no (caller must supply at least one pattern)
+- **When:** `ssh_shell_wait_for(patterns=[])` was invoked.
+- **Why:** Argument validation rejects empty pattern lists — the wait would never match.
+- **Cure:** Supply at least one regex / literal pattern.
+- **Prevention:** Treat the patterns list as a required, non-empty argument.
+- **Related:** [TOO_MANY_PATTERNS], [PATTERN_TOO_LONG].
+
+#### [TOO_MANY_PATTERNS] `ssh_shell_wait_for` patterns list exceeds the cap
+
+- **Category:** STATE
+- **Retryable:** no (caller must split / shrink)
+- **When:** `ssh_shell_wait_for` received more than 16 patterns in a single call.
+- **Why:** Cap protects the regex engine from pathological alternation.
+- **Cure:** Split the wait into multiple calls, or merge patterns into a single regex with `|`.
+- **Prevention:** Keep the patterns list small; favour one tight regex over many short ones.
+- **Related:** [EMPTY_PATTERNS], [PATTERN_TOO_LONG].
+
+#### [PATTERN_TOO_LONG] Single regex pattern exceeds the per-pattern char cap
+
+- **Category:** STATE
+- **Retryable:** no (caller must shorten the pattern)
+- **When:** A `ssh_shell_wait_for` pattern is longer than the per-pattern length cap.
+- **Why:** Cap protects the regex compiler from quadratic / catastrophic backtracking patterns.
+- **Cure:** Shorten the pattern; replace expensive alternations with anchored fragments.
+- **Prevention:** Pre-compile critical regexes client-side and validate length before sending.
+- **Related:** [EMPTY_PATTERNS], [TOO_MANY_PATTERNS].
+
+#### [INVALID_REPEAT] `repeat` argument outside `1..=64`
+
+- **Category:** STATE
+- **Retryable:** no (caller must clamp)
+- **When:** `ssh_shell_press` or `serial_press` received a `repeat` value of `0` or `>64`.
+- **Why:** Cap bounds the work per call; very large repeats should be split into multiple invocations.
+- **Cure:** Clamp `repeat` to `1..=64`; chain multiple calls if higher counts are required.
+- **Prevention:** Validate `repeat` client-side before issuing.
+- **Related:** [MODIFIER_NOT_ALLOWED].
+
+#### [MODIFIER_NOT_ALLOWED] Shift / Alt / Ctrl modifier rejected for the named key
+
+- **Category:** STATE
+- **Retryable:** no (caller must drop the modifier or pick a different key)
+- **When:** `ssh_shell_press` was invoked with a modifier flag (`shift`, `alt`, `ctrl`) on a key that does not support it (e.g. `ctrl=true` with `key=ctrl_c` is redundant; `shift=true` with a non-letter key may be a no-op).
+- **Why:** Server validates the modifier matrix to prevent ambiguous input bytes.
+- **Cure:** Inspect the DETAIL line for the rejected combination; either drop the modifier or pick a different `key`.
+- **Prevention:** Refer to the `ssh_shell_press` table in [API.md](./API.md) for the supported `(key, modifier)` matrix.
+- **Related:** [INVALID_REPEAT].
 
 ---
 
