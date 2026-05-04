@@ -179,6 +179,8 @@ All three binaries are thin shells over `composition::prod` (and, for the daemon
 
 30 tools with `port_forward` / 29 without. Catalogue and per-tool schemas: [docs/API.md](docs/API.md). Phase 3 adds the 9 subscription primitives (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`).
 
+> **Lane fanout (v5.3)**: `ssh_subscribe` lanes carry the rmcp peer captured at tool-invocation time and receive `notifications/resources/updated` push delivery on stdio/HTTP transports through `LaneFanoutBridge` (in `src/adapters/subscription/lane_bridge.rs`). The bridge is installed on `MemoryRegistry` at composition; legacy `broadcast` walks the lane snapshot for the URI before the v4 peer fan-out, calls `notifier.notify_resource_updated` per lane peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The Phase 4 NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
+
 Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
 
 ### MCP resources
