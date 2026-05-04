@@ -10,7 +10,6 @@
 //! caller decides whether to abort the daemon (typically only on a
 //! fatal `BrokenPipe`).
 
-use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
@@ -27,7 +26,7 @@ pub const PROTOCOL_VERSION: &str = "ssh-mcp-ndjson/1";
 /// Tagged on the `ev` field per ADR 0008. The discriminator is
 /// open-ended: consumers should ignore unknown values rather than
 /// failing.
-#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "ev", rename_all = "snake_case")]
 pub enum Event {
     /// Successful op confirmation.
@@ -186,6 +185,10 @@ pub enum Event {
     },
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if calls the predicate with &T; the &bool signature is required"
+)]
 const fn is_false(b: &bool) -> bool {
     !*b
 }

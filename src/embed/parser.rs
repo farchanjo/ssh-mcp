@@ -13,6 +13,8 @@
 //! [`crate::embed::formatter::Event`] (`ack`, `err`, `started`, ...).
 
 use schemars::JsonSchema;
+use std::io::ErrorKind;
+
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _};
@@ -303,7 +305,7 @@ where
 {
     /// Build a reader with an explicit per-line cap.
     #[must_use]
-    pub fn with_line_max(inner: R, line_max: usize) -> Self {
+    pub const fn with_line_max(inner: R, line_max: usize) -> Self {
         Self {
             inner,
             line_max,
@@ -313,7 +315,7 @@ where
 
     /// Build a reader with the default per-line cap.
     #[must_use]
-    pub fn new(inner: R) -> Self {
+    pub const fn new(inner: R) -> Self {
         Self::with_line_max(inner, DEFAULT_NDJSON_LINE_MAX)
     }
 
@@ -328,7 +330,7 @@ where
                     let len = self.buf.len();
                     return ParseOutcome::Invalid(ParseError::LineTooLong(len));
                 }
-                let trimmed = self.buf.trim_end_matches(['\r', '\n']);
+                let trimmed = self.buf.trim();
                 if trimmed.is_empty() {
                     // Empty / whitespace-only line — treat as a benign skip.
                     return Box::pin(self.next()).await;
@@ -340,7 +342,7 @@ where
             }
             Err(err) => {
                 let kind = err.kind();
-                if matches!(kind, std::io::ErrorKind::InvalidData) {
+                if matches!(kind, ErrorKind::InvalidData) {
                     ParseOutcome::Invalid(ParseError::InvalidUtf8(err.to_string()))
                 } else {
                     ParseOutcome::Invalid(ParseError::Io(err.to_string()))
@@ -368,9 +370,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_connect_op() {
-        let mut r = reader(
-            "{\"op\":\"connect\",\"host\":\"h\",\"user\":\"u\",\"id\":\"corr-1\"}\n",
-        );
+        let mut r =
+            reader("{\"op\":\"connect\",\"host\":\"h\",\"user\":\"u\",\"id\":\"corr-1\"}\n");
         let outcome = r.next().await;
         match outcome {
             ParseOutcome::Op(Op::Connect { host, user, id, .. }) => {
@@ -416,7 +417,10 @@ mod tests {
     async fn invalid_json_does_not_kill_reader() {
         let mut r = reader("{not-json}\n{\"op\":\"shutdown\"}\n");
         assert!(matches!(r.next().await, ParseOutcome::Invalid(_)));
-        assert!(matches!(r.next().await, ParseOutcome::Op(Op::Shutdown { .. })));
+        assert!(matches!(
+            r.next().await,
+            ParseOutcome::Op(Op::Shutdown { .. })
+        ));
         assert!(matches!(r.next().await, ParseOutcome::Eof));
     }
 
@@ -446,7 +450,10 @@ mod tests {
     #[tokio::test]
     async fn blank_lines_are_skipped() {
         let mut r = reader("\n\n   \n{\"op\":\"shutdown\"}\n");
-        assert!(matches!(r.next().await, ParseOutcome::Op(Op::Shutdown { .. })));
+        assert!(matches!(
+            r.next().await,
+            ParseOutcome::Op(Op::Shutdown { .. })
+        ));
         assert!(matches!(r.next().await, ParseOutcome::Eof));
     }
 
@@ -478,7 +485,13 @@ mod tests {
             "{\"op\":\"subscribe\",\"uri\":\"command://x/output\",\"lifetime\":\"auto-close\",\"grace_ms\":2000,\"lag_policy\":\"snapshot\",\"filter\":\"ERROR\",\"start_cursor\":42,\"id\":\"s1\"}\n",
         );
         match r.next().await {
-            ParseOutcome::Op(Op::Subscribe { uri, grace_ms, filter, start_cursor, .. }) => {
+            ParseOutcome::Op(Op::Subscribe {
+                uri,
+                grace_ms,
+                filter,
+                start_cursor,
+                ..
+            }) => {
                 assert_eq!(uri, "command://x/output");
                 assert_eq!(grace_ms, Some(2_000));
                 assert_eq!(filter.as_deref(), Some("ERROR"));
@@ -509,6 +522,9 @@ mod tests {
     #[tokio::test]
     async fn cr_lf_terminator_supported() {
         let mut r = reader("{\"op\":\"shutdown\"}\r\n");
-        assert!(matches!(r.next().await, ParseOutcome::Op(Op::Shutdown { .. })));
+        assert!(matches!(
+            r.next().await,
+            ParseOutcome::Op(Op::Shutdown { .. })
+        ));
     }
 }
