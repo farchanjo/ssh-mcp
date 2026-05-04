@@ -102,6 +102,22 @@ const fn default_pattern_timeout_secs() -> Option<u64> {
     Some(30)
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_release_when_no_subs() -> Option<bool> {
+    Some(false)
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_lifecycle_grace_ms() -> Option<u32> {
+    Some(2_000)
+}
+
 /// Arguments for the `ssh_shell_open` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SshShellOpenArgs {
@@ -132,6 +148,16 @@ pub struct SshShellOpenArgs {
     /// Oldest bytes dropped first when full.
     #[schemars(default = "default_max_buffer_size")]
     pub max_buffer_size: Option<String>,
+
+    /// v5 Phase 3 — auto-release when the resource has zero
+    /// subscribers. Default: false (legacy v4 behaviour).
+    #[schemars(default = "default_release_when_no_subs")]
+    pub release_when_no_subs: Option<bool>,
+
+    /// v5 Phase 3 — grace window in ms before auto-release fires.
+    /// Default: 2000.
+    #[schemars(default = "default_lifecycle_grace_ms")]
+    pub grace_ms: Option<u32>,
 }
 
 /// Arguments for the `ssh_shell_write` MCP tool.
