@@ -58,9 +58,11 @@ Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 
 
 ---
 
-## Tools (21 with `port_forward`, 20 without)
+## Tools (36 with `port_forward`, 35 without)
 
-The catalogue below covers every tool. v4.7 adds `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. Groups: Connection (5), Commands (6), Shell (6), SFTP (3), Network (1, feature-gated).
+v5.2 adds **6 serial / UART / TTY / COM tools** (ADR 0009): `ssh_serial_open`, `ssh_serial_close`, `ssh_serial_write`, `ssh_serial_send_key`, `ssh_serial_list_ports`, `ssh_serial_list_open`. The legacy 21-tool surface is unchanged; existing v3 / v4 / v5.0 / v5.1 hosts continue to work without changes.
+
+The catalogue below covers every tool. v5.2 adds Serial (6); v4.7 added `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. Groups: Connection (5), Commands (6), Shell (6), SFTP (3), **Serial (6, v5.2)**, Network (1, feature-gated), plus the 9 v5.1 subscription primitives.
 
 ## Connection (5)
 
@@ -811,6 +813,84 @@ REASON: [PERMISSION_DENIED] write '/tmp/locked.csv': permission denied
 
 ---
 
+## Serial (6, v5.2 — ADR 0009)
+
+Native UART / TTY / COM transport. Lock-free reader / writer split: `ArcSwap<RingBuffer>` history (subscribers slice `O(1)`, no contention with the OS reader); writes funnel through a bounded `mpsc::channel(64)` and surface `SERIAL_BACKPRESSURE` instead of stalling. Producer hooks into the same `SUBSCRIPTION_REGISTRY` debouncer as `command://*/output`, including the ADR 0006 Amendment 1 byte-threshold flush. Subscribe via `ssh_subscribe uri=serial://<SERIAL_ID>/output`.
+
+### ssh_serial_open (v5.2)
+
+Open a serial port and start its lock-free reader / writer tasks. Returns `SERIAL_ID` + the subscribe URI. Full `stty` parameter coverage:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `path` | string | required | `/dev/ttyUSB0` / `/dev/ttyACM0`, `/dev/tty.usbserial-XXXX`, `COM3`, … |
+| `baud_rate` | u32 | `115_200` | 9 600 / 19 200 / 38 400 / 57 600 / 115 200 / 230 400 / 460 800 / 921 600 |
+| `data_bits` | u8 | `8` | 5 / 6 / 7 / 8 |
+| `stop_bits` | string | `"1"` | `"1"` / `"2"` |
+| `parity` | string | `"none"` | `"none"` / `"odd"` / `"even"` (also `"N"` / `"O"` / `"E"`) |
+| `flow_control` | string | `"none"` | `"none"` / `"software"` (also `"xon/xoff"`) / `"hardware"` (also `"rts/cts"`) |
+| `read_timeout_ms` | u64 | `100` | OS read timeout |
+| `max_buffer_size` | u64 | `0` (= 1 MiB) | history cap; once full, head-truncates on append |
+| `initial_dtr` | bool? | `null` | `null` = driver default, `true` = raise, `false` = lower |
+| `initial_rts` | bool? | `null` | same semantics as `initial_dtr` |
+| `label` | string? | `null` | optional human label surfaced on `ssh_serial_list_open` |
+
+**Status values:** OK.
+**Errors:** INVALID_ARGUMENT (bad data_bits / parity / flow_control / stop_bits), SERIAL_ERROR (device busy / missing / permission denied / kernel control-line refusal).
+**Cost:** 1 OS open + 2 spawned tasks; typically <10 ms.
+**structured_content shape:** `{ tool: "ssh_serial_open", status, serial_id, path, baud_rate, data_bits, stop_bits, parity, flow_control, uri, next: [...] }`.
+
+### ssh_serial_close (v5.2)
+
+Cancel reader / writer tasks for the given `SERIAL_ID` and remove the registry entry. Idempotent — second call returns `NOOP`.
+
+**Status values:** OK, NOOP.
+**Cost:** O(1).
+
+### ssh_serial_write (v5.2)
+
+Enqueue bytes for transmission. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648 standard alphabet). Newlines are NOT auto-appended; use `ssh_serial_send_key` for `enter` / `cr` / `lf` / `crlf`.
+
+After the write, the response arrives via push on the existing `serial://<id>/output` subscription. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto` — never poll.
+
+**Status values:** OK.
+**Errors:** INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full — local sleep + retry).
+**Cost:** O(input.len). Sub-ms typical.
+
+### ssh_serial_send_key (v5.2)
+
+Send a named control keystroke without crafting bytes manually. Optional `repeat` 1..=64.
+
+| Key | Bytes |
+|---|---|
+| `enter` / `cr` | `\r` |
+| `lf` | `\n` |
+| `crlf` | `\r\n` |
+| `esc` | `\x1b` |
+| `tab` | `\t` |
+| `backspace` | `\x08` |
+| `ctrl_c` | `\x03` |
+| `ctrl_d` | `\x04` |
+| `ctrl_z` | `\x1a` |
+
+**Status values:** OK.
+**Errors:** INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.
+**Cost:** O(repeat).
+
+### ssh_serial_list_ports (v5.2)
+
+Snapshot the OS-visible serial devices. Returns the device paths the caller can pass to `ssh_serial_open`. No state mutation.
+
+**Status values:** OK.
+**Cost:** 1 OS enumeration (typically <5 ms).
+
+### ssh_serial_list_open (v5.2)
+
+Snapshot every serial port currently held by this process. Returns `SERIAL_ID`, path, baud rate, optional label, and the subscribe URI for each. No state mutation.
+
+**Status values:** OK.
+**Cost:** O(N) over the per-process registry.
+
 ## Forward (1)
 
 ### ssh_forward
@@ -844,7 +924,7 @@ NEXT: resources/subscribe forward://fwd-1/events
 
 ---
 
-## Resources (5 schemes)
+## Resources (6 schemes)
 
 URIs follow `<scheme>://<id>/<sub-path>[?cursor=auto|<N>|0]`. The `?cursor=` query string is silently ignored on point-in-time resources (`transfer://`, `session://`).
 
@@ -855,6 +935,7 @@ URIs follow `<scheme>://<id>/<sub-path>[?cursor=auto|<N>|0]`. The `?cursor=` que
 | `transfer` | `transfer://<transfer_id>/progress` | `application/json` | no | SFTP loop (`RunningTransfer`) |
 | `session` | `session://<session_id>/health` | `application/json` | no | Health probes / connect reuse path |
 | `forward` | `forward://<forward_id>/events` | `application/json` | yes | Forward task (feature-gated) |
+| **`serial`** | **`serial://<serial_id>/output`** | `text/plain` | **yes** | **Serial reader (`SerialPortState`, v5.2 — ADR 0009)** |
 
 ### `?cursor` semantics (byte-stream resources)
 
