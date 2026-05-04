@@ -308,7 +308,10 @@ mod tests {
         let mut p = LifecyclePolicy::release_with_default_grace();
         p.grace_ms = 10_000;
         let json = serde_json::to_string(&p).expect("ser");
-        assert!(json.contains("\"grace_ms\":10000"), "json missing grace_ms: {json}");
+        assert!(
+            json.contains("\"grace_ms\":10000"),
+            "json missing grace_ms: {json}"
+        );
     }
 
     // --- Snapshot ---------------------------------------------------
@@ -411,7 +414,11 @@ mod tests {
         let mut sorted = vec![owned, observed, releasing, closed];
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 4, "every variant must serialise to a distinct token");
+        assert_eq!(
+            sorted.len(),
+            4,
+            "every variant must serialise to a distinct token"
+        );
     }
 
     #[test]

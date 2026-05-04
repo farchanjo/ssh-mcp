@@ -66,9 +66,7 @@ impl fmt::Display for SubId {
 /// next push from the resource ring buffer.
 ///
 /// See ADR 0006 for the full decision matrix.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LagPolicy {
     /// Producer awaits `mpsc::Sender::send` until the consumer drains.
@@ -157,9 +155,7 @@ pub enum FilterRule {
 /// lane lifetime to a grace window measured from the last consumer
 /// interaction. [`Self::Lease`] caps the absolute lifetime regardless
 /// of activity (Phase 3 wiring).
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SubscriptionLifetime {
     /// Default: lane stays open until explicit unsubscribe.
@@ -204,9 +200,7 @@ pub struct SubscriberStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FilterRule, LagPolicy, LogLevel, SubId, SubscriberStats, SubscriptionLifetime,
-    };
+    use super::{FilterRule, LagPolicy, LogLevel, SubId, SubscriberStats, SubscriptionLifetime};
 
     // --- SubId ------------------------------------------------------
 
@@ -382,7 +376,10 @@ mod tests {
 
     #[test]
     fn subscription_lifetime_default_is_manual() {
-        assert_eq!(SubscriptionLifetime::default(), SubscriptionLifetime::Manual);
+        assert_eq!(
+            SubscriptionLifetime::default(),
+            SubscriptionLifetime::Manual
+        );
     }
 
     #[test]
@@ -473,7 +470,10 @@ mod tests {
     fn lag_policy_advertises_schema() {
         let schema = schemars::schema_for!(LagPolicy);
         let s = serde_json::to_string(&schema).expect("ser");
-        assert!(s.contains("snapshot"), "schema must include snapshot variant");
+        assert!(
+            s.contains("snapshot"),
+            "schema must include snapshot variant"
+        );
     }
 
     #[test]

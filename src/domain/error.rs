@@ -102,9 +102,7 @@ pub enum DomainError {
     /// allow it (e.g. resubscribe after Closed). Includes the observed
     /// state and the attempted operation name so adapters can render an
     /// actionable diagnostic.
-    #[error(
-        "lifecycle state conflict: cannot apply '{attempted}' while in {current:?}"
-    )]
+    #[error("lifecycle state conflict: cannot apply '{attempted}' while in {current:?}")]
     LifecycleStateConflict {
         /// State observed at the moment of the failed transition.
         current: LifecycleState,

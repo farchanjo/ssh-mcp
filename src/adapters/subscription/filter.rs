@@ -54,9 +54,8 @@ impl FilterPipeline {
     /// Returns [`DomainError::InvalidArgument`] when the pattern is
     /// not a valid regex.
     pub fn compile_regex(pattern: &str) -> Result<Regex, DomainError> {
-        Regex::new(pattern).map_err(|e| {
-            DomainError::InvalidArgument(format!("filter regex compile failed: {e}"))
-        })
+        Regex::new(pattern)
+            .map_err(|e| DomainError::InvalidArgument(format!("filter regex compile failed: {e}")))
     }
 
     /// Build a fresh pipeline from a [`FilterRule`].

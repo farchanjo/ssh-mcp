@@ -208,8 +208,16 @@ mod tests {
             Some(&Value::from(2_000_u64))
         );
         // Enum-typed fields still appear as properties with a $ref.
-        assert!(json.get("properties").and_then(|p| p.get("lifetime")).is_some());
-        assert!(json.get("properties").and_then(|p| p.get("lag_policy")).is_some());
+        assert!(
+            json.get("properties")
+                .and_then(|p| p.get("lifetime"))
+                .is_some()
+        );
+        assert!(
+            json.get("properties")
+                .and_then(|p| p.get("lag_policy"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -228,10 +236,8 @@ mod tests {
 
     #[test]
     fn ssh_sub_pause_resume_filter_replay_args_parse() {
-        let _: SshSubPauseArgs =
-            serde_json::from_value(json!({"sub_id": "x"})).expect("pause");
-        let _: SshSubResumeArgs =
-            serde_json::from_value(json!({"sub_id": "x"})).expect("resume");
+        let _: SshSubPauseArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("pause");
+        let _: SshSubResumeArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("resume");
         let f: SshSubFilterArgs =
             serde_json::from_value(json!({"sub_id": "x", "regex": "ERR.*"})).expect("filter");
         assert_eq!(f.regex, "ERR.*");

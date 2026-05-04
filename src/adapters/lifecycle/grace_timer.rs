@@ -137,7 +137,9 @@ fn fire_close(
     if !cas_ok {
         return;
     }
-    lifecycle.grace_until_ms_atomic().store(0, Ordering::Release);
+    lifecycle
+        .grace_until_ms_atomic()
+        .store(0, Ordering::Release);
     cascade.on_resource_closed(kind, resource_id, lifecycle.session_id());
     trace!(%resource_id, "grace timer fired close");
 }
@@ -223,10 +225,9 @@ mod tests {
         entry.grace_until_ms_atomic().store(0, Ordering::Release);
         // Force the state back to Owned via a fake transition so the
         // timer exits without firing close.
-        entry.state_atomic().store(
-            LifecycleState::Observed.as_u8(),
-            Ordering::Release,
-        );
+        entry
+            .state_atomic()
+            .store(LifecycleState::Observed.as_u8(), Ordering::Release);
         let cascade = CascadeCoordinator::new();
         run_grace_timer(ResourceKind::Shell, "sh-1", &entry, &cascade, &*c).await;
         // State stays at Observed because the timer never fired close.
@@ -254,10 +255,9 @@ mod tests {
         });
         // Resub via promote: flip state to Observed and clear the
         // deadline, then wake the timer.
-        entry.state_atomic().store(
-            LifecycleState::Observed.as_u8(),
-            Ordering::Release,
-        );
+        entry
+            .state_atomic()
+            .store(LifecycleState::Observed.as_u8(), Ordering::Release);
         entry.grace_until_ms_atomic().store(0, Ordering::Release);
         waker.notify_one();
         task.await.expect("join");
@@ -405,10 +405,9 @@ mod tests {
         // Cancel the timer almost immediately.
         entry.grace_until_ms_atomic().store(0, Ordering::Release);
         // Need the state to leave Releasing for the timer to bail.
-        entry.state_atomic().store(
-            LifecycleState::Observed.as_u8(),
-            Ordering::Release,
-        );
+        entry
+            .state_atomic()
+            .store(LifecycleState::Observed.as_u8(), Ordering::Release);
         waker.notify_one();
         task.await.expect("join");
         // State is Observed because we forced it back; the timer did
@@ -429,10 +428,9 @@ mod tests {
         // Advance the FakeClock-based deadline to 0 so the timer fires.
         let entry = a.entry(ResourceKind::Shell, "sh-1").expect("entry");
         entry.grace_until_ms_atomic().store(0, Ordering::Release);
-        entry.state_atomic().store(
-            LifecycleState::Releasing.as_u8(),
-            Ordering::Release,
-        );
+        entry
+            .state_atomic()
+            .store(LifecycleState::Releasing.as_u8(), Ordering::Release);
         let cascade = CascadeCoordinator::new();
         run_grace_timer(ResourceKind::Shell, "sh-1", &entry, &cascade, &*real).await;
         assert_eq!(entry.current_state(), LifecycleState::Releasing);
@@ -449,8 +447,12 @@ mod tests {
             &sess("s"),
             LifecyclePolicy::release_with_default_grace(),
         );
-        adapter.on_subscribe(ResourceKind::Shell, "sh-1").expect("sub");
-        adapter.on_unsubscribe(ResourceKind::Shell, "sh-1").expect("uns");
+        adapter
+            .on_subscribe(ResourceKind::Shell, "sh-1")
+            .expect("sub");
+        adapter
+            .on_unsubscribe(ResourceKind::Shell, "sh-1")
+            .expect("uns");
         let entry = adapter.entry(ResourceKind::Shell, "sh-1").expect("entry");
         // Do not advance the clock — the deadline should still be in the
         // future relative to the now=0 epoch.
@@ -469,10 +471,9 @@ mod tests {
         });
         // Cancel quickly so the test does not stall.
         entry.grace_until_ms_atomic().store(0, Ordering::Release);
-        entry.state_atomic().store(
-            LifecycleState::Observed.as_u8(),
-            Ordering::Release,
-        );
+        entry
+            .state_atomic()
+            .store(LifecycleState::Observed.as_u8(), Ordering::Release);
         entry.waker().notify_one();
         task.await.expect("join");
     }
