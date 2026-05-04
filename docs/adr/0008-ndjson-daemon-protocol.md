@@ -45,24 +45,43 @@ Ship `ssh-mcp-tail` as a single binary with three subcommands and a shared NDJSO
 
 ### Internal architecture
 
-```
-+-----------------------------------+
-|   ssh-mcp-tail (single process)   |
-|                                   |
-|  +-----------+  in-memory  +----+ |
-|  | rmcp     |   duplex    |rmcp| |
-|  | client   |◀───────────▶|svr | |
-|  +─────┬────+  bytes      +─┬──+ |
-|        │  (JSON-RPC)        │    |
-|        │                    │    |
-|        ▼                    ▼    |
-|   notification         use cases |
-|   subscribe                      |
-+-----------------------------------+
-        ▲ stdin (NDJSON ops)
-        │
-        ▼ stdout (NDJSON events)
-        ▼ stderr (RUST_LOG)
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    STDIN([stdin: NDJSON ops])
+    STDOUT([stdout: NDJSON events])
+    STDERR([stderr: RUST_LOG])
+
+    LR["LineReader<br/>(framed by \\n)"]
+    DSP["Dispatcher<br/>op -> tools/call"]
+
+    subgraph Process["ssh-mcp-tail (single process)"]
+        direction LR
+        CLI["rmcp client"]
+        DUP{{"tokio::io::duplex(64 KB)<br/>JSON-RPC bytes"}}
+        SVR["rmcp server<br/>(McpSshServer)"]
+        UC["use cases<br/>+ adapters"]
+        CLI <--> DUP
+        DUP <--> SVR
+        SVR --> UC
+    end
+
+    MUX["EventMux<br/>(round-robin lanes)"]
+    FMT["NDJSON formatter"]
+
+    STDIN --> LR --> DSP --> CLI
+    SVR -->|notifications/<br/>resources/updated| MUX
+    MUX --> FMT --> STDOUT
+    Process -.tracing.-> STDERR
+
+    classDef io fill:#21262d,color:#8b949e,stroke:#30363d
+    classDef active fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef ok fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef sub fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    class STDIN,STDOUT,STDERR io
+    class LR,DSP,CLI,DUP,SVR active
+    class UC ok
+    class MUX,FMT sub
 ```
 
 The `tokio::io::duplex(64 KB)` pair gives both sides a real bidirectional async byte channel. Both halves are wrapped in rmcp's transport trait; the server task spawns under `composition::embed::wire()`, and the client task is owned by the daemon's main loop.
@@ -109,6 +128,32 @@ One JSON object per line. `ev` is the discriminator:
 ```
 
 ### Backpressure and shutdown
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    autonumber
+    participant Sig as stdin EOF /<br/>shutdown op /<br/>SIGTERM
+    participant LR as LineReader
+    participant DSP as Dispatcher
+    participant SUB as Subscriptions
+    participant SESS as Sessions
+    participant SRV as embed server
+    participant MUX as EventMux
+    participant OUT as stdout
+
+    Sig->>LR: trigger drain
+    LR->>DSP: exit signal
+    DSP->>SUB: broadcast cancel
+    SUB-->>DSP: drained
+    DSP->>SESS: ssh_disconnect (each)
+    SESS-->>DSP: closed
+    DSP->>SRV: abort task
+    SRV->>MUX: flush pending
+    MUX->>OUT: write final events
+    OUT-->>Sig: close (exit 0)
+    Note over Sig,OUT: bounded by SSH_GRACE_HARD_TIMEOUT_S<br/>(default 30s)
+```
 
 - **stdin EOF or `{"op":"shutdown"}`**: graceful drain. LineReader exits → Dispatcher exits → broadcast cancel to subscription consumers → for each session call `ssh_disconnect` → embed server task abort → EventMux flush → stdout close → process exit 0.
 - **stdout SIGPIPE**: same graceful drain.

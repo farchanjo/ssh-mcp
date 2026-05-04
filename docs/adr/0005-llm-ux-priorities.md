@@ -20,6 +20,26 @@ This surface works well for ≥70B-class models. Empirically, smaller models (27
 2. **They forget to release subscriptions.** A 27B model finishing a task often does not call `resources/unsubscribe` even when the prompt told it to. The subscription leaks until peer GC fires (30 s default).
 3. **They ignore lag stats.** When `lag_drops > 0`, a 27B model rarely re-orients (e.g. by switching to `Snapshot` policy). It treats the marker as informational.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    F1["Hot-poll<br/>ssh_shell_read"]
+    F2["Forget<br/>unsubscribe"]
+    F3["Ignore<br/>lag_drops"]
+    C1["HINT: REQUIRED<br/>+ Hygiene field<br/>+ NEXT push-first"]
+    C2["lifetime=auto-close<br/>+ release_when_no_subs<br/>+ SUB_LEAK_RISK warn"]
+    C3["DETAIL one-sentence<br/>cure on every error<br/>+ stats canonical"]
+
+    F1 -->|cure| C1
+    F2 -->|cure| C2
+    F3 -->|cure| C3
+
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef good fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class F1,F2,F3 bad
+    class C1,C2,C3 good
+```
+
 The v5 design anticipates lifecycle binding (ADR 0003) and channel mux (ADR 0004), both of which add new failure modes if the LLM is not actively guided:
 
 - **`release_when_no_subs = true` with no subscriber.** A model that opens a shell with auto-clean enabled but forgets to subscribe immediately loses the shell after `grace_ms`. Without explicit guidance, this looks like a bug.
@@ -43,6 +63,28 @@ The server emits the same advisory in up to four places, in increasing specifici
 2. **Tool description** — every long-running tool ends with a `Hygiene:` field that says exactly what the model must do next.
 3. **Tool response `HINT:` line** — emitted on the wire after every successful long-running tool call. Phrasing is **REQUIRED NEXT STEP:** for required actions, **RECOMMENDED:** for soft suggestions.
 4. **Tool response `NEXT:` line** — concrete tool calls in priority order, push-first.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    L1["Layer 1: Implementation.instructions<br/>(root prompt — golden rules + 5 happy paths)"]
+    L2["Layer 2: tool description<br/>(per-tool When / Push / Cleanup / Cost / Hygiene)"]
+    L3["Layer 3: HINT: line<br/>(REQUIRED NEXT STEP / RECOMMENDED)"]
+    L4["Layer 4: NEXT: line<br/>(push-first ordered successors)"]
+
+    L1 --> L2
+    L2 --> L3
+    L3 --> L4
+
+    classDef root fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef desc fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef hint fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef next fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    class L1 root
+    class L2 desc
+    class L3 hint
+    class L4 next
+```
 
 ### Golden rules in `Implementation.instructions`
 
