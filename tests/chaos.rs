@@ -77,3 +77,69 @@ mod chaos14_uuidv7_collision_simulation;
 
 #[path = "chaos/chaos15_signal_storm.rs"]
 mod chaos15_signal_storm;
+
+#[path = "chaos/chaos16_sub_pause_resume_race_vs_producer.rs"]
+mod chaos16_sub_pause_resume_race_vs_producer;
+
+#[path = "chaos/chaos17_filter_regex_hot_reload_during_emission.rs"]
+mod chaos17_filter_regex_hot_reload_during_emission;
+
+#[path = "chaos/chaos18_replay_during_concurrent_producer.rs"]
+mod chaos18_replay_during_concurrent_producer;
+
+#[path = "chaos/chaos19_sub_list_during_burst_churn.rs"]
+mod chaos19_sub_list_during_burst_churn;
+
+#[path = "chaos/chaos20_sub_stats_read_during_active_writes.rs"]
+mod chaos20_sub_stats_read_during_active_writes;
+
+#[path = "chaos/chaos21_lag_policy_block_slow_timeout_fallback.rs"]
+mod chaos21_lag_policy_block_slow_timeout_fallback;
+
+#[path = "chaos/chaos22_lag_policy_drop_newest_verify.rs"]
+mod chaos22_lag_policy_drop_newest_verify;
+
+#[path = "chaos/chaos23_channel_mux_fairness_n_lanes.rs"]
+mod chaos23_channel_mux_fairness_n_lanes;
+
+#[path = "chaos/chaos24_release_when_no_subs_grace_vs_resubscribe.rs"]
+mod chaos24_release_when_no_subs_grace_vs_resubscribe;
+
+#[path = "chaos/chaos25_cascade_refcount_many_simultaneous_close.rs"]
+mod chaos25_cascade_refcount_many_simultaneous_close;
+
+#[path = "chaos/chaos26_session_refcount_underflow_attempt.rs"]
+mod chaos26_session_refcount_underflow_attempt;
+
+#[path = "chaos/chaos27_grace_fire_vs_explicit_close_race.rs"]
+mod chaos27_grace_fire_vs_explicit_close_race;
+
+#[path = "chaos/chaos28_filter_regex_compile_failure_runtime.rs"]
+mod chaos28_filter_regex_compile_failure_runtime;
+
+#[path = "chaos/chaos29_ring_buffer_overflow_replay_beyond_window.rs"]
+mod chaos29_ring_buffer_overflow_replay_beyond_window;
+
+#[path = "chaos/chaos30_subid_uuidv7_ordering_concurrent_subscribe.rs"]
+mod chaos30_subid_uuidv7_ordering_concurrent_subscribe;
+
+#[path = "chaos/chaos31_sub_leak_risk_warn_vs_sub_arrives_in_window.rs"]
+mod chaos31_sub_leak_risk_warn_vs_sub_arrives_in_window;
+
+#[path = "chaos/chaos32_leak_watcher_kill_phase_active.rs"]
+mod chaos32_leak_watcher_kill_phase_active;
+
+#[path = "chaos/chaos33_leak_warn_bridge_progress_token_disabled.rs"]
+mod chaos33_leak_warn_bridge_progress_token_disabled;
+
+#[path = "chaos/chaos34_ndjson_line_size_overflow.rs"]
+mod chaos34_ndjson_line_size_overflow;
+
+#[path = "chaos/chaos35_embed_transport_buffer_full.rs"]
+mod chaos35_embed_transport_buffer_full;
+
+#[path = "chaos/chaos36_daemon_heartbeat_during_active_drain.rs"]
+mod chaos36_daemon_heartbeat_during_active_drain;
+
+#[path = "chaos/chaos37_v4_legacy_subscribe_with_v5_features.rs"]
+mod chaos37_v4_legacy_subscribe_with_v5_features;
