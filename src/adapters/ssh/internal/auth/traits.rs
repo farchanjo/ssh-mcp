@@ -39,8 +39,4 @@ pub(crate) trait AuthStrategy: Send + Sync {
         handle: &mut client::Handle<SshClientHandler>,
         username: &str,
     ) -> Result<bool, String>;
-
-    /// Stable name for logging (`"password"`, `"key"`, `"agent"`,
-    /// `"chain"`).
-    fn name(&self) -> &'static str;
 }

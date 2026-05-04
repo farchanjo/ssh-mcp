@@ -76,7 +76,7 @@ use crate::adapters::ssh::internal::status_sink::{
     NoopShellStatusSink, SharedCommandRegistrationSink, SharedCommandStatusSink,
     SharedShellRegistrationSink, SharedShellStatusSink,
 };
-use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus, ShellInfo};
+use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus};
 use crate::domain::auth::AuthError;
 use crate::domain::command::{CommandEntity, CommandRequest};
 use crate::domain::error::DomainError;
@@ -994,7 +994,7 @@ impl RusshAdapter {
             self.config.inactivity_timeout,
             buffer_cap,
         );
-        self.bind_shell(&shell_id, session_id, &terminal, channel, buffer_cap)?;
+        self.bind_shell(&shell_id, session_id, channel, buffer_cap)?;
         // v4.3 fix: bridge the row into the domain `ShellRepository` as
         // a defensive cleanup safety net. The use case (`open_shell`) is
         // the canonical writer of this row — the sink only fires for
@@ -1024,19 +1024,13 @@ impl RusshAdapter {
         &self,
         shell_id: &ShellId,
         session_id: &SessionId,
-        terminal: &ShellTerminal,
         channel: Channel<Msg>,
         buffer_cap: u64,
     ) -> Result<(), DomainError> {
         let (read_half, write_half) = channel.split();
         let (input_tx, input_rx) = mpsc::channel::<WriteRequest>(SHELL_INPUT_CHANNEL_CAP);
         let cancel_token = CancellationToken::new();
-        let running = Arc::new(RunningShell::new(
-            build_shell_info(shell_id, session_id, terminal),
-            cancel_token.clone(),
-            input_tx.clone(),
-            buffer_cap,
-        ));
+        let running = Arc::new(RunningShell::new(cancel_token.clone(), buffer_cap));
 
         spawn_shell_writer_task(write_half, input_rx, cancel_token.clone());
         spawn_shell_reader_task(read_half, &running);
@@ -1275,22 +1269,6 @@ fn build_async_command_info(
         command: command.to_string(),
         status: AsyncCommandStatus::Running,
         started_at: started_at.to_rfc3339(),
-    }
-}
-
-/// Build a [`ShellInfo`] payload for the lock-free shell record.
-fn build_shell_info(
-    shell_id: &ShellId,
-    session_id: &SessionId,
-    terminal: &ShellTerminal,
-) -> ShellInfo {
-    ShellInfo {
-        shell_id: shell_id.as_str().to_string(),
-        session_id: session_id.as_str().to_string(),
-        term_type: terminal.term_type.clone(),
-        cols: terminal.cols,
-        rows: terminal.rows,
-        opened_at: Utc::now().to_rfc3339(),
     }
 }
 

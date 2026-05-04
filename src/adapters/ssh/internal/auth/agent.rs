@@ -48,10 +48,6 @@ impl AuthStrategy for AgentAuth {
 
         try_identities(handle, username, &identities, &mut agent).await
     }
-
-    fn name(&self) -> &'static str {
-        "agent"
-    }
 }
 
 /// Try each identity from the SSH agent until one succeeds.
@@ -94,42 +90,12 @@ async fn try_identities(
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentAuth, AuthStrategy};
-
-    #[test]
-    fn name_is_agent() {
-        let auth = AgentAuth::new();
-        assert_eq!(auth.name(), "agent");
-    }
-
-    #[test]
-    fn default_name_is_agent() {
-        let auth = AgentAuth;
-        assert_eq!(auth.name(), "agent");
-    }
-
-    #[test]
-    fn new_equals_default() {
-        let auth_new = AgentAuth::new();
-        let auth_default = AgentAuth;
-        assert_eq!(auth_new.name(), auth_default.name());
-    }
+    use super::AgentAuth;
 
     #[test]
     fn auth_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AgentAuth>();
-    }
-
-    #[test]
-    fn multiple_instances_share_name() {
-        let auth1 = AgentAuth::new();
-        let auth2 = AgentAuth::new();
-        let auth3 = AgentAuth;
-
-        assert_eq!(auth1.name(), "agent");
-        assert_eq!(auth2.name(), "agent");
-        assert_eq!(auth3.name(), "agent");
     }
 
     #[test]
@@ -142,12 +108,5 @@ mod tests {
     fn auth_unit_struct_size_is_zero() {
         // Unit-like struct: zero-sized.
         assert_eq!(std::mem::size_of::<AgentAuth>(), 0);
-    }
-
-    #[test]
-    fn name_is_static_str() {
-        let auth = AgentAuth::new();
-        let n: &'static str = auth.name();
-        assert_eq!(n, "agent");
     }
 }
