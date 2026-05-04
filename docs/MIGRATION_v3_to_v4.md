@@ -255,3 +255,26 @@ The remaining v4.x backlog:
 - Cross-adapter SFTP refinements (shared transfer scheduler, per-session SFTP semaphore tuning).
 
 See [adr/0002-adopt-hexagonal-architecture.md](./adr/0002-adopt-hexagonal-architecture.md) for the original deferral rationale and the H0 → H18 commit chain (the H17.6 closure is appended to that ADR's Consequences section).
+
+## v4.7 -> v4.8 addendum (no migration steps required)
+
+**v4.8 is strictly additive on `tools/list[].outputSchema` metadata.** No source-level migration steps are required for contributors of in-flight v4.7 patches.
+
+What changed:
+
+- 12 new typed result structs landed in `src/infra/mcp/results.rs` covering the tools that previously emitted free-form `structured_content` (`ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_wait_for`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`).
+- 24 new `output_schema = schema_for_type::<…Result>()` attributes on `#[tool]` macro sites in `src/infra/mcp/tool_router.rs` (12 with `port_forward`, 12 without).
+- `SshConnectResult` schema gained 4 additive optional fields (`name`, `replaced`, `matches`, `count`) covering the existing runtime payload variants on `status = "ok"` / `"reused"` / `"suggested"`.
+- `SshShellOpenResult` gained `initial_buffer: Option<String>` mirroring the v4.7 `INITIAL_BUFFER:` Markdown line.
+- `src/infra/mcp/results.rs` head doc-comment "Coverage" section rewritten to claim 21 / 21 (or 20 / 20 without `port_forward`).
+
+What did NOT change:
+
+- Markdown response body: byte-identical to v4.7.1.
+- `structured_content` JSON payload: byte-identical to v4.7.1 on every existing field.
+- Env vars, error codes, runtime behaviour, lock-free invariants, channel sizes, port surface: all unchanged.
+- Test suite: 1168 lib tests + 2 integration tests pass unchanged.
+
+For external crates implementing one of the 21 typed result structs as a deserialisation target: every struct is `#[non_exhaustive]` so callers cannot match exhaustively across versions. Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire — pre-v4.8 serde validators that accepted the v4.7 payload continue to accept the v4.8 payload.
+
+**No client-side migration required** — v3 / v4.0 / v4.5 / v4.6 / v4.7 hosts work against v4.8 servers without any change.

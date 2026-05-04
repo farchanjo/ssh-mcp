@@ -1,8 +1,10 @@
-# SSH MCP API Reference (v4.7.0)
+# SSH MCP API Reference (v4.8.0)
 
-Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.7.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0; the v4.7 `structured_content` payload sits next to it. v4.7 adds three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.8.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 / v4.7.x; the v4.7 `structured_content` payload sits next to it. v4.8 lifts typed `output_schema` advertisement to **all 21 tools** (was 9 in v4.7). v4.7 added three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
 
-> **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). 6 tools advertise `output_schema` (`ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress`); other 15 emit free-form structured payload. Errors as `{ tool, status: "error", code, reason, detail }`. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
+> **v4.8 — full `output_schema` coverage.** Every tool now publishes a typed JSON Schema on `tools/list[].outputSchema` mirroring its `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can validate every tool response against the published shape without hard-coding any field names. Strictly additive on the `tools/list` metadata; the Markdown body and `structured_content` JSON shape are byte-identical to v4.7.1. Reference: `src/infra/mcp/results.rs` (21 typed structs).
+
+> **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). v4.8 expanded `output_schema` advertisement from 9 / 21 to 21 / 21 tools. Errors render as `{ tool, status: "error", code, reason, detail }` on the structured channel. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
 > **v4.7 new tools — `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`.** Tool count moves from 18 to 21 (or 17 to 20 without `port_forward`). Per-tool sections below.
 
@@ -917,9 +919,39 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer →
 
 ---
 
-## structured_content channel and output_schema (v4.7)
+## structured_content channel and output_schema (v4.7 channel, v4.8 full schema)
 
-Every tool response carries BOTH the block-style Markdown (`content[].text`) AND a typed JSON object (`structured_content`). Text channel byte-identical with v4.6. 6 tools advertise `output_schema` for validation: `ssh_connect` -> `SshConnectResult`, `ssh_execute` -> `SshExecuteResult`, `ssh_get_command_output` -> `SshGetCommandOutputResult`, `ssh_shell_open` -> `SshShellOpenResult`, `ssh_shell_read` -> `SshShellReadResult`, `ssh_get_transfer_progress` -> `SshGetTransferProgressResult` (refs in `src/infra/mcp/results.rs`). Other 15 tools emit free-form structured payload (keys in per-tool sections). Full canonical example shapes per tool — including `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — live in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Error shape on every tool: `{ tool, status: "error", code, reason, detail }` (when the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion). Reference: `src/infra/mcp/helpers/structured.rs` (dual-channel render) + `src/infra/mcp/suggestions.rs` (Levenshtein picker).
+Every tool response carries BOTH the block-style Markdown (`content[].text`) AND a typed JSON object (`structured_content`). Text channel byte-identical with v4.7.1.
+
+**v4.8 — full coverage on `tools/list[].outputSchema`.** All 21 tools (or 20 without `port_forward`) now advertise a typed JSON Schema on `tools/list`. The schemas live as Rust structs in `src/infra/mcp/results.rs`:
+
+| Tool | Result struct |
+|:---|:---|
+| `ssh_connect` | `SshConnectResult` (with `SessionEntry` for `matches`) |
+| `ssh_disconnect` | `SshDisconnectResult` |
+| `ssh_disconnect_many` | `SshDisconnectManyResult` |
+| `ssh_list_sessions` | `SshListSessionsResult` (with `SessionEntry`) |
+| `ssh_disconnect_agent` | `SshDisconnectAgentResult` |
+| `ssh_execute` | `SshExecuteResult` |
+| `ssh_execute_batch` | `SshExecuteBatchResult` |
+| `ssh_run` | `SshRunResult` |
+| `ssh_get_command_output` | `SshGetCommandOutputResult` |
+| `ssh_list_commands` | `SshListCommandsResult` (with `CommandEntry`) |
+| `ssh_cancel_command` | `SshCancelCommandResult` |
+| `ssh_shell_open` | `SshShellOpenResult` (with optional `initial_buffer`) |
+| `ssh_shell_write` | `SshShellWriteResult` |
+| `ssh_shell_send_key` | `SshShellSendKeyResult` |
+| `ssh_shell_read` | `SshShellReadResult` |
+| `ssh_shell_wait_for` | `SshShellWaitForResult` |
+| `ssh_shell_close` | `SshShellCloseResult` |
+| `ssh_upload` | `SshUploadResult` |
+| `ssh_download` | `SshDownloadResult` |
+| `ssh_get_transfer_progress` | `SshGetTransferProgressResult` |
+| `ssh_forward` *(feature `port_forward`)* | `SshForwardResult` |
+
+Each struct is `#[non_exhaustive]` so callers cannot match exhaustively across versions; new optional fields can be added without bumping the major version. Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire.
+
+Full canonical example shapes per tool — including `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — live in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Error shape on every tool: `{ tool, status: "error", code, reason, detail }` (when the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion). Reference: `src/infra/mcp/helpers/structured.rs` (dual-channel render) + `src/infra/mcp/suggestions.rs` (Levenshtein picker).
 
 ---
 

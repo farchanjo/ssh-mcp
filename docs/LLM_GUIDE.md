@@ -1,6 +1,6 @@
-# LLM Guide (v4.7.0)
+# LLM Guide (v4.8.0)
 
-This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 on the text channel; v4.7 layers a parallel `structured_content` JSON channel, new tools, and an inter-tool conversation surface on top — without touching the v4.6 Markdown body. v4.7 adds three new tools (`ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — catalogue moves from 18 to 21, or 17 to 20 without `port_forward`), `resources/templates/list`, `notifications/progress` during long async waits, an MCP `prompts/list` + `prompts/get` catalog with 5 canonical workflows, idempotent retries via `_meta.idempotency_key` (15 mutating tools), `NOT_FOUND` closest-match suggestions, and an optional `INITIAL_BUFFER` line on `ssh_shell_open`. v4.6 surface (subscribe-first `HINT:`, `NEXT:` advisory, `AGENT_ID:` rename, JSON Schema defaults, cost hints, wired icon) carries forward unchanged.
+This guide is written for **small LLMs (~30B class)** driving ssh-mcp through an MCP host. The goal is to minimise cognitive load and token spend by directing the model to the most efficient tool / pattern for each intent. The MCP wire contract is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 / v4.7.x on the text channel; v4.7 layered a parallel `structured_content` JSON channel, new tools, and an inter-tool conversation surface on top — without touching the v4.6 Markdown body. **v4.8 lifts typed `output_schema` advertisement to all 21 tools (or 20 without `port_forward`)** — the runtime payload is byte-identical to v4.7.1; only the `tools/list[].outputSchema` metadata grows. Smaller models (Haiku / Llama / Qwen 7B-30B) can now validate every tool response against a published JSON Schema without hard-coding any field names. v4.7 carry-forward: three new tools (`ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — catalogue moves from 18 to 21, or 17 to 20 without `port_forward`), `resources/templates/list`, `notifications/progress` during long async waits, an MCP `prompts/list` + `prompts/get` catalog with 5 canonical workflows, idempotent retries via `_meta.idempotency_key` (15 mutating tools), `NOT_FOUND` closest-match suggestions, and an optional `INITIAL_BUFFER` line on `ssh_shell_open`. v4.6 surface (subscribe-first `HINT:`, `NEXT:` advisory, `AGENT_ID:` rename, JSON Schema defaults, cost hints, wired icon) carries forward unchanged.
 
 Cross references:
 
@@ -546,22 +546,39 @@ When the key matches a previous call within the TTL, the server returns the cach
 - **Reusing the same key for different argument sets.** The key is keyed on `(tool_name, key)` only; the cache does not hash the arguments. A retry with mutated arguments and the same key returns the cached response from the first call. Always pair `idempotency_key` with stable arguments.
 - **Using a cryptographically random key per attempt.** Defeats dedup. Re-use the same key across retries of the *same* logical operation (e.g. derive it from a user-visible request id).
 
-## K. structured_content channel (v4.7)
+## K. structured_content channel (v4.7) and full output_schema coverage (v4.8)
 
-Every tool response now carries BOTH the existing block-style Markdown (`content[].text` channel) AND a typed JSON object (`structured_content`). The text channel is byte-identical with v4.6 — every existing host that consumes Markdown keeps working without change. Smaller LLMs (27B class) can index the structured channel by key without parsing the Markdown body.
+Every tool response carries BOTH the existing block-style Markdown (`content[].text` channel) AND a typed JSON object (`structured_content`). The text channel is byte-identical with v4.7.1 — every existing host that consumes Markdown keeps working without change. Smaller LLMs (27B class) can index the structured channel by key without parsing the Markdown body.
 
-### Advertised `output_schema` (6 tools)
+### Advertised `output_schema` (21 / 21 — v4.8)
 
-The following 6 tools advertise an `output_schema` JSON Schema on `tools/list`, so clients can validate the structured payload against the published shape:
+**v4.8 lifts coverage to every tool.** Each one of the 21 tools (or 20 without `port_forward`) now advertises a typed JSON Schema on `tools/list[].outputSchema` mirroring its `structured_content` payload byte-for-byte. Smaller models can validate every response against the published shape without hard-coding any field names. Reference: `src/infra/mcp/results.rs` (full coverage doc-comment).
 
-- `ssh_connect` -> `SshConnectResult`
-- `ssh_execute` -> `SshExecuteResult`
-- `ssh_get_command_output` -> `SshGetCommandOutputResult`
-- `ssh_shell_open` -> `SshShellOpenResult` (carries optional `initial_buffer`)
-- `ssh_shell_read` -> `SshShellReadResult`
-- `ssh_get_transfer_progress` -> `SshGetTransferProgressResult`
+| Tool | Result struct |
+|:---|:---|
+| `ssh_connect` | `SshConnectResult` |
+| `ssh_disconnect` | `SshDisconnectResult` |
+| `ssh_disconnect_many` | `SshDisconnectManyResult` |
+| `ssh_list_sessions` | `SshListSessionsResult` |
+| `ssh_disconnect_agent` | `SshDisconnectAgentResult` |
+| `ssh_execute` | `SshExecuteResult` |
+| `ssh_execute_batch` | `SshExecuteBatchResult` |
+| `ssh_run` | `SshRunResult` |
+| `ssh_get_command_output` | `SshGetCommandOutputResult` |
+| `ssh_list_commands` | `SshListCommandsResult` |
+| `ssh_cancel_command` | `SshCancelCommandResult` |
+| `ssh_shell_open` | `SshShellOpenResult` (with optional `initial_buffer`) |
+| `ssh_shell_write` | `SshShellWriteResult` |
+| `ssh_shell_send_key` | `SshShellSendKeyResult` |
+| `ssh_shell_read` | `SshShellReadResult` |
+| `ssh_shell_wait_for` | `SshShellWaitForResult` |
+| `ssh_shell_close` | `SshShellCloseResult` |
+| `ssh_upload` | `SshUploadResult` |
+| `ssh_download` | `SshDownloadResult` |
+| `ssh_get_transfer_progress` | `SshGetTransferProgressResult` |
+| `ssh_forward` *(feature `port_forward`)* | `SshForwardResult` |
 
-The other 15 tools (including v4.7 `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`) emit a free-form structured payload — keys are documented in [API.md](./API.md) per tool, but no `output_schema` is published. Lifting the remaining tools is mechanical and tracked in v4.8.
+Each struct is `#[derive(Debug, Clone, Serialize, JsonSchema)] #[non_exhaustive]` (forward-compatible — new optional fields can be added without bumping the major version). Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire. Hosts that validated against v4.7's partial schema set continue to validate the same responses (additions only).
 
 ### Canonical example shapes
 

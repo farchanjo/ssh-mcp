@@ -1,6 +1,8 @@
-# SSH MCP Configuration Guide (v4.1.0)
+# SSH MCP Configuration Guide (v4.8.0)
 
-Reference for every tunable exposed by the v4.1.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+Reference for every tunable exposed by the v4.8.0 ssh-mcp server: environment variables, parameter priority, validation ranges, and a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every env var name, default, floor, and cap is identical to v3.0.0 / v4.0.0 / v4.7.x — see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
+
+> **v4.8 — no env-var changes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement; no new tunables, no renamed vars, no changed defaults. Every variable below is identical to v4.7.1.
 
 [[_TOC_]]
 
@@ -102,6 +104,29 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 | Variable | Type | Default | Floor | Cap | Description |
 |----------|------|---------|-------|-----|-------------|
 | `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans the subscription registry for peers whose rmcp transport has closed. rmcp 1.6 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
+
+## Idempotency cache (v4.7)
+
+The v4.7 idempotency wrapper deduplicates retries of mutating tools when the caller passes `_meta.idempotency_key` (1..=256 bytes). Key + tool tuple is cached in a per-process DashMap; a hit within the TTL returns the cached `CallToolResult` verbatim (Markdown body + structured payload).
+
+| Variable | Type | Default | Range | Description |
+|----------|------|---------|-------|-------------|
+| `SSH_IDEMPOTENCY_TTL_SECS` | `u64` (s) | `300` | `>= 1` | Idempotency cache TTL. Override via positive integer; otherwise default. |
+| `SSH_IDEMPOTENCY_MAX_ENTRIES` | `usize` | `1024` | `>= 1` | Soft cap on cache entries. When reached, oldest entries (by `inserted_at`) are pruned. |
+
+The `IDEMPOTENCY_KEY_MAX_BYTES` cap (256 bytes, `IDEMPOTENCY_KEY_TOO_LONG` on overflow) is hard-coded — UUIDv4 (36 bytes) and similar identifiers fit comfortably. Read-only tools (`ssh_list_*`, `ssh_get_*`, `ssh_shell_read`, `ssh_shell_wait_for`) ignore the key. Reference: `src/infra/mcp/idempotency.rs`.
+
+## Initial buffer peek on ssh_shell_open (v4.7)
+
+When the PTY emits stdout within ~100 ms after `ssh_shell_open`, the response embeds an `INITIAL_BUFFER:` Markdown line and a structured `initial_buffer` field. Smaller LLMs that follow the `subscribe -> read` pattern can sometimes skip the first `resources/read` round-trip when the prompt is already visible.
+
+| Variable | Type | Default | Range | Description |
+|----------|------|---------|-------|-------------|
+| `SSH_SHELL_OPEN_INITIAL_PEEK_MS` | `u64` (ms) | `100` | `>= 0` | Total budget the open call spends peeking for stdout before returning. |
+| `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS` | `u64` (ms) | `5` | `>= 1` | Polling tick within the budget; lower values catch the first chunk faster but cost CPU. |
+| `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES` | `usize` | `4096` | `>= 1` | Hard cap on the rendered slice (head bytes; tail dropped on overflow). |
+
+Reference: `src/infra/mcp/render/shell.rs::shell_open_render_with_initial`.
 
 ## Server transport
 
