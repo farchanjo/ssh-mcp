@@ -1,23 +1,23 @@
 # `ssh-mcp-tail` — NDJSON Daemon Reference
 
-`ssh-mcp-tail` is the v5.0 binary for running ssh-mcp as a Unix-composable NDJSON pipe. It embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired to itself through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON commands; stdout emits NDJSON events; stderr emits `RUST_LOG`-controlled tracing.
+v5.0 binary running ssh-mcp as a Unix-composable NDJSON pipe. Embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON ops; stdout emits NDJSON events; stderr carries `RUST_LOG`-controlled tracing.
 
-This document is **forthcoming** until Phase 4 of the v5 roadmap lands the binary. The protocol shape below is the design committed in [ADR 0008](./adr/0008-ndjson-daemon-protocol.md). Sections marked _v5.0 forthcoming_ describe surface that exists as design intent; the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes authoritative when Phase 4 ships.
+**Forthcoming** until Phase 4 lands the binary. Protocol shape below is the design from [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes authoritative when Phase 4 ships.
 
 ## When to use this binary
 
-Pick `ssh-mcp-tail` over `ssh-mcp-stdio` or `ssh-mcp` (HTTP) in any of the following scenarios:
+Pick `ssh-mcp-tail` over `ssh-mcp-stdio` / `ssh-mcp` (HTTP) when:
 
-- **Hosts without `resources/subscribe` support reaching the LLM.** Claude Code CLI (as of 2026-Q1) accepts the protocol but does not deliver `notifications/resources/updated` to the LLM as conversation context. Driving `ssh-mcp-tail` as a subprocess inside a Claude Code shell gives the LLM real push delivery via stdout NDJSON, bypassing the host's missing surface.
-- **Composable Unix pipelines.** `jq` filters, `tee` audit logs, `vector` / `fluentbit` / `logstash` shipping, browser-side bridges. The NDJSON format is purpose-built for line-oriented tools.
-- **In-process audit log / monitoring.** A long-running process can spawn `ssh-mcp-tail daemon` as a child, write ops to its stdin, and pipe events into a metrics or audit pipeline without implementing MCP itself.
-- **Integration tests.** Reuses `composition::embed::wire()` so the same adapters that power production binaries also power tests, browser bridges, and any in-process consumer.
+- **Host does not surface `notifications/resources/updated` to the LLM.** Claude Code CLI (as of 2026-Q1) accepts the protocol but never delivers push notifications to the model. Driving `ssh-mcp-tail` as a subprocess gives the LLM real push delivery via stdout NDJSON.
+- **Composable Unix pipelines.** `jq` filters, `tee` audit logs, `vector` / `fluentbit` / `logstash` shipping, browser bridges. NDJSON is purpose-built for line-oriented tools.
+- **In-process audit / monitoring.** A long-running process can spawn `ssh-mcp-tail daemon` as a child and pipe events without implementing MCP itself.
+- **Integration tests.** Reuses `composition::embed::wire()` — same adapters as production.
 
-For full-spec MCP hosts (mcp-inspector, custom rmcp clients, Goose CLI, Cline) the canonical `ssh-mcp` HTTP or `ssh-mcp-stdio` binary is the right tool. The daemon does **not** replace them; it complements them.
+For full-spec MCP hosts (mcp-inspector, custom rmcp clients, Goose CLI, Cline) the canonical HTTP / stdio binaries are still the right tool. The daemon complements them, not replaces them.
 
 ## Architecture summary
 
-The daemon embeds the rmcp `ServerHandler` inside the same process as an rmcp client; the two halves talk to each other via an in-memory `tokio::io::duplex(64 KB)` byte pair, which carries real JSON-RPC framing. The dispatcher reads NDJSON ops from stdin, translates them into `tools/call` and `resources/subscribe` requests on the embedded client, and forwards rmcp notifications to the stdout writer as NDJSON events.
+The daemon embeds the rmcp `ServerHandler` and an rmcp client in the same process, talking via an in-memory `tokio::io::duplex(64 KB)` byte pair carrying real JSON-RPC framing. The dispatcher reads NDJSON ops from stdin, translates them to `tools/call` / `resources/subscribe` requests on the embedded client, and forwards rmcp notifications to stdout as NDJSON events.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -49,13 +49,11 @@ sequenceDiagram
     MUX->>Out: {"ev":"push","sub_id":"...","delta":"..."}
 ```
 
-The `composition::embed::wire()` factory pins concrete `composition::prod` adapters (russh client, russh-sftp, DashMap repos, AuthChain, MemoryRegistry, RmcpAdapter, ...) and exposes both halves of the duplex so the binary main loop can spawn them as cooperating tasks. No IPC syscall is involved; both sides share the same async runtime.
-
-The full design rationale is in [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
+`composition::embed::wire()` pins concrete `composition::prod` adapters (russh client, russh-sftp, DashMap repos, AuthChain, MemoryRegistry, RmcpAdapter, ...) and exposes both halves of the duplex so the main loop can spawn them as cooperating tasks. No IPC syscall — both sides share the same async runtime. Full design rationale: [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
 
 ## Subcommands
 
-`ssh-mcp-tail` exposes three subcommands. `daemon` is the primary deliverable; `run` and `shell` are thin shell wrappers (~10 LOC each) over `daemon`.
+`daemon` is the primary deliverable; `run` and `shell` are thin shell wrappers (~10 LOC each) over `daemon`.
 
 | Subcommand | Use | Stdin | Stdout |
 |---|---|---|---|
@@ -83,9 +81,7 @@ cat ops.ndjson | ssh-mcp-tail daemon | tee out.ndjson
 
 ## NDJSON command schema (stdin)
 
-One JSON object per line, terminated by `\n`. Each op is `serde`-tagged on the `op` field. The optional `id` field on every op is echoed on every event tied to that op for correlation.
-
-The 11 ops below are the v5.0 schema. The shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` is the binding contract once Phase 4 ships.
+One JSON object per line, `\n`-terminated. `op` is the discriminator. Optional `id` field echoes back on every event tied to that op for correlation. 11 ops; shape locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md). JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes authoritative when Phase 4 ships.
 
 ### `connect`
 
@@ -259,13 +255,11 @@ sequenceDiagram
     Note over Trigger,Out: bounded by SSH_GRACE_HARD_TIMEOUT_S<br/>(default 30s)
 ```
 
-The shutdown sequence is detailed in [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
+Shutdown sequence detail: [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
 
 ## NDJSON event schema (stdout)
 
-One JSON object per line. `ev` is the discriminator. Events tied to a stdin op echo the op's `id` for correlation.
-
-The 14 event variants below cover the v5.0 schema. Additional variants may be added in v5.x; the discriminator is open-ended on the wire (consumers should ignore unknown `ev` values).
+One JSON object per line. `ev` is the discriminator. Events tied to a stdin op echo the op's `id` for correlation. 14 event variants in v5.0; the discriminator is open-ended (consumers should ignore unknown `ev` values).
 
 ### `ack`
 
@@ -278,13 +272,11 @@ Emitted for every successful stdin op. Carries the resource UUID(s) created.
 
 ### `err`
 
-Emitted on every failed op. The envelope mirrors [ADR 0007](./adr/0007-error-taxonomy.md): `code` is the wire code, `reason` is the one-sentence summary, `detail` is the action-oriented `DETAIL:` line.
+Emitted on every failed op. Envelope mirrors [ADR 0007](./adr/0007-error-taxonomy.md): `code` is the wire code, `reason` the one-sentence summary, `detail` the action-oriented cure. Full per-code reference: [docs/llm-ux/ERROR_HANDBOOK.md](./llm-ux/ERROR_HANDBOOK.md).
 
 ```json
 {"ev":"err","id":"corr-1","code":"AUTH_FAILED","reason":"Authentication failed","detail":"Check credentials; never retry without changing them."}
 ```
-
-The full code-by-code reference (cure, prevention, retry policy) lives in [`docs/llm-ux/ERROR_HANDBOOK.md`](./llm-ux/ERROR_HANDBOOK.md) (forthcoming).
 
 ### `started`
 
@@ -464,36 +456,26 @@ The full env var table for v5.0 (covering the legacy v4 entries plus all v5 addi
 
 ## Backpressure
 
-Per-lane and per-mux backpressure is governed by [ADR 0006](./adr/0006-backpressure-policies.md). The `lag_policy` argument on `subscribe` selects per-lane behaviour from `BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot`. `Snapshot` is the default: lane mpsc backlog drops, the next drain triggers a `read_resource(uri, cursor=current_seq)` rebuild from the per-resource ring buffer, and a `snapshot` event surfaces on the wire so the consumer's cursor advances.
+Per-lane and per-mux backpressure: [ADR 0006](./adr/0006-backpressure-policies.md). The `lag_policy` arg on `subscribe` picks `BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot`. `Snapshot` is the default — backlog drops, next drain rebuilds from the ring buffer, a `snapshot` event surfaces and the consumer cursor advances.
 
-The daemon's outbound writer is itself a bounded `mpsc::channel(SSH_MUX_BUFFER)`. When the consumer of the NDJSON stream stalls (a slow `jq` filter, a paused `tee`), the mux fills, the lane consumer's `try_send` fails, and the lane falls back to its own lag policy. The daemon never deadlocks on outbound stall: every fronteira has a documented overflow strategy.
+The daemon's outbound writer is a bounded `mpsc::channel(SSH_MUX_BUFFER)`. When the consumer of NDJSON stalls (slow `jq` filter, paused `tee`), the mux fills, lane `try_send` fails, lane falls back to its own lag policy. The daemon never deadlocks on outbound stall — every frontier has a documented overflow strategy.
 
-The `ssh_sub_stats` and `ssh_daemon_stats` MCP tools expose per-lane and aggregate counters (events_sent, lagged_drops, queue_depth, queue_high_watermark, block_total_ms). The daemon also auto-emits `daemon_stats` events on the NDJSON stream every `SSH_DAEMON_STATS_INTERVAL_S`.
+`ssh_sub_stats` and `ssh_daemon_stats` MCP tools expose per-lane / aggregate counters (events_sent, lagged_drops, queue_depth, queue_high_watermark, block_total_ms). The daemon also auto-emits `daemon_stats` events every `SSH_DAEMON_STATS_INTERVAL_S`.
 
 ## Lifecycle policy on subscribe
 
-Every subscribe-capable op (`subscribe`, `shell_open`, `exec`, `upload`, `download`) honours [ADR 0003](./adr/0003-lifecycle-binding.md). The two policy fields that matter:
+Every subscribe-capable op (`subscribe`, `shell_open`, `exec`, `upload`, `download`) honours [ADR 0003](./adr/0003-lifecycle-binding.md). Two policy fields matter:
 
-- `release_when_no_subs` (per resource creator) — when `true`, the resource transitions `Owned -> Releasing` once the subscriber count drops to zero, with a `grace_ms` window to allow re-subscription. New subscribes during the window cancel the grace timer (CAS `Releasing -> Observed`). The default is `false` to match v4 semantics; set it on every resource the daemon creates if you want auto-cleanup.
-- `lifetime` (per subscriber) — `manual` (caller closes), `auto-close` (release when last sub leaves and `release_when_no_subs=true`), `lease` (expires at deadline). The `auto-close` value is the safe default for daemon workloads.
+- `release_when_no_subs` (per resource creator) — when `true`, the resource transitions `Owned → Releasing` once subscriber count drops to zero, with a `grace_ms` window for re-subscription (CAS `Releasing → Observed` cancels the timer). Default `false` for v4 compat; set per resource for auto-cleanup.
+- `lifetime` (per subscriber) — `manual` (caller closes), `auto-close` (release when last sub leaves and `release_when_no_subs=true`), `lease` (deadline). `auto-close` is the safe default for daemon workloads.
 
-The state machine (Owned -> Observed -> Releasing -> Closed) and its CAS edges are documented in [ADR 0003](./adr/0003-lifecycle-binding.md). Cascade is automatic: a `disconnect` op decrements every owned resource's refcount; the parent session's `active_refs` aggregate fires the session-level grace timer when it reaches zero.
+State machine `Owned → Observed → Releasing → Closed` and CAS edges: [ADR 0003](./adr/0003-lifecycle-binding.md). Cascade is automatic — `disconnect` decrements every owned resource's refcount; the session's `active_refs` aggregate fires the session-level grace timer at zero.
 
 ## Error codes
 
-The daemon's `err` events use the same wire taxonomy as the MCP server (38 codes, 7 categories, action-oriented `DETAIL` lines). The complete reference is at [`docs/llm-ux/ERROR_HANDBOOK.md`](./llm-ux/ERROR_HANDBOOK.md) (forthcoming). The categories are summarised in [ADR 0007](./adr/0007-error-taxonomy.md):
+`err` events share the MCP server taxonomy (38 codes, 7 categories — [ADR 0007](./adr/0007-error-taxonomy.md), full per-code reference in [docs/llm-ux/ERROR_HANDBOOK.md](./llm-ux/ERROR_HANDBOOK.md)). Daemon-specific codes: `INVALID_OP` (NDJSON parse error or unknown `op` — daemon keeps processing subsequent lines) and `IDEMPOTENCY_KEY_MISMATCH` (same key, different args — pick a new key).
 
-| Category | Retry semantics |
-|---|---|
-| `AUTH` | Never retry. |
-| `TRANSPORT` | Auto-retry with exponential backoff (cap 10 s). |
-| `REMOTE` | Depends on remote command exit; LLM judges. |
-| `RESOURCE` | Never retry. |
-| `POLICY` | Retry conditional on policy change. |
-| `STATE` | Never retry without `_meta.idempotency_key`. |
-| `INTERNAL` | Never retry; report bug. |
-
-The two daemon-specific codes are `INVALID_OP` (NDJSON parse error or unknown `op` discriminator — the daemon continues processing subsequent lines) and `IDEMPOTENCY_KEY_MISMATCH` (same key with different argument set — pick a new key).
+Retry semantics: `AUTH` / `RESOURCE` / `INTERNAL` never retry; `TRANSPORT` retries with exponential backoff (cap 10 s); `REMOTE` LLM judges by exit code; `POLICY` retries after policy change; `STATE` retries only with a fresh `_meta.idempotency_key`.
 
 ## Composition recipes
 

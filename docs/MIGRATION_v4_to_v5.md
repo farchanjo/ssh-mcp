@@ -1,29 +1,10 @@
 # v4.x to v5.0 Migration Guide
 
-This document is for **MCP host operators, contributors, and downstream automations** moving from ssh-mcp v4.8.x to v5.0.x. It enumerates wire compatibility, additive surface, default-behaviour deltas, and recipes for the workflows that change shape under v5.
+For MCP host operators, contributors, and downstream automations moving from ssh-mcp v4.8.x to v5.0.x. Hosts that only consume the v4 surface need **zero** changes — v5 is wire-compatible on every legacy path; expansions are additive.
 
-If you only consume the v4 MCP surface and never opt into the new tools, env vars, or `release_when_no_subs` flag, no host-side change is required. v5 is wire-compatible with v4 on every legacy path. The expansions are additive.
+v5.0 is in flight on `feat/v5-foundation` (Phases 0–7). This guide is **forthcoming** until v5.0-rc1 tags. Sections marked _v5.0 forthcoming_ describe surface defined by the 6 ADRs at [docs/adr/0003-..0008.md](./adr/) but not yet wired into every binary; Phase 1 (lifecycle layer with v4-compatible defaults) is the only fully-wired phase as of this branch snapshot. Until rc1 tags, treat every wire example as design intent — the test fixtures and integration tests under `tests/` are the binding contract.
 
-## Status
-
-v5.0 is in flight on the `feat/v5-foundation` branch (Phase 0 through Phase 7). This guide is **forthcoming** until v5.0-rc1 ships; sections marked _v5.0 forthcoming_ describe surface that exists in design (the 6 ADRs at [`docs/adr/0003-..0008.md`](./adr/)) but is not yet exercised by every binary in the repo. Phase 1 (lifecycle layer with v4-compatible defaults) is the only fully-wired phase as of this branch snapshot.
-
-The guide will be promoted from _forthcoming_ to _active_ when v5.0-rc1 tags. Until then, treat every wire example as design intent — the test fixtures and integration tests under `tests/` are the binding contract.
-
-## Reading order
-
-If you maintain a host or an LLM prompt today, read the sections in order:
-
-1. [Wire compatibility summary](#wire-compatibility-summary)
-2. [Breaking changes](#breaking-changes)
-3. [Additive surface](#additive-surface)
-4. [Default-behaviour deltas](#default-behaviour-deltas)
-5. [Recipes (before / after)](#recipes-before--after)
-6. [LLM prompt updates](#llm-prompt-updates)
-7. [Deprecation timeline](#deprecation-timeline)
-8. [References](#references)
-
-If you only operate the binary, jump to [`docs/INSTRUCTIONS_DAEMON.md`](./INSTRUCTIONS_DAEMON.md) and [`docs/TROUBLESHOOTING.md`](./TROUBLESHOOTING.md).
+For operators (not host authors), jump to [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md) and [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
 
 ## Wire compatibility summary
 
@@ -48,24 +29,21 @@ If you only operate the binary, jump to [`docs/INSTRUCTIONS_DAEMON.md`](./INSTRU
 
 ## Breaking changes
 
-There is **no breaking change on the wire** between v4.8 and v5.0. There are zero tool removals, zero schema-narrowing edits, and zero behaviour changes for any unmodified host.
+**Zero breaking changes on the wire** between v4.8 and v5.0. No tool removals, no schema-narrowing edits, no behaviour changes for unmodified hosts. New deltas land as optional arguments or new env vars:
 
-The deltas below are introduced as new defaults or new env vars — never as forced behaviour changes:
+- `release_when_no_subs: bool` on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` (default `false`).
+- `lifetime: Lifetime`, `lag_policy: LagPolicy`, `filter` on the new `ssh_subscribe` tool ([ADR 0004](./adr/0004-channel-mux-fairness.md)).
+- New env vars per ADRs [0003](./adr/0003-lifecycle-binding.md), [0006](./adr/0006-backpressure-policies.md), [0008](./adr/0008-ndjson-daemon-protocol.md). Full table: [docs/CONFIGURATION.md](./CONFIGURATION.md) (promoted in Phase 6).
 
-- New optional argument `release_when_no_subs: bool` on `ssh_shell_open`, `ssh_execute`, `ssh_upload`, `ssh_download` (default: `false` to match v4 semantics — see [Default-behaviour deltas](#default-behaviour-deltas)).
-- New optional argument `lifetime: Lifetime` and `lag_policy: LagPolicy` on `ssh_subscribe` (the new tool — see [ADR 0004](./adr/0004-channel-mux-fairness.md)).
-- New optional `filter` (regex / level) argument on `ssh_subscribe`.
-- New env vars per [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0006](./adr/0006-backpressure-policies.md), and [ADR 0008](./adr/0008-ndjson-daemon-protocol.md). The full table is under [`docs/CONFIGURATION.md`](./CONFIGURATION.md) when Phase 6 lands; until then, the ADRs are the canonical source.
-
-If your host parses the wire format byte-for-byte (snapshot tests, audit pipelines), no replacement test fixture is required — every legacy assertion still holds.
+Hosts that snapshot wire bytes need no test fixture replacement — every legacy assertion still holds.
 
 ## Additive surface
 
-v5.0 adds nine net-new MCP tools and one second binary (`ssh-mcp-tail`). All are additive — older hosts that ignore them continue to work.
+v5.0 adds 9 net-new MCP tools and a second binary (`ssh-mcp-tail`). Older hosts that ignore them continue to work.
 
 ### Nine new tools (Phase 3)
 
-The tool catalogue grows from 21 to 30 (or from 20 to 29 without `port_forward`). All nine are subscription-management primitives that key on the new `SubId` (UUIDv7 per `resources/subscribe` or `ssh_subscribe` call) introduced by [ADR 0004](./adr/0004-channel-mux-fairness.md).
+Catalogue grows 21 → 30 (or 20 → 29 without `port_forward`). All nine are subscription-management primitives keyed on the new `SubId` (UUIDv7 per `resources/subscribe` or `ssh_subscribe` call — [ADR 0004](./adr/0004-channel-mux-fairness.md)).
 
 | Tool | Purpose | Returns | Idempotency |
 |---|---|---|---|
@@ -79,37 +57,35 @@ The tool catalogue grows from 21 to 30 (or from 20 to 29 without `port_forward`)
 | `ssh_sub_stats` | Per-sub_id counter snapshot (events_sent, lag_drops, queue_depth, ...). | typed `SubscriberStats` | n/a |
 | `ssh_daemon_stats` | Global stats aggregating across all sub_ids (active sessions, total subs, mux backlog, peer GC pace, ...). | typed `DaemonStats` | n/a |
 
-Every new tool emits the same dual channel as the v4 tools: a markdown body with `KEY: value` lines and an 8-hex-char nonce framing block, plus a parallel `structured_content` JSON object.
+Every new tool emits the same dual channel as the v4 tools: markdown `KEY: value` body with 8-hex nonce framing block, plus a parallel `structured_content` JSON object.
 
 ### New binary: `ssh-mcp-tail` (Phase 4)
 
-`ssh-mcp-tail` is a single binary with three subcommands (`run`, `shell`, `daemon`). Its primary mode (`daemon`) reads NDJSON commands on stdin and emits NDJSON events on stdout. It embeds the same `composition::prod` adapters used by `ssh-mcp` and `ssh-mcp-stdio`, wired to itself via an in-process `tokio::io::duplex` MCP transport.
-
-The binary exists for hosts that **do not** surface `notifications/resources/updated` to the LLM (Claude Code CLI as of 2026-Q1, and several IDE integrations). Driving it from such a host gives the LLM real push delivery without any host-level subscribe support.
-
-The full reference is at [`docs/INSTRUCTIONS_DAEMON.md`](./INSTRUCTIONS_DAEMON.md). The NDJSON op + event schema is enumerated there; this guide intentionally cross-links rather than duplicating.
+Three subcommands (`run`, `shell`, `daemon`); primary mode (`daemon`) reads NDJSON ops on stdin and emits NDJSON events on stdout. Embeds the same `composition::prod` adapters as `ssh-mcp` and `ssh-mcp-stdio`, wired to itself via an in-process `tokio::io::duplex` MCP transport. Exists for hosts that do **not** surface `notifications/resources/updated` to the LLM (Claude Code CLI as of 2026-Q1, several IDE integrations). Full reference + NDJSON op/event schema: [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md).
 
 ### New env vars
 
-The defaults preserve v4 behaviour. The new env vars are listed exhaustively in the canonical `docs/CONFIGURATION.md` table when Phase 6 promotes it; until then, [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0006](./adr/0006-backpressure-policies.md), and [ADR 0008](./adr/0008-ndjson-daemon-protocol.md) are authoritative. Highlights:
+Defaults preserve v4 behaviour. Full list and ranges live in [docs/CONFIGURATION.md](./CONFIGURATION.md) (promoted in Phase 6); ADRs [0003](./adr/0003-lifecycle-binding.md), [0006](./adr/0006-backpressure-policies.md), [0008](./adr/0008-ndjson-daemon-protocol.md) are authoritative until then. Highlights:
 
-- `SSH_LIFECYCLE_GRACE_MS` (default 2000) — grace window between last `ssh_unsubscribe` and `Closed` when `release_when_no_subs = true`.
-- `SSH_LIFECYCLE_OWN_GRACE_MS` (default unlimited unless `release_when_no_subs = true`) — grace for `Owned` resources that opted into auto-cleanup but never received a subscriber.
-- `SSH_SESSION_IDLE_GRACE_MS` (default 5000) — grace at the session level after `active_refs` drops to zero.
-- `SSH_LAG_POLICY_DEFAULT` (default `snapshot`) — lane LagPolicy for subscribers that do not specify.
-- `SSH_LANE_BUFFER` (default 1024) — per-lane mpsc capacity.
-- `SSH_MUX_BUFFER` (default 8192) — global mux mpsc capacity.
-- `SSH_BP_BLOCK_TIMEOUT_MS` (default 5000) — `BlockSlow` escape hatch.
-- `SSH_SUB_LEAK_RISK_WARN_S` (default 2) — warning threshold for `Owned` resources without subscribers.
-- `SSH_SUB_LEAK_RISK_KILL_S` (default 0 = off) — operator-opt-in hard kill threshold.
-- `SSH_NDJSON_LINE_MAX` (default 1 MB) — daemon stdin line size limit.
-- `SSH_HEARTBEAT_INTERVAL_S` (default 30) — daemon heartbeat cadence.
-- `SSH_DAEMON_STATS_INTERVAL_S` (default 60) — daemon stats auto-emit cadence.
-- `SSH_GRACE_HARD_TIMEOUT_S` (default 30) — daemon graceful shutdown deadline.
+| Var | Default | Purpose |
+|---|---|---|
+| `SSH_LIFECYCLE_GRACE_MS` | 2000 | Grace between last `ssh_unsubscribe` and `Closed` when `release_when_no_subs=true` |
+| `SSH_LIFECYCLE_OWN_GRACE_MS` | unlimited | Grace for `Owned` resources opted into auto-cleanup that never got a subscriber |
+| `SSH_SESSION_IDLE_GRACE_MS` | 5000 | Session-level grace after `active_refs == 0` |
+| `SSH_LAG_POLICY_DEFAULT` | `snapshot` | Lane LagPolicy when caller does not specify |
+| `SSH_LANE_BUFFER` | 1024 | Per-lane mpsc capacity |
+| `SSH_MUX_BUFFER` | 8192 | Global mux mpsc capacity |
+| `SSH_BP_BLOCK_TIMEOUT_MS` | 5000 | `BlockSlow` escape hatch |
+| `SSH_SUB_LEAK_RISK_WARN_S` | 2 | Warning threshold for `Owned` resources with 0 subs |
+| `SSH_SUB_LEAK_RISK_KILL_S` | 0 (off) | Operator-opt-in hard kill threshold |
+| `SSH_NDJSON_LINE_MAX` | 1 MB | Daemon stdin line size limit |
+| `SSH_HEARTBEAT_INTERVAL_S` | 30 | Daemon heartbeat cadence |
+| `SSH_DAEMON_STATS_INTERVAL_S` | 60 | Daemon stats auto-emit cadence |
+| `SSH_GRACE_HARD_TIMEOUT_S` | 30 | Daemon graceful shutdown deadline |
 
 ## Default-behaviour deltas
 
-The following defaults change between v4.8 and v5.0. None affect a host that does not opt into the new flag or env var; v4 idioms are preserved.
+These defaults change between v4.8 and v5.0. None affect a host that does not opt into a new flag or env var.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -145,7 +121,7 @@ flowchart LR
 | Shutdown sequence | abrupt for stdio; HTTP graceful via axum | NDJSON daemon adds explicit drain (`SSH_GRACE_HARD_TIMEOUT_S`) | `daemon` subcommand only |
 | Auto-warning for leak risk | none | `WARN: SUB_LEAK_RISK` line on next `ssh_list_*` call referencing the resource | always on once Phase 3 lands |
 
-The `release_when_no_subs = false` default means v5 hosts that do **not** add the flag inherit v4 leak semantics: a long-running shell persists until manually closed (or until the inactivity TTL fires). This is intentional. v6.0 will flip the default to `true`; v5 ships the flag wired but defaulted off so that hosts upgrade their prompts and idempotency strategy first.
+`release_when_no_subs = false` is intentional — v5 hosts that do **not** opt in inherit v4 leak semantics (long-running shell persists until manual close or inactivity TTL). v6.0 may flip the default; v5 ships it off so hosts upgrade prompts and idempotency strategy first.
 
 ## Recipes (before / after)
 
@@ -276,13 +252,15 @@ The daemon enforces the same lifecycle and lag policy as the in-process server. 
 
 ## LLM prompt updates
 
-If you embed `Implementation.instructions` in your host's system prompt or fine-tune a model on the v4 surface, refresh your prompt with the v5 root text. The canonical sources are [`docs/llm-ux/INSTRUCTIONS_27B.md`](./llm-ux/INSTRUCTIONS_27B.md) (compact prompt for 27B-class models) and [`docs/llm-ux/INSTRUCTIONS_70B.md`](./llm-ux/INSTRUCTIONS_70B.md) (extended prompt with tradeoff guidance). Both are forthcoming; until they ship, the prompt body is captured in [ADR 0005](./adr/0005-llm-ux-priorities.md).
+If you embed `Implementation.instructions` in your system prompt or fine-tune on the v4 surface, refresh with the v5 root text:
 
-The five golden rules from [ADR 0005](./adr/0005-llm-ux-priorities.md) (subscribe-first, always unsubscribe, watch lag_drops, cleanup on error, never hot-poll) are documented in [`docs/llm-ux/GOLDEN_RULES.md`](./llm-ux/GOLDEN_RULES.md) (forthcoming). If your fine-tuning recipe references rules by number, treat that file as the definitive list.
-
-The 10 prompts published via `prompts/list` change shape: 5 v4 carryovers (`run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`) plus 5 v5 additions (`push_first_long_command`, `push_first_interactive_shell`, `push_first_file_transfer`, `subscription_hygiene_audit`, `chaos_resume_after_disconnect`). The catalog is documented at [`docs/llm-ux/PROMPTS_CATALOG.md`](./llm-ux/PROMPTS_CATALOG.md) (forthcoming).
-
-The 10 documented anti-patterns (hot-poll, leak-on-error, lag-blindness, ...) live in [`docs/llm-ux/ANTIPATTERNS.md`](./llm-ux/ANTIPATTERNS.md) (forthcoming). Use this when the LLM produces a workflow that compiles but leaks.
+| Resource | Source |
+|---|---|
+| Compact root prompt (27B-class) | [docs/llm-ux/INSTRUCTIONS_27B.md](./llm-ux/INSTRUCTIONS_27B.md) |
+| Detailed root prompt (≥70B) | [docs/llm-ux/INSTRUCTIONS_70B.md](./llm-ux/INSTRUCTIONS_70B.md) |
+| Five golden rules | [docs/llm-ux/GOLDEN_RULES.md](./llm-ux/GOLDEN_RULES.md) |
+| 10 `prompts/list` workflows | [docs/llm-ux/PROMPTS_CATALOG.md](./llm-ux/PROMPTS_CATALOG.md) |
+| 10 documented anti-patterns | [docs/llm-ux/ANTIPATTERNS.md](./llm-ux/ANTIPATTERNS.md) |
 
 ## Deprecation timeline
 
@@ -296,22 +274,15 @@ No v4 idiom is forbidden in v5.0. No tool, env var, or wire format is removed. H
 
 ## References
 
-The 6 ADRs at [`docs/adr/`](./adr/) are the canonical source for every design decision behind v5.0. Read in order:
+ADRs (canonical for design decisions):
 
-- [ADR 0003 — Lifecycle Binding](./adr/0003-lifecycle-binding.md) — the refcount + grace-timer state machine and the `release_when_no_subs` flag.
-- [ADR 0004 — Channel Mux + SubId](./adr/0004-channel-mux-fairness.md) — the `(SubId, Uri)` cursor key and the per-lane mpsc fan-out.
-- [ADR 0005 — LLM UX Priorities](./adr/0005-llm-ux-priorities.md) — the layered escalation surface, the prompt catalog growth, the `SUB_LEAK_RISK` warning.
-- [ADR 0006 — Backpressure Policies](./adr/0006-backpressure-policies.md) — the four `LagPolicy` variants, the per-frontier failure mode matrix, the `BlockSlow` timeout escape hatch.
-- [ADR 0007 — Error Taxonomy](./adr/0007-error-taxonomy.md) — the 7 categories, the new codes (`RESOURCE_GONE`, `SUB_NOT_FOUND`, `LAG_*`, `INVALID_OP`, ...), and the canonical `DETAIL` phrasings.
-- [ADR 0008 — NDJSON Daemon Protocol](./adr/0008-ndjson-daemon-protocol.md) — `ssh-mcp-tail` op + event schema, in-process duplex transport, graceful shutdown.
+| ADR | Topic |
+|---|---|
+| [0003](./adr/0003-lifecycle-binding.md) | Lifecycle binding — refcount + grace-timer state machine, `release_when_no_subs` flag |
+| [0004](./adr/0004-channel-mux-fairness.md) | Channel mux + SubId — `(SubId, Uri)` cursor key, per-lane mpsc fan-out |
+| [0005](./adr/0005-llm-ux-priorities.md) | LLM UX priorities — layered escalation, prompt catalog, `SUB_LEAK_RISK` |
+| [0006](./adr/0006-backpressure-policies.md) | Backpressure — four `LagPolicy` variants, per-frontier matrix, `BlockSlow` timeout |
+| [0007](./adr/0007-error-taxonomy.md) | Error taxonomy — 7 categories, new codes (`RESOURCE_GONE`, `SUB_NOT_FOUND`, `LAG_*`, `INVALID_OP`, ...), canonical `DETAIL` phrasings |
+| [0008](./adr/0008-ndjson-daemon-protocol.md) | NDJSON daemon protocol — `ssh-mcp-tail` op/event schema, in-process duplex transport, graceful shutdown |
 
-Operational follow-on:
-
-- [`docs/INSTRUCTIONS_DAEMON.md`](./INSTRUCTIONS_DAEMON.md) — the daemon NDJSON reference.
-- [`docs/TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) — symptom-driven diagnostic guide.
-- [`docs/llm-ux/`](./llm-ux/) — prompt catalog, golden rules, error handbook, anti-patterns.
-- [`docs/MIGRATION_v3_to_v4.md`](./MIGRATION_v3_to_v4.md) — historical (v3 to v4 hexagonal restructuring; not relevant for v5).
-- [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) — full hexagonal layout (will be refreshed when Phase 6 lands).
-- [`docs/LOCKS.md`](./LOCKS.md) — lock-free invariants enforced by Clippy.
-- [`docs/RESOURCES.md`](./RESOURCES.md) — resource scheme contract.
-- [`docs/CONFIGURATION.md`](./CONFIGURATION.md) — full env var table (Phase 6 promotes the v5 entries).
+Operational follow-on: [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md), [TROUBLESHOOTING.md](./TROUBLESHOOTING.md), [llm-ux/](./llm-ux/), [ARCHITECTURE.md](./ARCHITECTURE.md), [LOCKS.md](./LOCKS.md), [RESOURCES.md](./RESOURCES.md), [CONFIGURATION.md](./CONFIGURATION.md). Historical: [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md).
