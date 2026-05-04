@@ -57,11 +57,16 @@ use super::peer_handle::{PeerTable, RmcpPeerHandle};
 fn map_resource_error(err: DomainError) -> McpError {
     match err {
         DomainError::InvalidArgument(reason) => McpError::invalid_params(reason, None),
+        // `ResourceGone` is semantically a not-found that documents the
+        // closed-then-attached race so the caller can stop polling. Folded
+        // into the same arm as the `*NotFound` variants to keep the wire
+        // mapping consistent and silence `clippy::match_same_arms`.
         DomainError::SessionNotFound(_)
         | DomainError::ShellNotFound(_)
         | DomainError::CommandNotFound(_)
         | DomainError::TransferNotFound(_)
-        | DomainError::ForwardNotFound(_) => McpError::resource_not_found(err.to_string(), None),
+        | DomainError::ForwardNotFound(_)
+        | DomainError::ResourceGone(_) => McpError::resource_not_found(err.to_string(), None),
         DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
         | DomainError::Transport(_)
@@ -72,7 +77,9 @@ fn map_resource_error(err: DomainError) -> McpError {
         | DomainError::Internal(_)
         | DomainError::MaxCommandsExceeded { .. }
         | DomainError::MaxShellsExceeded { .. }
-        | DomainError::MaxTransfersExceeded { .. } => {
+        | DomainError::MaxTransfersExceeded { .. }
+        | DomainError::LifecycleStateConflict { .. }
+        | DomainError::SessionRefcountUnderflow(_) => {
             McpError::internal_error(err.to_string(), None)
         }
     }

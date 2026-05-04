@@ -189,20 +189,31 @@ pub(crate) async fn render_tool_error_with_suggestions(
 const SUGGEST_TOP_N: usize = 3;
 
 async fn collect_suggestions(err: &DomainError, lister: &dyn IdLister) -> Vec<String> {
+    if let Some(target) = lookup_target(err) {
+        return suggest_for(target, lister).await;
+    }
+    Vec::new()
+}
+
+/// Variants that benefit from a closest-match suggestion.
+enum LookupTarget<'a> {
+    Session(&'a str),
+    Shell(&'a str),
+    Command(&'a str),
+    Transfer(&'a str),
+    Forward(&'a str),
+}
+
+/// Pick the lookup arm — exhaustive match keeps every existing
+/// `DomainError` variant under compile-time scrutiny without inflating
+/// `collect_suggestions` past the 30-line threshold.
+fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
     match err {
-        DomainError::SessionNotFound(id) => {
-            closest_ids(id.as_str(), lister.list_sessions().await, SUGGEST_TOP_N)
-        }
-        DomainError::ShellNotFound(id) => {
-            closest_ids(id.as_str(), lister.list_shells().await, SUGGEST_TOP_N)
-        }
-        DomainError::CommandNotFound(id) => {
-            closest_ids(id.as_str(), lister.list_commands().await, SUGGEST_TOP_N)
-        }
-        DomainError::TransferNotFound(id) => {
-            closest_ids(id.as_str(), lister.list_transfers().await, SUGGEST_TOP_N)
-        }
-        DomainError::ForwardNotFound(id) => collect_forward_suggestions(id.as_str(), lister).await,
+        DomainError::SessionNotFound(id) => Some(LookupTarget::Session(id.as_str())),
+        DomainError::ShellNotFound(id) => Some(LookupTarget::Shell(id.as_str())),
+        DomainError::CommandNotFound(id) => Some(LookupTarget::Command(id.as_str())),
+        DomainError::TransferNotFound(id) => Some(LookupTarget::Transfer(id.as_str())),
+        DomainError::ForwardNotFound(id) => Some(LookupTarget::Forward(id.as_str())),
         DomainError::InvalidArgument(_)
         | DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
@@ -214,7 +225,21 @@ async fn collect_suggestions(err: &DomainError, lister: &dyn IdLister) -> Vec<St
         | DomainError::Internal(_)
         | DomainError::MaxCommandsExceeded { .. }
         | DomainError::MaxShellsExceeded { .. }
-        | DomainError::MaxTransfersExceeded { .. } => Vec::new(),
+        | DomainError::MaxTransfersExceeded { .. }
+        | DomainError::ResourceGone(_)
+        | DomainError::LifecycleStateConflict { .. }
+        | DomainError::SessionRefcountUnderflow(_) => None,
+    }
+}
+
+/// Resolve a [`LookupTarget`] into the closest-id list.
+async fn suggest_for(target: LookupTarget<'_>, lister: &dyn IdLister) -> Vec<String> {
+    match target {
+        LookupTarget::Session(id) => closest_ids(id, lister.list_sessions().await, SUGGEST_TOP_N),
+        LookupTarget::Shell(id) => closest_ids(id, lister.list_shells().await, SUGGEST_TOP_N),
+        LookupTarget::Command(id) => closest_ids(id, lister.list_commands().await, SUGGEST_TOP_N),
+        LookupTarget::Transfer(id) => closest_ids(id, lister.list_transfers().await, SUGGEST_TOP_N),
+        LookupTarget::Forward(id) => collect_forward_suggestions(id, lister).await,
     }
 }
 
@@ -494,6 +519,21 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "MAX_TRANSFERS_EXCEEDED",
             "maximum transfers per session reached".to_string(),
             Some(format!("limit={limit}")),
+        ),
+        DomainError::ResourceGone(uri) => (
+            "RESOURCE_GONE",
+            "resource has been closed and is no longer observable".to_string(),
+            Some(uri.clone()),
+        ),
+        DomainError::LifecycleStateConflict { current, attempted } => (
+            "LIFECYCLE_STATE_CONFLICT",
+            format!("cannot apply '{attempted}' while in {current:?}"),
+            None,
+        ),
+        DomainError::SessionRefcountUnderflow(id) => (
+            "INTERNAL_ERROR",
+            format!("session refcount underflow on {id}"),
+            Some(id.as_str().to_string()),
         ),
     }
 }
