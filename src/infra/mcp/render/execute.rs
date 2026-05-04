@@ -42,10 +42,13 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
         out.push_str("\nAGENT_ID: ");
         out.push_str(&sanitize_value(agent.as_str()));
     }
+    // v5 Phase 3 — subscribe is RECOMMENDED for commands: long-poll
+    // via ssh_get_command_output still works, but push removes the
+    // poll loop entirely.
     append_subscribe_hint(
         &mut out,
         &format!(
-            "subscribe to command://{cmd}/output for realtime output (preferred over polling)",
+            "RECOMMENDED: ssh_subscribe uri=command://{cmd}/output. Falls back gracefully if you skip (use ssh_get_command_output wait=true).",
             cmd = command_id.as_str(),
         ),
     );
@@ -53,12 +56,15 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
     out
 }
 
-/// Successor tools after `ssh_execute: STARTED` — fetch output (with
-/// long-poll) or cancel the spawned command.
+/// Successor tools after `ssh_execute: STARTED`.
+///
+/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then the drive ops,
+/// with the long-poll fallback listed last.
 fn next_hint_for_execute(command_id: &str) -> String {
     format!(
-        "ssh_get_command_output(command_id={command_id}, wait=true) | \
-         ssh_cancel_command(command_id={command_id})"
+        "ssh_subscribe uri=command://{command_id}/output | \
+         ssh_cancel_command(command_id={command_id}) | \
+         ssh_get_command_output(command_id={command_id}, wait=true) (poll fallback)"
     )
 }
 

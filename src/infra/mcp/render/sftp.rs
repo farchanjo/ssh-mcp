@@ -81,6 +81,34 @@ fn render_started(
         TransferDirection::Download => (remote_path, local_path),
     };
     let mut out = String::with_capacity(384);
+    append_started_header(
+        &mut out,
+        tool,
+        transfer_id,
+        session_id,
+        agent_id,
+        from,
+        to,
+        total_bytes,
+    );
+    append_started_advisories(&mut out, transfer_id);
+    out
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "private helper extracted to keep render_started under 30 lines; consolidating is worse than the lint"
+)]
+fn append_started_header(
+    out: &mut String,
+    tool: &str,
+    transfer_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    from: &str,
+    to: &str,
+    total_bytes: u64,
+) {
     out.push_str(tool);
     out.push_str(": STARTED\nTRANSFER_ID: ");
     out.push_str(transfer_id);
@@ -100,18 +128,30 @@ fn render_started(
     out.push_str(&total_bytes.to_string());
     out.push_str(" bytes)\nBYTES: ");
     out.push_str(&total_bytes.to_string());
-    append_subscribe_hint(
-        &mut out,
-        &format!("subscribe to transfer://{transfer_id}/progress for realtime progress"),
-    );
-    append_next_line(&mut out, &next_hint_for_transfer(transfer_id));
-    out
 }
 
-/// Successor tools after an SFTP `STARTED` response — long-poll the
-/// transfer to terminal state.
+fn append_started_advisories(out: &mut String, transfer_id: &str) {
+    // v5 Phase 3 — subscribe is RECOMMENDED for transfers: long-poll
+    // via ssh_get_transfer_progress still works, but push avoids the
+    // poll churn for slow transfers.
+    append_subscribe_hint(
+        out,
+        &format!(
+            "RECOMMENDED: ssh_subscribe uri=transfer://{transfer_id}/progress. Falls back gracefully if you skip (use ssh_get_transfer_progress wait=true)."
+        ),
+    );
+    append_next_line(out, &next_hint_for_transfer(transfer_id));
+}
+
+/// Successor tools after an SFTP `STARTED` response.
+///
+/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then the long-poll
+/// fallback.
 fn next_hint_for_transfer(transfer_id: &str) -> String {
-    format!("ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true)")
+    format!(
+        "ssh_subscribe uri=transfer://{transfer_id}/progress | \
+         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
+    )
 }
 
 /// Append a single `NEXT: <hint>` advisory line listing concrete tool

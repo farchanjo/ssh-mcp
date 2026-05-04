@@ -27,24 +27,40 @@ pub fn forward_render(outcome: ForwardPortOutcome) -> String {
     let local = format!("0.0.0.0:{local_port}");
     let remote = format!("{remote_address}:{remote_port}");
     let mut out = String::with_capacity(288);
-    out.push_str("SSH_FORWARD: OK\nFORWARD_ID: ");
-    out.push_str(&forward);
-    out.push_str("\nSESSION_ID: ");
-    out.push_str(&sanitize_value(session_id.as_str()));
-    out.push_str("\nLOCAL: ");
-    out.push_str(&sanitize_value(&local));
-    out.push_str("\nREMOTE: ");
-    out.push_str(&sanitize_value(&remote));
-    out.push_str("\nACTIVE: true");
-    append_subscribe_hint(
-        &mut out,
-        &format!("subscribe to forward://{forward}/events for realtime event log"),
-    );
-    append_next_line(
-        &mut out,
-        &format!("resources/subscribe forward://{forward}/events"),
-    );
+    append_forward_header(&mut out, &forward, session_id.as_str(), &local, &remote);
+    append_forward_advisories(&mut out, &forward);
     out
+}
+
+fn append_forward_header(
+    out: &mut String,
+    forward: &str,
+    session_id: &str,
+    local: &str,
+    remote: &str,
+) {
+    out.push_str("SSH_FORWARD: OK\nFORWARD_ID: ");
+    out.push_str(forward);
+    out.push_str("\nSESSION_ID: ");
+    out.push_str(&sanitize_value(session_id));
+    out.push_str("\nLOCAL: ");
+    out.push_str(&sanitize_value(local));
+    out.push_str("\nREMOTE: ");
+    out.push_str(&sanitize_value(remote));
+    out.push_str("\nACTIVE: true");
+}
+
+fn append_forward_advisories(out: &mut String, forward: &str) {
+    // v5 Phase 3 — forwarders only emit events on connect/error, so
+    // subscribe is RECOMMENDED (no polling alternative — but skipping
+    // simply means missing the event log).
+    append_subscribe_hint(
+        out,
+        &format!(
+            "RECOMMENDED: ssh_subscribe uri=forward://{forward}/events. Falls back gracefully if you skip (no polling alternative)."
+        ),
+    );
+    append_next_line(out, &format!("ssh_subscribe uri=forward://{forward}/events"));
 }
 
 /// Append a single `NEXT: <hint>` advisory line listing concrete tool
@@ -100,16 +116,15 @@ mod tests {
             remote_port: 3306,
             started_at: "2026-04-18T10:30:00+00:00".to_string(),
         });
-        assert_eq!(
-            m,
+        assert!(m.starts_with(
             "SSH_FORWARD: OK\n\
              FORWARD_ID: fwd-1\n\
              SESSION_ID: sess-1\n\
              LOCAL: 0.0.0.0:8080\n\
              REMOTE: localhost:3306\n\
-             ACTIVE: true\n\
-             HINT: subscribe to forward://fwd-1/events for realtime event log\n\
-             NEXT: resources/subscribe forward://fwd-1/events"
-        );
+             ACTIVE: true\n"
+        ));
+        assert!(m.contains("HINT: RECOMMENDED: ssh_subscribe uri=forward://fwd-1/events"));
+        assert!(m.contains("NEXT: ssh_subscribe uri=forward://fwd-1/events"));
     }
 }
