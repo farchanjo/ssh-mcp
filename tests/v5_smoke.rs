@@ -8,9 +8,9 @@
 //!
 //! Tests:
 //! 1. `t05_subscribe_returns_sub_id` — the 9 Phase 3 tools register
-//!    and `ssh_subscribe` returns a non-empty SubId.
+//!    and `sub_open` returns a non-empty SubId.
 //! 2. `t06_release_when_no_subs_grace` — the new args flag is
-//!    discoverable on `ssh_shell_open` / `ssh_execute` / `ssh_upload` /
+//!    discoverable on `ssh_shell_open` / `ssh_exec` / `ssh_upload` /
 //!    `ssh_download` schemas.
 //! 3. `t07_lag_policy_snapshot_recovery` — `LagPolicy::Snapshot`
 //!    rebuilds after the lane mpsc fills.
@@ -23,8 +23,8 @@
 //!    `LeakWarnBridge` consumer-side wiring forwards alerts onto the
 //!    `notifications/progress` channel when `_meta.progressToken` is
 //!    set (no-op otherwise).
-//! 7. `t11_list_sessions_includes_warn` — `ssh_list_sessions` /
-//!    `ssh_list_commands` / `resources/list` render WARN lines for
+//! 7. `t11_list_sessions_includes_warn` — `ssh_sessions` /
+//!    `ssh_commands` / `resources/list` render WARN lines for
 //!    every resource currently flagged by the watcher's probe.
 //! 8. `t12_pause_resume_round_trip_via_lane_admin` — pause/resume
 //!    wiring through the dyn `LaneAdmin` port.
@@ -60,15 +60,15 @@ use ssh_mcp::ports::subscriber_lane::{LaneAdmin, LanePolicy, SubscriberLaneAsync
 use ssh_mcp::ports::subscriber_registry::ResourceKind;
 
 const PHASE3_TOOLS: [&str; 9] = [
-    "ssh_subscribe",
-    "ssh_unsubscribe",
-    "ssh_sub_pause",
-    "ssh_sub_resume",
-    "ssh_sub_filter",
-    "ssh_sub_replay",
-    "ssh_sub_list",
-    "ssh_sub_stats",
-    "ssh_daemon_stats",
+    "sub_open",
+    "sub_close",
+    "sub_pause",
+    "sub_resume",
+    "sub_filter",
+    "sub_replay",
+    "sub_list",
+    "sub_stats",
+    "sub_stats_all",
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -104,7 +104,7 @@ fn t06_release_when_no_subs_grace() {
     let server = build_server();
     let names = [
         "ssh_shell_open",
-        "ssh_execute",
+        "ssh_exec",
         "ssh_upload",
         "ssh_download",
     ];
@@ -402,7 +402,7 @@ async fn t11_list_sessions_includes_warn() {
     // 3. Wait until the watcher flags it.
     // 4. Pull the leak probe off the server and verify
     //    `current_alerts()` surfaces the alert — the same probe the
-    //    `ssh_list_sessions` / `ssh_list_commands` / `resources/list`
+    //    `ssh_sessions` / `ssh_commands` / `resources/list`
     //    handlers consult to append the WARN line.
     let (server, lifecycle, leak_handle) = build_server_with_leak_watcher();
     lifecycle.track_resource(
@@ -451,7 +451,7 @@ async fn t11_list_sessions_includes_warn() {
     let body = list_sessions_render_with_warnings(outcome, &alerts);
     assert!(
         body.contains("WARN: SUB_LEAK_RISK shell://leaky-t11/output"),
-        "ssh_list_sessions response body must include WARN line, body: {body}"
+        "ssh_sessions response body must include WARN line, body: {body}"
     );
 
     leak_handle.cancel.cancel();

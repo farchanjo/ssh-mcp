@@ -9,14 +9,14 @@
 //!
 //! Args are split per tool domain to keep the file sizes manageable:
 //!
-//! - [`connection`]: `ssh_connect`, `ssh_disconnect`, `ssh_list_sessions`,
+//! - [`connection`]: `ssh_connect`, `ssh_disconnect`, `ssh_sessions`,
 //!   `ssh_disconnect_agent` and the [`connection::ReusePolicy`] enum.
-//! - [`execute`]: `ssh_execute`, `ssh_get_command_output`,
-//!   `ssh_list_commands`, `ssh_cancel_command` and the
+//! - [`execute`]: `ssh_exec`, `ssh_exec_output`,
+//!   `ssh_commands`, `ssh_exec_cancel` and the
 //!   [`execute::CommandStatus`] enum.
-//! - [`shell`]: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`,
+//! - [`shell`]: `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_press`,
 //!   `ssh_shell_read`, `ssh_shell_wait_for`, `ssh_shell_close`.
-//! - [`sftp`]: `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress`.
+//! - [`sftp`]: `ssh_upload`, `ssh_download`, `ssh_transfer_progress`.
 //! - [`forward`]: `ssh_forward` (feature-gated `port_forward`).
 //!
 //! `tool_router.rs` references each type through its full submodule

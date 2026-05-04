@@ -115,7 +115,7 @@ const CATALOG: &[PromptDef] = &[
     PromptDef {
         name: "push_first_long_command",
         title: "Run a long command and consume its output via push",
-        description: "ssh_execute -> ssh_subscribe -> drain command://<id>/output without polling.",
+        description: "ssh_exec -> sub_open -> drain command://<id>/output without polling.",
         arguments: &[
             ("session_id", "SESSION_ID returned from ssh_connect.", true),
             ("command", "Long-running shell command line.", true),
@@ -124,7 +124,7 @@ const CATALOG: &[PromptDef] = &[
     PromptDef {
         name: "push_first_interactive_shell",
         title: "Drive an interactive shell with push-first reads",
-        description: "ssh_shell_open -> ssh_subscribe shell://<id>/output -> ssh_shell_write / ssh_shell_send_key.",
+        description: "ssh_shell_open -> sub_open shell://<id>/output -> ssh_shell_write / ssh_shell_press.",
         arguments: &[
             ("session_id", "SESSION_ID returned from ssh_connect.", true),
             (
@@ -137,7 +137,7 @@ const CATALOG: &[PromptDef] = &[
     PromptDef {
         name: "push_first_file_transfer",
         title: "Upload / download a file with progress push",
-        description: "ssh_upload (or ssh_download) -> ssh_subscribe transfer://<id>/progress -> drain until completed.",
+        description: "ssh_upload (or ssh_download) -> sub_open transfer://<id>/progress -> drain until completed.",
         arguments: &[
             ("session_id", "SESSION_ID returned from ssh_connect.", true),
             ("local_path", "Absolute local path.", true),
@@ -147,7 +147,7 @@ const CATALOG: &[PromptDef] = &[
     PromptDef {
         name: "subscription_hygiene_audit",
         title: "Audit and clean up zombie subscriptions",
-        description: "ssh_sub_list -> identify SUB_LEAK_RISK lanes -> ssh_unsubscribe each.",
+        description: "sub_list -> identify SUB_LEAK_RISK lanes -> sub_close each.",
         arguments: &[(
             "uri_prefix",
             "Optional URI prefix to scope the audit (e.g. shell://).",
@@ -157,9 +157,9 @@ const CATALOG: &[PromptDef] = &[
     PromptDef {
         name: "chaos_resume_after_disconnect",
         title: "Recover a subscription after a transport drop",
-        description: "ssh_sub_replay from cursor / ssh_sub_resume / refresh filter to chase a dropped peer.",
+        description: "sub_replay from cursor / sub_resume / refresh filter to chase a dropped peer.",
         arguments: &[
-            ("sub_id", "SUB_ID returned from ssh_subscribe.", true),
+            ("sub_id", "SUB_ID returned from sub_open.", true),
             (
                 "from_cursor",
                 "Byte cursor to replay from. Use 0 to replay the full window.",
@@ -262,7 +262,7 @@ fn render_investigate_session(args: &PromptArguments) -> Result<String, McpError
     let session_id = required_str(args, "session_id")?;
     Ok(format!(
         "Investigate the SSH session {session_id}:\n\
-         1. ssh_list_commands(session_id={session_id}) to see async commands\n\
+         1. ssh_commands(session_id={session_id}) to see async commands\n\
          2. resources/read session://{session_id}/health for health snapshot\n\
          3. ssh_disconnect(session_id={session_id}) when finished."
     ))
@@ -275,7 +275,7 @@ fn render_upload_and_verify(args: &PromptArguments) -> Result<String, McpError> 
     Ok(format!(
         "Upload {local_path} to {remote_path} on session {session_id}:\n\
          1. ssh_upload(session_id={session_id}, local_path={local_path}, remote_path={remote_path}) -> TRANSFER_ID\n\
-         2. ssh_get_transfer_progress(transfer_id=..., wait=true) until status=completed\n\
+         2. ssh_transfer_progress(transfer_id=..., wait=true) until status=completed\n\
          3. ssh_run(... command=\"sha256sum {remote_path}\") to verify integrity."
     ))
 }
@@ -288,7 +288,7 @@ fn render_interactive_shell_drive(args: &PromptArguments) -> Result<String, McpE
          1. ssh_shell_open(session_id={session_id}) -> SHELL_ID\n\
          2. resources/subscribe shell://<SHELL_ID>/output\n\
          3. ssh_shell_wait_for(shell_id=..., patterns=[\"{prompt_pattern}\"], timeout_secs=10)\n\
-         4. Drive with ssh_shell_write or ssh_shell_send_key."
+         4. Drive with ssh_shell_write or ssh_shell_press."
     ))
 }
 
@@ -305,10 +305,10 @@ fn render_push_first_long_command(args: &PromptArguments) -> Result<String, McpE
     let command = required_str(args, "command")?;
     Ok(format!(
         "Run a long-running command on {session_id} with push-first output:\n\
-         1. ssh_execute(session_id={session_id}, command=\"{command}\") -> COMMAND_ID\n\
-         2. ssh_subscribe(uri=\"command://<COMMAND_ID>/output\", lifetime=\"manual\") -> SUB_ID\n\
+         1. ssh_exec(session_id={session_id}, command=\"{command}\") -> COMMAND_ID\n\
+         2. sub_open(uri=\"command://<COMMAND_ID>/output\", lifetime=\"manual\") -> SUB_ID\n\
          3. Drain command://<COMMAND_ID>/output via push notifications (no polling)\n\
-         4. ssh_unsubscribe(sub_id=<SUB_ID>) when the command terminates."
+         4. sub_close(sub_id=<SUB_ID>) when the command terminates."
     ))
 }
 
@@ -318,9 +318,9 @@ fn render_push_first_interactive_shell(args: &PromptArguments) -> Result<String,
     Ok(format!(
         "Drive an interactive PTY on {session_id} with push-first reads:\n\
          1. ssh_shell_open(session_id={session_id}, release_when_no_subs=true) -> SHELL_ID\n\
-         2. ssh_subscribe(uri=\"shell://<SHELL_ID>/output\", filter=\"{prompt_pattern}\") -> SUB_ID\n\
-         3. ssh_shell_send_key / ssh_shell_write while drains arrive on the lane\n\
-         4. ssh_unsubscribe(sub_id=<SUB_ID>) and ssh_shell_close when finished."
+         2. sub_open(uri=\"shell://<SHELL_ID>/output\", filter=\"{prompt_pattern}\") -> SUB_ID\n\
+         3. ssh_shell_press / ssh_shell_write while drains arrive on the lane\n\
+         4. sub_close(sub_id=<SUB_ID>) and ssh_shell_close when finished."
     ))
 }
 
@@ -331,9 +331,9 @@ fn render_push_first_file_transfer(args: &PromptArguments) -> Result<String, Mcp
     Ok(format!(
         "Upload {local_path} -> {remote_path} on {session_id} with progress push:\n\
          1. ssh_upload(session_id={session_id}, local_path={local_path}, remote_path={remote_path}, release_when_no_subs=true) -> TRANSFER_ID\n\
-         2. ssh_subscribe(uri=\"transfer://<TRANSFER_ID>/progress\") -> SUB_ID\n\
+         2. sub_open(uri=\"transfer://<TRANSFER_ID>/progress\") -> SUB_ID\n\
          3. Drain transfer://<TRANSFER_ID>/progress until status=completed\n\
-         4. ssh_unsubscribe(sub_id=<SUB_ID>)."
+         4. sub_close(sub_id=<SUB_ID>)."
     ))
 }
 
@@ -353,9 +353,9 @@ fn render_subscription_hygiene_audit(args: &PromptArguments) -> Result<String, M
     };
     Ok(format!(
         "Audit and clean up zombie subscriptions ({prefix_clause}):\n\
-         1. ssh_sub_list(uri_prefix={prefix})\n\
-         2. For each entry tagged WARN: SUB_LEAK_RISK, call ssh_unsubscribe(sub_id=...)\n\
-         3. ssh_daemon_stats to confirm lanes_total and lagged_drops are bounded."
+         1. sub_list(uri_prefix={prefix})\n\
+         2. For each entry tagged WARN: SUB_LEAK_RISK, call sub_close(sub_id=...)\n\
+         3. sub_stats_all to confirm lanes_total and lagged_drops are bounded."
     ))
 }
 
@@ -372,10 +372,10 @@ fn render_chaos_resume(args: &PromptArguments) -> Result<String, McpError> {
     };
     Ok(format!(
         "Recover subscription {sub_id} after a transport drop:\n\
-         1. ssh_sub_replay(sub_id={sub_id}, from_cursor={cursor})\n\
-         2. ssh_sub_resume(sub_id={sub_id}) if the lane was paused\n\
-         3. ssh_sub_filter to refresh the regex when the input shape changed\n\
-         4. ssh_sub_stats to verify queue_depth and lagged_drops are bounded."
+         1. sub_replay(sub_id={sub_id}, from_cursor={cursor})\n\
+         2. sub_resume(sub_id={sub_id}) if the lane was paused\n\
+         3. sub_filter to refresh the regex when the input shape changed\n\
+         4. sub_stats to verify queue_depth and lagged_drops are bounded."
     ))
 }
 
@@ -476,7 +476,7 @@ mod tests {
         let PromptMessageContent::Text { text } = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_list_commands(session_id=sess-x)"));
+        assert!(text.contains("ssh_commands(session_id=sess-x)"));
         assert!(text.contains("session://sess-x/health"));
         assert!(text.contains("ssh_disconnect(session_id=sess-x)"));
     }
@@ -511,10 +511,10 @@ mod tests {
         let PromptMessageContent::Text { text } = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_execute(session_id=s-1"));
-        assert!(text.contains("ssh_subscribe"));
+        assert!(text.contains("ssh_exec(session_id=s-1"));
+        assert!(text.contains("sub_open"));
         assert!(text.contains("command://<COMMAND_ID>/output"));
-        assert!(text.contains("ssh_unsubscribe"));
+        assert!(text.contains("sub_close"));
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
             panic!("text expected");
         };
         assert!(text.contains("release_when_no_subs=true"));
-        assert!(text.contains("ssh_subscribe"));
+        assert!(text.contains("sub_open"));
         assert!(text.contains("filter=\"$ \""));
     }
 
@@ -616,7 +616,7 @@ mod tests {
         let PromptMessageContent::Text { text } = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_sub_replay(sub_id=019, from_cursor=0)"));
+        assert!(text.contains("sub_replay(sub_id=019, from_cursor=0)"));
         args.insert("from_cursor".to_string(), json!(2_048));
         let with_cursor = get_prompt("chaos_resume_after_disconnect", &args).expect("body");
         let PromptMessageContent::Text { text } = &with_cursor.messages[0].content else {

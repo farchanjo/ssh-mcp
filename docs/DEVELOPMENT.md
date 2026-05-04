@@ -304,7 +304,7 @@ Per-lane state lives behind `Arc<MultiplexLane>` at `src/adapters/subscription/s
 | `filter` | `ArcSwap<FilterRule>` | hot-reloadable regex / level. `load_full()` returns a snapshot before any `.await`. |
 | `lifecycle` | `Arc<ResourceLifecycle>` | back-link to the owning resource (Phase 1). |
 | `stats` | `SubscriberStats` (8 atomics) | `events_sent: AtomicU64`, `bytes_sent: AtomicU64`, `lagged_drops: AtomicU64`, `lagged_recoveries: AtomicU64`, `queue_depth: AtomicUsize`, `queue_high_watermark: AtomicUsize`, `block_total_ms: AtomicU64`. All `.load(Relaxed)` reads; `.fetch_add(Relaxed)` writes. `fetch_max(Relaxed)` for high watermark. |
-| `pause_flag` | `AtomicBool` | `Acquire` reads on the drain side; `Release` writes from `ssh_sub_pause` / `ssh_sub_resume`. |
+| `pause_flag` | `AtomicBool` | `Acquire` reads on the drain side; `Release` writes from `sub_pause` / `sub_resume`. |
 
 #### ChannelMux fairness
 
@@ -525,9 +525,9 @@ sequenceDiagram
     Server->>Server: SessionRepository.insert(SessionEntity)
     Server-->>Client: SSH_CONNECT: OK\nSESSION_ID: a3f2b1d7-...
 
-    Client->>Server: ssh_execute(session_id, command="uname -a")
+    Client->>Server: ssh_exec(session_id, command="uname -a")
     Server->>Server: register RunningCommand + spawn task
-    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
+    Server-->>Client: SSH_EXEC: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
     par command runs in background
         Server->>SSH: open_channel + exec
@@ -537,9 +537,9 @@ sequenceDiagram
         Server->>Server: ArcSwap publish + OnceCell::set(exit_code=0)
     end
 
-    Client->>Server: ssh_get_command_output(command_id, wait=true)
+    Client->>Server: ssh_exec_output(command_id, wait=true)
     Server->>Server: status_rx watch (Completed)
-    Server-->>Client: SSH_GET_COMMAND_OUTPUT: COMPLETED\nEXIT: 0\n--- stdout ... ---
+    Server-->>Client: SSH_EXEC_OUTPUT: COMPLETED\nEXIT: 0\n--- stdout ... ---
 
     Client->>Server: ssh_disconnect(session_id)
     Server->>Server: cancel commands, close shells, abort transfers
@@ -643,12 +643,12 @@ sequenceDiagram
 
     Note over Remote: shell prints date every second
 
-    Client->>Server: ssh_shell_send_key(shell_id, key=ctrl_c)
+    Client->>Server: ssh_shell_press(shell_id, key=ctrl_c)
     Server->>Server: ShellKey::CtrlC.encode(empty_mods) returns b"\x03"
     Server->>Shell: input_tx.send(WriteRequest::Data(b"\x03"))
     Shell->>Remote: \x03
     Remote-->>Shell: ^C $
-    Server-->>Client: SSH_SHELL_SEND_KEY OK<br/>SHELL_ID: ...<br/>KEY: ctrl_c<br/>BYTES_SENT: 1
+    Server-->>Client: SSH_SHELL_PRESS OK<br/>SHELL_ID: ...<br/>KEY: ctrl_c<br/>BYTES_SENT: 1
 
     Note over Client: Shell remains open and ready for next command.
 ```
@@ -664,9 +664,9 @@ sequenceDiagram
     participant Reg as SubscriptionRegistry
     participant Cmd as RunningCommand
 
-    Client->>Server: ssh_execute(session_id, command="cargo build --release")
+    Client->>Server: ssh_exec(session_id, command="cargo build --release")
     Server->>Cmd: spawn (ArcSwap of OutputBuffer + broadcast + OnceCell)
-    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
+    Server-->>Client: SSH_EXEC: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
     Client->>Server: resources/subscribe command://7d4c8e2a-.../output
     Server->>Reg: subscribe(Command, "7d4c8e2a-...", uri, peer_id, peer)

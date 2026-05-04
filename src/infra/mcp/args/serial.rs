@@ -6,12 +6,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// `ssh_serial_open` arguments. The full-fat parameter list is exposed
+/// `serial_open` arguments. The full-fat parameter list is exposed
 /// so embedded / industrial workflows that talk RS-485 / RS-422 / 7E1
 /// can configure end-to-end without shelling out to `stty`.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialOpenArgs {
+pub struct SerialOpenArgs {
     /// OS device path. Linux: `/dev/ttyUSB0` / `/dev/ttyACM0`.
     /// macOS: `/dev/tty.usbserial-XXXX`. Windows: `COM3`.
     pub path: String,
@@ -48,7 +48,7 @@ pub struct SshSerialOpenArgs {
     #[serde(default)]
     pub initial_rts: Option<bool>,
     /// Optional human label (e.g. `"GPS-1"`) surfaced on
-    /// `ssh_serial_list_open`.
+    /// `serial_active`.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -77,24 +77,24 @@ const fn default_read_timeout_ms() -> u64 {
     100
 }
 
-/// `ssh_serial_close` arguments.
+/// `serial_close` arguments.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialCloseArgs {
-    /// `SERIAL_ID` returned by `ssh_serial_open`.
+pub struct SerialCloseArgs {
+    /// `SERIAL_ID` returned by `serial_open`.
     pub serial_id: String,
 }
 
-/// `ssh_serial_write` arguments. The payload accepts plain UTF-8
+/// `serial_write` arguments. The payload accepts plain UTF-8
 /// text (`text` field) OR base64-encoded raw bytes (`bytes_base64`)
 /// for binary protocols. Exactly one must be supplied.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialWriteArgs {
-    /// `SERIAL_ID` returned by `ssh_serial_open`.
+pub struct SerialWriteArgs {
+    /// `SERIAL_ID` returned by `serial_open`.
     pub serial_id: String,
     /// UTF-8 text payload. Newlines are NOT auto-appended; pass `"foo\n"`
-    /// or use `ssh_serial_send_key` for `enter` / `cr` / `lf`.
+    /// or use `serial_press` for `enter` / `cr` / `lf`.
     #[serde(default)]
     pub text: Option<String>,
     /// Base64-encoded raw bytes (binary protocols, packed frames).
@@ -102,12 +102,12 @@ pub struct SshSerialWriteArgs {
     pub bytes_base64: Option<String>,
 }
 
-/// `ssh_serial_send_key` arguments. Mirrors the shell `send_key`
+/// `serial_press` arguments. Mirrors the shell `send_key`
 /// surface for serial-friendly named keystrokes.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SshSerialSendKeyArgs {
-    /// `SERIAL_ID` returned by `ssh_serial_open`.
+pub struct SerialPressArgs {
+    /// `SERIAL_ID` returned by `serial_open`.
     pub serial_id: String,
     /// Key name. Accepted: `"enter"` / `"cr"` (`\r`), `"lf"` (`\n`),
     /// `"crlf"` (`\r\n`), `"esc"` (`\x1b`), `"tab"` (`\t`),
@@ -123,20 +123,20 @@ const fn default_repeat() -> u32 {
     1
 }
 
-/// `ssh_serial_list_ports` takes no arguments.
+/// `serial_scan` takes no arguments.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::empty_structs_with_brackets,
     reason = "schemars derives type:null for unit structs (`pub struct X;`); MCP spec mandates inputSchema.type==object"
 )]
-pub struct SshSerialListPortsArgs {}
+pub struct SerialListPortsArgs {}
 
-/// `ssh_serial_list_open` takes no arguments.
+/// `serial_active` takes no arguments.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::empty_structs_with_brackets,
     reason = "schemars derives type:null for unit structs (`pub struct X;`); MCP spec mandates inputSchema.type==object"
 )]
-pub struct SshSerialListOpenArgs {}
+pub struct SerialListOpenArgs {}

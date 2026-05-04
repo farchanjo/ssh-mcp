@@ -10,7 +10,7 @@
 //! 1. Resolve the [`CommandEntity`] via [`CommandRepository::get`]. A missing
 //!    id short-circuits with [`DomainError::CommandNotFound`] so the inbound
 //!    adapter can render the canonical
-//!    `SSH_GET_COMMAND_OUTPUT: ERROR / REASON: [COMMAND_NOT_FOUND]` block.
+//!    `SSH_EXEC_OUTPUT: ERROR / REASON: [COMMAND_NOT_FOUND]` block.
 //! 2. When [`GetCommandOutputRequest::wait`] is `true`, poll the repository
 //!    until the command leaves [`CommandStatus::Running`] or the
 //!    `wait_timeout` budget is exhausted. The `OutputStreamPort` does not
@@ -52,7 +52,7 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Inbound DTO. Built by the rmcp tool wrapper (etapa H16).
 #[derive(Debug, Clone)]
 pub struct GetCommandOutputRequest {
-    /// `COMMAND_ID` returned from `ssh_execute`.
+    /// `COMMAND_ID` returned from `ssh_exec`.
     pub command_id: CommandId,
     /// `true` to block until the command leaves
     /// [`CommandStatus::Running`] or [`Self::wait_timeout`] elapses.

@@ -468,7 +468,7 @@ Per-lane and per-mux backpressure is governed by [ADR 0006](./adr/0006-backpress
 
 The daemon's outbound writer is itself a bounded `mpsc::channel(SSH_MUX_BUFFER)`. When the consumer of the NDJSON stream stalls (a slow `jq` filter, a paused `tee`), the mux fills, the lane consumer's `try_send` fails, and the lane falls back to its own lag policy. The daemon never deadlocks on outbound stall: every fronteira has a documented overflow strategy.
 
-The `ssh_sub_stats` and `ssh_daemon_stats` MCP tools expose per-lane and aggregate counters (events_sent, lagged_drops, queue_depth, queue_high_watermark, block_total_ms). The daemon also auto-emits `daemon_stats` events on the NDJSON stream every `SSH_DAEMON_STATS_INTERVAL_S`.
+The `sub_stats` and `sub_stats_all` MCP tools expose per-lane and aggregate counters (events_sent, lagged_drops, queue_depth, queue_high_watermark, block_total_ms). The daemon also auto-emits `daemon_stats` events on the NDJSON stream every `SSH_DAEMON_STATS_INTERVAL_S`.
 
 ## Lifecycle policy on subscribe
 

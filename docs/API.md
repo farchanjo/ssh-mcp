@@ -1,12 +1,12 @@
 # SSH MCP API Reference (v4.8.0)
 
-Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.8.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 / v4.7.x; the v4.7 `structured_content` payload sits next to it. v4.8 lifts typed `output_schema` advertisement to **all 21 tools** (was 9 in v4.7). v4.7 added three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4).
+Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 5 resource subscribe schemes, and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v4.8.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.0.x / v4.6.0 / v4.7.x; the v4.7 `structured_content` payload sits next to it. v4.8 lifts typed `output_schema` advertisement to **all 21 tools** (was 9 in v4.7). v4.7 added three new tools — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_exec_batch` (sequential 1..=16 commands per session), `ssh_disconnect_many` (best-effort batch, 1..=64 ids). v4.6 carry-forward: `AGENT_ID:` (was `AGENT:`), `NEXT:` advisory lines, four subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, wired `Implementation.icons`. v4.5 carry-forward: `EXPIRES_AT` / `PERSISTENT` / `HINT` on connect, `_meta` envelope on `resources/read`, granular wire error codes, server identity, tool annotations, `FORWARD_ID` / `SESSION_ID` on `ssh_forward`. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4).
 
 > **v4.8 — full `output_schema` coverage.** Every tool now publishes a typed JSON Schema on `tools/list[].outputSchema` mirroring its `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can validate every tool response against the published shape without hard-coding any field names. Strictly additive on the `tools/list` metadata; the Markdown body and `structured_content` JSON shape are byte-identical to v4.7.1. Reference: `src/infra/mcp/results.rs` (21 typed structs).
 
 > **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). v4.8 expanded `output_schema` advertisement from 9 / 21 to 21 / 21 tools. Errors render as `{ tool, status: "error", code, reason, detail }` on the structured channel. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
-> **v4.7 new tools — `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`.** Tool count moves from 18 to 21 (or 17 to 20 without `port_forward`). Per-tool sections below.
+> **v4.7 new tools — `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many`.** Tool count moves from 18 to 21 (or 17 to 20 without `port_forward`). Per-tool sections below.
 
 > **v4.6 wire change** — `AGENT:` -> `AGENT_ID:` (7 render sites). Hosts that grep `^AGENT:` literally must update; generic key-value parsers unaffected.
 
@@ -34,23 +34,23 @@ Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 
 
 | Status | Emitted by | Meaning |
 |--------|-----------|---------|
-| `OK` | most write/lifecycle tools (`ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_list_sessions`, `ssh_list_commands`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_close`, `ssh_forward`) | Success — see body for IDs. |
+| `OK` | most write/lifecycle tools (`ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_sessions`, `ssh_commands`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_press`, `ssh_shell_close`, `ssh_forward`) | Success — see body for IDs. |
 | `REUSED` | `ssh_connect` | Existing healthy session returned. |
 | `SUGGESTED` | `ssh_connect` | Matching session(s) exist; LLM picks one or retries with `force_new`. |
-| `STARTED` | `ssh_execute`, `ssh_upload`, `ssh_download` | Background work kicked off. |
-| `RUNNING` | `ssh_get_command_output`, `ssh_get_transfer_progress` | Background work still in progress; output marked `(partial)`. |
-| `COMPLETED` | `ssh_get_command_output`, `ssh_get_transfer_progress` | Background work finished. |
-| `TIMEOUT` | `ssh_get_command_output`, `ssh_shell_read.wait`, `ssh_shell_wait_for` | Long-poll deadline expired or `wait_for` matched no pattern. |
-| `FAILED` | `ssh_get_transfer_progress` | Transfer terminated with an error; `REASON:` line carries detail. |
-| `CANCELLED` | `ssh_cancel_command` | Work cancelled by caller; partial output included. |
-| `NOOP` | `ssh_cancel_command` | Idempotent cancel — command was not running. |
+| `STARTED` | `ssh_exec`, `ssh_upload`, `ssh_download` | Background work kicked off. |
+| `RUNNING` | `ssh_exec_output`, `ssh_transfer_progress` | Background work still in progress; output marked `(partial)`. |
+| `COMPLETED` | `ssh_exec_output`, `ssh_transfer_progress` | Background work finished. |
+| `TIMEOUT` | `ssh_exec_output`, `ssh_shell_read.wait`, `ssh_shell_wait_for` | Long-poll deadline expired or `wait_for` matched no pattern. |
+| `FAILED` | `ssh_transfer_progress` | Transfer terminated with an error; `REASON:` line carries detail. |
+| `CANCELLED` | `ssh_exec_cancel` | Work cancelled by caller; partial output included. |
+| `NOOP` | `ssh_exec_cancel` | Idempotent cancel — command was not running. |
 | `OPEN` / `CLOSED` | `ssh_shell_read` | Shell state during read. |
 | `MATCHED` | `ssh_shell_wait_for` | Pattern hit. |
 | `ERROR` | every tool that can fail | See `REASON` / `DETAIL`. |
 
 ### Output blocks
 
-`ssh_get_command_output` and `ssh_cancel_command` emit `stdout` and `stderr` blocks. `ssh_shell_read` and `ssh_shell_wait_for` emit a single `data` block. Empty blocks render as `--- stdout [a3f2b1d7] (empty) ---`. Truncation marks the delimiter with `(partial, truncated: showing 16.0KB of 2.3MB)`. Content is UTF-8 safely truncated to the **tail** (most recent bytes) when `max_output_bytes` is exceeded.
+`ssh_exec_output` and `ssh_exec_cancel` emit `stdout` and `stderr` blocks. `ssh_shell_read` and `ssh_shell_wait_for` emit a single `data` block. Empty blocks render as `--- stdout [a3f2b1d7] (empty) ---`. Truncation marks the delimiter with `(partial, truncated: showing 16.0KB of 2.3MB)`. Content is UTF-8 safely truncated to the **tail** (most recent bytes) when `max_output_bytes` is exceeded.
 
 ### Capability handshake
 
@@ -60,9 +60,9 @@ Complete API reference for the 21 MCP tools (or 20 without `port_forward`), the 
 
 ## Tools (36 with `port_forward`, 35 without)
 
-v5.2 adds **6 serial / UART / TTY / COM tools** (ADR 0009): `ssh_serial_open`, `ssh_serial_close`, `ssh_serial_write`, `ssh_serial_send_key`, `ssh_serial_list_ports`, `ssh_serial_list_open`. The legacy 21-tool surface is unchanged; existing v3 / v4 / v5.0 / v5.1 hosts continue to work without changes.
+v5.2 adds **6 serial / UART / TTY / COM tools** (ADR 0009): `serial_open`, `serial_close`, `serial_write`, `serial_press`, `serial_scan`, `serial_active`. The legacy 21-tool surface is unchanged; existing v3 / v4 / v5.0 / v5.1 hosts continue to work without changes.
 
-The catalogue below covers every tool. v5.2 adds Serial (6); v4.7 added `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. Groups: Connection (5), Commands (6), Shell (6), SFTP (3), **Serial (6, v5.2)**, Network (1, feature-gated), plus the 9 v5.1 subscription primitives.
+The catalogue below covers every tool. v5.2 adds Serial (6); v4.7 added `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many`. Groups: Connection (5), Commands (6), Shell (6), SFTP (3), **Serial (6, v5.2)**, Network (1, feature-gated), plus the 9 v5.1 subscription primitives.
 
 ## Connection (5)
 
@@ -97,7 +97,7 @@ AGENT_ID: claude-code-instance-abc123
 RETRY: 0
 PERSISTENT: false
 EXPIRES_AT: 2026-05-03T12:05:00+00:00
-NEXT: ssh_execute(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
+NEXT: ssh_exec(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
 `HOST` always renders as `username@host:port`. `AGENT_ID` (renamed from `AGENT:` in v4.6) is omitted when no `agent_id` was passed. `REPLACED: N` is appended when stale matches were purged before creating the session. `PERSISTENT: false` is followed by an `EXPIRES_AT:` RFC3339 deadline (= `connected_at + SSH_INACTIVITY_TIMEOUT`); ping the session before this fires (any cheap call works) to extend it. When the caller passes `persistent=true`, the response emits `PERSISTENT: true` and omits `EXPIRES_AT`. The trailing `NEXT:` line (v4.6) lists the three most-likely successor calls pre-filled with the freshly minted `SESSION_ID`.
@@ -108,10 +108,10 @@ SSH_CONNECT: REUSED
 SESSION_ID: a3f2b1d7-...
 HOST: alice@example.com:22
 AGENT_ID: claude-code-instance-abc123
-NEXT: ssh_execute(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
+NEXT: ssh_exec(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
-`RETRY`, `PERSISTENT`, and `EXPIRES_AT` are omitted on `REUSED` (the original connect already set them; query `ssh_list_sessions` to refresh).
+`RETRY`, `PERSISTENT`, and `EXPIRES_AT` are omitted on `REUSED` (the original connect already set them; query `ssh_sessions` to refresh).
 
 **Response — SUGGESTED (single match)**:
 ```
@@ -136,7 +136,7 @@ HINT: pick an existing SESSION_ID, or retry with reuse="force_new"
 NEXT: ssh_connect(session_id=<existing>) | ssh_connect(reuse="force_new")
 ```
 
-When more than 5 healthy sessions are owned by the same `agent_id`, an extra anti-leak hint is appended on `SUGGESTED` and on `ssh_list_sessions`:
+When more than 5 healthy sessions are owned by the same `agent_id`, an extra anti-leak hint is appended on `SUGGESTED` and on `ssh_sessions`:
 
 ```
 HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup
@@ -180,7 +180,7 @@ SESSION_ID: a3f2b1d7-...
 
 ---
 
-### ssh_list_sessions
+### ssh_sessions
 
 List active SSH sessions with health-check metadata.
 
@@ -195,7 +195,7 @@ The tool runs an `echo 1` health probe against every candidate session and remov
 
 **Response**:
 ```
-SSH_LIST_SESSIONS: OK
+SSH_SESSIONS: OK
 COUNT: 2
 - a3f2b1d7-... alice@prod-db:22 [agent: claude, healthy]
 - 9b1c2d3e-... alice@stage-db:22 [agent: claude, name: stage, healthy]
@@ -268,7 +268,7 @@ Each item carries the session id followed by `ok` (success) or `error [<CODE>] <
 
 ## Execute (6)
 
-### ssh_execute
+### ssh_exec
 
 Execute a shell command asynchronously. Returns immediately with a `COMMAND_ID`.
 
@@ -285,12 +285,12 @@ Limits: up to 100 concurrent multiplexed commands per session.
 
 **Response**:
 ```
-SSH_EXECUTE: STARTED
+SSH_EXEC: STARTED
 COMMAND_ID: 7d4c8e2a-...
 SESSION_ID: a3f2b1d7-...
 AGENT_ID: claude-code-instance-abc123
 HINT: subscribe to command://7d4c8e2a-.../output for realtime output (preferred over polling)
-NEXT: ssh_get_command_output(command_id=7d4c8e2a-..., wait=true) | ssh_cancel_command(command_id=7d4c8e2a-...)
+NEXT: ssh_exec_output(command_id=7d4c8e2a-..., wait=true) | ssh_exec_cancel(command_id=7d4c8e2a-...)
 ```
 
 `AGENT_ID:` is omitted when the session has no agent. The v4.6 `HINT:` line steers the LLM to subscribe rather than poll; `NEXT:` lists the two successor calls pre-filled with `COMMAND_ID`.
@@ -301,13 +301,13 @@ NEXT: ssh_get_command_output(command_id=7d4c8e2a-..., wait=true) | ssh_cancel_co
 
 ---
 
-### ssh_get_command_output
+### ssh_exec_output
 
 Read the current output and status of an async command.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `command_id` | `string` | — | `COMMAND_ID` from `ssh_execute`. |
+| `command_id` | `string` | — | `COMMAND_ID` from `ssh_exec`. |
 | `wait` | `bool?` | `false` | Block until completion or timeout. |
 | `wait_timeout_secs` | `u64?` | `30` | Long-poll deadline; cap `300`. |
 | `max_output_bytes` | `usize?` | `16384` | Hard cap `1 048 576` (env `SSH_MCP_OUTPUT_DEFAULT_BYTES` / `SSH_MCP_OUTPUT_MAX_BYTES_CAP`). Tail (most recent) preserved. |
@@ -316,7 +316,7 @@ Read the current output and status of an async command.
 
 **Response — COMPLETED**:
 ```
-SSH_GET_COMMAND_OUTPUT: COMPLETED
+SSH_EXEC_OUTPUT: COMPLETED
 COMMAND_ID: 7d4c8e2a-...
 EXIT: 0
 --- stdout [a3f2b1d7] ---
@@ -329,12 +329,12 @@ drwxr-xr-x  2 alice alice 4096 May  2 18:00 src
 
 **Response — RUNNING**:
 ```
-SSH_GET_COMMAND_OUTPUT: RUNNING
+SSH_EXEC_OUTPUT: RUNNING
 COMMAND_ID: 7d4c8e2a-...
 --- stdout [a3f2b1d7] (partial) ---
 ... bytes so far ...
 --- stderr [a3f2b1d7] (empty) ---
-NEXT: resources/subscribe command://7d4c8e2a-.../output | ssh_get_command_output(command_id=7d4c8e2a-..., wait=true)
+NEXT: resources/subscribe command://7d4c8e2a-.../output | ssh_exec_output(command_id=7d4c8e2a-..., wait=true)
 ```
 
 The v4.6 `NEXT:` on `RUNNING` steers toward subscribe-first push or a single long-poll instead of a tight polling loop.
@@ -345,7 +345,7 @@ The v4.6 `NEXT:` on `RUNNING` steers toward subscribe-first push or a single lon
 
 ---
 
-### ssh_list_commands
+### ssh_commands
 
 List async commands across one or all sessions.
 
@@ -357,7 +357,7 @@ List async commands across one or all sessions.
 
 **Response**:
 ```
-SSH_LIST_COMMANDS: OK
+SSH_COMMANDS: OK
 COUNT: 2
 - 7d4c8e2a-... [COMPLETED] a3f2b1d7-...: ls -la (18:00:00)
 - 9f8e7d6c-... [RUNNING] a3f2b1d7-...: tail -f /var/log/syslog (18:01:00)
@@ -369,7 +369,7 @@ Each item is `<COMMAND_ID> [<STATUS>] <SESSION_ID>: <command> (HH:MM:SS)`. STATU
 
 ---
 
-### ssh_cancel_command
+### ssh_exec_cancel
 
 Cancel a running async command.
 
@@ -382,7 +382,7 @@ Cancel a running async command.
 
 **Response — CANCELLED**:
 ```
-SSH_CANCEL_COMMAND: CANCELLED
+SSH_EXEC_CANCEL: CANCELLED
 COMMAND_ID: 9f8e7d6c-...
 --- stdout [b2e7c9d1] (partial) ---
 last line before cancel
@@ -397,7 +397,7 @@ last line before cancel
 
 ### ssh_run (v4.7)
 
-One-shot orchestration of `ssh_connect` + `ssh_execute(wait=true)` + (optional) `ssh_disconnect`. Avoids the three-round-trip `connect -> execute -> wait` choreography for short atomic commands like `uptime`, `hostname`, `cat /etc/release`. The session is minted (or reused via `reuse=auto`) under the hood.
+One-shot orchestration of `ssh_connect` + `ssh_exec(wait=true)` + (optional) `ssh_disconnect`. Avoids the three-round-trip `connect -> execute -> wait` choreography for short atomic commands like `uptime`, `hostname`, `cat /etc/release`. The session is minted (or reused via `reuse=auto`) under the hood.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -410,7 +410,7 @@ One-shot orchestration of `ssh_connect` + `ssh_execute(wait=true)` + (optional) 
 | `pty` | `bool?` | `false` | Allocate a pseudo-terminal for the command. |
 | `timeout_secs` | `u64?` | `30` | Maximum seconds to wait for the command. Cap `300` (`SshRunTimeoutCap`). |
 | `max_output_bytes` | `usize?` | `16384` | Max bytes returned in stdout/stderr. Cap `1 048 576`. |
-| `disconnect_after` | `bool?` | `true` | Disconnect the session after the command finishes (one-shot mode). Set `false` to keep the session open for follow-up `ssh_execute` calls. |
+| `disconnect_after` | `bool?` | `true` | Disconnect the session after the command finishes (one-shot mode). Set `false` to keep the session open for follow-up `ssh_exec` calls. |
 
 Behaviour:
 1. `ssh_run` mints (or reuses) a session via `reuse=auto`, ranking matches by `agent_id` when set.
@@ -441,7 +441,7 @@ DISCONNECTED: true
 
 ---
 
-### ssh_execute_batch (v4.7)
+### ssh_exec_batch (v4.7)
 
 Sequential execution of 1..=16 commands against a single session, with optional stop-on-failure semantics. Trades the per-command round-trip for a single tool call when a small linear pipeline (`mkdir`, `tar -xzf`, `chown -R`) needs to run in order.
 
@@ -458,7 +458,7 @@ Sequential execution of 1..=16 commands against a single session, with optional 
 
 **Response — HALTED**:
 ```
-SSH_EXECUTE_BATCH: HALTED
+SSH_EXEC_BATCH: HALTED
 SESSION_ID: a3f2b1d7-...
 TOTAL: 3
 EXECUTED: 2
@@ -469,7 +469,7 @@ EXECUTED: 2
 
 Each `results[]` entry carries its own `command_id`, `exit_code`, stdout/stderr blocks, and (optional) `error` string.
 
-**structured_content shape**: `{ tool: "ssh_execute_batch", status, session_id, total, executed, results: [{ index, command, status: "completed|failed|timeout|cancelled|skipped", command_id?, exit_code?, stdout, stderr, stdout_truncated, stderr_truncated, timed_out, error? }, ...] }`. Full schema in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Idempotency: pass `_meta.idempotency_key` to dedup retried batches.
+**structured_content shape**: `{ tool: "ssh_exec_batch", status, session_id, total, executed, results: [{ index, command, status: "completed|failed|timeout|cancelled|skipped", command_id?, exit_code?, stdout, stderr, stdout_truncated, stderr_truncated, timed_out, error? }, ...] }`. Full schema in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Idempotency: pass `_meta.idempotency_key` to dedup retried batches.
 
 **Errors**: `SESSION_NOT_FOUND`, `MAX_COMMANDS_EXCEEDED`, `TRANSPORT_ERROR`, `INVALID_ARGUMENT` (empty / `>16` commands), `IDEMPOTENCY_KEY_TOO_LONG`.
 
@@ -505,7 +505,7 @@ TERM: xterm 80x24
 AGENT_ID: claude-code-instance-abc123
 INITIAL_BUFFER: Last login: Sat May  3 14:22:01 2026 from 10.0.0.4\r\n$ 
 HINT: subscribe to shell://4b9c8e2a-.../output for realtime output (preferred over polling)
-NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_shell_send_key
+NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_shell_press
 ```
 
 `TERM` carries the terminal type and the geometry on a single line (`<term> <cols>x<rows>`). `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when no agent owns the session. The v4.6 `HINT:` steers toward push notifications; `NEXT:` names the three successor calls.
@@ -520,7 +520,7 @@ NEXT: resources/subscribe shell://4b9c8e2a-.../output | ssh_shell_write | ssh_sh
 
 ### ssh_shell_write
 
-Send raw bytes to an interactive shell. Use `ssh_shell_send_key` for named keystrokes whenever possible.
+Send raw bytes to an interactive shell. Use `ssh_shell_press` for named keystrokes whenever possible.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -543,7 +543,7 @@ The v4.6 `NEXT:` names the three ways to consume the response: cursor-based push
 
 ---
 
-### ssh_shell_send_key
+### ssh_shell_press
 
 Send a named keystroke to an interactive shell. Convenience wrapper over `ssh_shell_write` that maps semantic key names (e.g. `ctrl_c`, `arrow_up`, `f5`) to xterm-compatible byte sequences.
 
@@ -568,7 +568,7 @@ Send a named keystroke to an interactive shell. Convenience wrapper over `ssh_sh
 
 **Response — plain key**:
 ```
-SSH_SHELL_SEND_KEY: OK
+SSH_SHELL_PRESS: OK
 SHELL_ID: 4b9c8e2a-...
 KEY: ctrl_c
 REPEAT: 1
@@ -578,7 +578,7 @@ NEXT: resources/read shell://4b9c8e2a-.../output?cursor=auto | ssh_shell_wait_fo
 
 **Response — modified key**:
 ```
-SSH_SHELL_SEND_KEY: OK
+SSH_SHELL_PRESS: OK
 SHELL_ID: 4b9c8e2a-...
 KEY: arrow_up
 MODIFIERS: shift+ctrl
@@ -651,7 +651,7 @@ BYTES_RETURNED: 30
 some output
 followed by
 the prompt $
-NEXT: ssh_shell_write(shell_id=4b9c8e2a-..., ...) | ssh_shell_send_key(shell_id=4b9c8e2a-..., ...) | ssh_shell_close(shell_id=4b9c8e2a-...)
+NEXT: ssh_shell_write(shell_id=4b9c8e2a-..., ...) | ssh_shell_press(shell_id=4b9c8e2a-..., ...) | ssh_shell_close(shell_id=4b9c8e2a-...)
 ```
 
 **Response — TIMEOUT**:
@@ -721,7 +721,7 @@ TO: /tmp/data.csv
 SIZE: 2.3 MB (2412544 bytes)
 BYTES: 2412544
 HINT: subscribe to transfer://8f7e6d5c-.../progress for realtime progress
-NEXT: ssh_get_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
+NEXT: ssh_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 ```
 
 `FROM` is the source (local for upload, remote for download); `TO` is the destination. `SIZE` is the human-readable + raw byte count; `BYTES` is the raw count again. `AGENT_ID:` (renamed from `AGENT:` in v4.6) is omitted when the session has no agent. v4.6 `HINT:` steers toward subscribe; `NEXT:` names the long-poll fallback.
@@ -752,7 +752,7 @@ TO: /home/alice/backup.tar.gz
 SIZE: 105.0 MB (110100480 bytes)
 BYTES: 110100480
 HINT: subscribe to transfer://1a2b3c4d-.../progress for realtime progress
-NEXT: ssh_get_transfer_progress(transfer_id=1a2b3c4d-..., wait=true)
+NEXT: ssh_transfer_progress(transfer_id=1a2b3c4d-..., wait=true)
 ```
 
 Same shape as upload — `FROM` is the remote source, `TO` is the local destination. `AGENT_ID:`, `HINT:`, and `NEXT:` lines mirror upload.
@@ -763,7 +763,7 @@ Same shape as upload — `FROM` is the remote source, `TO` is the local destinat
 
 ---
 
-### ssh_get_transfer_progress
+### ssh_transfer_progress
 
 Read the current progress of an SFTP transfer.
 
@@ -779,16 +779,16 @@ Terminated transfers are cleaned from storage after `SSH_TRANSFER_CLEANUP_TTL` (
 
 **Response — RUNNING**:
 ```
-SSH_GET_TRANSFER_PROGRESS: RUNNING
+SSH_TRANSFER_PROGRESS: RUNNING
 TRANSFER_ID: 8f7e6d5c-...
 DIRECTION: UPLOAD
 PROGRESS: 47% (1153024/2412544 bytes)
-NEXT: resources/subscribe transfer://8f7e6d5c-.../progress | ssh_get_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
+NEXT: resources/subscribe transfer://8f7e6d5c-.../progress | ssh_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 ```
 
 **Response — COMPLETED**:
 ```
-SSH_GET_TRANSFER_PROGRESS: COMPLETED
+SSH_TRANSFER_PROGRESS: COMPLETED
 TRANSFER_ID: 8f7e6d5c-...
 DIRECTION: UPLOAD
 PROGRESS: 100% (2412544/2412544 bytes)
@@ -796,7 +796,7 @@ PROGRESS: 100% (2412544/2412544 bytes)
 
 **Response — FAILED**:
 ```
-SSH_GET_TRANSFER_PROGRESS: FAILED
+SSH_TRANSFER_PROGRESS: FAILED
 TRANSFER_ID: 8f7e6d5c-...
 DIRECTION: UPLOAD
 PROGRESS: 12% (307200/2412544 bytes)
@@ -815,9 +815,9 @@ REASON: [PERMISSION_DENIED] write '/tmp/locked.csv': permission denied
 
 ## Serial (6, v5.2 — ADR 0009)
 
-Native UART / TTY / COM transport. Lock-free reader / writer split: `ArcSwap<RingBuffer>` history (subscribers slice `O(1)`, no contention with the OS reader); writes funnel through a bounded `mpsc::channel(64)` and surface `SERIAL_BACKPRESSURE` instead of stalling. Producer hooks into the same `SUBSCRIPTION_REGISTRY` debouncer as `command://*/output`, including the ADR 0006 Amendment 1 byte-threshold flush. Subscribe via `ssh_subscribe uri=serial://<SERIAL_ID>/output`.
+Native UART / TTY / COM transport. Lock-free reader / writer split: `ArcSwap<RingBuffer>` history (subscribers slice `O(1)`, no contention with the OS reader); writes funnel through a bounded `mpsc::channel(64)` and surface `SERIAL_BACKPRESSURE` instead of stalling. Producer hooks into the same `SUBSCRIPTION_REGISTRY` debouncer as `command://*/output`, including the ADR 0006 Amendment 1 byte-threshold flush. Subscribe via `sub_open uri=serial://<SERIAL_ID>/output`.
 
-### ssh_serial_open (v5.2)
+### serial_open (v5.2)
 
 Open a serial port and start its lock-free reader / writer tasks. Returns `SERIAL_ID` + the subscribe URI. Full `stty` parameter coverage:
 
@@ -833,23 +833,23 @@ Open a serial port and start its lock-free reader / writer tasks. Returns `SERIA
 | `max_buffer_size` | u64 | `0` (= 1 MiB) | history cap; once full, head-truncates on append |
 | `initial_dtr` | bool? | `null` | `null` = driver default, `true` = raise, `false` = lower |
 | `initial_rts` | bool? | `null` | same semantics as `initial_dtr` |
-| `label` | string? | `null` | optional human label surfaced on `ssh_serial_list_open` |
+| `label` | string? | `null` | optional human label surfaced on `serial_active` |
 
 **Status values:** OK.
 **Errors:** INVALID_ARGUMENT (bad data_bits / parity / flow_control / stop_bits), SERIAL_ERROR (device busy / missing / permission denied / kernel control-line refusal).
 **Cost:** 1 OS open + 2 spawned tasks; typically <10 ms.
-**structured_content shape:** `{ tool: "ssh_serial_open", status, serial_id, path, baud_rate, data_bits, stop_bits, parity, flow_control, uri, next: [...] }`.
+**structured_content shape:** `{ tool: "serial_open", status, serial_id, path, baud_rate, data_bits, stop_bits, parity, flow_control, uri, next: [...] }`.
 
-### ssh_serial_close (v5.2)
+### serial_close (v5.2)
 
 Cancel reader / writer tasks for the given `SERIAL_ID` and remove the registry entry. Idempotent — second call returns `NOOP`.
 
 **Status values:** OK, NOOP.
 **Cost:** O(1).
 
-### ssh_serial_write (v5.2)
+### serial_write (v5.2)
 
-Enqueue bytes for transmission. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648 standard alphabet). Newlines are NOT auto-appended; use `ssh_serial_send_key` for `enter` / `cr` / `lf` / `crlf`.
+Enqueue bytes for transmission. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648 standard alphabet). Newlines are NOT auto-appended; use `serial_press` for `enter` / `cr` / `lf` / `crlf`.
 
 After the write, the response arrives via push on the existing `serial://<id>/output` subscription. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto` — never poll.
 
@@ -857,7 +857,7 @@ After the write, the response arrives via push on the existing `serial://<id>/ou
 **Errors:** INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full — local sleep + retry).
 **Cost:** O(input.len). Sub-ms typical.
 
-### ssh_serial_send_key (v5.2)
+### serial_press (v5.2)
 
 Send a named control keystroke without crafting bytes manually. Optional `repeat` 1..=64.
 
@@ -877,14 +877,14 @@ Send a named control keystroke without crafting bytes manually. Optional `repeat
 **Errors:** INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.
 **Cost:** O(repeat).
 
-### ssh_serial_list_ports (v5.2)
+### serial_scan (v5.2)
 
-Snapshot the OS-visible serial devices. Returns the device paths the caller can pass to `ssh_serial_open`. No state mutation.
+Snapshot the OS-visible serial devices. Returns the device paths the caller can pass to `serial_open`. No state mutation.
 
 **Status values:** OK.
 **Cost:** 1 OS enumeration (typically <5 ms).
 
-### ssh_serial_list_open (v5.2)
+### serial_active (v5.2)
 
 Snapshot every serial port currently held by this process. Returns `SERIAL_ID`, path, baud rate, optional label, and the subscribe URI for each. No state mutation.
 
@@ -988,7 +988,7 @@ Returned by `get_info()`:
     "tools": { "listChanged": true },
     "resources": { "subscribe": true, "listChanged": true }
   },
-  "instructions": "SSH MCP. 21 tools, 5 push streams (shell://, command://, transfer://, session://, forward://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_execute. Then ssh_subscribe command://<id>/output for push. ssh_unsubscribe when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. Drive with ssh_shell_write or ssh_shell_send_key. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then ssh_get_transfer_progress wait=true.\n4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_execute calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
+  "instructions": "SSH MCP. 21 tools, 5 push streams (shell://, command://, transfer://, session://, forward://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. Then sub_open command://<id>/output for push. sub_close when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then resources/subscribe shell://<id>/output. Drive with ssh_shell_write or ssh_shell_press. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then ssh_transfer_progress wait=true.\n4) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_exec calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
 }
 ```
 
@@ -1013,35 +1013,35 @@ Every tool response carries BOTH the block-style Markdown (`content[].text`) AND
 | `ssh_connect` | `SshConnectResult` (with `SessionEntry` for `matches`) |
 | `ssh_disconnect` | `SshDisconnectResult` |
 | `ssh_disconnect_many` | `SshDisconnectManyResult` |
-| `ssh_list_sessions` | `SshListSessionsResult` (with `SessionEntry`) |
+| `ssh_sessions` | `SshSessionsResult` (with `SessionEntry`) |
 | `ssh_disconnect_agent` | `SshDisconnectAgentResult` |
-| `ssh_execute` | `SshExecuteResult` |
-| `ssh_execute_batch` | `SshExecuteBatchResult` |
+| `ssh_exec` | `SshExecResult` |
+| `ssh_exec_batch` | `SshExecBatchResult` |
 | `ssh_run` | `SshRunResult` |
-| `ssh_get_command_output` | `SshGetCommandOutputResult` |
-| `ssh_list_commands` | `SshListCommandsResult` (with `CommandEntry`) |
-| `ssh_cancel_command` | `SshCancelCommandResult` |
+| `ssh_exec_output` | `SshExecOutputResult` |
+| `ssh_commands` | `SshCommandsResult` (with `CommandEntry`) |
+| `ssh_exec_cancel` | `SshExecCancelResult` |
 | `ssh_shell_open` | `SshShellOpenResult` (with optional `initial_buffer`) |
 | `ssh_shell_write` | `SshShellWriteResult` |
-| `ssh_shell_send_key` | `SshShellSendKeyResult` |
+| `ssh_shell_press` | `SshShellPressResult` |
 | `ssh_shell_read` | `SshShellReadResult` |
 | `ssh_shell_wait_for` | `SshShellWaitForResult` |
 | `ssh_shell_close` | `SshShellCloseResult` |
 | `ssh_upload` | `SshUploadResult` |
 | `ssh_download` | `SshDownloadResult` |
-| `ssh_get_transfer_progress` | `SshGetTransferProgressResult` |
+| `ssh_transfer_progress` | `SshTransferProgressResult` |
 | `ssh_forward` *(feature `port_forward`)* | `SshForwardResult` |
 
 Each struct is `#[non_exhaustive]` so callers cannot match exhaustively across versions; new optional fields can be added without bumping the major version. Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire.
 
-Full canonical example shapes per tool — including `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` — live in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Error shape on every tool: `{ tool, status: "error", code, reason, detail }` (when the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion). Reference: `src/infra/mcp/helpers/structured.rs` (dual-channel render) + `src/infra/mcp/suggestions.rs` (Levenshtein picker).
+Full canonical example shapes per tool — including `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many` — live in [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47). Error shape on every tool: `{ tool, status: "error", code, reason, detail }` (when the source repo has live entries, `detail` carries the v4.7 NOT_FOUND closest-match suggestion). Reference: `src/infra/mcp/helpers/structured.rs` (dual-channel render) + `src/infra/mcp/suggestions.rs` (Levenshtein picker).
 
 ---
 
 ## Resource templates / Progress / Prompts / Idempotency (v4.7)
 
 - **Resource templates** — `resources/templates/list` advertises 4 RFC 6570 URI shapes without `port_forward`, 5 with. Full payload + MIME table in [RESOURCES.md - Resource Templates (v4.7)](./RESOURCES.md#resource-templates-v47).
-- **Progress notifications** — when a request includes `_meta.progressToken`, the server fires periodic `notifications/progress` updates during `ssh_get_command_output(wait=true)` (5 s cadence), `ssh_get_transfer_progress(wait=true)` (5 s), and `ssh_shell_wait_for` (1 s). Payload `{progress_token, progress, total, message}`. Best-effort — transport errors swallowed. See [LLM_GUIDE.md section L](./LLM_GUIDE.md#l-progress-notifications-v47). Reference: `src/infra/mcp/progress.rs::ProgressEmitter`.
+- **Progress notifications** — when a request includes `_meta.progressToken`, the server fires periodic `notifications/progress` updates during `ssh_exec_output(wait=true)` (5 s cadence), `ssh_transfer_progress(wait=true)` (5 s), and `ssh_shell_wait_for` (1 s). Payload `{progress_token, progress, total, message}`. Best-effort — transport errors swallowed. See [LLM_GUIDE.md section L](./LLM_GUIDE.md#l-progress-notifications-v47). Reference: `src/infra/mcp/progress.rs::ProgressEmitter`.
 - **Prompts catalog** — `prompts/list` advertises 5 canonical workflows; `prompts/get` returns a parameterised tool-sequence recipe. See [LLM_GUIDE.md section M](./LLM_GUIDE.md#m-prompts-catalog-v47). Reference: `src/infra/mcp/prompts.rs`.
 - **Idempotency** — mutating tools (15 total) accept `_meta.idempotency_key` (1..=256 bytes). Cached response replays within the TTL window (default 300 s, env `SSH_IDEMPOTENCY_TTL_SECS`; cap 1024 entries, env `SSH_IDEMPOTENCY_MAX_ENTRIES`). Read-only tools ignore the key. Oversized keys raise `IDEMPOTENCY_KEY_TOO_LONG`. See [LLM_GUIDE.md → Idempotency](./LLM_GUIDE.md#idempotency) + [OPERATIONS.md → v4.7 idempotency error](./OPERATIONS.md#v47-idempotency-error). Reference: `src/infra/mcp/idempotency.rs`.
 
@@ -1057,15 +1057,15 @@ Every tool description ends with a single-line `Cost:` hint (O() + latency + blo
 
 ## Cross-reference — keyboard input
 
-Use the table below to choose between `ssh_shell_send_key` and `ssh_shell_write`:
+Use the table below to choose between `ssh_shell_press` and `ssh_shell_write`:
 
 | Goal | Tool | Notes |
 |------|------|-------|
-| Interrupt running command | `ssh_shell_send_key key=ctrl_c` | Preferred. |
-| Submit Enter | `ssh_shell_send_key key=enter` | Or `ssh_shell_write input="\n"`. |
+| Interrupt running command | `ssh_shell_press key=ctrl_c` | Preferred. |
+| Submit Enter | `ssh_shell_press key=enter` | Or `ssh_shell_write input="\n"`. |
 | Type a command line | `ssh_shell_write input="ls -la\n"` | `send_key` rejects bulk text. |
-| Arrow key navigation | `ssh_shell_send_key key=arrow_up` | Modifiers allowed. |
-| Function keys | `ssh_shell_send_key key=f5` | Modifiers allowed. |
-| Back-tab in completion menu | `ssh_shell_send_key key=tab shift=true` | Tab accepts Shift only. |
-| Send Ctrl+Shift+End in a TUI | `ssh_shell_send_key key=end shift=true ctrl=true` | Modifier rule honored. |
+| Arrow key navigation | `ssh_shell_press key=arrow_up` | Modifiers allowed. |
+| Function keys | `ssh_shell_press key=f5` | Modifiers allowed. |
+| Back-tab in completion menu | `ssh_shell_press key=tab shift=true` | Tab accepts Shift only. |
+| Send Ctrl+Shift+End in a TUI | `ssh_shell_press key=end shift=true ctrl=true` | Modifier rule honored. |
 | Send Alt+B (word back in readline) | `ssh_shell_write input="\x1bb"` | `send_key` does not expose every escape; raw bytes when needed. |

@@ -20,7 +20,7 @@ flowchart TD
 
     CA["switch to<br/>ssh-mcp-tail daemon"]
     CB["recreate via<br/>shell_open / execute"]
-    CC["ssh_sub_resume<br/>+ ssh_sub_filter"]
+    CC["sub_resume<br/>+ sub_filter"]
     CD["ssh_shell_close +<br/>set release_when_no_subs"]
     CE["set release_when_no_subs<br/>OR shorter inactivity TTL"]
     CF["lag_policy=snapshot<br/>(default) or block_slow"]
@@ -50,7 +50,7 @@ flowchart TD
   1. [Subscriber receives no push events](#1-subscriber-receives-no-push-events)
   2. [Shell becomes a zombie after caller disconnects](#2-shell-becomes-a-zombie-after-caller-disconnects)
   3. [`lag_drops > 0` in subscriber stats](#3-lag_drops--0-in-subscriber-stats)
-  4. [`ssh_subscribe` returns `RESOURCE_GONE`](#4-ssh_subscribe-returns-resource_gone)
+  4. [`sub_open` returns `RESOURCE_GONE`](#4-sub_open-returns-resource_gone)
   5. [Cascade disconnect closes session unexpectedly](#5-cascade-disconnect-closes-session-unexpectedly)
   6. [Stuck transfer (`bytes_transferred` not advancing)](#6-stuck-transfer-bytes_transferred-not-advancing)
   7. [High CPU under load](#7-high-cpu-under-load)
@@ -68,7 +68,7 @@ flowchart TD
 
 ### 1. Subscriber receives no push events
 
-**Symptom.** A host called `ssh_subscribe` (or the legacy `resources/subscribe`), the call returned a `sub_id`, and yet no `notifications/resources/updated` (or NDJSON `push` events) reach the consumer.
+**Symptom.** A host called `sub_open` (or the legacy `resources/subscribe`), the call returned a `sub_id`, and yet no `notifications/resources/updated` (or NDJSON `push` events) reach the consumer.
 
 #### Causes
 
@@ -76,14 +76,14 @@ flowchart TD
 2. **Subscription was closed by peer GC.** Peer-GC scans the subscription registry every `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed. Reconnecting client gets a fresh `PeerId`; the old `sub_id` is dead.
 3. **Lifecycle moved to `Releasing` without a re-subscribe inside the grace window.** When the last subscriber on a `release_when_no_subs=true` resource unsubscribed, the grace timer started counting down (`SSH_LIFECYCLE_GRACE_MS`, default 2000 ms). A new `subscribe` after grace expired returns `RESOURCE_GONE`.
 4. **Filter excludes everything.** The lane has a regex / level filter that rejects every event before it hits the mpsc.
-5. **Lane is paused.** A prior `ssh_sub_pause` call suspended the drain loop. Producer is still emitting; the lane mpsc fills under its lag policy.
+5. **Lane is paused.** A prior `sub_pause` call suspended the drain loop. Producer is still emitting; the lane mpsc fills under its lag policy.
 
 #### Diagnosis
 
 ```text
-ssh_sub_list                          # find your sub_id; check uri matches
-ssh_sub_stats(sub_id=...)             # look at events_sent / lag_drops / queue_depth
-ssh_daemon_stats                      # global view; confirm the mux is forwarding events
+sub_list                          # find your sub_id; check uri matches
+sub_stats(sub_id=...)             # look at events_sent / lag_drops / queue_depth
+sub_stats_all                      # global view; confirm the mux is forwarding events
 ```
 
 If `events_sent > 0` but the consumer sees nothing, the host or transport is dropping the notification. Inspect with `mcp-inspector` or `wireshark` against `ssh-mcp` HTTP. If `events_sent == 0`, the lane is idle — check the filter, the pause state, and the lifecycle.
@@ -98,15 +98,15 @@ RUST_LOG=ssh_mcp=debug,ssh_mcp::adapters::subscription=trace ssh-mcp-stdio
 |---|---|
 | Host drops notifications | Switch to `ssh-mcp-tail daemon` and consume NDJSON push events directly. See [DAEMON.md](./DAEMON.md). |
 | Peer GC swept the sub | Re-subscribe with the right `uri`. Track `sub_id`s in your host state and refresh on reconnect. |
-| Grace window expired | Recreate the resource via `ssh_shell_open` / `ssh_execute` / `ssh_upload`. |
-| Filter too strict | Hot-reload via `ssh_sub_filter` with a less restrictive pattern. |
-| Lane paused | Call `ssh_sub_resume` on the `sub_id`. |
+| Grace window expired | Recreate the resource via `ssh_shell_open` / `ssh_exec` / `ssh_upload`. |
+| Filter too strict | Hot-reload via `sub_filter` with a less restrictive pattern. |
+| Lane paused | Call `sub_resume` on the `sub_id`. |
 
 References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md).
 
 ### 2. Shell becomes a zombie after caller disconnects
 
-**Symptom.** A long-running shell (`shell://<id>/output`) keeps consuming a russh channel after the original caller's transport closed. `ssh_list_sessions` shows the session; the PTY is still allocated on the remote.
+**Symptom.** A long-running shell (`shell://<id>/output`) keeps consuming a russh channel after the original caller's transport closed. `ssh_sessions` shows the session; the PTY is still allocated on the remote.
 
 #### Causes
 
@@ -118,9 +118,9 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-c
 #### Diagnosis
 
 ```text
-ssh_list_sessions                     # confirm session is alive
-ssh_sub_list(filter_by_uri=shell://*) # any subscriber on the zombie shell?
-ssh_sub_stats(sub_id=...)             # if a sub exists: any events_sent?
+ssh_sessions                     # confirm session is alive
+sub_list(filter_by_uri=shell://*) # any subscriber on the zombie shell?
+sub_stats(sub_id=...)             # if a sub exists: any events_sent?
 ```
 
 A zombie shell typically shows: session alive, zero subs on its `shell://` URI, output still flowing if you do `ssh_shell_read(shell_id, wait=false)`.
@@ -138,7 +138,7 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0005](./adr/0005-l
 
 ### 3. `lag_drops > 0` in subscriber stats
 
-**Symptom.** `ssh_sub_stats` reports `lagged_drops` greater than zero, or NDJSON `lagged` events appear on the daemon stdout. Events are being dropped under the lane's lag policy.
+**Symptom.** `sub_stats` reports `lagged_drops` greater than zero, or NDJSON `lagged` events appear on the daemon stdout. Events are being dropped under the lane's lag policy.
 
 #### Causes
 
@@ -149,14 +149,14 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0005](./adr/0005-l
 #### Diagnosis
 
 ```text
-ssh_sub_stats(sub_id=...)
+sub_stats(sub_id=...)
   # look at:
   #   queue_depth         (how full the lane is right now)
   #   queue_high_watermark (peak occupancy)
   #   lagged_drops        (cumulative drops)
   #   lagged_recoveries   (snapshot rebuilds completed)
   #   block_total_ms      (cumulative BlockSlow waits)
-ssh_daemon_stats
+sub_stats_all
   # mux_queue_depth: outbound backlog
 ```
 
@@ -169,26 +169,26 @@ A lane with `queue_high_watermark = SSH_LANE_BUFFER` and growing `lagged_drops` 
 | Drops on a monitoring lane | Switch to `lag_policy=snapshot` (the v5.0 default). The lane drops backlog and rebuilds via the per-resource ring buffer; the consumer sees a `snapshot` event with the live tail. |
 | Drops on an audit / forensic lane | Switch to `lag_policy=block_slow`. Producer pauses until consumer drains. Set `SSH_BP_BLOCK_TIMEOUT_MS` if you need a hard ceiling. |
 | Drops on a fast monitoring lane that wants gap markers | `lag_policy=drop_oldest` keeps the freshest events; `lagged` markers tell the consumer how many were lost. |
-| Consumer downstream is slow | Profile the downstream sink. Add a buffer (kafka, vector). Filter server-side via `ssh_sub_filter` to reduce production rate. |
+| Consumer downstream is slow | Profile the downstream sink. Add a buffer (kafka, vector). Filter server-side via `sub_filter` to reduce production rate. |
 
 References: [ADR 0006](./adr/0006-backpressure-policies.md), [DAEMON.md](./DAEMON.md).
 
-### 4. `ssh_subscribe` returns `RESOURCE_GONE`
+### 4. `sub_open` returns `RESOURCE_GONE`
 
-**Symptom.** A subscribe op returns `REASON: [RESOURCE_GONE] Resource closed (lifecycle Releasing/Closed)` with `DETAIL: recreate via ssh_shell_open / ssh_execute / ssh_upload.` The host expected the resource to still be alive.
+**Symptom.** A subscribe op returns `REASON: [RESOURCE_GONE] Resource closed (lifecycle Releasing/Closed)` with `DETAIL: recreate via ssh_shell_open / ssh_exec / ssh_upload.` The host expected the resource to still be alive.
 
 #### Causes
 
 1. **Grace timer expired between create and subscribe.** A resource was created with `release_when_no_subs=true` and `SSH_LIFECYCLE_OWN_GRACE_MS` elapsed before any subscriber attached. The lifecycle moved `Owned -> Releasing -> Closed`.
-2. **Last unsubscribe + grace timer.** A previous `ssh_unsubscribe` was the last subscriber; the grace timer fired before re-subscribe.
+2. **Last unsubscribe + grace timer.** A previous `sub_close` was the last subscriber; the grace timer fired before re-subscribe.
 3. **Cascade close.** The parent session was disconnected; every owned resource cascaded to `Closed`.
-4. **Manual close.** `ssh_shell_close` / `ssh_cancel_command` was called.
+4. **Manual close.** `ssh_shell_close` / `ssh_exec_cancel` was called.
 
 #### Diagnosis
 
 ```text
-ssh_list_sessions            # is the parent session still alive?
-ssh_list_commands            # for command:// URIs
+ssh_sessions            # is the parent session still alive?
+ssh_commands            # for command:// URIs
 # the absence of the resource confirms it has been Closed
 ```
 
@@ -198,15 +198,15 @@ Check `RUST_LOG=ssh_mcp::adapters::lifecycle=trace` for the CAS edges that fired
 
 Recreate the resource and subscribe immediately:
 
-- Shells: `ssh_shell_open(...)` + `ssh_subscribe(uri="shell://<new>/output", ...)` in the same workflow.
-- Commands: re-run `ssh_execute(...)`. Note that re-running is not idempotent for side-effect commands — the resource lifecycle does not stash exit-code history past `Closed`.
+- Shells: `ssh_shell_open(...)` + `sub_open(uri="shell://<new>/output", ...)` in the same workflow.
+- Commands: re-run `ssh_exec(...)`. Note that re-running is not idempotent for side-effect commands — the resource lifecycle does not stash exit-code history past `Closed`.
 - Transfers: re-issue `ssh_upload` / `ssh_download`.
 
 #### Prevention
 
 | Pattern | Prevention |
 |---|---|
-| Subscribe-after-create race | Issue `ssh_subscribe` immediately after the create call, in the same turn. Default grace window is 2 s. |
+| Subscribe-after-create race | Issue `sub_open` immediately after the create call, in the same turn. Default grace window is 2 s. |
 | Long-lived `Owned` without subscriber | Set `release_when_no_subs=false` on resources you intend to keep alive without observing. |
 | Re-subscribe after disconnect | Track the `sub_id` and `uri`. On reconnect, resubscribe to the same URI within `SSH_LIFECYCLE_GRACE_MS`. |
 
@@ -218,7 +218,7 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0007](./adr/0007-e
 
 #### Causes
 
-1. **Operator confused two sessions.** `ssh_list_sessions` may show stale entries; double-check the `session_id` before disconnecting.
+1. **Operator confused two sessions.** `ssh_sessions` may show stale entries; double-check the `session_id` before disconnecting.
 2. **Cascade close on the parent session.** A disconnect on a session always cascade-closes every owned shell, command, and transfer. By design — see [ADR 0003](./adr/0003-lifecycle-binding.md).
 3. **`active_refs` underflow bug.** Theoretical only; surfaces as `SESSION_REFCOUNT_UNDERFLOW` (an `INTERNAL` category error). If you see this code, file a bug.
 4. **`ssh_disconnect_agent(agent_id)`** wipes every session under that `agent_id`. If multiple sessions share an `agent_id`, all of them close.
@@ -226,9 +226,9 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0007](./adr/0007-e
 #### Diagnosis
 
 ```text
-ssh_list_sessions                   # which sessions exist
-ssh_sub_list                        # which subs are bound to each
-ssh_list_commands                   # which commands per session
+ssh_sessions                   # which sessions exist
+sub_list                        # which subs are bound to each
+ssh_commands                   # which commands per session
 ```
 
 After the disconnect, check the structured logs for `SESSION_REFCOUNT_UNDERFLOW`:
@@ -243,7 +243,7 @@ If the cascade closed more than expected, the most likely cause is an `agent_id`
 
 | Cause | Cure |
 |---|---|
-| Wrong `session_id` | Use `ssh_list_sessions` to confirm; cancel the next disconnect. |
+| Wrong `session_id` | Use `ssh_sessions` to confirm; cancel the next disconnect. |
 | Shared `agent_id` | Use distinct `agent_id`s for distinct logical scopes. |
 | `SESSION_REFCOUNT_UNDERFLOW` | File a bug with the structured logs (see [When to file a bug](#when-to-file-a-bug)). |
 
@@ -251,20 +251,20 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0007](./adr/0007-e
 
 ### 6. Stuck transfer (`bytes_transferred` not advancing)
 
-**Symptom.** `ssh_get_transfer_progress` shows `bytes_transferred` stuck at a single value across multiple polls. `transfer://<tid>/progress` push events stop arriving. The remote file is incomplete.
+**Symptom.** `ssh_transfer_progress` shows `bytes_transferred` stuck at a single value across multiple polls. `transfer://<tid>/progress` push events stop arriving. The remote file is incomplete.
 
 #### Causes
 
 1. **Network stall.** TCP backpressure on the underlying socket; russh recv window is full.
 2. **Remote disk full.** SFTP `STATUS_NO_SPACE_LEFT_ON_DEVICE`; the daemon would emit `SFTP_ERROR` with the underlying message in `DETAIL:` if the remote signalled the error.
 3. **Remote process killed.** OOM, signal; the SFTP session detects EOF and emits `SFTP_ERROR`.
-4. **Subscribe missing.** The transfer is alive (the bytes are flowing on the wire); the subscriber lane mpsc is paused (`ssh_sub_pause`) or has a filter that excludes progress events. The transfer is fine; observability is broken.
+4. **Subscribe missing.** The transfer is alive (the bytes are flowing on the wire); the subscriber lane mpsc is paused (`sub_pause`) or has a filter that excludes progress events. The transfer is fine; observability is broken.
 
 #### Diagnosis
 
 ```text
-ssh_get_transfer_progress(tid=..., wait=false)   # snapshot current state
-ssh_sub_stats(sub_id=...)                         # if subscribed: events_sent stuck?
+ssh_transfer_progress(tid=..., wait=false)   # snapshot current state
+sub_stats(sub_id=...)                         # if subscribed: events_sent stuck?
 ```
 
 Check the live SSH connection on the remote side (`netstat`, `ss` on the remote, `iftop` on the local).
@@ -275,7 +275,7 @@ Check the live SSH connection on the remote side (`netstat`, `ss` on the remote,
 |---|---|
 | Network stall | Wait; `russh` will resume when TCP recovers. If hard-stalled > 60 s, cancel and retry. |
 | Disk full / remote error | Check `/var/log/ssh-mcp.log` for `SFTP_ERROR`; address the remote condition; restart the transfer. |
-| Subscribe broken | `ssh_sub_resume`, then `ssh_sub_filter` to reset filter, then `ssh_sub_replay` from the last seen cursor. |
+| Subscribe broken | `sub_resume`, then `sub_filter` to reset filter, then `sub_replay` from the last seen cursor. |
 
 References: [ADR 0007](./adr/0007-error-taxonomy.md), `SFTP_ERROR` (`REMOTE` category).
 
@@ -300,22 +300,22 @@ RUST_LOG=ssh_mcp=debug ssh-mcp-stdio
 tokio-console
 ```
 
-The `ssh_daemon_stats` event surfaces the mux backlog and the debouncer pace.
+The `sub_stats_all` event surfaces the mux backlog and the debouncer pace.
 
 #### Cure
 
 | Cause | Cure |
 |---|---|
-| Hot poll | Update the host's prompt to use `ssh_subscribe` instead of `ssh_shell_read` in a loop. Five golden rules: [LLM_GUIDE.md](./LLM_GUIDE.md#golden-rules). |
+| Hot poll | Update the host's prompt to use `sub_open` instead of `ssh_shell_read` in a loop. Five golden rules: [LLM_GUIDE.md](./LLM_GUIDE.md#golden-rules). |
 | Debouncer storm | Increase `SSH_NOTIFY_DEBOUNCE_MS` (default 200 ms; try 500–1000 ms for very noisy resources). |
-| Mux loop spinning | File a bug; capture `tokio-console` profile and `ssh_daemon_stats`. |
+| Mux loop spinning | File a bug; capture `tokio-console` profile and `sub_stats_all`. |
 | Regex backtracking | Replace the filter with a simpler pattern; consider a level filter instead of regex. |
 
 References: [ADR 0005](./adr/0005-llm-ux-priorities.md), [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants).
 
 ### 8. High memory under load
 
-**Symptom.** RSS grows over time; `ssh_daemon_stats` shows growing `events_sent_total` but flat `lagged_drops_total`. Memory does not free.
+**Symptom.** RSS grows over time; `sub_stats_all` shows growing `events_sent_total` but flat `lagged_drops_total`. Memory does not free.
 
 #### Causes
 
@@ -327,12 +327,12 @@ References: [ADR 0005](./adr/0005-llm-ux-priorities.md), [DEVELOPMENT.md](./DEVE
 #### Diagnosis
 
 ```text
-ssh_daemon_stats
+sub_stats_all
   # active_subs                — number of lanes
   # active_sessions            — number of sessions
   # events_sent_total          — global production rate
   # mux_queue_depth            — outbound backlog
-ssh_sub_stats(sub_id=...)     # per-lane queue_depth + queue_high_watermark
+sub_stats(sub_id=...)     # per-lane queue_depth + queue_high_watermark
 ```
 
 A lane with `queue_high_watermark` close to `SSH_LANE_BUFFER` is hoarding memory.
@@ -342,7 +342,7 @@ A lane with `queue_high_watermark` close to `SSH_LANE_BUFFER` is hoarding memory
 | Cause | Cure |
 |---|---|
 | Ring buffers too large | Lower `SSH_SHELL_MAX_BUFFER` / `SSH_COMMAND_MAX_BUFFER_SIZE` for the workload. Trade-off: smaller buffer means snapshot rebuilds may not cover the gap; expect more `LAG_DETECTED` warnings. |
-| Stuck lanes | Use `ssh_sub_list` to find lanes with high `queue_depth`; resume them, switch their `lag_policy` to `snapshot`, or unsubscribe and recreate. |
+| Stuck lanes | Use `sub_list` to find lanes with high `queue_depth`; resume them, switch their `lag_policy` to `snapshot`, or unsubscribe and recreate. |
 | Idempotency cache | Lower `SSH_IDEMPOTENCY_MAX_ENTRIES` or `SSH_IDEMPOTENCY_TTL_SECS`. |
 | Stats overhead | If you are running 65000+ subs on a single daemon, partition into multiple daemon processes (each is single-tenant in v5.0). |
 
@@ -395,7 +395,7 @@ DETAIL: <optional context>
 ```
 
 ```json
-{ "tool": "ssh_execute", "status": "error", "code": "SESSION_NOT_FOUND",
+{ "tool": "ssh_exec", "status": "error", "code": "SESSION_NOT_FOUND",
   "reason": "no session with id sess-x",
   "detail": "closest matches: sess-1, sess-a" }
 ```
@@ -447,10 +447,10 @@ Empty keys are treated as absent (idempotency OFF for that call), so callers do 
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
-| `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/disconnect.rs::execute` | Run `ssh_list_sessions` to recover the live ID list, or call `ssh_connect`. v4.7+: when at least one live session exists, `DETAIL:` carries `closest matches: <id1>, <id2>, <id3>`. |
+| `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/disconnect.rs::execute` | Run `ssh_sessions` to recover the live ID list, or call `ssh_connect`. v4.7+: when at least one live session exists, `DETAIL:` carries `closest matches: <id1>, <id2>, <id3>`. |
 | `TRANSPORT_ERROR` | russh transport failed during teardown. | `src/adapters/ssh/russh_adapter.rs::disconnect` | Treat as success (the session is gone either way). Surface details if needed. |
 
-### ssh_list_sessions
+### ssh_sessions
 
 No error codes. Returns an empty list when the optional `agent_id` filter matches nothing or when no sessions are stored. Dead sessions are health-checked and pruned before the response is built.
 
@@ -458,33 +458,33 @@ No error codes. Returns an empty list when the optional `agent_id` filter matche
 
 No error codes. Unknown `agent_id` returns `SESSIONS: 0` and `COMMANDS: 0`.
 
-### ssh_execute
+### ssh_exec
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/execute_command.rs::execute` | Reconnect via `ssh_connect`. v4.7+: `DETAIL: closest matches: ...` populated when the session repo holds at least one live entry. |
-| `MAX_COMMANDS_EXCEEDED` | Per-session running-command cap (100) reached. `DETAIL: limit=100`. | `src/application/execute_command.rs::execute` | Wait for in-flight commands to complete, or `ssh_cancel_command` an obsolete one. |
+| `MAX_COMMANDS_EXCEEDED` | Per-session running-command cap (100) reached. `DETAIL: limit=100`. | `src/application/execute_command.rs::execute` | Wait for in-flight commands to complete, or `ssh_exec_cancel` an obsolete one. |
 | `CHANNEL_FAILED` | russh failed to open the exec channel. Tagged transport. | `src/adapters/ssh/russh_adapter.rs::execute_command` | Inspect; common causes: remote `MaxSessions` exhaustion, kex failure. |
 | `TRANSPORT_ERROR` | russh transport error not covered by a tag. | `src/adapters/ssh/russh_adapter.rs::execute_command` | Inspect; consider a fresh session (`ssh_connect reuse=force_new`). |
 
-### ssh_get_command_output
+### ssh_exec_output
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
-| `COMMAND_NOT_FOUND` | No async command with the given `COMMAND_ID`. May indicate the command was cleaned up after `SSH_COMMAND_CLEANUP_TTL`. | `src/application/get_command_output.rs::execute` | Re-issue `ssh_execute`, or rely on the original output captured before the TTL. |
+| `COMMAND_NOT_FOUND` | No async command with the given `COMMAND_ID`. May indicate the command was cleaned up after `SSH_COMMAND_CLEANUP_TTL`. | `src/application/get_command_output.rs::execute` | Re-issue `ssh_exec`, or rely on the original output captured before the TTL. |
 | `COMMAND_FAILED` | Status flipped to `Failed` (transport error, exec channel died mid-run). Tagged transport. | `src/adapters/ssh/russh_adapter.rs::execute_command` | Inspect `REASON`; retry the command if the cause looks transient (network), otherwise surface the failure to the user. |
 
-### ssh_list_commands
+### ssh_commands
 
 No error codes. Filters that match nothing return an empty list.
 
-### ssh_cancel_command
+### ssh_exec_cancel
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `COMMAND_NOT_FOUND` | No async command with the given `COMMAND_ID`. | `src/application/cancel_command.rs::execute` | Already cleaned up — treat as success. |
 
-`NOOP` is not an error: when the command exists but is no longer running, the tool returns `SSH_CANCEL_COMMAND: NOOP` as a successful `CallToolResult`.
+`NOOP` is not an error: when the command exists but is no longer running, the tool returns `SSH_EXEC_CANCEL: NOOP` as a successful `CallToolResult`.
 
 ### ssh_shell_open
 
@@ -503,7 +503,7 @@ No error codes. Filters that match nothing return an empty list.
 | `WRITE_FAILED` | The dedicated background writer task closed (russh transport gone). | `src/adapters/ssh/russh_adapter.rs::send_shell_data` (tagged transport) | Treat the shell as dead: call `ssh_shell_close` (idempotent) and reopen if needed. |
 | `TRANSPORT_ERROR` | russh transport error not covered by a tag. | `src/adapters/ssh/russh_adapter.rs::send_shell_data` | Inspect; reopen the shell. |
 
-### ssh_shell_send_key
+### ssh_shell_press
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
@@ -560,11 +560,11 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/download_file.rs::execute` | Reconnect via `ssh_connect`. |
 | `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap (10) reached. `DETAIL: limit=10`. | `src/application/download_file.rs::execute` | Wait for an in-flight transfer. |
-| `SFTP_OPEN_FAILED` | Failed to open the SFTP subsystem on the SSH session (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `open`) | Verify the remote host has SFTP enabled (`Subsystem sftp`); fall back to `ssh_execute` + manual `cat`. |
+| `SFTP_OPEN_FAILED` | Failed to open the SFTP subsystem on the SSH session (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `open`) | Verify the remote host has SFTP enabled (`Subsystem sftp`); fall back to `ssh_exec` + manual `cat`. |
 | `REMOTE_METADATA_ERROR` | Remote `stat` failed during download — file missing, permission denied, transport blip mid-stat. | `src/adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` | Inspect `REASON`; verify the remote path and the download user's permissions. |
 | `SFTP_ERROR` | Untagged catch-all for `DomainError::Sftp`. | `src/adapters/sftp/russh_sftp_adapter.rs` | Inspect `REASON`; check remote disk, permissions, SFTP availability. |
 
-### ssh_get_transfer_progress
+### ssh_transfer_progress
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
@@ -681,8 +681,8 @@ sequenceDiagram
     participant Server as McpSshServer
     participant Cmd as RunningCommand
 
-    Client->>Server: ssh_execute(session_id, command="sleep 600")
-    Server-->>Client: SSH_EXECUTE: STARTED\nCOMMAND_ID: 7d4c8e2a-...
+    Client->>Server: ssh_exec(session_id, command="sleep 600")
+    Server-->>Client: SSH_EXEC: STARTED\nCOMMAND_ID: 7d4c8e2a-...
 
     Note over Client: Decide to cancel.
 
@@ -690,11 +690,11 @@ sequenceDiagram
         Client->>Rmcp: notifications/cancelled {requestId}
         Rmcp->>Server: native cancellation routing
         Server->>Server: tool task aborted and status_rx becomes Cancelled
-    and via ssh_cancel_command tool
-        Client->>Server: ssh_cancel_command(command_id="7d4c8e2a-...")
+    and via ssh_exec_cancel tool
+        Client->>Server: ssh_exec_cancel(command_id="7d4c8e2a-...")
         Server->>Cmd: cancel_token.cancel()
         Cmd->>Cmd: status_rx becomes Cancelled
-        Server-->>Client: SSH_CANCEL_COMMAND CANCELLED<br/>--- stdout (partial) ---
+        Server-->>Client: SSH_EXEC_CANCEL CANCELLED<br/>--- stdout (partial) ---
     end
 
     Note over Cmd: status persists as Cancelled until the SSH_COMMAND_CLEANUP_TTL post-read GC removes it.
@@ -778,10 +778,10 @@ sequenceDiagram
     Server->>Reg: subscribe(Session, "s1", uri, peer_id, peer)
     Client->>Server: resources/subscribe session://s2/health
 
-    Note over Server,Reg: ssh_list_sessions probes echo 1 every call. Each probe fires HealthEvent::Healthy.
+    Note over Server,Reg: ssh_sessions probes echo 1 every call. Each probe fires HealthEvent::Healthy.
 
     par s1 stays healthy
-        Client->>Server: ssh_list_sessions
+        Client->>Server: ssh_sessions
         Server->>SS: probe s1 -> ok -> health_tx.send(Healthy)
         Server->>Reg: poke(Session, "s1")
         Reg-->>Client: notifications/resources/updated session://s1/health
@@ -822,7 +822,7 @@ Layered example:
 RUST_LOG=ssh_mcp=info,ssh_mcp::adapters::lifecycle=trace ssh-mcp-stdio
 ```
 
-### `ssh_daemon_stats`
+### `sub_stats_all`
 
 Global counters across every active session, sub, and lane:
 
@@ -831,9 +831,9 @@ Global counters across every active session, sub, and lane:
 - `mux_queue_depth`, `peer_gc_pace_per_min`
 - `rejected_ops_total`, `rejected_ops_by_code`
 
-Available via the `ssh_daemon_stats` MCP tool, and auto-emitted on the NDJSON stream every `SSH_DAEMON_STATS_INTERVAL_S` (default 60 s).
+Available via the `sub_stats_all` MCP tool, and auto-emitted on the NDJSON stream every `SSH_DAEMON_STATS_INTERVAL_S` (default 60 s).
 
-### `ssh_sub_stats`
+### `sub_stats`
 
 Per-`sub_id` snapshot (atomic counters; lock-free read):
 
@@ -844,7 +844,7 @@ Per-`sub_id` snapshot (atomic counters; lock-free read):
 
 Use this when a single workflow misbehaves and you have its `sub_id`. Full list: [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0006](./adr/0006-backpressure-policies.md).
 
-### `ssh_list_sessions` / `ssh_list_commands`
+### `ssh_sessions` / `ssh_commands`
 
 v4 carry-over tools. Useful to confirm which sessions / commands are alive before issuing a `disconnect` or a cascade-impacting op.
 
@@ -902,7 +902,7 @@ Capture in the bug report:
 - ssh-mcp version (e.g. `v5.0.0-rc1` or branch + commit SHA).
 - The exact tool / op call sequence that reproduces the issue.
 - `RUST_LOG=ssh_mcp=debug` output for the relevant time window.
-- `ssh_daemon_stats` snapshot at the moment of the issue.
+- `sub_stats_all` snapshot at the moment of the issue.
 - The wire response or NDJSON event that surprised you.
 - Reproducer (shell script or Rust test) ideally.
 

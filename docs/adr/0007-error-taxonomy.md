@@ -91,7 +91,7 @@ For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 cod
 
 | Code | Category | Retry | DETAIL |
 |---|---|---|---|
-| `RESOURCE_GONE` | RESOURCE | no | "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_execute / ssh_upload." |
+| `RESOURCE_GONE` | RESOURCE | no | "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_exec / ssh_upload." |
 | `LIFECYCLE_STATE_CONFLICT` | INTERNAL | no | "Unexpected lifecycle CAS failure; collect logs + report." |
 | `SESSION_REFCOUNT_UNDERFLOW` | INTERNAL | no | "Cascade decrement past zero; collect logs + report." |
 | `GRACE_TIMER_EXPIRED` | RESOURCE | no | "Grace elapsed; recreate resource." |
@@ -100,9 +100,9 @@ For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 cod
 
 | Code | Category | Retry | DETAIL |
 |---|---|---|---|
-| `SUB_NOT_FOUND` | RESOURCE | no | "Use ssh_sub_list to enumerate active subscriptions." |
+| `SUB_NOT_FOUND` | RESOURCE | no | "Use sub_list to enumerate active subscriptions." |
 | `MAX_SUBS_PER_URI_EXCEEDED` | POLICY | conditional | "Share an existing sub via fan-out client-side, or unsubscribe stale ones." |
-| `MAX_SUBS_TOTAL_EXCEEDED` | POLICY | conditional | "Audit ssh_sub_list and unsubscribe stale subscriptions." |
+| `MAX_SUBS_TOTAL_EXCEEDED` | POLICY | conditional | "Audit sub_list and unsubscribe stale subscriptions." |
 | `INVALID_LIFETIME` | STATE | no | "lifetime ∈ {manual, auto-close, lease}." |
 | `INVALID_LAG_POLICY` | STATE | no | "lag_policy ∈ {block_slow, drop_oldest, drop_newest, snapshot}." |
 
@@ -113,20 +113,20 @@ For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 cod
 | `LANE_BUFFER_FULL` | POLICY | conditional | "Increase SSH_LANE_BUFFER or switch lag_policy to snapshot." |
 | `LAG_DETECTED` | POLICY | recover | "Lagged N events; snapshot rebuilt; cursor adjusted." |
 | `LAG_BACKPRESSURE` | POLICY | conditional | "Consume stdout faster or raise SSH_BP_BLOCK_TIMEOUT_MS." |
-| `RING_BUFFER_OVERFLOW` | POLICY | recover | "Head bytes dropped; use ssh_sub_replay from cursor." |
+| `RING_BUFFER_OVERFLOW` | POLICY | recover | "Head bytes dropped; use sub_replay from cursor." |
 | `MUX_BACKPRESSURE` | POLICY | conditional | "Outbound writer blocked; consume the daemon NDJSON output faster." |
 
 #### LLM UX hygiene (ADR 0005)
 
 | Code | Category | Retry | DETAIL |
 |---|---|---|---|
-| `SUB_LEAK_RISK` | POLICY | warn | "Resource owned > 2 s with 0 subs and no auto-cleanup; ssh_subscribe or recreate with release_when_no_subs=true." |
+| `SUB_LEAK_RISK` | POLICY | warn | "Resource owned > 2 s with 0 subs and no auto-cleanup; sub_open or recreate with release_when_no_subs=true." |
 
 #### NDJSON daemon (ADR 0008)
 
 | Code | Category | Retry | DETAIL |
 |---|---|---|---|
-| `INVALID_OP` | STATE | no | "Op not in {connect, exec, ...}; check the op enum or use ssh_sub_list." |
+| `INVALID_OP` | STATE | no | "Op not in {connect, exec, ...}; check the op enum or use sub_list." |
 | `IDEMPOTENCY_KEY_MISMATCH` | STATE | no | "Same idempotency_key with different args; pick a new key." |
 
 ### Wire format unchanged
@@ -143,7 +143,7 @@ Plus the structured JSON channel:
 
 ```json
 { "tool": "ssh_x", "status": "error", "code": "RESOURCE_GONE",
-  "reason": "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_execute / ssh_upload." }
+  "reason": "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_exec / ssh_upload." }
 ```
 
 (Note: `reason` carries the DETAIL on the structured channel; the markdown channel keeps both REASON and DETAIL on separate lines for backwards compatibility.)
@@ -154,7 +154,7 @@ Plus the structured JSON channel:
 
 ### Closest-match suggestions
 
-Already implemented in v4.7 for `NOT_FOUND` codes. Extended in v5.0 to cover `SUB_NOT_FOUND` (suggests by sub_id prefix match) and `RESOURCE_GONE` (suggests open resources of the same kind on the same session). The DETAIL line concatenates the suggestion: `DETAIL: Use ssh_sub_list to see active subscriptions. Closest: 019028a3-... (open since 14:32:07)`.
+Already implemented in v4.7 for `NOT_FOUND` codes. Extended in v5.0 to cover `SUB_NOT_FOUND` (suggests by sub_id prefix match) and `RESOURCE_GONE` (suggests open resources of the same kind on the same session). The DETAIL line concatenates the suggestion: `DETAIL: Use sub_list to see active subscriptions. Closest: 019028a3-... (open since 14:32:07)`.
 
 ## Consequences
 

@@ -64,9 +64,9 @@ pub enum LifetimeKind {
 
 // ---- argument structs -------------------------------------------------
 
-/// Arguments for the `ssh_subscribe` MCP tool.
+/// Arguments for the `sub_open` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubscribeArgs {
+pub struct SubOpenArgs {
     /// Resource URI (e.g. `shell://<id>/output`, `command://<id>/output`).
     pub uri: String,
 
@@ -91,30 +91,30 @@ pub struct SshSubscribeArgs {
     pub filter: Option<String>,
 }
 
-/// Arguments for the `ssh_unsubscribe` MCP tool.
+/// Arguments for the `sub_close` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshUnsubscribeArgs {
-    /// `SUB_ID` returned from `ssh_subscribe`.
+pub struct SubCloseArgs {
+    /// `SUB_ID` returned from `sub_open`.
     pub sub_id: String,
 }
 
-/// Arguments for the `ssh_sub_pause` MCP tool.
+/// Arguments for the `sub_pause` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubPauseArgs {
+pub struct SubPauseArgs {
     /// `SUB_ID` to pause.
     pub sub_id: String,
 }
 
-/// Arguments for the `ssh_sub_resume` MCP tool.
+/// Arguments for the `sub_resume` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubResumeArgs {
+pub struct SubResumeArgs {
     /// `SUB_ID` to resume.
     pub sub_id: String,
 }
 
-/// Arguments for the `ssh_sub_filter` MCP tool.
+/// Arguments for the `sub_filter` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubFilterArgs {
+pub struct SubFilterArgs {
     /// `SUB_ID` whose filter is being updated.
     pub sub_id: String,
 
@@ -123,9 +123,9 @@ pub struct SshSubFilterArgs {
     pub regex: String,
 }
 
-/// Arguments for the `ssh_sub_replay` MCP tool.
+/// Arguments for the `sub_replay` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubReplayArgs {
+pub struct SubReplayArgs {
     /// `SUB_ID` to replay.
     pub sub_id: String,
 
@@ -135,9 +135,9 @@ pub struct SshSubReplayArgs {
     pub from_cursor: Option<u64>,
 }
 
-/// Arguments for the `ssh_sub_list` MCP tool.
+/// Arguments for the `sub_list` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubListArgs {
+pub struct SubListArgs {
     /// Optional URI prefix filter. Returns only subs whose canonical
     /// URI starts with this prefix.
     pub uri_prefix: Option<String>,
@@ -147,21 +147,21 @@ pub struct SshSubListArgs {
     pub peer_id: Option<String>,
 }
 
-/// Arguments for the `ssh_sub_stats` MCP tool.
+/// Arguments for the `sub_stats` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshSubStatsArgs {
+pub struct SubStatsArgs {
     /// `SUB_ID` to inspect.
     pub sub_id: String,
 }
 
-/// Arguments for the `ssh_daemon_stats` MCP tool. Currently empty —
+/// Arguments for the `sub_stats_all` MCP tool. Currently empty —
 /// the tool returns aggregate counters across every lane in scope.
 ///
 /// Carries a `_reserved` field with `#[serde(default, skip)]` so the
 /// struct stays non-empty (avoids `clippy::empty_structs_with_brackets`)
 /// while remaining wire-compatible with `{}`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
-pub struct SshDaemonStatsArgs {
+pub struct SubStatsAllArgs {
     /// Reserved field — not deserialised, never serialised. Phase 4
     /// may layer optional knobs (e.g. `top_n`) here.
     #[serde(default, skip)]
@@ -172,8 +172,8 @@ pub struct SshDaemonStatsArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        LifetimeKind, SshDaemonStatsArgs, SshSubFilterArgs, SshSubListArgs, SshSubPauseArgs,
-        SshSubReplayArgs, SshSubResumeArgs, SshSubStatsArgs, SshSubscribeArgs, SshUnsubscribeArgs,
+        LifetimeKind, SubStatsAllArgs, SubFilterArgs, SubListArgs, SubPauseArgs,
+        SubReplayArgs, SubResumeArgs, SubStatsArgs, SubOpenArgs, SubCloseArgs,
     };
     use schemars::schema_for;
     use serde_json::{Value, json};
@@ -201,7 +201,7 @@ mod tests {
         // numeric/string-typed fields the default lands directly on
         // the property. This test asserts the latter (numeric grace_ms)
         // and the schema's mere existence for the enum-typed fields.
-        let schema = schema_for!(SshSubscribeArgs);
+        let schema = schema_for!(SubOpenArgs);
         let json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&json, "grace_ms"),
@@ -223,32 +223,32 @@ mod tests {
     #[test]
     fn ssh_subscribe_args_parse_minimal_payload() {
         let v = json!({"uri": "shell://x/output"});
-        let parsed: SshSubscribeArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubOpenArgs = serde_json::from_value(v).expect("parse");
         assert_eq!(parsed.uri, "shell://x/output");
     }
 
     #[test]
     fn ssh_unsubscribe_args_round_trip() {
         let v = json!({"sub_id": "019028a3"});
-        let parsed: SshUnsubscribeArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubCloseArgs = serde_json::from_value(v).expect("parse");
         assert_eq!(parsed.sub_id, "019028a3");
     }
 
     #[test]
     fn ssh_sub_pause_resume_filter_replay_args_parse() {
-        let _: SshSubPauseArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("pause");
-        let _: SshSubResumeArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("resume");
-        let f: SshSubFilterArgs =
+        let _: SubPauseArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("pause");
+        let _: SubResumeArgs = serde_json::from_value(json!({"sub_id": "x"})).expect("resume");
+        let f: SubFilterArgs =
             serde_json::from_value(json!({"sub_id": "x", "regex": "ERR.*"})).expect("filter");
         assert_eq!(f.regex, "ERR.*");
-        let r: SshSubReplayArgs =
+        let r: SubReplayArgs =
             serde_json::from_value(json!({"sub_id": "x", "from_cursor": 42})).expect("replay");
         assert_eq!(r.from_cursor, Some(42));
     }
 
     #[test]
     fn ssh_sub_list_args_accept_empty_payload() {
-        let parsed: SshSubListArgs = serde_json::from_value(json!({})).expect("parse");
+        let parsed: SubListArgs = serde_json::from_value(json!({})).expect("parse");
         assert!(parsed.uri_prefix.is_none());
         assert!(parsed.peer_id.is_none());
     }
@@ -256,21 +256,21 @@ mod tests {
     #[test]
     fn ssh_sub_stats_args_parse() {
         let v = json!({"sub_id": "abc"});
-        let parsed: SshSubStatsArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubStatsArgs = serde_json::from_value(v).expect("parse");
         assert_eq!(parsed.sub_id, "abc");
     }
 
     #[test]
     fn ssh_daemon_stats_args_round_trip_empty() {
         let v = json!({});
-        let _: SshDaemonStatsArgs = serde_json::from_value(v).expect("parse");
-        let v2 = SshDaemonStatsArgs::default();
+        let _: SubStatsAllArgs = serde_json::from_value(v).expect("parse");
+        let v2 = SubStatsAllArgs::default();
         let _ = format!("{v2:?}");
     }
 
     #[test]
     fn ssh_sub_replay_default_cursor_is_zero() {
-        let schema = schema_for!(SshSubReplayArgs);
+        let schema = schema_for!(SubReplayArgs);
         let json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&json, "from_cursor"),
@@ -288,7 +288,7 @@ mod tests {
             "lag_policy": "drop_oldest",
             "filter": "ERR.*"
         });
-        let parsed: SshSubscribeArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubOpenArgs = serde_json::from_value(v).expect("parse");
         assert_eq!(parsed.uri, "shell://x/output");
         assert_eq!(parsed.lifetime, Some(LifetimeKind::AutoClose));
         assert_eq!(parsed.grace_ms, Some(5_000));
@@ -300,7 +300,7 @@ mod tests {
     fn ssh_sub_filter_args_accept_empty_regex() {
         // Empty regex clears the filter — the args struct accepts it.
         let v = json!({"sub_id": "x", "regex": ""});
-        let parsed: SshSubFilterArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubFilterArgs = serde_json::from_value(v).expect("parse");
         assert!(parsed.regex.is_empty());
     }
 
@@ -308,25 +308,25 @@ mod tests {
     fn ssh_sub_replay_args_negative_cursor_is_rejected() {
         // u64 deserialisation rejects negative values via serde.
         let v = json!({"sub_id": "x", "from_cursor": -1});
-        assert!(serde_json::from_value::<SshSubReplayArgs>(v).is_err());
+        assert!(serde_json::from_value::<SubReplayArgs>(v).is_err());
     }
 
     #[test]
     fn ssh_subscribe_args_rejects_unknown_lifetime() {
         let v = json!({"uri": "shell://x/output", "lifetime": "forever"});
-        assert!(serde_json::from_value::<SshSubscribeArgs>(v).is_err());
+        assert!(serde_json::from_value::<SubOpenArgs>(v).is_err());
     }
 
     #[test]
     fn ssh_subscribe_args_rejects_unknown_lag_policy() {
         let v = json!({"uri": "shell://x/output", "lag_policy": "nope"});
-        assert!(serde_json::from_value::<SshSubscribeArgs>(v).is_err());
+        assert!(serde_json::from_value::<SubOpenArgs>(v).is_err());
     }
 
     #[test]
     fn ssh_sub_list_args_round_trip_with_both_filters() {
         let v = json!({"uri_prefix": "shell://", "peer_id": "p-1"});
-        let parsed: SshSubListArgs = serde_json::from_value(v).expect("parse");
+        let parsed: SubListArgs = serde_json::from_value(v).expect("parse");
         assert_eq!(parsed.uri_prefix.as_deref(), Some("shell://"));
         assert_eq!(parsed.peer_id.as_deref(), Some("p-1"));
     }

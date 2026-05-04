@@ -160,7 +160,7 @@ pub struct SubscriptionRegistry {
     byte_triggered_flushes: AtomicU64,
     /// Optional forwarder to the hexagonal `MemoryRegistry`. Composition
     /// root installs an impl so legacy producer pokes / byte deltas
-    /// also wake `ssh_subscribe` lanes via the lane-fanout bridge.
+    /// also wake `sub_open` lanes via the lane-fanout bridge.
     forwarder: ArcSwap<Option<Arc<dyn ProducerForwarder>>>,
 }
 
@@ -215,7 +215,7 @@ impl SubscriptionRegistry {
         if let Some(entry) = self.wakers.get(&(kind, id.to_string())) {
             entry.notify_one();
         }
-        // Forward to hexagonal registry so `ssh_subscribe` lanes also
+        // Forward to hexagonal registry so `sub_open` lanes also
         // see producer pokes (the legacy debouncer fires the legacy
         // peer fanout; the forwarder fires the hexagonal one).
         let fwd = self.forwarder.load_full();
@@ -437,7 +437,7 @@ impl SubscriptionRegistry {
     /// no-debouncer paths return immediately.
     pub fn record_bytes(&self, kind: ResourceKind, id: &str, bytes_added: usize) {
         // Always forward to the hexagonal registry — bytes accumulate
-        // there independently so `ssh_subscribe` lane stats track the
+        // there independently so `sub_open` lane stats track the
         // wire even when the legacy peer set is empty.
         let fwd = self.forwarder.load_full();
         if let Some(forwarder) = fwd.as_ref() {
@@ -466,7 +466,7 @@ impl SubscriptionRegistry {
     }
 
     /// Process-wide count of byte-threshold-triggered broadcasts.
-    /// Surfaced via `ssh_daemon_stats`.
+    /// Surfaced via `sub_stats_all`.
     #[must_use]
     pub fn byte_triggered_flushes_total(&self) -> u64 {
         self.byte_triggered_flushes.load(Ordering::Relaxed)

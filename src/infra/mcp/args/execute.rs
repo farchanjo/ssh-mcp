@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::policy::CommandStatusFilter;
 
-/// Async command status filter used by `ssh_list_commands`.
+/// Async command status filter used by `ssh_commands`.
 ///
 /// Replaces the v2.0.1 `Option<String>` filter (which silently ignored
 /// invalid values) with a tagged enum that errors at deserialization
@@ -84,7 +84,7 @@ const fn default_max_items() -> Option<usize> {
     Some(500)
 }
 
-// ssh_run / ssh_execute_batch defaults --------------------------------
+// ssh_run / ssh_exec_batch defaults --------------------------------
 #[expect(
     clippy::unnecessary_wraps,
     reason = "serde requires the fn return type to match the field type Option<T>"
@@ -130,9 +130,9 @@ const fn default_stop_on_failure() -> Option<bool> {
     Some(true)
 }
 
-/// Arguments for the `ssh_execute` MCP tool.
+/// Arguments for the `ssh_exec` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshExecuteArgs {
+pub struct SshExecArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
 
@@ -162,10 +162,10 @@ pub struct SshExecuteArgs {
     pub grace_ms: Option<u32>,
 }
 
-/// Arguments for the `ssh_get_command_output` MCP tool.
+/// Arguments for the `ssh_exec_output` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshGetCommandOutputArgs {
-    /// `COMMAND_ID` returned from `ssh_execute`.
+pub struct SshExecOutputArgs {
+    /// `COMMAND_ID` returned from `ssh_exec`.
     pub command_id: String,
 
     /// Block until completion or `wait_timeout_secs` expires. Default:
@@ -185,9 +185,9 @@ pub struct SshGetCommandOutputArgs {
     pub max_output_bytes: Option<usize>,
 }
 
-/// Arguments for the `ssh_list_commands` MCP tool.
+/// Arguments for the `ssh_commands` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshListCommandsArgs {
+pub struct SshCommandsArgs {
     /// `SESSION_ID` returned from `ssh_connect`. Optional filter; when
     /// omitted returns commands across all sessions.
     pub session_id: Option<String>,
@@ -202,10 +202,10 @@ pub struct SshListCommandsArgs {
     pub max_items: Option<usize>,
 }
 
-/// Arguments for the `ssh_cancel_command` MCP tool.
+/// Arguments for the `ssh_exec_cancel` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshCancelCommandArgs {
-    /// `COMMAND_ID` returned from `ssh_execute`.
+pub struct SshExecCancelArgs {
+    /// `COMMAND_ID` returned from `ssh_exec`.
     pub command_id: String,
 
     /// Maximum bytes shown in stdout/stderr. Default: 16384. Cap:
@@ -218,7 +218,7 @@ pub struct SshCancelCommandArgs {
 
 /// Arguments for the `ssh_run` MCP tool.
 ///
-/// One-shot orchestration of `ssh_connect` + `ssh_execute` +
+/// One-shot orchestration of `ssh_connect` + `ssh_exec` +
 /// (optional) `ssh_disconnect`. Avoids the three-round-trip
 /// `connect -> execute -> wait` choreography for short atomic
 /// commands like `uptime`, `hostname`, etc.
@@ -260,16 +260,16 @@ pub struct SshRunArgs {
 
     /// Disconnect the session after the command finishes. Default:
     /// true (one-shot mode). Set false to keep the session open and
-    /// reuse it for subsequent `ssh_execute` calls.
+    /// reuse it for subsequent `ssh_exec` calls.
     #[schemars(default = "default_disconnect_after_run")]
     pub disconnect_after: Option<bool>,
 }
 
-/// Arguments for the `ssh_execute_batch` MCP tool — sequential
+/// Arguments for the `ssh_exec_batch` MCP tool — sequential
 /// execution of multiple commands on the same session, with optional
 /// stop-on-failure semantics.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshExecuteBatchArgs {
+pub struct SshExecBatchArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
 
@@ -297,8 +297,8 @@ pub struct SshExecuteBatchArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandStatus, SshCancelCommandArgs, SshExecuteArgs, SshGetCommandOutputArgs,
-        SshListCommandsArgs,
+        CommandStatus, SshExecCancelArgs, SshExecArgs, SshExecOutputArgs,
+        SshCommandsArgs,
     };
     use crate::domain::policy::CommandStatusFilter;
     use schemars::schema_for;
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn ssh_execute_schema_emits_documented_defaults() {
-        let schema = schema_for!(SshExecuteArgs);
+        let schema = schema_for!(SshExecArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "timeout_secs"),
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn ssh_get_command_output_schema_emits_documented_defaults() {
-        let schema = schema_for!(SshGetCommandOutputArgs);
+        let schema = schema_for!(SshExecOutputArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "wait"),
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn ssh_list_commands_schema_emits_max_items_default() {
-        let schema = schema_for!(SshListCommandsArgs);
+        let schema = schema_for!(SshCommandsArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "max_items"),
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn ssh_cancel_command_schema_emits_documented_defaults() {
-        let schema = schema_for!(SshCancelCommandArgs);
+        let schema = schema_for!(SshExecCancelArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "max_output_bytes"),
@@ -389,7 +389,7 @@ mod tests {
         );
     }
 
-    // ---------- v4.7-step3 ssh_run / ssh_execute_batch arg tests ------
+    // ---------- v4.7-step3 ssh_run / ssh_exec_batch arg tests ------
 
     #[test]
     fn ssh_run_schema_emits_documented_defaults() {
@@ -416,8 +416,8 @@ mod tests {
 
     #[test]
     fn ssh_execute_batch_schema_emits_documented_defaults() {
-        use super::SshExecuteBatchArgs;
-        let schema = schema_for!(SshExecuteBatchArgs);
+        use super::SshExecBatchArgs;
+        let schema = schema_for!(SshExecBatchArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "stop_on_failure"),
@@ -455,13 +455,13 @@ mod tests {
 
     #[test]
     fn ssh_execute_batch_args_round_trip() {
-        use super::SshExecuteBatchArgs;
+        use super::SshExecBatchArgs;
         let raw = serde_json::json!({
             "session_id": "sess-1",
             "commands": ["uptime", "hostname"],
             "stop_on_failure": false,
         });
-        let parsed: SshExecuteBatchArgs = serde_json::from_value(raw).expect("parse");
+        let parsed: SshExecBatchArgs = serde_json::from_value(raw).expect("parse");
         assert_eq!(parsed.session_id, "sess-1");
         assert_eq!(parsed.commands.len(), 2);
         assert_eq!(parsed.stop_on_failure, Some(false));

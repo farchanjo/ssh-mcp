@@ -9,7 +9,7 @@ Proposed (v5.0.0). Implementation tracked under Phase 1 of the v5 roadmap.
 ssh-mcp v4 keeps two distinct conceptual surfaces strictly decoupled:
 
 - **Subscription** (observability): a peer registers via `resources/subscribe`; the `MemoryRegistry` debouncer fans push notifications out over the rmcp transport.
-- **Resource ownership** (remote state): a shell, an async command, or an in-flight SFTP transfer is a real artefact on the remote host. It is created by `ssh_shell_open`, `ssh_execute`, or `ssh_upload`/`ssh_download`, and torn down by an explicit `ssh_shell_close`, `ssh_cancel_command`, or `ssh_disconnect` (which cascades through every owned resource).
+- **Resource ownership** (remote state): a shell, an async command, or an in-flight SFTP transfer is a real artefact on the remote host. It is created by `ssh_shell_open`, `ssh_exec`, or `ssh_upload`/`ssh_download`, and torn down by an explicit `ssh_shell_close`, `ssh_exec_cancel`, or `ssh_disconnect` (which cascades through every owned resource).
 
 These two surfaces never interact at the lifecycle level. A subscriber can attach to a `command://<id>/output` URI, fail to consume the events, drop its rmcp transport, and the underlying remote command will keep running until the parent session is disconnected or the command finishes on its own. In practice this is the dominant leak vector reported by 27B-class LLM hosts that drive the server: the host launches a long shell, opens a subscription, then either dies, forgets the subscription, or polls the resource via a non-push code path. The remote shell zombies until the inactivity sweeper terminates the session — which itself does not fire while a subscriber is still nominally connected.
 
@@ -168,7 +168,7 @@ SessionPolicy {
 }
 ```
 
-Every `ssh_shell_open`, `ssh_execute`, `ssh_upload`, `ssh_download` call accepts a new optional parameter `release_when_no_subs: Option<bool>` (Phase 3). Phase 1 lands the layer with the v4-compat default; Phase 3 surfaces the parameter into the MCP tool schema.
+Every `ssh_shell_open`, `ssh_exec`, `ssh_upload`, `ssh_download` call accepts a new optional parameter `release_when_no_subs: Option<bool>` (Phase 3). Phase 1 lands the layer with the v4-compat default; Phase 3 surfaces the parameter into the MCP tool schema.
 
 ### Error model
 
@@ -197,7 +197,7 @@ These map onto MCP wire codes `RESOURCE_GONE`, `INTERNAL_ERROR`, `INTERNAL_ERROR
 
 ### Neutral
 
-- **No public MCP wire change in Phase 1.** The new policy parameter on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` lands in Phase 3 alongside the LLM UX overhaul. Phase 1 wires the layer underneath with the v4-compat default, so existing MCP hosts see no behaviour change.
+- **No public MCP wire change in Phase 1.** The new policy parameter on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` lands in Phase 3 alongside the LLM UX overhaul. Phase 1 wires the layer underneath with the v4-compat default, so existing MCP hosts see no behaviour change.
 - **Existing `SessionReaper` keeps working.** Refcount supersedes TTL: a session with `active_refs > 0` is never reaped by the inactivity sweeper. A session that drops to zero refs falls through to the existing TTL path if `idle_grace_ms` expires before any new resource is opened.
 
 ## References

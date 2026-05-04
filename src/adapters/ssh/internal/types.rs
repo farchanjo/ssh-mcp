@@ -51,7 +51,7 @@ impl fmt::Display for AsyncCommandStatus {
 }
 
 /// Information about a single async command. Stored in the v3 command
-/// storage and rendered into `ssh_list_commands` markdown.
+/// storage and rendered into `ssh_commands` markdown.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AsyncCommandInfo {
     /// Unique identifier for this command

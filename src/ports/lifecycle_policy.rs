@@ -25,7 +25,7 @@
 //! - `on_subscribe` / `on_unsubscribe` — refcount manipulation, drives
 //!   the Owned -> Observed -> Releasing transitions.
 //! - `force_close` — explicit close path used by `ssh_shell_close`,
-//!   `ssh_cancel_command`, etc.
+//!   `ssh_exec_cancel`, etc.
 //! - `snapshot` — read-only inspection for diagnostics.
 //! - `arm_grace_timer` / `cancel_grace_timer` — async helpers consumed
 //!   by the adapter's grace-timer task.

@@ -85,9 +85,9 @@ pub struct SshDownloadArgs {
     pub grace_ms: Option<u32>,
 }
 
-/// Arguments for the `ssh_get_transfer_progress` MCP tool.
+/// Arguments for the `ssh_transfer_progress` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshGetTransferProgressArgs {
+pub struct SshTransferProgressArgs {
     /// `TRANSFER_ID` returned from `ssh_upload` or `ssh_download`.
     pub transfer_id: String,
 
@@ -103,7 +103,7 @@ pub struct SshGetTransferProgressArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::SshGetTransferProgressArgs;
+    use super::SshTransferProgressArgs;
     use schemars::schema_for;
     use serde_json::Value;
 
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn ssh_get_transfer_progress_schema_emits_documented_defaults() {
-        let schema = schema_for!(SshGetTransferProgressArgs);
+        let schema = schema_for!(SshTransferProgressArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "wait"),

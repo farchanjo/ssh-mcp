@@ -5,7 +5,7 @@
 //! markdown body the rmcp wrapper sends back. The shape mirrors the v4
 //! tools — `TOOL_NAME: STATUS / KEY: value / NEXT / HINT`.
 //!
-//! v5 hygiene additions: a strong `HINT:` line at every `ssh_subscribe`
+//! v5 hygiene additions: a strong `HINT:` line at every `sub_open`
 //! response (`HINT: REQUIRED NEXT STEP: ...`) so 27B-class models never
 //! leave a lane open without claiming responsibility, and a
 //! Hygiene-tail block on long-running tools (`Cleanup:` / `Cost:` /
@@ -88,7 +88,7 @@ pub fn append_hygiene(
 // Subscribe
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for a successful `ssh_subscribe`.
+/// Render the markdown body for a successful `sub_open`.
 #[must_use]
 pub fn subscribe_render(outcome: &SubscribeOutcome) -> String {
     let mut out = String::with_capacity(256);
@@ -96,7 +96,7 @@ pub fn subscribe_render(outcome: &SubscribeOutcome) -> String {
     append_subscribe_advisories(&mut out, outcome);
     append_hygiene(
         &mut out,
-        Some("ssh_unsubscribe"),
+        Some("sub_close"),
         Some("O(1) lane open + per-event mpsc"),
         Some("Pass _meta.idempotency_key to dedup retries"),
         Some("Hold the SUB_ID; never re-open the same URI without first unsubscribing"),
@@ -105,7 +105,7 @@ pub fn subscribe_render(outcome: &SubscribeOutcome) -> String {
 }
 
 fn append_subscribe_header(out: &mut String, outcome: &SubscribeOutcome) {
-    out.push_str("SSH_SUBSCRIBE: OK\nSUB_ID: ");
+    out.push_str("SUB_OPEN: OK\nSUB_ID: ");
     out.push_str(outcome.sub_id.as_str());
     out.push_str("\nURI: ");
     out.push_str(&sanitize_value(&outcome.uri));
@@ -121,7 +121,7 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
     append_next(
         out,
         &format!(
-            "ssh_sub_pause | ssh_sub_resume | ssh_sub_filter | ssh_sub_replay | ssh_unsubscribe sub_id={}",
+            "sub_pause | sub_resume | sub_filter | sub_replay | sub_close sub_id={}",
             outcome.sub_id
         ),
     );
@@ -129,7 +129,7 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
         out,
         HintStrength::Required,
         &format!(
-            "ssh_unsubscribe sub_id={} when done. Skip and the lane becomes a zombie.",
+            "sub_close sub_id={} when done. Skip and the lane becomes a zombie.",
             outcome.sub_id
         ),
     );
@@ -140,11 +140,11 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
     );
 }
 
-/// Render the structured JSON twin for `ssh_subscribe`.
+/// Render the structured JSON twin for `sub_open`.
 #[must_use]
 pub fn subscribe_structured(outcome: &SubscribeOutcome) -> Value {
     json!({
-        "tool": "ssh_subscribe",
+        "tool": "sub_open",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
         "uri": outcome.uri,
@@ -166,11 +166,11 @@ const fn lifetime_label(lifetime: SubscriptionLifetime) -> &'static str {
 // Unsubscribe
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for `ssh_unsubscribe`.
+/// Render the markdown body for `sub_close`.
 #[must_use]
 pub fn unsubscribe_render(outcome: &UnsubscribeOutcome) -> String {
     let mut out = String::with_capacity(192);
-    out.push_str("SSH_UNSUBSCRIBE: OK\nSUB_ID: ");
+    out.push_str("SUB_CLOSE: OK\nSUB_ID: ");
     out.push_str(outcome.sub_id.as_str());
     if let Some(uri) = outcome.uri.as_deref() {
         out.push_str("\nURI: ");
@@ -182,15 +182,15 @@ pub fn unsubscribe_render(outcome: &UnsubscribeOutcome) -> String {
         out.push_str("\nGRACE_REMAINING_MS: ");
         out.push_str(&ms.to_string());
     }
-    append_next(&mut out, "ssh_sub_list | ssh_subscribe (new lane)");
+    append_next(&mut out, "sub_list | sub_open (new lane)");
     out
 }
 
-/// Render the structured JSON twin for `ssh_unsubscribe`.
+/// Render the structured JSON twin for `sub_close`.
 #[must_use]
 pub fn unsubscribe_structured(outcome: &UnsubscribeOutcome) -> Value {
     json!({
-        "tool": "ssh_unsubscribe",
+        "tool": "sub_close",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
         "uri": outcome.uri,
@@ -203,28 +203,28 @@ pub fn unsubscribe_structured(outcome: &UnsubscribeOutcome) -> Value {
 // Pause / Resume / Filter / Replay (toggles)
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for `ssh_sub_pause`.
+/// Render the markdown body for `sub_pause`.
 #[must_use]
 pub fn pause_render(outcome: &SubToggleOutcome) -> String {
-    toggle_render("SSH_SUB_PAUSE", outcome, "paused")
+    toggle_render("SUB_PAUSE", outcome, "paused")
 }
 
-/// Render the structured JSON twin for `ssh_sub_pause`.
+/// Render the structured JSON twin for `sub_pause`.
 #[must_use]
 pub fn pause_structured(outcome: &SubToggleOutcome) -> Value {
-    toggle_structured("ssh_sub_pause", outcome)
+    toggle_structured("sub_pause", outcome)
 }
 
-/// Render the markdown body for `ssh_sub_resume`.
+/// Render the markdown body for `sub_resume`.
 #[must_use]
 pub fn resume_render(outcome: &SubToggleOutcome) -> String {
-    toggle_render("SSH_SUB_RESUME", outcome, "resumed")
+    toggle_render("SUB_RESUME", outcome, "resumed")
 }
 
-/// Render the structured JSON twin for `ssh_sub_resume`.
+/// Render the structured JSON twin for `sub_resume`.
 #[must_use]
 pub fn resume_structured(outcome: &SubToggleOutcome) -> Value {
-    toggle_structured("ssh_sub_resume", outcome)
+    toggle_structured("sub_resume", outcome)
 }
 
 fn toggle_render(tool: &str, outcome: &SubToggleOutcome, state_label: &str) -> String {
@@ -234,7 +234,7 @@ fn toggle_render(tool: &str, outcome: &SubToggleOutcome, state_label: &str) -> S
     out.push_str(outcome.sub_id.as_str());
     out.push_str("\nSTATE: ");
     out.push_str(state_label);
-    append_next(&mut out, "ssh_sub_stats | ssh_sub_resume | ssh_sub_pause");
+    append_next(&mut out, "sub_stats | sub_resume | sub_pause");
     out
 }
 
@@ -247,23 +247,23 @@ fn toggle_structured(tool: &str, outcome: &SubToggleOutcome) -> Value {
     })
 }
 
-/// Render the markdown body for `ssh_sub_filter`.
+/// Render the markdown body for `sub_filter`.
 #[must_use]
 pub fn filter_render(outcome: &SetFilterOutcome) -> String {
     let mut out = String::with_capacity(192);
-    out.push_str("SSH_SUB_FILTER: OK\nSUB_ID: ");
+    out.push_str("SUB_FILTER: OK\nSUB_ID: ");
     out.push_str(outcome.sub_id.as_str());
     out.push_str("\nFILTER: ");
     out.push_str(&filter_label(&outcome.filter));
-    append_next(&mut out, "ssh_sub_stats | ssh_sub_replay | ssh_sub_filter");
+    append_next(&mut out, "sub_stats | sub_replay | sub_filter");
     out
 }
 
-/// Render the structured JSON twin for `ssh_sub_filter`.
+/// Render the structured JSON twin for `sub_filter`.
 #[must_use]
 pub fn filter_structured(outcome: &SetFilterOutcome) -> Value {
     json!({
-        "tool": "ssh_sub_filter",
+        "tool": "sub_filter",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
         "filter": filter_label(&outcome.filter),
@@ -278,23 +278,23 @@ fn filter_label(filter: &FilterRule) -> String {
     }
 }
 
-/// Render the markdown body for `ssh_sub_replay`.
+/// Render the markdown body for `sub_replay`.
 #[must_use]
 pub fn replay_render(outcome: &ReplayOutcome) -> String {
     let mut out = String::with_capacity(160);
-    out.push_str("SSH_SUB_REPLAY: OK\nSUB_ID: ");
+    out.push_str("SUB_REPLAY: OK\nSUB_ID: ");
     out.push_str(outcome.sub_id.as_str());
     out.push_str("\nFROM_CURSOR: ");
     out.push_str(&outcome.from_cursor.to_string());
-    append_next(&mut out, "ssh_sub_stats | ssh_sub_filter | ssh_sub_replay");
+    append_next(&mut out, "sub_stats | sub_filter | sub_replay");
     out
 }
 
-/// Render the structured JSON twin for `ssh_sub_replay`.
+/// Render the structured JSON twin for `sub_replay`.
 #[must_use]
 pub fn replay_structured(outcome: &ReplayOutcome) -> Value {
     json!({
-        "tool": "ssh_sub_replay",
+        "tool": "sub_replay",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
         "from_cursor": outcome.from_cursor,
@@ -305,16 +305,16 @@ pub fn replay_structured(outcome: &ReplayOutcome) -> Value {
 // List
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for `ssh_sub_list`.
+/// Render the markdown body for `sub_list`.
 #[must_use]
 pub fn list_render(outcome: &ListSubsOutcome) -> String {
     let mut out = String::with_capacity(256);
-    out.push_str("SSH_SUB_LIST: OK\nSUBS_TOTAL: ");
+    out.push_str("SUB_LIST: OK\nSUBS_TOTAL: ");
     out.push_str(&outcome.subs.len().to_string());
     for s in &outcome.subs {
         append_summary_line(&mut out, s);
     }
-    append_next(&mut out, "ssh_sub_stats | ssh_unsubscribe | ssh_subscribe");
+    append_next(&mut out, "sub_stats | sub_close | sub_open");
     out
 }
 
@@ -331,7 +331,7 @@ fn append_summary_line(out: &mut String, s: &SubSummary) {
     out.push_str(if s.paused { "true" } else { "false" });
 }
 
-/// Render the structured JSON twin for `ssh_sub_list`.
+/// Render the structured JSON twin for `sub_list`.
 #[must_use]
 pub fn list_structured(outcome: &ListSubsOutcome) -> Value {
     let subs: Vec<Value> = outcome
@@ -351,7 +351,7 @@ pub fn list_structured(outcome: &ListSubsOutcome) -> Value {
         })
         .collect();
     json!({
-        "tool": "ssh_sub_list",
+        "tool": "sub_list",
         "status": "ok",
         "subs_total": outcome.subs.len(),
         "subs": subs,
@@ -362,11 +362,11 @@ pub fn list_structured(outcome: &ListSubsOutcome) -> Value {
 // Sub stats
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for `ssh_sub_stats`.
+/// Render the markdown body for `sub_stats`.
 #[must_use]
 pub fn sub_stats_render(outcome: &SubStatsOutcome) -> String {
     let mut out = String::with_capacity(256);
-    out.push_str("SSH_SUB_STATS: OK\nSUB_ID: ");
+    out.push_str("SUB_STATS: OK\nSUB_ID: ");
     out.push_str(outcome.sub_id.as_str());
     out.push_str("\nEVENTS_SENT: ");
     out.push_str(&outcome.stats.events_sent.to_string());
@@ -384,16 +384,16 @@ pub fn sub_stats_render(outcome: &SubStatsOutcome) -> String {
     out.push_str(&outcome.stats.block_total_ms.to_string());
     append_next(
         &mut out,
-        "ssh_sub_filter | ssh_sub_replay | ssh_unsubscribe",
+        "sub_filter | sub_replay | sub_close",
     );
     out
 }
 
-/// Render the structured JSON twin for `ssh_sub_stats`.
+/// Render the structured JSON twin for `sub_stats`.
 #[must_use]
 pub fn sub_stats_structured(outcome: &SubStatsOutcome) -> Value {
     json!({
-        "tool": "ssh_sub_stats",
+        "tool": "sub_stats",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
         "events_sent": outcome.stats.events_sent,
@@ -410,11 +410,11 @@ pub fn sub_stats_structured(outcome: &SubStatsOutcome) -> Value {
 // Daemon stats
 // ---------------------------------------------------------------------------
 
-/// Render the markdown body for `ssh_daemon_stats`.
+/// Render the markdown body for `sub_stats_all`.
 #[must_use]
 pub fn daemon_stats_render(outcome: &DaemonStatsOutcome) -> String {
     let mut out = String::with_capacity(256);
-    out.push_str("SSH_DAEMON_STATS: OK\nLANES_TOTAL: ");
+    out.push_str("SUB_STATS_ALL: OK\nLANES_TOTAL: ");
     out.push_str(&outcome.lanes_total.to_string());
     out.push_str("\nEVENTS_SENT_TOTAL: ");
     out.push_str(&outcome.events_sent_total.to_string());
@@ -426,15 +426,15 @@ pub fn daemon_stats_render(outcome: &DaemonStatsOutcome) -> String {
     out.push_str(&outcome.lagged_recoveries_total.to_string());
     out.push_str("\nQUEUE_HIGH_WATERMARK_MAX: ");
     out.push_str(&outcome.queue_high_watermark_max.to_string());
-    append_next(&mut out, "ssh_sub_list | ssh_sub_stats");
+    append_next(&mut out, "sub_list | sub_stats");
     out
 }
 
-/// Render the structured JSON twin for `ssh_daemon_stats`.
+/// Render the structured JSON twin for `sub_stats_all`.
 #[must_use]
 pub fn daemon_stats_structured(outcome: &DaemonStatsOutcome) -> Value {
     json!({
-        "tool": "ssh_daemon_stats",
+        "tool": "sub_stats_all",
         "status": "ok",
         "lanes_total": outcome.lanes_total,
         "events_sent_total": outcome.events_sent_total,
@@ -477,18 +477,18 @@ mod tests {
     #[test]
     fn append_hint_produces_required_or_recommended_line() {
         let mut s = String::new();
-        append_hint(&mut s, HintStrength::Required, "ssh_unsubscribe x");
-        assert!(s.contains("HINT: REQUIRED NEXT STEP: ssh_unsubscribe x"));
+        append_hint(&mut s, HintStrength::Required, "sub_close x");
+        assert!(s.contains("HINT: REQUIRED NEXT STEP: sub_close x"));
         let mut t = String::new();
-        append_hint(&mut t, HintStrength::Recommended, "ssh_sub_stats x");
-        assert!(t.contains("HINT: RECOMMENDED: ssh_sub_stats x"));
+        append_hint(&mut t, HintStrength::Recommended, "sub_stats x");
+        assert!(t.contains("HINT: RECOMMENDED: sub_stats x"));
     }
 
     #[test]
     fn append_next_emits_canonical_next_line() {
         let mut s = String::new();
-        append_next(&mut s, "ssh_subscribe");
-        assert_eq!(s, "\nNEXT: ssh_subscribe");
+        append_next(&mut s, "sub_open");
+        assert_eq!(s, "\nNEXT: sub_open");
     }
 
     #[test]
@@ -511,14 +511,14 @@ mod tests {
             grace_ms: 2_000,
         };
         let body = subscribe_render(&outcome);
-        assert!(body.starts_with("SSH_SUBSCRIBE: OK"));
+        assert!(body.starts_with("SUB_OPEN: OK"));
         assert!(body.contains("SUB_ID: 019"));
         assert!(body.contains("URI: shell://x/output"));
         assert!(body.contains("LIFETIME: auto_close"));
         assert!(body.contains("LAG_POLICY: snapshot"));
         assert!(body.contains("GRACE_MS: 2000"));
         assert!(body.contains("NEXT: "));
-        assert!(body.contains("HINT: REQUIRED NEXT STEP: ssh_unsubscribe sub_id=019"));
+        assert!(body.contains("HINT: REQUIRED NEXT STEP: sub_close sub_id=019"));
         assert!(
             body.contains(
                 "HINT: RECOMMENDED: Data arrives async via notifications/resources/updated"
@@ -526,7 +526,7 @@ mod tests {
         );
         assert!(body.contains("Do NOT use any MCP tool as a sleep"));
         assert!(body.contains("Start-Sleep -Milliseconds 100"));
-        assert!(body.contains("Cleanup: ssh_unsubscribe"));
+        assert!(body.contains("Cleanup: sub_close"));
         assert!(body.contains("Cost: O(1) lane open"));
         assert!(body.contains("Idempotency: Pass _meta.idempotency_key"));
         assert!(body.contains("Hygiene: Hold the SUB_ID"));
@@ -542,7 +542,7 @@ mod tests {
             grace_ms: 0,
         };
         let json = subscribe_structured(&outcome);
-        assert_eq!(json["tool"], "ssh_subscribe");
+        assert_eq!(json["tool"], "sub_open");
         assert_eq!(json["sub_id"], "019");
         assert_eq!(json["uri"], "shell://x/output");
         assert_eq!(json["lifetime"], "lease");
@@ -559,12 +559,12 @@ mod tests {
             grace_remaining_ms: Some(1_000),
         };
         let body = unsubscribe_render(&outcome);
-        assert!(body.starts_with("SSH_UNSUBSCRIBE: OK"));
+        assert!(body.starts_with("SUB_CLOSE: OK"));
         assert!(body.contains("URI: shell://x/output"));
         assert!(body.contains("LIFECYCLE_STATE: closed"));
         assert!(body.contains("GRACE_REMAINING_MS: 1000"));
         let json = unsubscribe_structured(&outcome);
-        assert_eq!(json["tool"], "ssh_unsubscribe");
+        assert_eq!(json["tool"], "sub_close");
         assert_eq!(json["uri"], "shell://x/output");
     }
 
@@ -630,7 +630,7 @@ mod tests {
             ],
         };
         let body = list_render(&outcome);
-        assert!(body.contains("SSH_SUB_LIST: OK"));
+        assert!(body.contains("SUB_LIST: OK"));
         assert!(body.contains("SUBS_TOTAL: 2"));
         assert!(body.contains("\nSUB a shell"));
         assert!(body.contains("\nSUB b shell"));
@@ -690,7 +690,7 @@ mod tests {
             queue_high_watermark_max: 12,
         };
         let body = daemon_stats_render(&outcome);
-        assert!(body.starts_with("SSH_DAEMON_STATS: OK"));
+        assert!(body.starts_with("SUB_STATS_ALL: OK"));
         assert!(body.contains("LANES_TOTAL: 7"));
         assert!(body.contains("EVENTS_SENT_TOTAL: 70"));
         assert!(body.contains("BYTES_SENT_TOTAL: 7000"));
@@ -818,7 +818,7 @@ mod tests {
         };
         let body = subscribe_render(&outcome);
         // The HINT line's REQUIRED tag steers the LLM straight at the
-        // ssh_unsubscribe step before the broader NEXT enumeration.
+        // sub_close step before the broader NEXT enumeration.
         let hint_idx = body.find("HINT: REQUIRED").expect("hint present");
         let next_idx = body.find("NEXT: ").expect("next present");
         // NEXT precedes HINT in this render; both must exist.

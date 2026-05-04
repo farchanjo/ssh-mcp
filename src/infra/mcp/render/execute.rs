@@ -26,7 +26,7 @@ use crate::infra::mcp::render::connection::{append_sub_leak_risk_warnings, warni
 /// KiB).
 const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024;
 
-/// Render an [`ExecuteOutcome`] as `SSH_EXECUTE: STARTED`.
+/// Render an [`ExecuteOutcome`] as `SSH_EXEC: STARTED`.
 #[must_use]
 pub fn execute_render(outcome: ExecuteOutcome) -> String {
     let ExecuteOutcome {
@@ -36,7 +36,7 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
         started_at: _,
     } = outcome;
     let mut out = String::with_capacity(288);
-    out.push_str("SSH_EXECUTE: STARTED\nCOMMAND_ID: ");
+    out.push_str("SSH_EXEC: STARTED\nCOMMAND_ID: ");
     out.push_str(command_id.as_str());
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id.as_str());
@@ -45,12 +45,12 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
         out.push_str(&sanitize_value(agent.as_str()));
     }
     // v5 Phase 3 — subscribe is RECOMMENDED for commands: long-poll
-    // via ssh_get_command_output still works, but push removes the
+    // via ssh_exec_output still works, but push removes the
     // poll loop entirely.
     append_subscribe_hint(
         &mut out,
         &format!(
-            "RECOMMENDED: ssh_subscribe uri=command://{cmd}/output. Falls back gracefully if you skip (use ssh_get_command_output wait=true).",
+            "RECOMMENDED: sub_open uri=command://{cmd}/output. Falls back gracefully if you skip (use ssh_exec_output wait=true).",
             cmd = command_id.as_str(),
         ),
     );
@@ -58,15 +58,15 @@ pub fn execute_render(outcome: ExecuteOutcome) -> String {
     out
 }
 
-/// Successor tools after `ssh_execute: STARTED`.
+/// Successor tools after `ssh_exec: STARTED`.
 ///
-/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then the drive ops,
+/// v5 Phase 3 ordering: `sub_open` FIRST (push), then the drive ops,
 /// with the long-poll fallback listed last.
 fn next_hint_for_execute(command_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=command://{command_id}/output | \
-         ssh_cancel_command(command_id={command_id}) | \
-         ssh_get_command_output(command_id={command_id}, wait=true) (poll fallback)"
+        "sub_open uri=command://{command_id}/output | \
+         ssh_exec_cancel(command_id={command_id}) | \
+         ssh_exec_output(command_id={command_id}, wait=true) (poll fallback)"
     )
 }
 
@@ -86,7 +86,7 @@ fn append_subscribe_hint(out: &mut String, hint: &str) {
 }
 
 /// Render a [`GetCommandOutputResult`] as the v3
-/// `SSH_GET_COMMAND_OUTPUT` block.
+/// `SSH_EXEC_OUTPUT` block.
 #[must_use]
 pub fn get_command_output_render(result: GetCommandOutputResult) -> String {
     let GetCommandOutputResult {
@@ -119,7 +119,7 @@ pub fn get_command_output_render(result: GetCommandOutputResult) -> String {
     out
 }
 
-/// Compose the static head of `SSH_GET_COMMAND_OUTPUT` (status + ids +
+/// Compose the static head of `SSH_EXEC_OUTPUT` (status + ids +
 /// optional exit + stdout/stderr blocks). Pulled out so the entry point
 /// stays under the 30-line cognitive threshold.
 fn build_get_command_output_head(
@@ -130,7 +130,7 @@ fn build_get_command_output_head(
     stderr_block: &str,
 ) -> String {
     let mut out = String::with_capacity(192 + stdout_block.len() + stderr_block.len());
-    out.push_str("SSH_GET_COMMAND_OUTPUT: ");
+    out.push_str("SSH_EXEC_OUTPUT: ");
     out.push_str(status_label);
     out.push_str("\nCOMMAND_ID: ");
     out.push_str(command_id);
@@ -149,8 +149,8 @@ fn build_get_command_output_head(
 /// updates or long-poll the same tool.
 fn next_hint_for_running_command(command_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=command://{command_id}/output (preferred) | \
-         ssh_get_command_output(command_id={command_id}, wait=true) (poll fallback)"
+        "sub_open uri=command://{command_id}/output (preferred) | \
+         ssh_exec_output(command_id={command_id}, wait=true) (poll fallback)"
     )
 }
 
@@ -173,7 +173,7 @@ const fn classify_state(
     }
 }
 
-/// Render a [`ListCommandsOutcome`] as the v3 `SSH_LIST_COMMANDS` block.
+/// Render a [`ListCommandsOutcome`] as the v3 `SSH_COMMANDS` block.
 ///
 /// Equivalent to [`list_commands_render_with_warnings`] with no
 /// [`LeakRiskAlert`] entries. Kept for legacy callers.
@@ -191,10 +191,10 @@ pub fn list_commands_render_with_warnings(
 ) -> String {
     let ListCommandsOutcome { commands, total } = outcome;
     if commands.is_empty() && total == 0 && alerts.is_empty() {
-        return String::from("SSH_LIST_COMMANDS: OK\nCOUNT: 0");
+        return String::from("SSH_COMMANDS: OK\nCOUNT: 0");
     }
     let mut out = String::with_capacity(64 + commands.len() * 128 + alerts.len() * 96);
-    out.push_str("SSH_LIST_COMMANDS: OK\nCOUNT: ");
+    out.push_str("SSH_COMMANDS: OK\nCOUNT: ");
     out.push_str(&commands.len().to_string());
     if total > commands.len() {
         out.push_str(" (showing ");
@@ -212,7 +212,7 @@ pub fn list_commands_render_with_warnings(
     out
 }
 
-/// Append a `NEXT:` line steering toward `ssh_subscribe` (preferred) for
+/// Append a `NEXT:` line steering toward `sub_open` (preferred) for
 /// the first running command in a list. Honours v5 narrative closure:
 /// discovery flows terminate in a push lane, with poll listed as fallback.
 fn append_next_for_running(out: &mut String, commands: &[CommandEntity]) {
@@ -224,9 +224,9 @@ fn append_next_for_running(out: &mut String, commands: &[CommandEntity]) {
         append_next_line(
             out,
             &format!(
-                "ssh_subscribe uri=command://{id}/output (preferred for running entries) | \
-                 ssh_get_command_output(command_id={id}, wait=true) (poll fallback) | \
-                 ssh_cancel_command(command_id={id})"
+                "sub_open uri=command://{id}/output (preferred for running entries) | \
+                 ssh_exec_output(command_id={id}, wait=true) (poll fallback) | \
+                 ssh_exec_cancel(command_id={id})"
             ),
         );
     }
@@ -263,7 +263,7 @@ fn extract_time(ts: &str) -> &str {
     }
 }
 
-/// Render a [`CancelCommandOutcome`] as the v3 `SSH_CANCEL_COMMAND`
+/// Render a [`CancelCommandOutcome`] as the v3 `SSH_EXEC_CANCEL`
 /// block.
 #[must_use]
 pub fn cancel_command_render(outcome: CancelCommandOutcome) -> String {
@@ -296,7 +296,7 @@ fn render_cancel_cancelled(command_id: &str, stdout: &[u8], stderr: &[u8]) -> St
         Some("partial"),
     );
     let mut out = String::with_capacity(96 + stdout_block.len() + stderr_block.len());
-    out.push_str("SSH_CANCEL_COMMAND: CANCELLED\nCOMMAND_ID: ");
+    out.push_str("SSH_EXEC_CANCEL: CANCELLED\nCOMMAND_ID: ");
     out.push_str(command_id);
     out.push('\n');
     out.push_str(&stdout_block);
@@ -307,7 +307,7 @@ fn render_cancel_cancelled(command_id: &str, stdout: &[u8], stderr: &[u8]) -> St
 
 fn render_cancel_noop(command_id: &str, status: CommandStatus) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_CANCEL_COMMAND: NOOP\nCOMMAND_ID: ");
+    out.push_str("SSH_EXEC_CANCEL: NOOP\nCOMMAND_ID: ");
     out.push_str(command_id);
     out.push_str("\nREASON: ");
     out.push_str(status_name_upper(status));
@@ -325,14 +325,14 @@ fn render_cancel_noop(command_id: &str, status: CommandStatus) -> String {
 #[must_use]
 pub fn execute_structured(outcome: &ExecuteOutcome) -> Value {
     json!({
-        "tool":   "ssh_execute",
+        "tool":   "ssh_exec",
         "status": "started",
         "session_id": outcome.session_id.as_str(),
         "command_id": outcome.command_id.as_str(),
         "agent_id":   outcome.agent_id.as_ref().map(AgentId::as_str),
         "next": [
-            "ssh_get_command_output",
-            "ssh_cancel_command",
+            "ssh_exec_output",
+            "ssh_exec_cancel",
         ],
     })
 }
@@ -367,11 +367,11 @@ pub fn get_command_output_structured(result: &GetCommandOutputResult) -> Value {
         let id = result.command_id.as_str();
         json!([
             format!("resources/subscribe command://{id}/output"),
-            format!("ssh_get_command_output(command_id={id}, wait=true)"),
+            format!("ssh_exec_output(command_id={id}, wait=true)"),
         ])
     });
     json!({
-        "tool":     "ssh_get_command_output",
+        "tool":     "ssh_exec_output",
         "status":   status_label,
         "command_id": result.command_id.as_str(),
         "exit_code": result.exit_code,
@@ -413,7 +413,7 @@ pub fn list_commands_structured_with_warnings(
 ) -> Value {
     let commands: Vec<Value> = outcome.commands.iter().map(command_json).collect();
     json!({
-        "tool":   "ssh_list_commands",
+        "tool":   "ssh_commands",
         "status": "ok",
         "commands": commands,
         "count":   outcome.commands.len(),
@@ -435,7 +435,7 @@ pub fn cancel_command_structured(outcome: &CancelCommandOutcome) -> Value {
             let (stdout_str, stdout_info) = truncate_utf8_safe_tail(stdout, DEFAULT_OUTPUT_BYTES);
             let (stderr_str, stderr_info) = truncate_utf8_safe_tail(stderr, DEFAULT_OUTPUT_BYTES);
             json!({
-                "tool":   "ssh_cancel_command",
+                "tool":   "ssh_exec_cancel",
                 "status": "ok",
                 "command_id": command_id.as_str(),
                 "stdout":   stdout_str,
@@ -445,7 +445,7 @@ pub fn cancel_command_structured(outcome: &CancelCommandOutcome) -> Value {
             })
         }
         CancelCommandOutcome::NotRunning { command_id, status } => json!({
-            "tool":   "ssh_cancel_command",
+            "tool":   "ssh_exec_cancel",
             "status": "noop",
             "command_id": command_id.as_str(),
             "reason": command_status_lower(*status),
@@ -454,7 +454,7 @@ pub fn cancel_command_structured(outcome: &CancelCommandOutcome) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// v4.7-step3 — ssh_run + ssh_execute_batch render helpers
+// v4.7-step3 — ssh_run + ssh_exec_batch render helpers
 // ---------------------------------------------------------------------------
 
 /// Status string used by both Markdown and structured payloads when
@@ -486,7 +486,7 @@ pub const fn run_status_lower(result: &GetCommandOutputResult) -> &'static str {
 
 /// Render the Markdown body for the `ssh_run` tool.
 ///
-/// The block layout mirrors `ssh_get_command_output`'s body so
+/// The block layout mirrors `ssh_exec_output`'s body so
 /// existing parsers keep extracting `EXIT:` / `--- stdout ---` lines
 /// unchanged; the session/disconnect lines are unique to `ssh_run`.
 #[must_use]
@@ -566,9 +566,9 @@ pub const fn batch_entry_status(result: &GetCommandOutputResult) -> &'static str
     run_status_lower(result)
 }
 
-/// Build the per-command structured entry for `ssh_execute_batch`.
+/// Build the per-command structured entry for `ssh_exec_batch`.
 /// Returns the `index`/`command_id`/`stdout`/`stderr` shape consumed
-/// by [`crate::infra::mcp::results::SshExecuteBatchResult`].
+/// by [`crate::infra::mcp::results::SshExecBatchResult`].
 #[must_use]
 pub fn batch_entry_structured(
     index: usize,
@@ -609,7 +609,7 @@ pub fn batch_skipped_entry(index: usize, command_text: &str) -> Value {
     })
 }
 
-/// Render the Markdown body for `ssh_execute_batch`. Each executed
+/// Render the Markdown body for `ssh_exec_batch`. Each executed
 /// command emits a per-index header line plus a stdout/stderr block
 /// pair; skipped commands surface as `--- skipped #N: <command> ---`.
 #[must_use]
@@ -622,7 +622,7 @@ pub fn batch_render(
 ) -> String {
     let label = if halted { "HALTED" } else { "OK" };
     let mut out = String::with_capacity(96 + entries.len() * 192);
-    out.push_str("SSH_EXECUTE_BATCH: ");
+    out.push_str("SSH_EXEC_BATCH: ");
     out.push_str(label);
     out.push_str("\nSESSION_ID: ");
     out.push_str(session_id);
@@ -721,7 +721,7 @@ mod tests {
             agent_id: None,
             started_at: "2026-04-18T10:30:00+00:00".to_string(),
         });
-        assert!(m.contains("SSH_EXECUTE: STARTED"));
+        assert!(m.contains("SSH_EXEC: STARTED"));
         assert!(m.contains("COMMAND_ID: cmd-1"));
         assert!(m.contains("SESSION_ID: sess-1"));
     }
@@ -734,7 +734,7 @@ mod tests {
         };
         assert_eq!(
             list_commands_render(outcome),
-            "SSH_LIST_COMMANDS: OK\nCOUNT: 0"
+            "SSH_COMMANDS: OK\nCOUNT: 0"
         );
     }
 
@@ -744,7 +744,7 @@ mod tests {
             command_id: CommandId::new("c-1".to_string()),
             status: CommandStatus::Completed,
         });
-        assert!(m.contains("SSH_CANCEL_COMMAND: NOOP"));
+        assert!(m.contains("SSH_EXEC_CANCEL: NOOP"));
         assert!(m.contains("REASON: COMPLETED"));
     }
 
@@ -760,11 +760,11 @@ mod tests {
             timed_out: false,
             last_seq: 0,
         });
-        assert!(m.contains("SSH_GET_COMMAND_OUTPUT: COMPLETED"));
+        assert!(m.contains("SSH_EXEC_OUTPUT: COMPLETED"));
         assert!(m.contains("EXIT: 0"));
     }
 
-    // ---------- v4.7-step3 ssh_run / ssh_execute_batch render tests ----
+    // ---------- v4.7-step3 ssh_run / ssh_exec_batch render tests ----
 
     #[test]
     fn run_render_emits_session_command_disconnected_lines() {
@@ -869,7 +869,7 @@ mod tests {
             },
         ];
         let body = super::batch_render("sess-b", true, 1, 2, &entries);
-        assert!(body.starts_with("SSH_EXECUTE_BATCH: HALTED"));
+        assert!(body.starts_with("SSH_EXEC_BATCH: HALTED"));
         assert!(body.contains("SESSION_ID: sess-b"));
         assert!(body.contains("EXECUTED: 1"));
         assert!(body.contains("TOTAL: 2"));
@@ -941,7 +941,7 @@ mod tests {
             total: 0,
         };
         let body = list_commands_render_with_warnings(outcome, &[]);
-        assert_eq!(body, "SSH_LIST_COMMANDS: OK\nCOUNT: 0");
+        assert_eq!(body, "SSH_COMMANDS: OK\nCOUNT: 0");
     }
 
     #[test]

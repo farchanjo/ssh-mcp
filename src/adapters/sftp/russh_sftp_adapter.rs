@@ -234,7 +234,7 @@ pub struct RusshSftpAdapter {
     /// the domain `TransferRepository`. Defaults to a no-op when the
     /// adapter is built without a composition root (tests, fixtures).
     /// The composition root replaces it via
-    /// [`Self::with_status_sink`] so `ssh_get_transfer_progress`
+    /// [`Self::with_status_sink`] so `ssh_transfer_progress`
     /// observes terminal state.
     status_sink: SharedTransferStatusSink,
     /// Bridge that mirrors the in-memory `InflightTransfers` lifecycle
@@ -405,7 +405,7 @@ impl RusshSftpAdapter {
                 );
             }
             // The repository row deliberately survives the streaming
-            // task. `ssh_get_transfer_progress` (in `wait` mode) and
+            // task. `ssh_transfer_progress` (in `wait` mode) and
             // `transfer://X/progress` resource readers must observe the
             // terminal `Completed` snapshot — the status sink already
             // marked it for them. The use case is the canonical path
@@ -483,7 +483,7 @@ impl RusshSftpAdapter {
     /// pumps the latest `bytes_transferred` value into the configured
     /// [`SharedTransferStatusSink`] via
     /// [`crate::adapters::ssh::internal::status_sink::TransferStatusSink::record_progress`].
-    /// Without this watcher `ssh_get_transfer_progress` would always read
+    /// Without this watcher `ssh_transfer_progress` would always read
     /// `bytes_transferred = 0` from the [`TransferRepository`] until the
     /// streaming task reached a terminal state (because `record_progress`
     /// is the only path that updates the repository row mid-flight).
@@ -638,7 +638,7 @@ impl RusshSftpAdapter {
 /// v4.8.1 fix: also carries a `progress_rx` cloned off the broadcast
 /// sender BEFORE the sender enters the streaming task. The running-tick
 /// watcher uses this receiver to pump partial-progress updates into the
-/// `TransferRepository` so `ssh_get_transfer_progress` reads non-zero
+/// `TransferRepository` so `ssh_transfer_progress` reads non-zero
 /// `bytes_transferred` while the transfer is still running.
 struct SharedBundle {
     shared: TransferShared,
@@ -1093,7 +1093,7 @@ mod tests {
 // v4.8.1: live-tick → repo sync coverage
 // ---------------------------------------------------------------------------
 //
-// The bug: `ssh_get_transfer_progress` returned `bytes_transferred = 0`
+// The bug: `ssh_transfer_progress` returned `bytes_transferred = 0`
 // for every poll while the transfer was still running because the SFTP
 // adapter only sync'd the live `AtomicU64` into the
 // `TransferRepository` row at terminal handoff. The fix spawns a

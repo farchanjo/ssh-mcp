@@ -144,7 +144,7 @@ pub struct SshConnectArgs {
     pub compress: Option<bool>,
 
     /// Optional human-readable name for the session (e.g. `production-db`,
-    /// `staging-server`). Surfaces in `ssh_list_sessions` to help
+    /// `staging-server`). Surfaces in `ssh_sessions` to help
     /// disambiguate identical hosts.
     pub name: Option<String>,
 
@@ -171,9 +171,9 @@ pub struct SshDisconnectArgs {
     pub session_id: String,
 }
 
-/// Arguments for the `ssh_list_sessions` MCP tool.
+/// Arguments for the `ssh_sessions` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshListSessionsArgs {
+pub struct SshSessionsArgs {
     /// `AGENT_ID` returned from `ssh_connect`. Optional filter; when
     /// omitted returns sessions from every agent on this server.
     pub agent_id: Option<String>,
@@ -205,7 +205,7 @@ pub struct SshDisconnectManyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReusePolicy, SshConnectArgs, SshListSessionsArgs};
+    use super::{ReusePolicy, SshConnectArgs, SshSessionsArgs};
     use crate::domain::policy::ReusePolicy as DomainReusePolicy;
     use schemars::schema_for;
     use serde_json::Value;
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn ssh_list_sessions_schema_emits_max_items_default() {
-        let schema = schema_for!(SshListSessionsArgs);
+        let schema = schema_for!(SshSessionsArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "max_items"),

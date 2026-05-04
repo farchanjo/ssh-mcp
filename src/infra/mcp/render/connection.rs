@@ -123,19 +123,19 @@ fn append_next_line(out: &mut String, hint: &str) {
 /// / disconnect, each pre-filled with the freshly minted `SESSION_ID`.
 /// Successor tools after `ssh_connect: OK | REUSED` — spawn a resource
 /// (command / shell / transfer / forward) whose ID becomes the target of
-/// `ssh_subscribe` for push-first observation, then `ssh_disconnect`
+/// `sub_open` for push-first observation, then `ssh_disconnect`
 /// (or `ssh_disconnect_agent` / `ssh_disconnect_many`) to close.
 ///
-/// v5 narrative closure: the trailing `(then ssh_subscribe ...)` reminds
+/// v5 narrative closure: the trailing `(then sub_open ...)` reminds
 /// 27B-class models that every spawned ID is a push-stream entry point,
 /// not a poll target.
 fn next_hint_for_session(session_id: &str) -> String {
     format!(
-        "ssh_execute(session_id={session_id}, command=...) | \
+        "ssh_exec(session_id={session_id}, command=...) | \
          ssh_shell_open(session_id={session_id}) | \
          ssh_upload(session_id={session_id}, ...) | \
          ssh_disconnect(session_id={session_id}) \
-         (each spawn returns an ID that ssh_subscribe streams as push)"
+         (each spawn returns an ID that sub_open streams as push)"
     )
 }
 
@@ -305,7 +305,7 @@ pub fn disconnect_render(outcome: &DisconnectOutcome) -> String {
     out
 }
 
-/// Render a [`ListSessionsOutcome`] as the v3 `SSH_LIST_SESSIONS` block.
+/// Render a [`ListSessionsOutcome`] as the v3 `SSH_SESSIONS` block.
 ///
 /// Equivalent to [`list_sessions_render_with_warnings`] with an empty
 /// alert slice. Kept as a thin shim so tests + downstream callers that
@@ -329,10 +329,10 @@ pub fn list_sessions_render_with_warnings(
         total,
     } = outcome;
     if healthy.is_empty() && total == 0 && alerts.is_empty() {
-        return String::from("SSH_LIST_SESSIONS: OK\nCOUNT: 0");
+        return String::from("SSH_SESSIONS: OK\nCOUNT: 0");
     }
     let mut out = String::with_capacity(64 + healthy.len() * 128 + alerts.len() * 96);
-    out.push_str("SSH_LIST_SESSIONS: OK\nCOUNT: ");
+    out.push_str("SSH_SESSIONS: OK\nCOUNT: ");
     out.push_str(&healthy.len().to_string());
     if total > healthy.len() {
         out.push_str(" (showing ");
@@ -407,8 +407,8 @@ const fn resource_kind_label(k: ResourceKind) -> &'static str {
     }
 }
 
-/// Successor tools after a non-empty `ssh_list_sessions` — observe a
-/// session via push (`ssh_subscribe session://<id>/health`), bulk-cleanup
+/// Successor tools after a non-empty `ssh_sessions` — observe a
+/// session via push (`sub_open session://<id>/health`), bulk-cleanup
 /// with `ssh_disconnect_agent` when an agent owns sessions, or a
 /// targeted `ssh_disconnect` against any listed `session_id`.
 ///
@@ -422,13 +422,13 @@ fn next_hint_for_list_sessions(healthy: &[SessionEntity]) -> String {
     agent.map_or_else(
         || {
             format!(
-                "ssh_subscribe uri=session://{session_id}/health | \
+                "sub_open uri=session://{session_id}/health | \
                  ssh_disconnect(session_id={session_id})"
             )
         },
         |agent_id| {
             format!(
-                "ssh_subscribe uri=session://{session_id}/health | \
+                "sub_open uri=session://{session_id}/health | \
                  ssh_disconnect_agent(agent_id={agent_id}) | \
                  ssh_disconnect(session_id={session_id})"
             )
@@ -611,7 +611,7 @@ fn connect_connected_json(
         "expires_at": expires_at_iso(session.connected_at, persistent, inactivity_timeout),
         "replaced": replaced,
         "next": [
-            "ssh_execute",
+            "ssh_exec",
             "ssh_shell_open",
             "ssh_disconnect",
         ],
@@ -636,7 +636,7 @@ fn connect_reused_json(
         "persistent": persistent,
         "expires_at": expires_at_iso(session.connected_at, persistent, inactivity_timeout),
         "next": [
-            "ssh_execute",
+            "ssh_exec",
             "ssh_shell_open",
             "ssh_disconnect",
         ],
@@ -696,7 +696,7 @@ pub fn list_sessions_structured_with_warnings(
     let hint = anti_leak_hint_text(&outcome.healthy);
     let next = next_for_list_sessions(&outcome.healthy, hint.is_some());
     json!({
-        "tool":   "ssh_list_sessions",
+        "tool":   "ssh_sessions",
         "status": "ok",
         "agent_id_filter": filter_agent,
         "sessions": healthy,
@@ -791,7 +791,7 @@ impl DisconnectManyEntry {
 
 /// Render the Markdown body for `ssh_disconnect_many`. Each entry
 /// becomes one `- <session_id>: OK | ERROR [<code>] <reason>` line so
-/// the response mirrors the layout of `ssh_list_sessions` etc.
+/// the response mirrors the layout of `ssh_sessions` etc.
 #[must_use]
 pub fn disconnect_many_render(entries: &[DisconnectManyEntry]) -> String {
     let total = entries.len();
@@ -901,7 +901,7 @@ mod tests {
         };
         assert_eq!(
             list_sessions_render(outcome),
-            "SSH_LIST_SESSIONS: OK\nCOUNT: 0"
+            "SSH_SESSIONS: OK\nCOUNT: 0"
         );
     }
 

@@ -1,8 +1,8 @@
 //! Best-effort `notifications/progress` emitter for v4.7.
 //!
-//! Long-running tools (`ssh_get_command_output(wait=true)`,
-//! `ssh_get_transfer_progress(wait=true)`, `ssh_shell_wait_for`,
-//! `ssh_execute(wait=true)`) used to leave the LLM in dead air for tens of
+//! Long-running tools (`ssh_exec_output(wait=true)`,
+//! `ssh_transfer_progress(wait=true)`, `ssh_shell_wait_for`,
+//! `ssh_exec(wait=true)`) used to leave the LLM in dead air for tens of
 //! seconds. This module wraps each polling loop in a `tokio::select!` that
 //! interleaves the use case future with a bounded `tokio::time::interval`
 //! tick that fires `Peer::notify_progress` updates against the calling

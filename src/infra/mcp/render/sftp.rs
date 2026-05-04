@@ -132,12 +132,12 @@ fn append_started_header(
 
 fn append_started_advisories(out: &mut String, transfer_id: &str) {
     // v5 Phase 3 — subscribe is RECOMMENDED for transfers: long-poll
-    // via ssh_get_transfer_progress still works, but push avoids the
+    // via ssh_transfer_progress still works, but push avoids the
     // poll churn for slow transfers.
     append_subscribe_hint(
         out,
         &format!(
-            "RECOMMENDED: ssh_subscribe uri=transfer://{transfer_id}/progress. Falls back gracefully if you skip (use ssh_get_transfer_progress wait=true)."
+            "RECOMMENDED: sub_open uri=transfer://{transfer_id}/progress. Falls back gracefully if you skip (use ssh_transfer_progress wait=true)."
         ),
     );
     append_next_line(out, &next_hint_for_transfer(transfer_id));
@@ -145,12 +145,12 @@ fn append_started_advisories(out: &mut String, transfer_id: &str) {
 
 /// Successor tools after an SFTP `STARTED` response.
 ///
-/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then the long-poll
+/// v5 Phase 3 ordering: `sub_open` FIRST (push), then the long-poll
 /// fallback.
 fn next_hint_for_transfer(transfer_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=transfer://{transfer_id}/progress | \
-         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
+        "sub_open uri=transfer://{transfer_id}/progress | \
+         ssh_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
     )
 }
 
@@ -170,7 +170,7 @@ fn append_subscribe_hint(out: &mut String, hint: &str) {
 }
 
 /// Render a [`GetTransferProgressResult`] as the v3
-/// `SSH_GET_TRANSFER_PROGRESS` block.
+/// `SSH_TRANSFER_PROGRESS` block.
 #[must_use]
 pub fn transfer_progress_render(result: &GetTransferProgressResult) -> String {
     let dir_upper = match result.direction {
@@ -214,7 +214,7 @@ fn render_progress_block(
     in_flight: bool,
 ) -> String {
     let mut out = String::with_capacity(224);
-    out.push_str("SSH_GET_TRANSFER_PROGRESS: ");
+    out.push_str("SSH_TRANSFER_PROGRESS: ");
     out.push_str(status);
     out.push_str("\nTRANSFER_ID: ");
     out.push_str(transfer_id);
@@ -237,8 +237,8 @@ fn render_progress_block(
 /// for push progress events or long-poll the same tool to terminal.
 fn next_hint_for_in_flight_transfer(transfer_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=transfer://{transfer_id}/progress (preferred) | \
-         ssh_get_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
+        "sub_open uri=transfer://{transfer_id}/progress (preferred) | \
+         ssh_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
     )
 }
 
@@ -251,7 +251,7 @@ fn render_progress_failed(
     reason: &str,
 ) -> String {
     let mut out = String::with_capacity(192);
-    out.push_str("SSH_GET_TRANSFER_PROGRESS: FAILED\nTRANSFER_ID: ");
+    out.push_str("SSH_TRANSFER_PROGRESS: FAILED\nTRANSFER_ID: ");
     out.push_str(transfer_id);
     out.push_str("\nDIRECTION: ");
     out.push_str(dir);
@@ -298,7 +298,7 @@ pub fn upload_structured(outcome: &UploadOutcome) -> Value {
         "to":          outcome.remote_path,
         "size_bytes":  outcome.total_bytes,
         "next": [
-            "ssh_get_transfer_progress(wait=true)",
+            "ssh_transfer_progress(wait=true)",
         ],
     })
 }
@@ -316,7 +316,7 @@ pub fn download_structured(outcome: &DownloadOutcome) -> Value {
         "to":          outcome.local_path,
         "size_bytes":  outcome.total_bytes,
         "next": [
-            "ssh_get_transfer_progress(wait=true)",
+            "ssh_transfer_progress(wait=true)",
         ],
     })
 }
@@ -346,11 +346,11 @@ pub fn transfer_progress_structured(result: &GetTransferProgressResult) -> Value
         let id = result.transfer_id.as_str();
         json!([
             format!("resources/subscribe transfer://{id}/progress"),
-            format!("ssh_get_transfer_progress(transfer_id={id}, wait=true)"),
+            format!("ssh_transfer_progress(transfer_id={id}, wait=true)"),
         ])
     });
     json!({
-        "tool":      "ssh_get_transfer_progress",
+        "tool":      "ssh_transfer_progress",
         "status":    transfer_status_lower(result.status),
         "transfer_id": result.transfer_id.as_str(),
         "direction": transfer_direction_lower(result.direction),
@@ -398,7 +398,7 @@ mod tests {
             error: None,
             last_seq: 0,
         });
-        assert!(m.starts_with("SSH_GET_TRANSFER_PROGRESS: COMPLETED\n"));
+        assert!(m.starts_with("SSH_TRANSFER_PROGRESS: COMPLETED\n"));
         assert!(m.contains("PROGRESS: 100%"));
     }
 }

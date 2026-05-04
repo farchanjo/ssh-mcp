@@ -106,7 +106,7 @@ where
     /// clear on `ssh_disconnect_agent`. Optional so test fixtures can
     /// construct without the full lifecycle adapter.
     lifecycle: Option<Arc<dyn LifecyclePolicyPort>>,
-    /// v5.3.2 lane cascade — closes orphaned `ssh_subscribe` lanes
+    /// v5.3.2 lane cascade — closes orphaned `sub_open` lanes
     /// bound to the resources owned by sessions of this agent.
     lane_admin: Option<Arc<dyn LaneAdmin>>,
 }
@@ -166,7 +166,7 @@ where
         }
     }
 
-    /// Close every `ssh_subscribe` lane bound to a resource id.
+    /// Close every `sub_open` lane bound to a resource id.
     async fn close_lanes_for_resource(&self, resource_id: &str) {
         let Some(lane_admin) = self.lane_admin.as_ref() else {
             return;

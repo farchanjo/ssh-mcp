@@ -692,7 +692,7 @@ where
 
 /// v5 Phase 2: log the synthesised `SubId` so operators can
 /// correlate subscriptions across logs. Phase 3 introduces a
-/// dedicated `ssh_subscribe` tool that returns the `SubId` in the
+/// dedicated `sub_open` tool that returns the `SubId` in the
 /// response body.
 fn log_subscribe_outcome(outcome: &SubscribeResourceOutcome) {
     if let Some(sub_id) = outcome.sub_id.as_ref() {

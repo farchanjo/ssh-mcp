@@ -407,8 +407,8 @@ mod tests {
     #[test]
     fn idempotency_cache_dedups_within_ttl() {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
-        cache.put("ssh_execute", "k1", "BODY1".to_string(), json!({"v": 1}));
-        let hit = cache.get("ssh_execute", "k1").expect("entry present");
+        cache.put("ssh_exec", "k1", "BODY1".to_string(), json!({"v": 1}));
+        let hit = cache.get("ssh_exec", "k1").expect("entry present");
         assert_eq!(hit.body, "BODY1");
         assert_eq!(hit.structured["v"], 1);
     }
@@ -417,10 +417,10 @@ mod tests {
     fn idempotency_cache_evicts_after_ttl() {
         // 1ms TTL -> the second access must observe the entry as expired.
         let cache = IdempotencyCache::new(Duration::from_millis(1), 16);
-        cache.put("ssh_execute", "k1", "B".to_string(), Value::Null);
+        cache.put("ssh_exec", "k1", "B".to_string(), Value::Null);
         // Sleep long enough to outlive the TTL.
         std::thread::sleep(Duration::from_millis(5));
-        assert!(cache.get("ssh_execute", "k1").is_none());
+        assert!(cache.get("ssh_exec", "k1").is_none());
         // The miss eagerly drops the expired entry.
         assert_eq!(cache.len(), 0);
     }
@@ -431,7 +431,7 @@ mod tests {
         for i in 0..5_u32 {
             // Stagger insertions slightly so `inserted_at` orderings are deterministic.
             cache.put(
-                "ssh_execute",
+                "ssh_exec",
                 &format!("k{i}"),
                 format!("B{i}"),
                 Value::Null,
@@ -440,9 +440,9 @@ mod tests {
         }
         // The oldest two entries (k0, k1) should have been pruned.
         assert!(cache.len() <= 3);
-        assert!(cache.get("ssh_execute", "k4").is_some());
-        assert!(cache.get("ssh_execute", "k0").is_none());
-        assert!(cache.get("ssh_execute", "k1").is_none());
+        assert!(cache.get("ssh_exec", "k4").is_some());
+        assert!(cache.get("ssh_exec", "k0").is_none());
+        assert!(cache.get("ssh_exec", "k1").is_none());
     }
 
     #[test]
@@ -518,7 +518,7 @@ mod tests {
             // No key -> we record a fresh hit on every call.
             counter.fetch_add(1, Ordering::SeqCst);
             // Cache.get returns None because nothing was inserted.
-            assert!(cache.get("ssh_execute", "k-absent").is_none());
+            assert!(cache.get("ssh_exec", "k-absent").is_none());
         }
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
@@ -533,12 +533,12 @@ mod tests {
         let counter = AtomicUsize::new(0);
         let key = "retry-1";
         for _ in 0..2 {
-            if cache.get("ssh_execute", key).is_some() {
+            if cache.get("ssh_exec", key).is_some() {
                 continue; // cached -> skip the use case
             }
             counter.fetch_add(1, Ordering::SeqCst);
             cache.put(
-                "ssh_execute",
+                "ssh_exec",
                 key,
                 "body".to_string(),
                 json!({"status": "started"}),
@@ -549,7 +549,7 @@ mod tests {
             1,
             "use case must run exactly once"
         );
-        let cached = cache.get("ssh_execute", key).expect("entry persists");
+        let cached = cache.get("ssh_exec", key).expect("entry persists");
         assert_eq!(cached.body, "body");
         assert_eq!(cached.structured["status"], "started");
     }
@@ -642,13 +642,13 @@ mod tests {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
         let fp = "deadbeefcafebabe".to_string();
         cache.put_with_fingerprint(
-            "ssh_execute",
+            "ssh_exec",
             "k1",
             fp.clone(),
             "body".to_string(),
             json!({"v": 1}),
         );
-        match cache.get_with_fingerprint("ssh_execute", "k1", &fp) {
+        match cache.get_with_fingerprint("ssh_exec", "k1", &fp) {
             IdempotencyOutcome::Hit(c) => {
                 assert_eq!(c.body, "body");
                 assert_eq!(c.args_fingerprint, fp);
@@ -661,14 +661,14 @@ mod tests {
     fn cache_mismatch_when_fingerprint_differs() {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
         cache.put_with_fingerprint(
-            "ssh_execute",
+            "ssh_exec",
             "k1",
             "fp-A".to_string(),
             "body-A".to_string(),
             json!({"v": "a"}),
         );
         // Same key, different fingerprint -> Mismatch (NOT Hit).
-        match cache.get_with_fingerprint("ssh_execute", "k1", "fp-B") {
+        match cache.get_with_fingerprint("ssh_exec", "k1", "fp-B") {
             IdempotencyOutcome::Mismatch => {}
             other => unreachable!("expected Mismatch, got {other:?}"),
         }
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn cache_miss_when_no_entry_exists() {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
-        let outcome = cache.get_with_fingerprint("ssh_execute", "ghost", "fp");
+        let outcome = cache.get_with_fingerprint("ssh_exec", "ghost", "fp");
         assert!(matches!(outcome, IdempotencyOutcome::Miss));
     }
 
@@ -685,14 +685,14 @@ mod tests {
     fn cache_miss_after_ttl_even_with_matching_fingerprint() {
         let cache = IdempotencyCache::new(Duration::from_millis(1), 16);
         cache.put_with_fingerprint(
-            "ssh_execute",
+            "ssh_exec",
             "k1",
             "fp".to_string(),
             "B".to_string(),
             Value::Null,
         );
         std::thread::sleep(Duration::from_millis(5));
-        let outcome = cache.get_with_fingerprint("ssh_execute", "k1", "fp");
+        let outcome = cache.get_with_fingerprint("ssh_exec", "k1", "fp");
         assert!(matches!(outcome, IdempotencyOutcome::Miss));
     }
 
@@ -701,24 +701,24 @@ mod tests {
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
         let fp = "shared-fp".to_string();
         cache.put_with_fingerprint(
-            "ssh_execute",
+            "ssh_exec",
             "k1",
             fp.clone(),
             "body-1".to_string(),
             json!({"v": 1}),
         );
         cache.put_with_fingerprint(
-            "ssh_execute",
+            "ssh_exec",
             "k2",
             fp.clone(),
             "body-2".to_string(),
             json!({"v": 2}),
         );
-        match cache.get_with_fingerprint("ssh_execute", "k1", &fp) {
+        match cache.get_with_fingerprint("ssh_exec", "k1", &fp) {
             IdempotencyOutcome::Hit(c) => assert_eq!(c.body, "body-1"),
             other => unreachable!("expected Hit, got {other:?}"),
         }
-        match cache.get_with_fingerprint("ssh_execute", "k2", &fp) {
+        match cache.get_with_fingerprint("ssh_exec", "k2", &fp) {
             IdempotencyOutcome::Hit(c) => assert_eq!(c.body, "body-2"),
             other => unreachable!("expected Hit, got {other:?}"),
         }
@@ -731,8 +731,8 @@ mod tests {
         // — preserves byte-compat for any callers that bypass the
         // fingerprint API.
         let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
-        cache.put("ssh_execute", "k1", "body".to_string(), Value::Null);
-        match cache.get_with_fingerprint("ssh_execute", "k1", "") {
+        cache.put("ssh_exec", "k1", "body".to_string(), Value::Null);
+        match cache.get_with_fingerprint("ssh_exec", "k1", "") {
             IdempotencyOutcome::Hit(c) => assert_eq!(c.body, "body"),
             other => unreachable!("expected Hit on legacy entry, got {other:?}"),
         }

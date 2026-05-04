@@ -143,7 +143,7 @@ pub struct MemoryRegistry<N> {
     flush_bytes_threshold: usize,
     /// ADR 0006 Amendment 1 — process-wide count of broadcasts
     /// triggered by the byte-threshold branch. Surfaced via
-    /// `ssh_daemon_stats`. Wire-compat: also returned by
+    /// `sub_stats_all`. Wire-compat: also returned by
     /// [`MemoryRegistry::byte_triggered_flushes_total`].
     byte_triggered_flushes: AtomicU64,
     /// Notifier the debouncer fans out over.
@@ -162,7 +162,7 @@ pub struct MemoryRegistry<N> {
     /// [`Arc::new_cyclic`] and never overwritten.
     self_ref: Weak<Self>,
     /// Optional lane-fanout bridge installed by the composition root.
-    /// Wakes up `ssh_subscribe` lanes from the legacy URI broadcast
+    /// Wakes up `sub_open` lanes from the legacy URI broadcast
     /// path so stdio/HTTP transports get push delivery without a
     /// dedicated channel-mux drain task. Lock-free swap via
     /// [`ArcSwap`].
@@ -239,7 +239,7 @@ where
 
     /// Install (or replace) the lane-fanout bridge. The bridge is
     /// consulted by [`broadcast`] after the legacy peer fan-out so
-    /// `ssh_subscribe`-created lanes also receive push notifications
+    /// `sub_open`-created lanes also receive push notifications
     /// on stdio/HTTP transports.
     pub fn install_lane_bridge(&self, bridge: Arc<dyn LaneNotifierBridge>) {
         self.lane_bridge.store(Arc::new(Some(bridge)));
@@ -465,7 +465,7 @@ where
     }
 
     /// Process-wide count of byte-threshold-triggered broadcasts
-    /// (ADR 0006 Amendment 1). Used by `ssh_daemon_stats` to surface
+    /// (ADR 0006 Amendment 1). Used by `sub_stats_all` to surface
     /// the cross-resource flush rate to the LLM.
     #[must_use]
     pub fn byte_triggered_flushes_total(&self) -> u64 {
@@ -565,7 +565,7 @@ where
 {
     fn forward_poke(&self, kind: ResourceKind, id: &str) {
         // Mirror legacy producer pokes into the hexagonal debouncer
-        // so `ssh_subscribe` lanes wake up alongside legacy peer subs.
+        // so `sub_open` lanes wake up alongside legacy peer subs.
         self.poke(kind, id);
     }
 
@@ -865,7 +865,7 @@ where
     N: NotifierPort + Send + Sync + 'static,
 {
     // Phase 4-equivalent fanout for stdio/HTTP transports: also
-    // notify every `ssh_subscribe`-created lane bound to this URI
+    // notify every `sub_open`-created lane bound to this URI
     // through the installed [`LaneNotifierBridge`]. The bridge runs
     // BEFORE the legacy peer fanout so lane stats stay in lock-step
     // even when the legacy subscriber set is empty.
