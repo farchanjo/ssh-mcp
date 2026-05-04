@@ -70,6 +70,8 @@ pub struct ExecuteRequest {
     pub timeout: Option<Duration>,
     /// Whether the channel must allocate a PTY.
     pub use_pty: bool,
+    /// v5 Phase 3 — optional lifecycle policy override.
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing the freshly minted command id and the metadata
@@ -181,14 +183,15 @@ where
         self.persist_running_command(&command_id, &req, started_at)
             .await?;
         self.spawn_or_rollback(&command_id, &req).await?;
-        // v5 lifecycle binding (Phase 1): register the freshly spawned
-        // command with the default policy. Phase 3 will accept a
-        // per-call override.
+        // v5 lifecycle binding: register the freshly spawned command.
+        // The policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
         self.lifecycle.track_resource(
             ResourceKind::Command,
             command_id.as_str(),
             &req.session_id,
-            LifecyclePolicy::default(),
+            req.lifecycle_policy.unwrap_or_default(),
         );
 
         self.subscribers
@@ -439,6 +442,7 @@ mod tests {
             command: "ls -la".to_string(),
             timeout: None,
             use_pty: false,
+            lifecycle_policy: None,
         }
     }
 
