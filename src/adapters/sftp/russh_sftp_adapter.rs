@@ -778,6 +778,19 @@ fn fresh_entity(
     entity
 }
 
+impl RusshSftpAdapter {
+    /// v4.3 fix: defensive registration spawned so the adapter return
+    /// path is not blocked by a redundant repo write. The use case
+    /// (`upload_file` / `download_file`) is the canonical writer; the
+    /// sink only fills adapter-driven paths.
+    fn defensive_register(&self, entity: TransferEntity) {
+        let sink = Arc::clone(&self.registration_sink);
+        tokio::spawn(async move {
+            sink.register(entity).await;
+        });
+    }
+}
+
 impl SftpClientPort for RusshSftpAdapter {
     async fn upload(
         &self,
@@ -789,11 +802,9 @@ impl SftpClientPort for RusshSftpAdapter {
             local_path,
             remote_path,
         } = request;
-
         let handle = self.preflight(&session_id)?;
         let resolved_local = resolve_local_path(&local_path);
         let total_bytes = stat_local_size(&resolved_local).await?;
-
         self.spawn_upload_task(
             handle,
             transfer_id.clone(),
@@ -802,7 +813,6 @@ impl SftpClientPort for RusshSftpAdapter {
             remote_path.clone(),
             total_bytes,
         );
-
         let entity = fresh_entity(
             transfer_id,
             session_id,
@@ -811,15 +821,7 @@ impl SftpClientPort for RusshSftpAdapter {
             remote_path,
             total_bytes,
         );
-        // v4.3 fix: defensive registration spawned so the adapter return
-        // path is not blocked by a redundant repo write. The use case
-        // (`upload_file`) is the canonical writer; the sink only fills
-        // adapter-driven paths.
-        let sink = Arc::clone(&self.registration_sink);
-        let entity_for_sink = entity.clone();
-        tokio::spawn(async move {
-            sink.register(entity_for_sink).await;
-        });
+        self.defensive_register(entity.clone());
         Ok(entity)
     }
 
@@ -862,12 +864,7 @@ impl SftpClientPort for RusshSftpAdapter {
             remote_path,
             total_bytes,
         );
-        // See `upload` for the rationale.
-        let sink = Arc::clone(&self.registration_sink);
-        let entity_for_sink = entity.clone();
-        tokio::spawn(async move {
-            sink.register(entity_for_sink).await;
-        });
+        self.defensive_register(entity.clone());
         Ok(entity)
     }
 

@@ -49,6 +49,7 @@ use bytes::Bytes;
 use russh::compression;
 use russh::{Channel, ChannelMsg, Preferred, client};
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::adapters::config::internal::{MAX_RETRY_DELAY, resolve_command_max_buffer_size};
@@ -591,8 +592,7 @@ async fn open_async_channel(
     let mut attempt = 0_u32;
     loop {
         if command.cancel_token.is_cancelled() {
-            broadcast_close(command, None);
-            let _ = command.status_tx.send(AsyncCommandStatus::Cancelled);
+            finish_open_channel(command, AsyncCommandStatus::Cancelled);
             return None;
         }
         attempt += 1;
@@ -604,23 +604,40 @@ async fn open_async_channel(
                 return Some(ch);
             }
             Err(e) => {
-                let msg = e.to_string();
-                warn!("channel_open_session attempt {attempt} failed: {msg}");
-                if is_transient_open_error(&msg) && attempt < MAX_ATTEMPTS {
-                    if wait_with_cancel(&command.cancel_token, attempt).await {
-                        broadcast_close(command, None);
-                        let _ = command.status_tx.send(AsyncCommandStatus::Cancelled);
-                        return None;
-                    }
-                    continue;
+                if handle_open_error(command, attempt, MAX_ATTEMPTS, &e).await {
+                    return None;
                 }
-                let _ = command.error.set(format!("Failed to open channel: {e}"));
-                broadcast_close(command, None);
-                let _ = command.status_tx.send(AsyncCommandStatus::Failed);
-                return None;
             }
         }
     }
+}
+
+/// Broadcast a channel close + status update for [`open_async_channel`].
+fn finish_open_channel(command: &Arc<RunningCommand>, status: AsyncCommandStatus) {
+    broadcast_close(command, None);
+    let _ = command.status_tx.send(status);
+}
+
+/// Returns `true` when the caller should stop (channel ultimately failed
+/// or got cancelled), `false` when the caller should retry.
+async fn handle_open_error(
+    command: &Arc<RunningCommand>,
+    attempt: u32,
+    max_attempts: u32,
+    err: &russh::Error,
+) -> bool {
+    let msg = err.to_string();
+    warn!("channel_open_session attempt {attempt} failed: {msg}");
+    if is_transient_open_error(&msg) && attempt < max_attempts {
+        if wait_with_cancel(&command.cancel_token, attempt).await {
+            finish_open_channel(command, AsyncCommandStatus::Cancelled);
+            return true;
+        }
+        return false;
+    }
+    let _ = command.error.set(format!("Failed to open channel: {err}"));
+    finish_open_channel(command, AsyncCommandStatus::Failed);
+    true
 }
 
 /// Classify a `channel_open_session` error as transient (slot may reopen soon).
@@ -633,10 +650,7 @@ fn is_transient_open_error(msg: &str) -> bool {
 }
 
 /// Sleep the exponential backoff for `attempt`, or return `true` if cancelled.
-async fn wait_with_cancel(
-    cancel_token: &tokio_util::sync::CancellationToken,
-    attempt: u32,
-) -> bool {
+async fn wait_with_cancel(cancel_token: &CancellationToken, attempt: u32) -> bool {
     const BASE_BACKOFF_MS: u64 = 100;
     const MAX_BACKOFF_MS: u64 = 1_000;
     let step = BASE_BACKOFF_MS.saturating_mul(u64::from(1_u32 << (attempt - 1)));
@@ -835,29 +849,20 @@ async fn collect_async_output(
     channel: &mut Channel<client::Msg>,
     command: &Arc<RunningCommand>,
 ) -> Option<i32> {
-    let max_buffer = resolve_command_max_buffer_size();
-    let max = usize::try_from(max_buffer).unwrap_or(usize::MAX);
+    let max = usize::try_from(resolve_command_max_buffer_size()).unwrap_or(usize::MAX);
     let mut exit_code: Option<i32> = None;
     let mut owned = OutputBuffer::with_capacity(4096, 1024);
     let mut local_stdout = Vec::with_capacity(4096);
     let mut local_stderr = Vec::with_capacity(1024);
-
-    loop {
-        let msg = channel.wait().await;
-        let should_break = process_channel_msg(
-            msg,
-            &mut exit_code,
-            &mut local_stdout,
-            &mut local_stderr,
-            &mut owned,
-            command,
-            max,
-        );
-        if should_break {
-            break;
-        }
-    }
-
+    while !process_channel_msg(
+        channel.wait().await,
+        &mut exit_code,
+        &mut local_stdout,
+        &mut local_stderr,
+        &mut owned,
+        command,
+        max,
+    ) {}
     flush_local_buffers(
         &mut local_stdout,
         &mut local_stderr,
@@ -904,7 +909,6 @@ fn process_channel_msg(
         }
         Some(ChannelMsg::Eof) => exit_code.is_some(),
         Some(ChannelMsg::Close) | None => true,
-        Some(ChannelMsg::ExtendedData { .. } | ChannelMsg::OpenFailure(_)) => false,
         Some(_) => false,
     }
 }
