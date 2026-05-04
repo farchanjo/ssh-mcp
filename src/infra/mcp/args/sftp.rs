@@ -3,7 +3,7 @@
 //! Mirrors v3 `src/mcp/tools/sftp.rs::Ssh*Args` exactly.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // Schemars 1.2 default-fn helpers — see `connection.rs` for rationale.
 #[expect(
@@ -38,7 +38,7 @@ const fn default_lifecycle_grace_ms() -> Option<u32> {
 }
 
 /// Arguments for the `ssh_upload` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshUploadArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
@@ -62,7 +62,7 @@ pub struct SshUploadArgs {
 }
 
 /// Arguments for the `ssh_download` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshDownloadArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
@@ -86,7 +86,7 @@ pub struct SshDownloadArgs {
 }
 
 /// Arguments for the `ssh_get_transfer_progress` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshGetTransferProgressArgs {
     /// `TRANSFER_ID` returned from `ssh_upload` or `ssh_download`.
     pub transfer_id: String,

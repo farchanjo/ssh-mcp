@@ -3,10 +3,10 @@
 //! Mirrors v3 `src/mcp/tools/forward.rs::SshForwardArgs` exactly.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Arguments for the `ssh_forward` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshForwardArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,

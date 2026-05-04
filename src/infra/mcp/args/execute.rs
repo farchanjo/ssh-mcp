@@ -3,7 +3,7 @@
 //! Mirrors v3 `src/mcp/tools/execute.rs::Ssh*Args` exactly.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::policy::CommandStatusFilter;
 
@@ -12,7 +12,7 @@ use crate::domain::policy::CommandStatusFilter;
 /// Replaces the v2.0.1 `Option<String>` filter (which silently ignored
 /// invalid values) with a tagged enum that errors at deserialization
 /// time for typos such as `"runing"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
     /// The command is currently executing.
@@ -131,7 +131,7 @@ const fn default_stop_on_failure() -> Option<bool> {
 }
 
 /// Arguments for the `ssh_execute` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshExecuteArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,
@@ -163,7 +163,7 @@ pub struct SshExecuteArgs {
 }
 
 /// Arguments for the `ssh_get_command_output` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshGetCommandOutputArgs {
     /// `COMMAND_ID` returned from `ssh_execute`.
     pub command_id: String,
@@ -186,7 +186,7 @@ pub struct SshGetCommandOutputArgs {
 }
 
 /// Arguments for the `ssh_list_commands` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshListCommandsArgs {
     /// `SESSION_ID` returned from `ssh_connect`. Optional filter; when
     /// omitted returns commands across all sessions.
@@ -203,7 +203,7 @@ pub struct SshListCommandsArgs {
 }
 
 /// Arguments for the `ssh_cancel_command` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshCancelCommandArgs {
     /// `COMMAND_ID` returned from `ssh_execute`.
     pub command_id: String,
@@ -222,7 +222,7 @@ pub struct SshCancelCommandArgs {
 /// (optional) `ssh_disconnect`. Avoids the three-round-trip
 /// `connect -> execute -> wait` choreography for short atomic
 /// commands like `uptime`, `hostname`, etc.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshRunArgs {
     /// SSH server address in the form `host:port` (e.g.
     /// `192.168.1.1:22`, `example.com:2222`). Port defaults to 22.
@@ -268,7 +268,7 @@ pub struct SshRunArgs {
 /// Arguments for the `ssh_execute_batch` MCP tool — sequential
 /// execution of multiple commands on the same session, with optional
 /// stop-on-failure semantics.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshExecuteBatchArgs {
     /// `SESSION_ID` returned from `ssh_connect`.
     pub session_id: String,

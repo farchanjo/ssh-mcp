@@ -8,7 +8,7 @@
 //! and pick reasonable values.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::subscription::LagPolicy;
 
@@ -51,7 +51,7 @@ const fn default_replay_cursor() -> Option<u64> {
 /// Lifetime selector exposed on the wire surface. Translates into a
 /// [`crate::domain::subscription::SubscriptionLifetime`] inside the use
 /// case once the optional `grace_ms` / `ttl_secs` is folded in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LifetimeKind {
     /// Lane stays open until explicit unsubscribe (default).
@@ -65,7 +65,7 @@ pub enum LifetimeKind {
 // ---- argument structs -------------------------------------------------
 
 /// Arguments for the `ssh_subscribe` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubscribeArgs {
     /// Resource URI (e.g. `shell://<id>/output`, `command://<id>/output`).
     pub uri: String,
@@ -92,28 +92,28 @@ pub struct SshSubscribeArgs {
 }
 
 /// Arguments for the `ssh_unsubscribe` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshUnsubscribeArgs {
     /// `SUB_ID` returned from `ssh_subscribe`.
     pub sub_id: String,
 }
 
 /// Arguments for the `ssh_sub_pause` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubPauseArgs {
     /// `SUB_ID` to pause.
     pub sub_id: String,
 }
 
 /// Arguments for the `ssh_sub_resume` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubResumeArgs {
     /// `SUB_ID` to resume.
     pub sub_id: String,
 }
 
 /// Arguments for the `ssh_sub_filter` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubFilterArgs {
     /// `SUB_ID` whose filter is being updated.
     pub sub_id: String,
@@ -124,7 +124,7 @@ pub struct SshSubFilterArgs {
 }
 
 /// Arguments for the `ssh_sub_replay` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubReplayArgs {
     /// `SUB_ID` to replay.
     pub sub_id: String,
@@ -136,7 +136,7 @@ pub struct SshSubReplayArgs {
 }
 
 /// Arguments for the `ssh_sub_list` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubListArgs {
     /// Optional URI prefix filter. Returns only subs whose canonical
     /// URI starts with this prefix.
@@ -148,7 +148,7 @@ pub struct SshSubListArgs {
 }
 
 /// Arguments for the `ssh_sub_stats` MCP tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshSubStatsArgs {
     /// `SUB_ID` to inspect.
     pub sub_id: String,
@@ -160,7 +160,7 @@ pub struct SshSubStatsArgs {
 /// Carries a `_reserved` field with `#[serde(default, skip)]` so the
 /// struct stays non-empty (avoids `clippy::empty_structs_with_brackets`)
 /// while remaining wire-compatible with `{}`.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct SshDaemonStatsArgs {
     /// Reserved field — not deserialised, never serialised. Phase 4
     /// may layer optional knobs (e.g. `top_n`) here.

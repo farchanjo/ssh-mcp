@@ -26,17 +26,15 @@ with a reason — never silently. ``SSH_MCP_TEST_TARGET`` may override the
 local fixture for tests that benefit from a real host.
 
 Coverage notes:
-- ``IDEMPOTENCY_KEY_MISMATCH`` is documented in the 38-code taxonomy
-  but the live binary's idempotency cache currently keys on
-  (tool, idempotency_key) only — the args fingerprint check is
-  scheduled for a follow-up. The mismatch test below asserts the
-  current dedup behaviour and is updated to assert the MISMATCH code
-  once the args-hash gate ships.
+- ``IDEMPOTENCY_KEY_MISMATCH`` is enforced strictly: the cache keys on
+  ``(tool, idempotency_key, args_fingerprint)`` and surfaces
+  ``INVALID_ARGUMENT`` with the ``IDEMPOTENCY_KEY_MISMATCH`` tag when a
+  caller reuses the same key with different args.
 - ``RING_BUFFER_OVERFLOW`` is reachable only via cursor replay past
   the buffer head — covered.
 - ``MAX_SUBS_TOTAL_EXCEEDED`` and ``MAX_SUBS_PER_URI_EXCEEDED`` need
   thousands of lanes to trigger with default caps; lower the caps via
-  env vars and assert the wire code surfaces.
+  env vars and assert the wire code surfaces strictly.
 """
 
 from __future__ import annotations
@@ -993,3 +991,41 @@ class TestIdempotencyAdversarial:
                 assert cid_a != cid_b, (first.text, second.text)
             finally:
                 call(client, "ssh_disconnect", {"session_id": sid})
+
+    def test_idempotency_key_mismatch(
+        self, adv_client: McpClient, local_fx: LocalSshdFixture
+    ) -> None:
+        """Same idempotency_key + different args -> ``IDEMPOTENCY_KEY_MISMATCH``.
+
+        v5 strengthens the v4.7-step5 cache so the args fingerprint is
+        part of the dedup contract: replaying a stale response for a
+        different argument shape would silently mask user intent. The
+        server now surfaces ``INVALID_ARGUMENT`` with the
+        ``IDEMPOTENCY_KEY_MISMATCH`` tag instead.
+        """
+        sid = connect_local(adv_client, local_fx, agent="idemp-mismatch")
+        try:
+            meta = {"idempotency_key": f"adv-mismatch-{uuid.uuid4()}"}
+            first = call(
+                adv_client,
+                "ssh_execute",
+                {"session_id": sid, "command": "echo FIRST"},
+                meta=meta,
+            )
+            assert first.status == "OK", first.text
+            # Reusing the SAME key with DIFFERENT args must NOT replay
+            # the cached body — strict fingerprint enforcement returns
+            # INVALID_ARGUMENT with the IDEMPOTENCY_KEY_MISMATCH tag.
+            second = call(
+                adv_client,
+                "ssh_execute",
+                {"session_id": sid, "command": "echo SECOND"},
+                meta=meta,
+            )
+            assert second.status == "ERROR", second.text
+            assert second.reason_code == "INVALID_ARGUMENT", second.text
+            assert "IDEMPOTENCY_KEY_MISMATCH" in (
+                second.parsed.get("reason") or ""
+            ), second.text
+        finally:
+            call(adv_client, "ssh_disconnect", {"session_id": sid})
