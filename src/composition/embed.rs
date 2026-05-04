@@ -60,7 +60,7 @@ pub type EmbedRunError = Box<dyn Error + Send + Sync>;
 /// Surfaces [`crate::embed::duplex_transport::EmbedError`] when the
 /// rmcp handshake fails on either side of the duplex.
 pub async fn wire_embed_transport(mux_buffer: usize) -> Result<EmbedTransport, EmbedRunError> {
-    let (use_cases, peer_table, idempotency, id_lister) = build_use_cases();
+    let (use_cases, peer_table, idempotency, id_lister, _lifecycle_concrete) = build_use_cases();
     let server = McpSshServer::new(use_cases, peer_table, idempotency).with_id_lister(id_lister);
 
     let (server_stream, client_stream) = duplex_pair();

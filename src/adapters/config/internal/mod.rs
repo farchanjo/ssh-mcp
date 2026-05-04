@@ -234,6 +234,29 @@ pub const FILTER_REGEX_MAX_ENV_VAR: &str = "SSH_FILTER_REGEX_MAX";
 /// v5 Phase 2 — env var for the replay window (bytes).
 pub const REPLAY_WINDOW_BYTES_ENV_VAR: &str = "SSH_REPLAY_WINDOW_BYTES";
 
+/// v5 Phase 3 default `SUB_LEAK_RISK` warn threshold (seconds).
+///
+/// The leak watcher emits a warning when an `Owned` resource has
+/// existed longer than this without subscribers AND was not opened
+/// with `release_when_no_subs=true`.
+pub const DEFAULT_SUB_LEAK_RISK_WARN_S: u32 = 2;
+/// v5 Phase 3 — floor for the warn threshold.
+pub const SUB_LEAK_RISK_WARN_S_MIN: u32 = 1;
+/// v5 Phase 3 — cap for the warn threshold.
+pub const SUB_LEAK_RISK_WARN_S_MAX: u32 = 3_600;
+/// v5 Phase 3 — env var for the warn threshold.
+pub const SUB_LEAK_RISK_WARN_S_ENV_VAR: &str = "SSH_SUB_LEAK_RISK_WARN_S";
+
+/// v5 Phase 3 default `SUB_LEAK_RISK` hard-close threshold (seconds).
+///
+/// Default `0` disables hard-close; any value >= 1 triggers a
+/// `force_close` after the resource crosses that age.
+pub const DEFAULT_SUB_LEAK_RISK_KILL_S: u32 = 0;
+/// v5 Phase 3 — cap for the kill threshold.
+pub const SUB_LEAK_RISK_KILL_S_MAX: u32 = 86_400;
+/// v5 Phase 3 — env var for the kill threshold.
+pub const SUB_LEAK_RISK_KILL_S_ENV_VAR: &str = "SSH_SUB_LEAK_RISK_KILL_S";
+
 /// Environment variable name for shell output buffer max size
 pub const SHELL_MAX_BUFFER_SIZE_ENV_VAR: &str = "SSH_SHELL_MAX_BUFFER_SIZE";
 /// Environment variable name for the per-command output buffer cap.
@@ -759,6 +782,28 @@ pub fn resolve_replay_window_bytes() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_REPLAY_WINDOW_BYTES)
         .clamp(REPLAY_WINDOW_BYTES_MIN, REPLAY_WINDOW_BYTES_MAX)
+}
+
+/// Resolve the `SUB_LEAK_RISK` warn threshold
+/// (`SSH_SUB_LEAK_RISK_WARN_S`). Defaults to 2 seconds.
+#[must_use]
+pub fn resolve_sub_leak_risk_warn_s() -> u32 {
+    env::var(SUB_LEAK_RISK_WARN_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SUB_LEAK_RISK_WARN_S)
+        .clamp(SUB_LEAK_RISK_WARN_S_MIN, SUB_LEAK_RISK_WARN_S_MAX)
+}
+
+/// Resolve the `SUB_LEAK_RISK` hard-close threshold
+/// (`SSH_SUB_LEAK_RISK_KILL_S`). Defaults to 0 (disabled).
+#[must_use]
+pub fn resolve_sub_leak_risk_kill_s() -> u32 {
+    env::var(SUB_LEAK_RISK_KILL_S_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SUB_LEAK_RISK_KILL_S)
+        .min(SUB_LEAK_RISK_KILL_S_MAX)
 }
 
 // ---------------------------------------------------------------------------
