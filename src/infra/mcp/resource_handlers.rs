@@ -691,9 +691,9 @@ where
 }
 
 /// v5 Phase 2: log the synthesised `SubId` so operators can
-/// correlate subscriptions across logs. Phase 3 introduces a
-/// dedicated `sub_open` tool that returns the `SubId` in the
-/// response body.
+/// correlate subscriptions across logs. The Phase 3 `sub_open` tool
+/// returns the `SubId` in the response body for callers that drive
+/// the lane explicitly.
 fn log_subscribe_outcome(outcome: &SubscribeResourceOutcome) {
     if let Some(sub_id) = outcome.sub_id.as_ref() {
         tracing::info!(
@@ -731,10 +731,11 @@ where
             uri: request.uri,
             peer_id,
             // v5 Phase 2: the rmcp `resources/unsubscribe` schema
-            // does not carry a `sub_id` yet — Phase 3 introduces
-            // dedicated `ssh_sub_*` tools that pass it explicitly.
-            // For now the use case skips the lane close-by-id path
-            // when the protocol cannot supply the sub_id.
+            // does not carry a `sub_id`; the v6.0 `sub_close` tool
+            // (formerly Phase 3 `ssh_sub_close`) is the path that
+            // passes it explicitly. The use case skips the
+            // lane close-by-id path when the protocol cannot supply
+            // the sub_id.
             sub_id: None,
         })
         .await

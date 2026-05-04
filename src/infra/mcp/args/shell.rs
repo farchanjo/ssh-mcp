@@ -298,7 +298,7 @@ pub struct SshShellCloseArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshShellOpenArgs, SshShellReadArgs, SshShellPressArgs, SshShellWaitForArgs};
+    use super::{SshShellOpenArgs, SshShellPressArgs, SshShellReadArgs, SshShellWaitForArgs};
     use schemars::schema_for;
     use serde_json::Value;
 

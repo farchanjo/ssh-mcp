@@ -382,10 +382,7 @@ pub fn sub_stats_render(outcome: &SubStatsOutcome) -> String {
     out.push_str(&outcome.stats.queue_high_watermark.to_string());
     out.push_str("\nBLOCK_TOTAL_MS: ");
     out.push_str(&outcome.stats.block_total_ms.to_string());
-    append_next(
-        &mut out,
-        "sub_filter | sub_replay | sub_close",
-    );
+    append_next(&mut out, "sub_filter | sub_replay | sub_close");
     out
 }
 

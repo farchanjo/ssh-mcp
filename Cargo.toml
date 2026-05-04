@@ -19,9 +19,9 @@ path = "src/bin/ssh_mcp_stdio.rs"
 name = "ssh-mcp"
 path = "src/main.rs"
 
-# v5 Phase 4: NDJSON daemon binary embedding the rmcp client + server through
+# NDJSON daemon binary embedding the rmcp client + server through
 # an in-process `tokio::io::duplex` transport. See ADR 0008 and
-# `docs/INSTRUCTIONS_DAEMON.md`.
+# `docs/DAEMON.md`.
 [[bin]]
 name = "ssh-mcp-tail"
 path = "src/bin/ssh_mcp_tail.rs"

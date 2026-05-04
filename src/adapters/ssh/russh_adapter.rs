@@ -56,10 +56,10 @@ use dashmap::mapref::entry::Entry;
 use russh::Disconnect;
 use russh::client::{self, Msg};
 use russh::{Channel, ChannelMsg};
-use tokio::sync::{Notify, broadcast, mpsc};
 use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use tokio::io::AsyncWriteExt as _;
 use tokio::io::copy_bidirectional;
@@ -854,8 +854,14 @@ impl SshClientPort for RusshAdapter {
         let task_cancel = cancel.clone();
         let task_handle = handle;
         let task = tokio::spawn(async move {
-            run_forward_accept_loop(listener, task_handle, remote_address, remote_port, task_cancel)
-                .await;
+            run_forward_accept_loop(
+                listener,
+                task_handle,
+                remote_address,
+                remote_port,
+                task_cancel,
+            )
+            .await;
         });
         self.forwards.insert(
             local_port,
@@ -950,12 +956,7 @@ async fn forward_one_connection(
     cancel: CancellationToken,
 ) {
     let channel = match ssh_handle
-        .channel_open_direct_tcpip(
-            remote_address,
-            u32::from(remote_port),
-            originator,
-            0_u32,
-        )
+        .channel_open_direct_tcpip(remote_address, u32::from(remote_port), originator, 0_u32)
         .await
     {
         Ok(ch) => ch,

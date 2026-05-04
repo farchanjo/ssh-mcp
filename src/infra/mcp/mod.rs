@@ -5,8 +5,9 @@
 //!
 //! - [`server`] — the [`server::McpSshServer`] struct (the rmcp
 //!   `ServerHandler` host).
-//! - [`tool_router`] — the `#[tool_router]` impl populating the 18 tool
-//!   fns + the matching `#[tool_handler] impl ServerHandler` block.
+//! - [`tool_router`] — the `#[tool_router]` impl populating the 36 tool
+//!   fns (35 without `port_forward`) + the matching
+//!   `#[tool_handler] impl ServerHandler` block.
 //! - [`resource_handlers`] — adapters between rmcp `resources/*` payloads
 //!   and the corresponding `crate::application::*_resource` use cases.
 //! - [`peer_handle`] — re-exports the

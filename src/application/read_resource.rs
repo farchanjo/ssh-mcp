@@ -1063,8 +1063,8 @@ mod tests {
     #[test]
     fn parse_uri_accepts_uuidv7_and_legacy_id_charsets() {
         // UUIDv7-style id (lowercase hex + dashes).
-        let parsed = parse_uri("shell://01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab/output")
-            .expect("parse uuidv7");
+        let parsed =
+            parse_uri("shell://01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab/output").expect("parse uuidv7");
         assert_eq!(parsed.id, "01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab");
         // Legacy snake-case + numeric id.
         let parsed = parse_uri("command://cmd_42-abc/output").expect("parse legacy");

@@ -355,8 +355,8 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// every lane bound to `uri`. Used by the `MemoryRegistry`
     /// notifier integration to fan `notifications/resources/updated`
     /// out to lane peers and increment lane stats on stdio/HTTP
-    /// transports (Phase 4 NDJSON daemon keeps using the channel-mux
-    /// outbound sink instead).
+    /// transports (the `ssh-mcp-tail` NDJSON daemon keeps using the
+    /// channel-mux outbound sink instead).
     pub fn lanes_for_uri_public(&self, uri: &str) -> Vec<Arc<LaneState>> {
         self.snapshot_lanes_for_uri(uri)
     }
@@ -740,7 +740,8 @@ mod tests {
             lag_policy: lag,
             lifetime: SubscriptionLifetime::Manual,
             filter: FilterRule::None,
-            buffer_size: 4, peer: None,
+            buffer_size: 4,
+            peer: None,
         }
     }
 
@@ -1144,7 +1145,8 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERROR".to_string()),
-                    buffer_size: 4, peer: None,
+                    buffer_size: 4,
+                    peer: None,
                 },
             )
             .await
@@ -1175,7 +1177,8 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERROR".to_string()),
-                    buffer_size: 4, peer: None,
+                    buffer_size: 4,
+                    peer: None,
                 },
             )
             .await

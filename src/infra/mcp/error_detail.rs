@@ -1,6 +1,6 @@
 //! Centralised DETAIL pedagogy lookup for the v5 error taxonomy.
 //!
-//! Source of truth: [`docs/llm-ux/ERROR_HANDBOOK.md`] + [ADR 0007].
+//! Source of truth: [`docs/LLM_GUIDE.md` → Error handbook] + [ADR 0007].
 //!
 //! Each wire code maps to a single one-sentence cure tuned for direct
 //! LLM consumption. Both the markdown DETAIL line and the structured
@@ -75,9 +75,7 @@ const fn detail_for_remote(code: &str) -> Option<&'static str> {
 
 const fn detail_for_resource(code: &str) -> Option<&'static str> {
     Some(match code.as_bytes() {
-        b"SESSION_NOT_FOUND" => {
-            "Use ssh_sessions; recreate via ssh_connect if the id is stale."
-        }
+        b"SESSION_NOT_FOUND" => "Use ssh_sessions; recreate via ssh_connect if the id is stale.",
         b"SHELL_NOT_FOUND" => {
             "Recreate via ssh_shell_open; subscribe to shell://<id>/output to track lifecycle."
         }
@@ -141,9 +139,7 @@ const fn detail_for_policy_lag(code: &str) -> Option<&'static str> {
             "Lagged N events; snapshot rebuilt; cursor adjusted. Consume faster or switch lag_policy."
         }
         b"LAG_BACKPRESSURE" => "Consume stdout faster or raise SSH_BP_BLOCK_TIMEOUT_MS.",
-        b"RING_BUFFER_OVERFLOW" => {
-            "Head bytes dropped; use sub_replay from a more recent cursor."
-        }
+        b"RING_BUFFER_OVERFLOW" => "Head bytes dropped; use sub_replay from a more recent cursor.",
         b"SUB_LEAK_RISK" => {
             "Resource has no observers. Either sub_open or recreate with release_when_no_subs=true."
         }
@@ -167,7 +163,7 @@ const fn detail_for_state(code: &str) -> Option<&'static str> {
             "Same key, different args; mint a fresh _meta.idempotency_key per distinct argument set."
         }
         b"INVALID_OP" => {
-            "Op not in the daemon enum; verify against docs/api/ssh-mcp-ndjson.schema.json (Phase 4)."
+            "Op not in the daemon enum; verify against docs/DAEMON.md → NDJSON command schema."
         }
         b"EMPTY_PATTERNS" => "patterns must contain at least one entry.",
         b"TOO_MANY_PATTERNS" => {
@@ -332,7 +328,7 @@ mod tests {
 
     #[test]
     fn taxonomy_covers_38_codes_minimum() {
-        // Every code documented in docs/llm-ux/ERROR_HANDBOOK.md must
+        // Every code documented in docs/LLM_GUIDE.md (Error handbook) must
         // resolve. This is the canonical list from ADR 0007 §"38-code
         // taxonomy"; the assert acts as a regression gate.
         let codes = [

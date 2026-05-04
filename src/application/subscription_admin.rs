@@ -429,10 +429,10 @@ impl ListSubsUseCase {
         if let Some(prefix) = req.uri_prefix.as_deref() {
             subs.retain(|s| s.uri.starts_with(prefix));
         }
-        // peer_id filter is reserved — Phase 3 lanes are not peer-keyed.
+        // peer_id filter is reserved — current lanes are not peer-keyed.
         // The argument is accepted (and validated as `Option<String>`) so
-        // callers can roll forward into Phase 4 / Phase 5 wiring without
-        // a wire-format break.
+        // callers can roll forward into a future peer-aware filter
+        // without a wire-format break.
         let _ = &req.peer_id;
         Ok(ListSubsOutcome { subs })
     }
@@ -613,7 +613,8 @@ mod tests {
                 uri: "shell://sh-1/output?cursor=auto".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -648,7 +649,8 @@ mod tests {
                 uri: "ftp://x/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap_err();
@@ -663,7 +665,8 @@ mod tests {
                 uri: "shell://x/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::Regex("([".to_string()), peer: None,
+                filter: FilterRule::Regex("([".to_string()),
+                peer: None,
             })
             .await
             .unwrap_err();
@@ -1006,7 +1009,8 @@ mod tests {
                 uri: "shell://o/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::DropOldest,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1021,7 +1025,8 @@ mod tests {
                 uri: "shell://b/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::BlockSlow,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1036,7 +1041,8 @@ mod tests {
                 uri: "shell://q/output?cursor=auto".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1051,7 +1057,8 @@ mod tests {
                 uri: "command://c/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1066,7 +1073,8 @@ mod tests {
                 uri: "transfer://t/progress".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1081,7 +1089,8 @@ mod tests {
                 uri: "session://s/health".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1096,7 +1105,8 @@ mod tests {
                 uri: "forward://f/events".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1114,7 +1124,8 @@ mod tests {
                 uri: "shell://x1/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1123,7 +1134,8 @@ mod tests {
                 uri: "shell://x2/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1132,7 +1144,8 @@ mod tests {
                 uri: "shell://x3/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap_err();
@@ -1149,7 +1162,8 @@ mod tests {
                 uri: "shell://same/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap();
@@ -1158,7 +1172,8 @@ mod tests {
                 uri: "shell://same/output".to_string(),
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: LagPolicy::Snapshot,
-                filter: FilterRule::None, peer: None,
+                filter: FilterRule::None,
+                peer: None,
             })
             .await
             .unwrap_err();
@@ -1231,7 +1246,8 @@ mod tests {
                     lag_policy: LagPolicy::Snapshot,
                     lifetime: SubscriptionLifetime::Manual,
                     filter: FilterRule::Regex("ERR".to_string()),
-                    buffer_size: 16, peer: None,
+                    buffer_size: 16,
+                    peer: None,
                 },
             )
             .await

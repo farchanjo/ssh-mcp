@@ -886,7 +886,7 @@ pub fn resolve_sub_leak_risk_kill_s() -> u32 {
 // v5 Phase 4 — NDJSON daemon-specific resolvers
 // ---------------------------------------------------------------------------
 // These resolvers govern only the `ssh-mcp-tail` binary; the HTTP and
-// stdio binaries never read them. Defaults match `docs/INSTRUCTIONS_DAEMON.md`
+// stdio binaries never read them. Defaults match `docs/DAEMON.md`
 // and the limits table in ADR 0008.
 
 /// Default cap on a single NDJSON line received on the daemon's stdin

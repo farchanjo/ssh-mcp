@@ -101,21 +101,22 @@ pub struct SubCloseArgs {
 /// Arguments for the `sub_pause` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SubPauseArgs {
-    /// `SUB_ID` to pause.
+    /// `SUB_ID` returned from `sub_open` — the lane to pause.
     pub sub_id: String,
 }
 
 /// Arguments for the `sub_resume` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SubResumeArgs {
-    /// `SUB_ID` to resume.
+    /// `SUB_ID` returned from `sub_open` — the lane to resume.
     pub sub_id: String,
 }
 
 /// Arguments for the `sub_filter` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SubFilterArgs {
-    /// `SUB_ID` whose filter is being updated.
+    /// `SUB_ID` returned from `sub_open` — the lane whose filter is
+    /// being updated.
     pub sub_id: String,
 
     /// New regex filter. Empty string clears the filter (forward all
@@ -126,7 +127,7 @@ pub struct SubFilterArgs {
 /// Arguments for the `sub_replay` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SubReplayArgs {
-    /// `SUB_ID` to replay.
+    /// `SUB_ID` returned from `sub_open` — the lane to replay.
     pub sub_id: String,
 
     /// Cursor (byte offset) to replay from. Default: 0 — replays from
@@ -142,15 +143,15 @@ pub struct SubListArgs {
     /// URI starts with this prefix.
     pub uri_prefix: Option<String>,
 
-    /// Optional peer-id filter. Currently a placeholder — Phase 3 lanes
-    /// are not peer-keyed; reserved for future wiring.
+    /// Optional peer-id filter. Currently a placeholder — lanes are
+    /// not peer-keyed today; reserved for future peer-aware filtering.
     pub peer_id: Option<String>,
 }
 
 /// Arguments for the `sub_stats` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SubStatsArgs {
-    /// `SUB_ID` to inspect.
+    /// `SUB_ID` returned from `sub_open` — the lane to inspect.
     pub sub_id: String,
 }
 
@@ -162,8 +163,8 @@ pub struct SubStatsArgs {
 /// while remaining wire-compatible with `{}`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct SubStatsAllArgs {
-    /// Reserved field — not deserialised, never serialised. Phase 4
-    /// may layer optional knobs (e.g. `top_n`) here.
+    /// Reserved field — not deserialised, never serialised. Future
+    /// revisions may layer optional knobs (e.g. `top_n`) here.
     #[serde(default, skip)]
     #[allow(dead_code, reason = "reserved field for forward-compat")]
     _reserved: (),
@@ -172,8 +173,8 @@ pub struct SubStatsAllArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        LifetimeKind, SubStatsAllArgs, SubFilterArgs, SubListArgs, SubPauseArgs,
-        SubReplayArgs, SubResumeArgs, SubStatsArgs, SubOpenArgs, SubCloseArgs,
+        LifetimeKind, SubCloseArgs, SubFilterArgs, SubListArgs, SubOpenArgs, SubPauseArgs,
+        SubReplayArgs, SubResumeArgs, SubStatsAllArgs, SubStatsArgs,
     };
     use schemars::schema_for;
     use serde_json::{Value, json};
