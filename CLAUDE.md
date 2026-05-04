@@ -2,7 +2,7 @@
 
 ssh-mcp **v5.0** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus four v5 layers: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — in flight), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
 
-Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md).
+Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
 
 ## Build commands
 
@@ -117,7 +117,7 @@ stateDiagram-v2
     class Closed closed
 ```
 
-Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download`. Field table, memory ordering, cascade orchestration: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#phase-1--lifecycle-binding-merged) and [docs/LOCKS.md](docs/LOCKS.md#lifecycle-adapter-invariants-phase-1).
+Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download`. Field table, memory ordering, cascade orchestration: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#phase-1--lifecycle-binding-merged) and [docs/DEVELOPMENT.md → Lifecycle adapter invariants](docs/DEVELOPMENT.md#lifecycle-adapter-invariants-phase-1).
 
 ### Channel mux pipeline
 
@@ -163,7 +163,7 @@ Per-lane field table and full subscribe pipeline (producer → debouncer → lan
 3. Wire `HINT:` line — `REQUIRED NEXT STEP:` for required actions, `RECOMMENDED:` for soft suggestions.
 4. Wire `NEXT:` line — concrete tool calls in push-first priority order.
 
-Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 38-code error taxonomy with one-sentence DETAIL lines tuned for direct LLM consumption. Full guide: [docs/llm-ux/](docs/llm-ux/).
+Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 38-code error taxonomy with one-sentence DETAIL lines tuned for direct LLM consumption. Full guide: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
 
 ### Binary targets
 
@@ -171,7 +171,7 @@ Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 3
 |---|---|---|---|
 | `ssh-mcp` | `src/main.rs` | HTTP (axum 0.8 + rmcp StreamableHttpService) | Tracks sessions through `Mcp-Session-Id` header. Default bind `0.0.0.0:8000`, path `/`. Root mount uses `Router::fallback_service` (axum 0.8 panics on a nested `/` mount). |
 | `ssh-mcp-stdio` | `src/bin/ssh_mcp_stdio.rs` | Stdio MCP (`rmcp::transport::io::stdio()`) | Logs to stderr via `RUST_LOG`. |
-| `ssh-mcp-tail` | `src/bin/ssh_mcp_tail.rs` | NDJSON over stdin/stdout (Phase 4 — in flight) | Three subcommands (`run`, `shell`, `daemon`); `daemon` is the primary deliverable. Reference: [docs/INSTRUCTIONS_DAEMON.md](docs/INSTRUCTIONS_DAEMON.md). |
+| `ssh-mcp-tail` | `src/bin/ssh_mcp_tail.rs` | NDJSON over stdin/stdout (Phase 4 — in flight) | Three subcommands (`run`, `shell`, `daemon`); `daemon` is the primary deliverable. Reference: [docs/DAEMON.md](docs/DAEMON.md). |
 
 All three binaries are thin shells over `composition::prod` (and, for the daemon, `composition::embed`). Each spawns a background **peer-GC task** that scans the subscription registry on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed (rmcp 1.6 does not surface a peer-disconnect callback).
 
@@ -192,7 +192,7 @@ All 30 (or 29 without `port_forward`) MCP tools return a single markdown `Text<S
 - First line: `TOOL_NAME: STATUS` (e.g. `SSH_CONNECT: OK`).
 - One `KEY: value` per line. All IDs suffixed with `_ID`.
 - Output blocks use an 8-hex-char nonce per response: `--- stdout [a3f2b1d7] ---\n<content>\n--- stderr [a3f2b1d7] (empty) ---`.
-- Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: <one-sentence cure>` plus structured `{ tool, status: "error", code, reason, detail }`. Codes: [ADR 0007](docs/adr/0007-error-taxonomy.md) and [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md).
+- Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: <one-sentence cure>` plus structured `{ tool, status: "error", code, reason, detail }`. Codes: [ADR 0007](docs/adr/0007-error-taxonomy.md) and [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook).
 
 The v4 / v5 markdown shape is byte-identical to v3 on the legacy text channel (verified by snapshot tests in `tests/v4_smoke.rs`).
 
@@ -206,7 +206,7 @@ All settings follow: **Parameter → Environment Variable → Default**. Full ta
 - **Retryable**: `TRANSPORT` class — exponential backoff via `backon`, max 10 s.
 - **Non-retryable**: `AUTH`, `RESOURCE`, `STATE` (without `_meta.idempotency_key`), `INTERNAL`.
 - All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers use `Result<T, DomainError>` (`thiserror`).
-- Every error response carries a one-sentence `DETAIL:` line tuned for direct LLM consumption — see [docs/llm-ux/ERROR_HANDBOOK.md](docs/llm-ux/ERROR_HANDBOOK.md).
+- Every error response carries a one-sentence `DETAIL:` line tuned for direct LLM consumption — see [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook).
 
 ## Code standards
 
@@ -225,7 +225,7 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 **Clippy gate is production-only.** The canonical command is `cargo clippy --release --all-features -- -D warnings` and must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453). Production code stays under the full strict baseline; test code is gated by `cargo test --lib` (must keep green) plus `cargo build --release --all-targets` (must stay warning-free). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
 
-Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecycle adapter atomics, lane mpsc, mux fairness, cascade refcount): [docs/LOCKS.md](docs/LOCKS.md).
+Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecycle adapter atomics, lane mpsc, mux fairness, cascade refcount): [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants).
 
 ### General
 
@@ -248,4 +248,4 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 - MSRV bumped to Rust **1.95** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.95).
 - New env vars (lifecycle / lane / mux / daemon) — defaults preserve v4 behaviour. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
-Full host migration guide: [docs/MIGRATION_v4_to_v5.md](docs/MIGRATION_v4_to_v5.md). v3 → v4 contributor narrative (the v4.1 deep-decouple addendum): [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md).
+Full host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). v3 → v4 contributor narrative (the v4.1 deep-decouple addendum): [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4).
