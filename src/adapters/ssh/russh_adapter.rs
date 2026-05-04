@@ -1031,7 +1031,7 @@ impl RusshAdapter {
         let running = Arc::new(RunningShell::new(cancel_token.clone(), buffer_cap));
 
         spawn_shell_writer_task(write_half, input_rx, cancel_token.clone());
-        spawn_shell_reader_task(read_half, &running);
+        spawn_shell_reader_task(read_half, &running, shell_id.clone());
 
         match self.shells.entry(shell_id.clone()) {
             Entry::Vacant(slot) => {
@@ -1137,13 +1137,14 @@ struct ShellReaderHandles {
     cancel_token: CancellationToken,
     max_buffer_size: Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
+    shell_id: ShellId,
 }
 
 impl ShellReaderHandles {
     /// Build the bundle from a borrowed [`Arc<RunningShell>`] without
     /// consuming it — the caller still needs the `Arc` to register the
     /// shell record.
-    fn from_running(running: &Arc<RunningShell>) -> Self {
+    fn from_running(running: &Arc<RunningShell>, shell_id: ShellId) -> Self {
         Self {
             history: Arc::clone(&running.history),
             output_tx: running.output_tx.clone(),
@@ -1151,6 +1152,7 @@ impl ShellReaderHandles {
             cancel_token: running.cancel_token.clone(),
             max_buffer_size: Arc::clone(&running.max_buffer_size),
             last_activity_ms: Arc::clone(&running.last_activity_ms),
+            shell_id,
         }
     }
 }
@@ -1161,8 +1163,12 @@ impl ShellReaderHandles {
 /// without the registry-side debouncing — the
 /// [`crate::ports::subscription::SubscriberRegistry`] adapter (H9) will
 /// observe the per-shell broadcast channel directly.
-fn spawn_shell_reader_task(read_half: russh::ChannelReadHalf, running: &Arc<RunningShell>) {
-    let handles = ShellReaderHandles::from_running(running);
+fn spawn_shell_reader_task(
+    read_half: russh::ChannelReadHalf,
+    running: &Arc<RunningShell>,
+    shell_id: ShellId,
+) {
+    let handles = ShellReaderHandles::from_running(running, shell_id);
     tokio::spawn(async move {
         run_shell_reader(read_half, handles).await;
     });
@@ -1185,6 +1191,7 @@ async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellR
         }
     }
     if !local.is_empty() {
+        let chunk_len = local.len();
         flush_shell_buffer(
             &handles.history,
             &handles.output_tx,
@@ -1192,7 +1199,14 @@ async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellR
             &mut local,
             &handles.max_buffer_size,
         );
+        notify_shell_resource(handles.shell_id.as_str(), chunk_len);
     }
+}
+
+fn notify_shell_resource(shell_id: &str, bytes_added: usize) {
+    use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Shell, shell_id);
+    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Shell, shell_id, bytes_added);
 }
 
 /// Handle a single russh frame. Returns `true` to continue the reader
@@ -1208,6 +1222,7 @@ fn handle_reader_msg(
             local.extend_from_slice(&data);
             handles.last_activity_ms.store(now_ms(), Ordering::Relaxed);
             if local.len() >= SHELL_FLUSH_THRESHOLD {
+                let chunk_len = local.len();
                 flush_shell_buffer(
                     &handles.history,
                     &handles.output_tx,
@@ -1215,6 +1230,7 @@ fn handle_reader_msg(
                     local,
                     &handles.max_buffer_size,
                 );
+                notify_shell_resource(handles.shell_id.as_str(), chunk_len);
             }
             true
         }
