@@ -146,10 +146,14 @@ PUSH-FIRST HAPPY PATHS:
    ssh_upload(release_when_no_subs=true)
    -> ssh_subscribe(uri=transfer://<tid>/progress).
 
-FALLBACK (no subscribe support):
-4) ssh_run (one-shot connect+exec+disconnect).
-5) ssh_execute -> ssh_get_command_output(wait=true,
+FALLBACK:
+4) ssh_execute -> ssh_get_command_output(wait=true,
                                          wait_timeout_secs=30).
+   (Use when host lacks subscribe support; reuses session.)
+5) ssh_run (PENALIZED: connect+exec+disconnect every call).
+   Pays full handshake (200-2000 ms) + tears session. Only when
+   you will NEVER touch this host again. Two ssh_run calls cost
+   as much as one ssh_connect + two ssh_execute calls.
 
 CLEANUP CHECKLIST (run at workflow end):
  [ ] ssh_unsubscribe every sub_id you opened
@@ -186,22 +190,24 @@ flowchart TD
     P1["Path 1: async cmd<br/>connect -> execute<br/>(release_when_no_subs)<br/>-> subscribe command://<br/>-> drain until completed"]
     P2["Path 2: shell<br/>connect -> shell_open<br/>(release_when_no_subs)<br/>-> subscribe shell://<br/>-> write / send_key"]
     P3["Path 3: upload<br/>upload<br/>(release_when_no_subs)<br/>-> subscribe transfer://<br/>-> drain progress"]
-    P4["Path 4 (fallback): one-shot<br/>ssh_run(addr, user, cmd)<br/>returns exit_code"]
-    P5["Path 5 (fallback): wait<br/>execute<br/>-> get_command_output<br/>(wait=true, timeout)"]
+    P4["Path 4 (fallback): wait<br/>execute<br/>-> get_command_output<br/>(wait=true, timeout)<br/>reuses session"]
+    P5["Path 5 (PENALIZED): one-shot<br/>ssh_run(addr, user, cmd)<br/>full handshake every call"]
 
     Q -->|yes| K
     Q -->|no| K2{"workflow shape?"}
     K -->|"long async cmd"| P1
     K -->|"interactive shell"| P2
     K -->|"file transfer"| P3
-    K2 -->|"short one-shot"| P4
-    K2 -->|"any other"| P5
+    K2 -->|"any reuse possible"| P4
+    K2 -->|"never revisit host"| P5
 
     classDef push fill:#238636,color:#f0f6fc,stroke:#2ea043
     classDef fallback fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef penalized fill:#cf222e,color:#f0f6fc,stroke:#f85149
     classDef branch fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     class P1,P2,P3 push
-    class P4,P5 fallback
+    class P4 fallback
+    class P5 penalized
     class Q,K,K2 branch
 ```
 
@@ -252,19 +258,23 @@ PUSH-FIRST HAPPY PATHS (preferred):
    -> ssh_subscribe(uri=transfer://<tid>/progress, lifetime=auto-close)
    -> consume bytes_transferred events until completion event.
 
-FALLBACK PATHS (only when host has no subscribe support):
+FALLBACK PATHS:
 
-4) One-shot:
-   ssh_run(address, username, command [, disconnect_after=true])
-   returns exit_code in a single tool call. Best for short commands
-   that fit in one round-trip.
-
-5) Wait-on-result:
-   ssh_execute(...) returns command_id immediately
+4) Wait-on-result (PREFERRED FALLBACK — reuses session):
+   ssh_connect(reuse=auto) -> ssh_execute(...) returns command_id
    -> ssh_get_command_output(command_id, wait=true,
                              wait_timeout_secs=30) blocks until
-   completion or timeout. Falls back gracefully but costs a polling
-   round-trip per call.
+   completion or timeout. Use when host has no subscribe support.
+   Keeps the session alive for the next call.
+
+5) One-shot (PENALIZED — avoid unless single-touch):
+   ssh_run(address, username, command [, disconnect_after=true])
+   pays a full SSH handshake (200-2000 ms) and tears the session
+   down on every call. Two ssh_run calls cost as much as one
+   ssh_connect + two ssh_execute calls. Acceptable ONLY when you
+   will NEVER touch this host again (e.g. one-shot capability sniff
+   across many distinct hosts, N=1 command per host). For any reuse
+   default to path 1.
 
 TRADEOFF GUIDE:
 
@@ -327,7 +337,8 @@ The single most important table. Pick the star-marked path whenever the host adv
 
 | What you want                                      | Tool / Pattern                                                |
 | -------------------------------------------------- | ------------------------------------------------------------- |
-| Run a one-shot remote command                      | `ssh_run` (or `ssh_execute` -> `ssh_get_command_output`)      |
+| Run a one-shot remote command (host you may revisit) | `ssh_connect(reuse=auto)` -> `ssh_execute` -> `ssh_subscribe command://<id>/output` *  |
+| Run a one-shot remote command (single-touch host)  | `ssh_run` (PENALIZED: full handshake + teardown per call)     |
 | Open an interactive shell                          | `ssh_shell_open` + `resources/subscribe shell://<id>/output` * |
 | Send `Ctrl+C`, arrows, function keys               | `ssh_shell_send_key`                                          |
 | Send raw text input                                | `ssh_shell_write`                                             |
