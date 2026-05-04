@@ -72,6 +72,10 @@ use crate::domain::keys::KeyModifiers;
 use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
+use crate::infra::mcp::args::serial::{
+    SshSerialCloseArgs, SshSerialListOpenArgs, SshSerialListPortsArgs, SshSerialOpenArgs,
+    SshSerialSendKeyArgs, SshSerialWriteArgs,
+};
 use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
@@ -93,6 +97,10 @@ use crate::infra::mcp::results::{
     SshListSessionsResult, SshRunResult, SshShellCloseResult, SshShellOpenResult,
     SshShellReadResult, SshShellSendKeyResult, SshShellWaitForResult, SshShellWriteResult,
     SshUploadResult,
+};
+use crate::infra::mcp::results::{
+    SshSerialCloseResult, SshSerialListOpenResult, SshSerialListPortsResult, SshSerialOpenResult,
+    SshSerialSendKeyResult, SshSerialWriteResult,
 };
 use crate::infra::mcp::suggestions::{closest_ids, render_closest_matches};
 use crate::ports::auth_strategy::AuthStrategyPort;
@@ -238,7 +246,10 @@ fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
         DomainError::CommandNotFound(id) => Some(LookupTarget::Command(id.as_str())),
         DomainError::TransferNotFound(id) => Some(LookupTarget::Transfer(id.as_str())),
         DomainError::ForwardNotFound(id) => Some(LookupTarget::Forward(id.as_str())),
-        DomainError::InvalidArgument(_)
+        // v5.2 (ADR 0009): closest-match for serial lands alongside `serial_list`.
+        DomainError::SerialNotFound(_)
+        | DomainError::Serial(_)
+        | DomainError::InvalidArgument(_)
         | DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
         | DomainError::Transport(_)
@@ -568,6 +579,12 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "no forwarder with the given ID".to_string(),
             Some(id.as_str().to_string()),
         ),
+        DomainError::SerialNotFound(id) => (
+            "SERIAL_NOT_FOUND",
+            "no open serial port with the given ID".to_string(),
+            Some(id.as_str().to_string()),
+        ),
+        DomainError::Serial(reason) => ("SERIAL_ERROR", reason.clone(), None),
         DomainError::Auth(reason) => ("AUTH_FAILED", reason.to_string(), None),
         DomainError::ConnectFailed(reason) => ("CONNECTION_FAILED", reason.clone(), None),
         DomainError::Transport(reason) => {
@@ -2306,6 +2323,91 @@ where
     ) -> Result<CallToolResult, McpError> {
         Ok(run_daemon_stats(self.use_cases.daemon_stats.as_ref()))
     }
+
+    // -----------------------------------------------------------------------
+    // v5.2 — Serial transport (ADR 0009). Lock-free reader / writer split;
+    // subscribe via `serial://<id>/output` plugs into the same debouncer
+    // pipeline as shell/command, including the ADR 0006 Amendment 1
+    // byte-threshold flush.
+    // -----------------------------------------------------------------------
+
+    #[tool(
+        title = "Open a serial port",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
+        description = "Open a UART / TTY / COM serial port and start its lock-free reader / writer tasks. The returned SERIAL_ID can be passed to ssh_subscribe uri=serial://<SERIAL_ID>/output for push delivery (same debouncer + 64 KiB byte-threshold flush as shell:// / command://).\n\nWhen to use:\n- Driving an embedded board, GPS, RS-485 sensor, modem, or debug UART from an LLM host.\n- Streaming bursty serial output without polling.\n\nFull configuration: path, baud_rate (default 115200), data_bits (5..=8, default 8), stop_bits (1|2, default 1), parity (none|odd|even, default none), flow_control (none|software|hardware, default none), read_timeout_ms (default 100), max_buffer_size (0 = adapter default 1 MiB), initial_dtr / initial_rts (None = driver default), label.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (bad data_bits / parity / flow_control / stop_bits), SERIAL_ERROR (device busy / missing / permission denied / kernel control-line refusal).\n\nCost: 1 open() + 2 spawned tasks (reader + writer); typically <10 ms.",
+        output_schema = schema_for_type::<SshSerialOpenResult>()
+    )]
+    async fn ssh_serial_open(
+        &self,
+        Parameters(args): Parameters<SshSerialOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_open(args))
+    }
+
+    #[tool(
+        title = "Close a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true),
+        description = "Cancel reader / writer tasks for the given SERIAL_ID and remove the registry entry. Idempotent — a second call returns NOOP.\n\nStatus values: OK, NOOP.\n\nCost: O(1).",
+        output_schema = schema_for_type::<SshSerialCloseResult>()
+    )]
+    async fn ssh_serial_close(
+        &self,
+        Parameters(args): Parameters<SshSerialCloseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_close(args))
+    }
+
+    #[tool(
+        title = "Write to a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
+        description = "Enqueue bytes for transmission on a SERIAL_ID. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648, for binary protocols). Newlines are NOT auto-appended; use ssh_serial_send_key for `enter`/`cr`/`lf`/`crlf`.\n\nAfter the write — DO NOT poll. The response arrives via push on the existing serial://<id>/output subscription. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full — local sleep + retry).\n\nCost: O(input.len). Sub-ms typical.",
+        output_schema = schema_for_type::<SshSerialWriteResult>()
+    )]
+    async fn ssh_serial_write(
+        &self,
+        Parameters(args): Parameters<SshSerialWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_write(args))
+    }
+
+    #[tool(
+        title = "Send a named keystroke to a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
+        description = "Send a named control keystroke without crafting the bytes manually. Accepted: `enter`/`cr` (\\r), `lf` (\\n), `crlf` (\\r\\n), `esc` (\\x1b), `tab` (\\t), `backspace` (\\x08), `ctrl_c` (\\x03), `ctrl_d` (\\x04), `ctrl_z` (\\x1a). Optional `repeat` 1..=64.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.\n\nCost: O(repeat).",
+        output_schema = schema_for_type::<SshSerialSendKeyResult>()
+    )]
+    async fn ssh_serial_send_key(
+        &self,
+        Parameters(args): Parameters<SshSerialSendKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_send_key(args))
+    }
+
+    #[tool(
+        title = "List OS-visible serial devices",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
+        description = "Snapshot the OS-visible serial devices. Returns `path` strings the caller can pass to ssh_serial_open. No state mutation.\n\nCost: 1 OS enumeration (typically <5 ms).",
+        output_schema = schema_for_type::<SshSerialListPortsResult>()
+    )]
+    async fn ssh_serial_list_ports(
+        &self,
+        Parameters(args): Parameters<SshSerialListPortsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_list_ports(&args))
+    }
+
+    #[tool(
+        title = "List currently open serial ports",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
+        description = "Snapshot every serial port currently held by this process. Returns SERIAL_ID, path, baud_rate, optional label, and the subscribe URI for each. No state mutation.\n\nCost: O(N) over the per-process registry.",
+        output_schema = schema_for_type::<SshSerialListOpenResult>()
+    )]
+    async fn ssh_serial_list_open(
+        &self,
+        Parameters(args): Parameters<SshSerialListOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_list_open(&args))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3358,6 +3460,459 @@ where
         Parameters(_args): Parameters<SshDaemonStatsArgs>,
     ) -> Result<CallToolResult, McpError> {
         Ok(run_daemon_stats(self.use_cases.daemon_stats.as_ref()))
+    }
+
+    // -----------------------------------------------------------------------
+    // v5.2 — Serial transport (ADR 0009). Identical surface to the
+    // `port_forward = enabled` flavour above; mirrors so the
+    // catalogue stays consistent regardless of feature flags.
+    // -----------------------------------------------------------------------
+
+    #[tool(
+        title = "Open a serial port",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialOpenResult>()
+    )]
+    async fn ssh_serial_open(
+        &self,
+        Parameters(args): Parameters<SshSerialOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_open(args))
+    }
+
+    #[tool(
+        title = "Close a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialCloseResult>()
+    )]
+    async fn ssh_serial_close(
+        &self,
+        Parameters(args): Parameters<SshSerialCloseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_close(args))
+    }
+
+    #[tool(
+        title = "Write to a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialWriteResult>()
+    )]
+    async fn ssh_serial_write(
+        &self,
+        Parameters(args): Parameters<SshSerialWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_write(args))
+    }
+
+    #[tool(
+        title = "Send a named keystroke to a serial port",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialSendKeyResult>()
+    )]
+    async fn ssh_serial_send_key(
+        &self,
+        Parameters(args): Parameters<SshSerialSendKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_send_key(args))
+    }
+
+    #[tool(
+        title = "List OS-visible serial devices",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialListPortsResult>()
+    )]
+    async fn ssh_serial_list_ports(
+        &self,
+        Parameters(args): Parameters<SshSerialListPortsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_list_ports(&args))
+    }
+
+    #[tool(
+        title = "List currently open serial ports",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
+        description = "See port_forward variant for full doc — same surface.",
+        output_schema = schema_for_type::<SshSerialListOpenResult>()
+    )]
+    async fn ssh_serial_list_open(
+        &self,
+        Parameters(args): Parameters<SshSerialListOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(serial_tool_helpers::run_serial_list_open(&args))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-standing serial-tool helpers shared between the two `tool_router` impls
+// (v5.2; ADR 0009).
+// ---------------------------------------------------------------------------
+
+#[allow(
+    clippy::wildcard_imports,
+    reason = "narrow blanket import for the serial tool helpers — keeps the section legible"
+)]
+mod serial_tool_helpers {
+    use super::*;
+    use crate::adapters::serial::state::{
+        self, SERIAL_REGISTRY, SerialConfig, SerialFlowControl, SerialOpenError, SerialParity,
+        SerialStopBits, SerialWriteError,
+    };
+    use crate::domain::ids::SerialId;
+    use crate::infra::mcp::args::serial::{
+        SshSerialCloseArgs, SshSerialListOpenArgs, SshSerialListPortsArgs, SshSerialOpenArgs,
+        SshSerialSendKeyArgs, SshSerialWriteArgs,
+    };
+    use crate::infra::mcp::helpers::structured::ok_text_and_structured;
+    use crate::infra::mcp::render::serial as render_serial;
+    use crate::infra::mcp::results::{
+        SshSerialCloseResult, SshSerialListOpenResult, SshSerialListPortsResult,
+        SshSerialOpenResult, SshSerialSendKeyResult, SshSerialWriteResult,
+    };
+    use bytes::Bytes;
+    use serde_json::json;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    fn invalid(reason: impl Into<String>) -> CallToolResult {
+        let body = format!(
+            "SSH_SERIAL: ERROR\nREASON: [INVALID_ARGUMENT] {0}\nDETAIL: validate the offending field and retry",
+            reason.into()
+        );
+        let structured = json!({
+            "tool":   "ssh_serial",
+            "status": "error",
+            "code":   "INVALID_ARGUMENT",
+            "reason": "invalid serial argument",
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    fn open_error(err: &SerialOpenError) -> CallToolResult {
+        let (code, reason): (&str, String) = match err {
+            SerialOpenError::InvalidDataBits(_) => ("INVALID_ARGUMENT", err.to_string()),
+            SerialOpenError::Open { .. } | SerialOpenError::ControlLine { .. } => {
+                ("SERIAL_ERROR", err.to_string())
+            }
+        };
+        let body = format!(
+            "SSH_SERIAL_OPEN: ERROR\nREASON: [{code}] {reason}\nDETAIL: ssh_serial_list_ports lists OS-visible devices"
+        );
+        let structured = json!({
+            "tool":   "ssh_serial_open",
+            "status": "error",
+            "code":   code,
+            "reason": reason,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    fn write_error(err: &SerialWriteError) -> CallToolResult {
+        let (code, detail) = match err {
+            SerialWriteError::NotFound(_) => {
+                ("SERIAL_NOT_FOUND", "no open serial port with the given ID")
+            }
+            SerialWriteError::Backpressure(_) => (
+                "SERIAL_BACKPRESSURE",
+                "write queue full — the consumer is slower than the producer; retry after a short local sleep",
+            ),
+        };
+        let reason = err.to_string();
+        let body = format!("SSH_SERIAL_WRITE: ERROR\nREASON: [{code}] {reason}\nDETAIL: {detail}");
+        let structured = json!({
+            "tool":   "ssh_serial_write",
+            "status": "error",
+            "code":   code,
+            "reason": err.to_string(),
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    pub fn run_serial_open(args: SshSerialOpenArgs) -> CallToolResult {
+        let config = match build_serial_config(args) {
+            Ok(cfg) => cfg,
+            Err(e) => return invalid(e),
+        };
+        let serial_id = match state::open_port(&config) {
+            Ok(id) => id,
+            Err(e) => return open_error(&e),
+        };
+        let Some(port_state) = SERIAL_REGISTRY.get(&serial_id) else {
+            return invalid("registry insert race; retry");
+        };
+        let result = build_open_result(&serial_id, &port_state);
+        let body = render_serial::serial_open_render(&result);
+        let structured = render_serial::serial_open_structured(&result);
+        ok_text_and_structured(body, structured)
+    }
+
+    fn build_serial_config(args: SshSerialOpenArgs) -> Result<SerialConfig, String> {
+        let stop_bits = SerialStopBits::from_str(&args.stop_bits)?;
+        let parity = SerialParity::from_str(&args.parity)?;
+        let flow_control = SerialFlowControl::from_str(&args.flow_control)?;
+        Ok(SerialConfig {
+            path: args.path,
+            baud_rate: args.baud_rate,
+            data_bits: args.data_bits,
+            stop_bits,
+            parity,
+            flow_control,
+            read_timeout: Duration::from_millis(args.read_timeout_ms),
+            max_buffer_size: args.max_buffer_size,
+            initial_dtr: args.initial_dtr,
+            initial_rts: args.initial_rts,
+            label: args.label,
+        })
+    }
+
+    fn build_open_result(
+        serial_id: &SerialId,
+        port_state: &state::SerialPortState,
+    ) -> SshSerialOpenResult {
+        SshSerialOpenResult {
+            tool: "ssh_serial_open".to_string(),
+            status: "ok".to_string(),
+            serial_id: serial_id.as_str().to_string(),
+            path: port_state.config.path.clone(),
+            baud_rate: port_state.config.baud_rate,
+            data_bits: port_state.config.data_bits,
+            stop_bits: format_stop_bits(port_state.config.stop_bits).to_string(),
+            parity: format_parity(port_state.config.parity).to_string(),
+            flow_control: format_flow_control(port_state.config.flow_control).to_string(),
+            uri: port_state.uri(),
+        }
+    }
+
+    pub fn run_serial_close(args: SshSerialCloseArgs) -> CallToolResult {
+        let id = SerialId::new(args.serial_id);
+        let closed = state::close_port(&id);
+        let result = SshSerialCloseResult {
+            tool: "ssh_serial_close".to_string(),
+            status: if closed { "ok" } else { "noop" }.to_string(),
+            serial_id: id.as_str().to_string(),
+        };
+        let body = render_serial::serial_close_render(&result.serial_id, closed);
+        let structured = json!({
+            "tool":      result.tool,
+            "status":    result.status,
+            "serial_id": result.serial_id,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    pub fn run_serial_write(args: SshSerialWriteArgs) -> CallToolResult {
+        let payload: Bytes = match (args.text, args.bytes_base64) {
+            (Some(t), None) => Bytes::from(t.into_bytes()),
+            (None, Some(b64)) => match base64_decode(&b64) {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(reason) => return invalid(reason),
+            },
+            (Some(_), Some(_)) => {
+                return invalid("specify exactly one of `text` or `bytes_base64`");
+            }
+            (None, None) => return invalid("missing payload (text or bytes_base64)"),
+        };
+        let id = SerialId::new(args.serial_id);
+        let bytes_sent = payload.len();
+        if let Err(e) = state::write_port(&id, payload) {
+            return write_error(&e);
+        }
+        let result = SshSerialWriteResult {
+            tool: "ssh_serial_write".to_string(),
+            status: "ok".to_string(),
+            serial_id: id.as_str().to_string(),
+            bytes_sent,
+        };
+        let body = render_serial::serial_write_render(&result.serial_id, bytes_sent);
+        let structured = json!({
+            "tool":       result.tool,
+            "status":     result.status,
+            "serial_id":  result.serial_id,
+            "bytes_sent": result.bytes_sent,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    pub fn run_serial_send_key(args: SshSerialSendKeyArgs) -> CallToolResult {
+        let Some(unit) = key_label_to_bytes(&args.key) else {
+            return invalid(format!("unknown key: {}", args.key));
+        };
+        let repeat = args.repeat.clamp(1, 64);
+        let payload = expand_key_payload(unit, repeat);
+        let id = SerialId::new(args.serial_id);
+        let bytes_sent = payload.len();
+        if let Err(e) = state::write_port(&id, Bytes::from(payload)) {
+            return write_error(&e);
+        }
+        render_send_key_ok(&id, args.key, repeat, bytes_sent)
+    }
+
+    fn render_send_key_ok(
+        id: &SerialId,
+        key: String,
+        repeat: u32,
+        bytes_sent: usize,
+    ) -> CallToolResult {
+        let result = SshSerialSendKeyResult {
+            tool: "ssh_serial_send_key".to_string(),
+            status: "ok".to_string(),
+            serial_id: id.as_str().to_string(),
+            key,
+            repeat,
+            bytes_sent,
+        };
+        let body = render_serial::serial_send_key_render(
+            &result.serial_id,
+            &result.key,
+            result.repeat,
+            result.bytes_sent,
+        );
+        let structured = json!({
+            "tool":       result.tool,
+            "status":     result.status,
+            "serial_id":  result.serial_id,
+            "key":        result.key,
+            "repeat":     result.repeat,
+            "bytes_sent": result.bytes_sent,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    fn key_label_to_bytes(key: &str) -> Option<&'static [u8]> {
+        match key.to_ascii_lowercase().as_str() {
+            "enter" | "cr" => Some(b"\r"),
+            "lf" => Some(b"\n"),
+            "crlf" => Some(b"\r\n"),
+            "esc" => Some(b"\x1b"),
+            "tab" => Some(b"\t"),
+            "backspace" => Some(b"\x08"),
+            "ctrl_c" => Some(b"\x03"),
+            "ctrl_d" => Some(b"\x04"),
+            "ctrl_z" => Some(b"\x1a"),
+            _ => None,
+        }
+    }
+
+    fn expand_key_payload(unit: &[u8], repeat: u32) -> Vec<u8> {
+        let total = unit
+            .len()
+            .saturating_mul(usize::try_from(repeat).unwrap_or(1));
+        let mut payload = Vec::with_capacity(total);
+        for _ in 0..repeat {
+            payload.extend_from_slice(unit);
+        }
+        payload
+    }
+
+    pub fn run_serial_list_ports(_args: &SshSerialListPortsArgs) -> CallToolResult {
+        let paths = state::available_ports();
+        let result = SshSerialListPortsResult {
+            tool: "ssh_serial_list_ports".to_string(),
+            status: "ok".to_string(),
+            paths: paths.clone(),
+            total: paths.len(),
+        };
+        let body = render_serial::serial_list_ports_render(&result.paths);
+        let structured = json!({
+            "tool":   result.tool,
+            "status": result.status,
+            "paths":  result.paths,
+            "total":  result.total,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    pub fn run_serial_list_open(_args: &SshSerialListOpenArgs) -> CallToolResult {
+        let entries: Vec<_> = SERIAL_REGISTRY
+            .snapshot()
+            .iter()
+            .map(|s| render_serial::open_entry_from_state(s))
+            .collect();
+        let result = SshSerialListOpenResult {
+            tool: "ssh_serial_list_open".to_string(),
+            status: "ok".to_string(),
+            ports: entries.clone(),
+            total: entries.len(),
+        };
+        let body = render_serial::serial_list_open_render(&result.ports);
+        let structured = json!({
+            "tool":   result.tool,
+            "status": result.status,
+            "ports":  serde_json::to_value(&result.ports).unwrap_or_default(),
+            "total":  result.total,
+        });
+        ok_text_and_structured(body, structured)
+    }
+
+    const fn format_stop_bits(b: SerialStopBits) -> &'static str {
+        match b {
+            SerialStopBits::One => "1",
+            SerialStopBits::Two => "2",
+        }
+    }
+
+    const fn format_parity(p: SerialParity) -> &'static str {
+        match p {
+            SerialParity::None => "none",
+            SerialParity::Odd => "odd",
+            SerialParity::Even => "even",
+        }
+    }
+
+    const fn format_flow_control(f: SerialFlowControl) -> &'static str {
+        match f {
+            SerialFlowControl::None => "none",
+            SerialFlowControl::Software => "software",
+            SerialFlowControl::Hardware => "hardware",
+        }
+    }
+
+    fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+        // Tiny RFC 4648 standard-alphabet base64 decoder. Inline so the
+        // serial tools do not pull a new dependency.
+        let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !bytes.len().is_multiple_of(4) {
+            let len = bytes.len();
+            return Err(format!("base64 length not multiple of 4 ({len})"));
+        }
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            decode_base64_chunk(chunk, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn decode_base64_chunk(chunk: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut buf = [0_u32; 4];
+        let mut pad = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                pad += 1;
+            } else {
+                let idx = ALPHA
+                    .iter()
+                    .position(|&a| a == c)
+                    .ok_or_else(|| format!("invalid base64 char: {}", char::from(c)))?;
+                buf[i] = u32::try_from(idx).unwrap_or(0);
+            }
+        }
+        let n = (buf[0] << 18) | (buf[1] << 12) | (buf[2] << 6) | buf[3];
+        out.push(u8::try_from((n >> 16) & 0xFF).unwrap_or(0));
+        if pad < 2 {
+            out.push(u8::try_from((n >> 8) & 0xFF).unwrap_or(0));
+        }
+        if pad < 1 {
+            out.push(u8::try_from(n & 0xFF).unwrap_or(0));
+        }
+        Ok(())
     }
 }
 

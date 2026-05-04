@@ -86,15 +86,14 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         DomainError::InvalidArgument(_)
         | DomainError::InvalidLagPolicy(_)
         | DomainError::InvalidLifetime(_) => ResourceErrorCategory::InvalidParams,
-        // `ResourceGone` is semantically a not-found that documents
-        // the closed-then-attached race so the caller can stop
-        // polling. Folded into the same arm as the `*NotFound`
-        // variants to keep the wire mapping consistent.
+        // `ResourceGone` folds in here so the wire mapping stays consistent
+        // with the `*NotFound` variants.
         DomainError::SessionNotFound(_)
         | DomainError::ShellNotFound(_)
         | DomainError::CommandNotFound(_)
         | DomainError::TransferNotFound(_)
         | DomainError::ForwardNotFound(_)
+        | DomainError::SerialNotFound(_)
         | DomainError::ResourceGone(_)
         | DomainError::SubNotFound(_) => ResourceErrorCategory::NotFound,
         DomainError::Auth(_)
@@ -103,6 +102,7 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         | DomainError::Timeout(_)
         | DomainError::Storage(_)
         | DomainError::Sftp(_)
+        | DomainError::Serial(_)
         | DomainError::PortInUse(_)
         | DomainError::Internal(_)
         | DomainError::MaxCommandsExceeded { .. }
@@ -242,6 +242,7 @@ const fn kind_label(k: ResourceKind) -> &'static str {
         ResourceKind::Transfer => "transfer",
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
+        ResourceKind::Serial => "serial",
     }
 }
 
@@ -374,6 +375,9 @@ where
     OS: OutputStreamPort + Send + Sync,
     Sub: SubscriberRegistryPort,
 {
+    if let Some(content) = try_serial_read(&request.uri) {
+        return Ok(ReadResourceResult::new(vec![content]));
+    }
     let handle = RmcpPeerHandle::resolve(ctx, peer_table);
     let req = ReadResourceRequest {
         uri: request.uri,
@@ -407,6 +411,9 @@ where
     OS: OutputStreamPort + Send + Sync,
     Sub: SubscriberRegistryPort,
 {
+    if let Some(content) = try_serial_read(&request.uri) {
+        return Ok(ReadResourceResult::new(vec![content]));
+    }
     let handle = RmcpPeerHandle::resolve(ctx, peer_table);
     let req = ReadResourceRequest {
         uri: request.uri,
@@ -422,6 +429,39 @@ where
 /// Defensive ceiling on rendered command-output payloads. The registry
 /// already truncates upstream; this matches the v3 wire-boundary cap.
 const COMMAND_BLOCK_CAP_BYTES: usize = 64 * 1024;
+
+/// Short-circuit `resources/read` for `serial://<id>/output` URIs.
+///
+/// v5.2 (ADR 0009) — serial state lives on the static
+/// `SERIAL_REGISTRY` and is therefore reachable directly from the
+/// MCP infra layer without going through the application read use
+/// case. Returns `None` for any non-serial URI so the caller can
+/// fall through to the existing flow.
+fn try_serial_read(uri: &str) -> Option<ResourceContents> {
+    use crate::adapters::serial::state::{SERIAL_REGISTRY, read_history_from_cursor};
+    use crate::domain::ids::SerialId;
+
+    let (scheme, rest) = uri.split_once("://")?;
+    if scheme != "serial" {
+        return None;
+    }
+    let serial_id = rest.split_once('/').map_or(rest, |(id, _)| id).to_string();
+    let id = SerialId::new(serial_id);
+    let state = SERIAL_REGISTRY.get(&id)?;
+    let (data, cursor) = read_history_from_cursor(&state, 0);
+    let text = String::from_utf8_lossy(&data).into_owned();
+    let meta = serde_json::json!({
+        "cursor":      cursor,
+        "buffer_size": data.len(),
+        "kind":        "serial",
+    });
+    Some(ResourceContents::TextResourceContents {
+        uri: state.uri(),
+        mime_type: Some("text/plain".to_string()),
+        text,
+        meta: Some(serde_json::from_value(meta).unwrap_or_default()),
+    })
+}
 
 /// Render a [`ReadResourceOutcome`] as a single
 /// [`ResourceContents::TextResourceContents`] entry, attaching the v3
