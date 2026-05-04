@@ -43,6 +43,8 @@ use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, TransferId};
+use crate::domain::session::SessionEntity;
+use crate::domain::transfer::TransferEntity;
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
 use crate::ports::id_generator::IdGeneratorPort;
@@ -65,7 +67,9 @@ pub struct DownloadRequest {
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
-/// must render. Mirrors the shape of
+/// must render.
+///
+/// Mirrors the shape of
 /// [`crate::application::upload_file::UploadOutcome`] so the inbound
 /// adapter can render both directions through a single helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,37 +171,21 @@ where
         // `TransferRepository::insert_if_under_cap` — see
         // [`crate::application::upload_file`] for the same rationale.
         self.guard_transfer_cap(&req.session_id).await?;
-
         let transfer_id = self.ids.new_transfer_id();
-        let entity = self
-            .sftp
-            .download(
-                transfer_id.clone(),
-                PortDownloadRequest {
-                    session_id: req.session_id.clone(),
-                    remote_path: req.remote_path.clone(),
-                    local_path: req.local_path.clone(),
-                },
-            )
-            .await?;
-
+        let entity = self.spawn_download(&transfer_id, &req).await?;
         // Snapshot before the move into `insert`.
         let resolved_local = entity.local_path.clone();
         let resolved_remote = entity.remote_path.clone();
         let total_bytes = entity.total_bytes;
         let started_at = entity.started_at;
-
         self.persist_or_rollback(&transfer_id, entity).await?;
-
         self.subscribers
             .poke(ResourceKind::Transfer, transfer_id.as_str());
-
         // Touching the clock keeps the port plumbed even though the
         // adapter owns the canonical `started_at`. A future iteration
         // can route every timestamp through the clock without another
         // constructor churn.
         let _ = self.clock.utc_now();
-
         Ok(DownloadOutcome {
             transfer_id,
             session_id: req.session_id,
@@ -209,12 +197,28 @@ where
         })
     }
 
+    /// Drive the SFTP adapter to spawn the download streaming task and
+    /// return the snapshot transfer entity.
+    async fn spawn_download(
+        &self,
+        transfer_id: &TransferId,
+        req: &DownloadRequest,
+    ) -> Result<TransferEntity, DomainError> {
+        self.sftp
+            .download(
+                transfer_id.clone(),
+                PortDownloadRequest {
+                    session_id: req.session_id.clone(),
+                    remote_path: req.remote_path.clone(),
+                    local_path: req.local_path.clone(),
+                },
+            )
+            .await
+    }
+
     /// Resolve the session entity, mapping `Ok(None)` to
     /// [`DomainError::SessionNotFound`].
-    async fn lookup_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<crate::domain::session::SessionEntity, DomainError> {
+    async fn lookup_session(&self, session_id: &SessionId) -> Result<SessionEntity, DomainError> {
         self.sessions
             .get(session_id)
             .await?
@@ -240,7 +244,7 @@ where
     async fn persist_or_rollback(
         &self,
         transfer_id: &TransferId,
-        entity: crate::domain::transfer::TransferEntity,
+        entity: TransferEntity,
     ) -> Result<(), DomainError> {
         let cap = self.config.max_transfers_per_session();
         if let Err(err) = self.transfers.insert_if_under_cap(entity, cap).await {
