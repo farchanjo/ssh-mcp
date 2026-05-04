@@ -191,7 +191,9 @@ pub fn list_commands_render_with_warnings(
 ) -> String {
     let ListCommandsOutcome { commands, total } = outcome;
     if commands.is_empty() && total == 0 && alerts.is_empty() {
-        return String::from("SSH_COMMANDS: OK\nCOUNT: 0");
+        return String::from(
+            "SSH_COMMANDS: OK\nCOUNT: 0\nNEXT: ssh_exec(session_id=..., command=...) (then sub_open uri=command://<COMMAND_ID>/output)",
+        );
     }
     let mut out = String::with_capacity(64 + commands.len() * 128 + alerts.len() * 96);
     out.push_str("SSH_COMMANDS: OK\nCOUNT: ");
@@ -514,7 +516,22 @@ pub fn run_render(result: &GetCommandOutputResult, session_id: &str, disconnecte
     out.push_str(&stdout_block);
     out.push('\n');
     out.push_str(&stderr_block);
+    if !disconnected {
+        append_next_line(&mut out, &next_hint_for_run_kept_alive(session_id));
+    }
     out
+}
+
+/// NEXT advisory when `ssh_run` kept the session alive — mirrors the
+/// `ssh_connect` post-spawn chain so the LLM knows the `session_id` is
+/// reusable and lists the most-likely successor calls.
+fn next_hint_for_run_kept_alive(session_id: &str) -> String {
+    format!(
+        "ssh_exec(session_id={session_id}, command=...) | \
+         ssh_shell_open(session_id={session_id}) | \
+         ssh_upload(session_id={session_id}, ...) | \
+         ssh_disconnect(session_id={session_id})"
+    )
 }
 
 /// Pick the truncation `(partial)` annotation based on the terminal
@@ -647,7 +664,18 @@ pub fn batch_render(
             }
         }
     }
+    append_next_line(&mut out, &next_hint_for_batch(session_id));
     out
+}
+
+/// NEXT advisory after `ssh_exec_batch` — steers smaller LLMs back to
+/// the push-first single-command path for any further async work.
+fn next_hint_for_batch(session_id: &str) -> String {
+    format!(
+        "ssh_exec(session_id={session_id}, command=...) + sub_open uri=command://<COMMAND_ID>/output (PREFERRED for further async work — push delivery, no poll loop) | \
+         ssh_exec_batch(session_id={session_id}, ...) (next sequential batch) | \
+         ssh_disconnect(session_id={session_id})"
+    )
 }
 
 /// Lightweight view consumed by [`batch_render`]. Borrows command text
@@ -732,10 +760,10 @@ mod tests {
             commands: vec![],
             total: 0,
         };
-        assert_eq!(
-            list_commands_render(outcome),
-            "SSH_COMMANDS: OK\nCOUNT: 0"
-        );
+        let body = list_commands_render(outcome);
+        assert!(body.starts_with("SSH_COMMANDS: OK\nCOUNT: 0"));
+        assert!(body.contains("NEXT: ssh_exec("));
+        assert!(body.contains("sub_open uri=command://"));
     }
 
     #[test]
@@ -935,13 +963,15 @@ mod tests {
     }
 
     #[test]
-    fn list_commands_render_with_no_alerts_matches_legacy() {
+    fn list_commands_render_with_no_alerts_appends_subscribe_steering() {
         let outcome = ListCommandsOutcome {
             commands: vec![],
             total: 0,
         };
         let body = list_commands_render_with_warnings(outcome, &[]);
-        assert_eq!(body, "SSH_COMMANDS: OK\nCOUNT: 0");
+        assert!(body.starts_with("SSH_COMMANDS: OK\nCOUNT: 0"));
+        assert!(body.contains("NEXT: ssh_exec("));
+        assert!(body.contains("sub_open uri=command://"));
     }
 
     #[test]

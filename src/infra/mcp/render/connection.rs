@@ -329,7 +329,9 @@ pub fn list_sessions_render_with_warnings(
         total,
     } = outcome;
     if healthy.is_empty() && total == 0 && alerts.is_empty() {
-        return String::from("SSH_SESSIONS: OK\nCOUNT: 0");
+        return String::from(
+            "SSH_SESSIONS: OK\nCOUNT: 0\nNEXT: ssh_connect(address=..., username=..., agent_id=..., reuse=auto) (then sub_open uri=session://<SESSION_ID>/health for health monitoring)",
+        );
     }
     let mut out = String::with_capacity(64 + healthy.len() * 128 + alerts.len() * 96);
     out.push_str("SSH_SESSIONS: OK\nCOUNT: ");
@@ -899,10 +901,10 @@ mod tests {
             removed_dead: vec![],
             total: 0,
         };
-        assert_eq!(
-            list_sessions_render(outcome),
-            "SSH_SESSIONS: OK\nCOUNT: 0"
-        );
+        let body = list_sessions_render(outcome);
+        assert!(body.starts_with("SSH_SESSIONS: OK\nCOUNT: 0"));
+        assert!(body.contains("NEXT: ssh_connect("));
+        assert!(body.contains("sub_open uri=session://"));
     }
 
     #[test]
