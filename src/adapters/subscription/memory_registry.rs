@@ -30,6 +30,7 @@
 //!   subscribers, asks each [`PeerHandle::is_closed`], and drops the
 //!   ones whose transport has gone away.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -143,7 +144,7 @@ where
             sequence_counters: DashMap::new(),
             wakers: DashMap::new(),
             notifier,
-            self_ref: weak.clone(),
+            self_ref: Weak::clone(weak),
         })
     }
 
@@ -327,7 +328,7 @@ where
 
     fn gc_closed_peers(&self) -> usize {
         let mut closed: Vec<PeerId> = Vec::new();
-        let mut seen: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+        let mut seen: HashSet<PeerId> = HashSet::new();
         for entry in &self.subscribers {
             for sub in entry.value() {
                 if seen.insert(sub.peer_id.clone()) && sub.peer.is_closed() {
