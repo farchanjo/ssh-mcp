@@ -12,11 +12,11 @@ use super::traits::AuthStrategy;
 ///
 /// Connects to the SSH agent (via `SSH_AUTH_SOCK`) and tries each
 /// available identity until one succeeds.
-pub(crate) struct AgentAuth;
+pub struct AgentAuth;
 
 impl AgentAuth {
     /// Create a new SSH agent authentication strategy.
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

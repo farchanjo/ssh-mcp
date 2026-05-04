@@ -34,8 +34,8 @@
 //! [`chain::AuthChain`] enum kept the adapter dyn-free, dropping the
 //! direct `async-trait` dependency in the crate.
 
-pub(crate) mod agent;
-pub(crate) mod chain;
-pub(crate) mod key;
-pub(crate) mod password;
-pub(crate) mod traits;
+pub mod agent;
+pub mod chain;
+pub mod key;
+pub mod password;
+pub mod traits;
