@@ -60,6 +60,29 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
     /// subscribers exist.
     fn poke(&self, kind: ResourceKind, resource_id: &str);
 
+    /// Record `bytes_added` newly produced bytes for `(kind, resource_id)`.
+    ///
+    /// ADR 0006 Amendment 1 — accumulates against the per-resource
+    /// byte counter. When the counter crosses
+    /// `SSH_NOTIFY_FLUSH_BYTES`, the registry forces an immediate
+    /// debouncer flush (skipping the debounce sleep). When the
+    /// threshold is `0` (disabled) or no debouncer is running for the
+    /// resource, this is a near-zero-cost no-op (single relaxed
+    /// `fetch_add`). Producers (russh shell stdout, async command
+    /// stdout, SFTP transfer progress) call this every time they
+    /// append to the resource's ring buffer.
+    ///
+    /// Default impl is a no-op so test fixtures and the legacy
+    /// (Phase 1) adapter compile unchanged. The production
+    /// [`crate::adapters::subscription::memory_registry::MemoryRegistry`]
+    /// overrides this with the threshold + counter + `flush_now`
+    /// pipeline.
+    fn record_bytes(&self, _kind: ResourceKind, _resource_id: &str, _bytes_added: usize) {
+        // No-op default. Production registry overrides; test stubs and
+        // the legacy adapter inherit the no-op so they keep their v4
+        // semantics.
+    }
+
     /// Decrement every peer cursor on `uri` by `bytes_dropped` (saturating).
     /// Called when the underlying ring buffer drops bytes from the head.
     fn compensate_truncation(&self, uri: &str, bytes_dropped: u64);

@@ -932,10 +932,15 @@ fn publish_stdout(
     }
     command.output_history.store(Arc::new(owned.clone()));
     let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let chunk_len = chunk.len();
     let _ = command
         .output_tx
         .send(OutputChunk::Stdout { seq, data: chunk });
     SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
+    // ADR 0006 Amendment 1 — feed the byte-threshold counter so a
+    // chatty stdout flushes the push channel as soon as it has
+    // produced `SSH_NOTIFY_FLUSH_BYTES` since the last broadcast.
+    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Command, &command.info.command_id, chunk_len);
 }
 
 /// Publish a stderr batch: broadcast the delta and store a fresh snapshot.
@@ -957,10 +962,14 @@ fn publish_stderr(
     }
     command.output_history.store(Arc::new(owned.clone()));
     let seq = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Command, &command.info.command_id);
+    let chunk_len = chunk.len();
     let _ = command
         .output_tx
         .send(OutputChunk::Stderr { seq, data: chunk });
     SUBSCRIPTION_REGISTRY.poke(ResourceKind::Command, &command.info.command_id);
+    // ADR 0006 Amendment 1 — mirror of the stdout path; chatty
+    // stderr should flush the push channel just as fast.
+    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Command, &command.info.command_id, chunk_len);
 }
 
 /// Flush remaining local buffers to the lock-free output state.
