@@ -71,7 +71,7 @@ where
     /// HTTP entry point that builds one server per session).
     pub(super) leak_watcher: Option<Arc<LeakWatcher>>,
     /// v5 Phase 3 — read-only probe consumed by the list renderers
-    /// (`ssh_list_sessions`, `ssh_list_commands`, `resources/list`).
+    /// (`ssh_sessions`, `ssh_commands`, `resources/list`).
     /// Defaults to `None` so tests construct the server without
     /// touching the watcher; production wiring shares the
     /// [`LeakWatcher`] handle behind both this and `leak_watcher`.
@@ -120,7 +120,7 @@ where
     ///    `WARN: SUB_LEAK_RISK <uri>` lines through
     ///    [`crate::infra::mcp::leak_warn_bridge`] for tool calls that
     ///    supply `_meta.progressToken`.
-    /// 2. The list renderers (`ssh_list_sessions`, `ssh_list_commands`,
+    /// 2. The list renderers (`ssh_sessions`, `ssh_commands`,
     ///    `resources/list`) append `WARN: SUB_LEAK_RISK <uri>` lines
     ///    for resources currently flagged by the watcher.
     #[must_use]
@@ -178,7 +178,7 @@ where
 
     /// Borrow the read-only leak probe when wired. Used by the list
     /// renderers to inject `WARN: SUB_LEAK_RISK <uri>` lines into
-    /// `ssh_list_sessions`, `ssh_list_commands`, and the resource list
+    /// `ssh_sessions`, `ssh_commands`, and the resource list
     /// path.
     #[must_use]
     pub const fn leak_probe(&self) -> Option<&Arc<dyn LeakWatcherProbe>> {

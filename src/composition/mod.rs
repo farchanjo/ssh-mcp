@@ -170,23 +170,23 @@ where
     pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
 
     // -- v5 Phase 3 subscription-administration use cases ---------
-    /// `ssh_subscribe` use case (Phase 3 lane admin).
+    /// `sub_open` use case (Phase 3 lane admin).
     pub sub_subscribe: Arc<SubscribeUseCase>,
-    /// `ssh_unsubscribe` use case (Phase 3 lane admin).
+    /// `sub_close` use case (Phase 3 lane admin).
     pub sub_unsubscribe: Arc<UnsubscribeUseCase>,
-    /// `ssh_sub_pause` use case.
+    /// `sub_pause` use case.
     pub sub_pause: Arc<PauseSubUseCase>,
-    /// `ssh_sub_resume` use case.
+    /// `sub_resume` use case.
     pub sub_resume: Arc<ResumeSubUseCase>,
-    /// `ssh_sub_filter` use case.
+    /// `sub_filter` use case.
     pub sub_filter: Arc<SetFilterUseCase>,
-    /// `ssh_sub_replay` use case.
+    /// `sub_replay` use case.
     pub sub_replay: Arc<ReplaySubUseCase>,
-    /// `ssh_sub_list` use case.
+    /// `sub_list` use case.
     pub sub_list: Arc<ListSubsUseCase>,
-    /// `ssh_sub_stats` use case.
+    /// `sub_stats` use case.
     pub sub_stats: Arc<SubStatsUseCase>,
-    /// `ssh_daemon_stats` use case.
+    /// `sub_stats_all` use case.
     pub daemon_stats: Arc<DaemonStatsUseCase>,
 }
 
@@ -271,22 +271,22 @@ where
     pub lifecycle_policy: Arc<dyn LifecyclePolicyPort>,
 
     // -- v5 Phase 3 subscription-administration use cases ---------
-    /// `ssh_subscribe` use case (Phase 3 lane admin).
+    /// `sub_open` use case (Phase 3 lane admin).
     pub sub_subscribe: Arc<SubscribeUseCase>,
-    /// `ssh_unsubscribe` use case (Phase 3 lane admin).
+    /// `sub_close` use case (Phase 3 lane admin).
     pub sub_unsubscribe: Arc<UnsubscribeUseCase>,
-    /// `ssh_sub_pause` use case.
+    /// `sub_pause` use case.
     pub sub_pause: Arc<PauseSubUseCase>,
-    /// `ssh_sub_resume` use case.
+    /// `sub_resume` use case.
     pub sub_resume: Arc<ResumeSubUseCase>,
-    /// `ssh_sub_filter` use case.
+    /// `sub_filter` use case.
     pub sub_filter: Arc<SetFilterUseCase>,
-    /// `ssh_sub_replay` use case.
+    /// `sub_replay` use case.
     pub sub_replay: Arc<ReplaySubUseCase>,
-    /// `ssh_sub_list` use case.
+    /// `sub_list` use case.
     pub sub_list: Arc<ListSubsUseCase>,
-    /// `ssh_sub_stats` use case.
+    /// `sub_stats` use case.
     pub sub_stats: Arc<SubStatsUseCase>,
-    /// `ssh_daemon_stats` use case.
+    /// `sub_stats_all` use case.
     pub daemon_stats: Arc<DaemonStatsUseCase>,
 }

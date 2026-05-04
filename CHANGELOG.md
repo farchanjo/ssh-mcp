@@ -5,15 +5,107 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0] — 2026-05-04
+
+Tool-name namespace cleanup. **First wire-breaking release since v5.0** — only `tools/list` name strings change. Every other surface (resource URI schemes, push narrative, error taxonomy, structured-content payloads, env vars, MSRV, dependency graph) is byte-identical to v5.3.2.
+
+### Why
+
+The v5.x catalogue grew organically: SSH ops, lane administration, and local serial all sat under the `ssh_*` prefix even though `sub_*` is cross-resource (works for `serial://` too) and `serial_*` doesn't run over SSH at all. Smaller LLMs got confused — they'd attempt `serial_open` over an SSH session_id, or treat `ssh_subscribe` as SSH-specific and skip subscribing to a serial port. v6.0 splits the catalogue across three semantic eixos so the tool name itself encodes the transport.
+
+### Renames (15 tools)
+
+**`ssh_*` (21 tools)** — operations that travel over SSH:
+
+| v5.x | v6.0.0 | Reason |
+|---|---|---|
+| `ssh_connect` / `ssh_disconnect` / `ssh_disconnect_agent` / `ssh_disconnect_many` / `ssh_run` | _(unchanged)_ | session lifecycle |
+| `ssh_list_sessions` | `ssh_sessions` | drop `list_` redundancy |
+| `ssh_execute` | `ssh_exec` | -3 chars per ref |
+| `ssh_execute_batch` | `ssh_exec_batch` | follows `exec_*` group |
+| `ssh_get_command_output` | `ssh_exec_output` | drop `get_`, group under `exec_*` |
+| `ssh_cancel_command` | `ssh_exec_cancel` | follows `exec_*` group |
+| `ssh_list_commands` | `ssh_commands` | drop `list_` |
+| `ssh_shell_open` / `_write` / `_read` / `_close` / `_wait_for` | _(unchanged)_ | clear group |
+| `ssh_shell_send_key` | `ssh_shell_press` | drop `send_`, mirrors `serial_press` |
+| `ssh_upload` / `ssh_download` / `ssh_forward` | _(unchanged)_ | clear |
+| `ssh_get_transfer_progress` | `ssh_transfer_progress` | drop `get_` |
+
+**`sub_*` (9 tools)** — subscription / lane management (cross-resource — works for shell / command / transfer / session / forward / serial alike):
+
+| v5.x | v6.0.0 |
+|---|---|
+| `ssh_subscribe` | `sub_open` |
+| `ssh_unsubscribe` | `sub_close` |
+| `ssh_sub_pause/resume/filter/replay/list/stats` | `sub_pause/resume/filter/replay/list/stats` |
+| `ssh_daemon_stats` | `sub_stats_all` |
+
+Verb-uniform: `open / close / pause / resume / filter / replay / list / stats / stats_all`. The `ssh_` prefix is dropped because subscription / lane administration is not SSH-specific (also serves `serial://` / `forward://` / `session://`).
+
+**`serial_*` (6 tools)** — local UART / TTY / COM (no SSH involved):
+
+| v5.x | v6.0.0 |
+|---|---|
+| `serial_open` | `serial_open` |
+| `serial_close` | `serial_close` |
+| `serial_write` | `serial_write` |
+| `serial_press` | `serial_press` |
+| `serial_scan` | `serial_scan` |
+| `serial_active` | `serial_active` |
+
+`serial_scan` (host-visible discovery) vs `serial_active` (per-process held) resolve the prior `list_ports` / `list_open` ambiguity.
+
+### Unchanged (LLM UX preserved)
+
+- **Resource URI schemes**: `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://`.
+- **Push narrative**: `notifications/resources/updated` + `resources/read?cursor=auto` flow.
+- **HINT line severities** + 38-code error taxonomy.
+- **Tool descriptions / `When/Push/Cleanup/Cost/Idempotency/Hygiene` blocks**: cross-references updated to the new names everywhere (root `Implementation.instructions`, `NEXT:` lines, render bodies, prompt templates).
+- **Lane fanout pipeline + production port-forward listener + lifecycle cascade close**: all v5.3 semantics carry forward unchanged.
+
+### Migration
+
+Hosts on v3 / v4 / v5 update with the sed snippet (full guide in [docs/MIGRATION.md → v5 → v6](docs/MIGRATION.md#v5--v6)):
+
+```sed
+s/\bssh_unsubscribe\b/sub_close/g          # do BEFORE ssh_subscribe — substring trap
+s/\bssh_subscribe\b/sub_open/g
+s/\bssh_sub_/sub_/g
+s/\bssh_daemon_stats\b/sub_stats_all/g
+s/\bssh_serial_send_key\b/serial_press/g
+s/\bssh_serial_list_ports\b/serial_scan/g
+s/\bssh_serial_list_open\b/serial_active/g
+s/\bssh_serial_/serial_/g
+s/\bssh_execute_batch\b/ssh_exec_batch/g   # do BEFORE ssh_execute
+s/\bssh_execute\b/ssh_exec/g
+s/\bssh_get_command_output\b/ssh_exec_output/g
+s/\bssh_cancel_command\b/ssh_exec_cancel/g
+s/\bssh_list_commands\b/ssh_commands/g
+s/\bssh_list_sessions\b/ssh_sessions/g
+s/\bssh_get_transfer_progress\b/ssh_transfer_progress/g
+s/\bssh_shell_send_key\b/ssh_shell_press/g
+```
+
+### Quality
+
+- 1657 lib + 41 chaos + 32 property + 2 v5_smoke + 13 integration tests all green.
+- Production clippy strict gate (`cargo clippy --release --all-features --bin ssh-mcp-stdio -- -D warnings`) exit 0.
+- Schema validation: every one of the 36 MCP tools satisfies `inputSchema.type == "object"`.
+
+### Breaking changes
+
+- **15 tool names renamed** (catalogue above). Hosts must update their `tools/list` parser or apply the sed migration.
+- **No-op rename** for all 21 carried-forward `ssh_*` tools — wire shape and structured content stay byte-identical.
+
 ## [5.3.2] — 2026-05-04
 
 Hotfix on top of 5.3.1 — lane cascade on session / agent disconnect. Wire-compatible drop-in.
 
 ### Fixed
 
-- **`ssh_subscribe` lanes cascade-close on disconnect.** Stress test surfaced that `ssh_subscribe`-created lanes outlived their parent session even after `force_close` fired on the underlying resource. Per ADR 0004, lane lifetime is intentionally independent of session lifecycle (lifetime variants `auto_close` / `lease` exist for that), but the manual-lifetime case left orphan lanes consuming `lanes_total` and leaking the `SubId` registry. `DisconnectSessionUseCase` and `DisconnectAgentUseCase` now hold an optional `LaneAdmin` handle and call `lane_admin.close(sub_id)` for every lane bound to the resource id of each child being torn down — same pass that fires `lifecycle.force_close`.
+- **`sub_open` lanes cascade-close on disconnect.** Stress test surfaced that `sub_open`-created lanes outlived their parent session even after `force_close` fired on the underlying resource. Per ADR 0004, lane lifetime is intentionally independent of session lifecycle (lifetime variants `auto_close` / `lease` exist for that), but the manual-lifetime case left orphan lanes consuming `lanes_total` and leaking the `SubId` registry. `DisconnectSessionUseCase` and `DisconnectAgentUseCase` now hold an optional `LaneAdmin` handle and call `lane_admin.close(sub_id)` for every lane bound to the resource id of each child being torn down — same pass that fires `lifecycle.force_close`.
 
-After the fix: `lanes_total = 0` immediately after `ssh_disconnect` / `ssh_disconnect_agent`. Manual subscribers can still call `ssh_unsubscribe` explicitly while the session is alive — only orphan lanes (resource gone) are reaped.
+After the fix: `lanes_total = 0` immediately after `ssh_disconnect` / `ssh_disconnect_agent`. Manual subscribers can still call `sub_close` explicitly while the session is alive — only orphan lanes (resource gone) are reaped.
 
 ### Quality
 
@@ -42,10 +134,10 @@ Lane fanout pipeline + production port-forward listener. Wire-compatible drop-in
 
 ### What landed
 
-- **`ssh_subscribe` push delivery wired end-to-end on stdio/HTTP transport.** Lanes carry the rmcp peer captured at tool-invocation time (`SubscribeRequest.peer: Option<Arc<dyn PeerHandle>>`); the new `LaneFanoutBridge` (`src/adapters/subscription/lane_bridge.rs`) walks the lane snapshot for the broadcast URI, calls `notifier.notify_resource_updated` per peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). Phase 4 NDJSON daemon keeps the channel-mux outbound sink (lane peer = `None`).
+- **`sub_open` push delivery wired end-to-end on stdio/HTTP transport.** Lanes carry the rmcp peer captured at tool-invocation time (`SubscribeRequest.peer: Option<Arc<dyn PeerHandle>>`); the new `LaneFanoutBridge` (`src/adapters/subscription/lane_bridge.rs`) walks the lane snapshot for the broadcast URI, calls `notifier.notify_resource_updated` per peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). Phase 4 NDJSON daemon keeps the channel-mux outbound sink (lane peer = `None`).
 - **3 new ports** (`src/ports/notifier.rs`):
   - `LaneNotifierBridge` — boxed-future, dyn-safe trait the `MemoryRegistry::broadcast` consults before the legacy peer fan-out.
-  - `DebouncerActivator` — lets `ssh_subscribe`-only flows wake the per-resource debouncer the legacy `resources/subscribe` path uses.
+  - `DebouncerActivator` — lets `sub_open`-only flows wake the per-resource debouncer the legacy `resources/subscribe` path uses.
   - `ProducerForwarder` — runtime adapters (russh / sftp / serial / shell PTY) feed the legacy `SUBSCRIPTION_REGISTRY` singleton; the forwarder mirrors every `poke` / `record_bytes` into the hexagonal `MemoryRegistry`.
 - **Memory-registry hardening** (`src/adapters/subscription/memory_registry.rs`):
   - `record_bytes` lazy-inserts the per-resource counter so producers writing pre-subscribe do not lose accumulation.
@@ -54,8 +146,8 @@ Lane fanout pipeline + production port-forward listener. Wire-compatible drop-in
 - **Production port-forward listener.** `ssh_forward` no longer drops the listener after preflight: `SshClientPort::open_forward` / `close_forward` (returning a `ForwardHandle { bound_addr }`) drive a real accept loop. Per-connection: `Handle::channel_open_direct_tcpip(remote_addr, remote_port, originator, 0)` + `tokio::io::copy_bidirectional`. Sessions cascade-close their forwards on disconnect — no port leaks, no zombie listeners.
 - **Shell PTY producer wired.** `flush_shell_buffer` now calls `SUBSCRIPTION_REGISTRY.poke(Shell, id)` + `record_bytes(Shell, id, chunk_len)` after every flush, so `shell://<id>/output` lanes see real PTY bytes (not just the 1 s force-flush keepalive tick).
 - **URI charset hardening.** `parse_uri` rejects ids outside `[A-Za-z0-9_-]+` (whitespace, unicode, control chars, dot-dot) with a new `ParseError::BadIdCharset`. UUIDv7 + legacy snake_case ids unaffected.
-- **`serial://` scheme** is now first-class on the `ssh_subscribe` URI parser (the legacy URI parser already supported it; the application-side parser was the only gap).
-- **MCP schema spec compliance.** `SshSerialListPortsArgs` / `SshSerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts (Claude Code) accept the full `tools/list` batch.
+- **`serial://` scheme** is now first-class on the `sub_open` URI parser (the legacy URI parser already supported it; the application-side parser was the only gap).
+- **MCP schema spec compliance.** `SerialListPortsArgs` / `SerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts (Claude Code) accept the full `tools/list` batch.
 
 ### Quality
 
@@ -83,14 +175,14 @@ ADR 0009 — native serial / UART / TTY / COM transport. Adds a sixth push-resou
   - `open_port`, `close_port` (idempotent), `write_port` (returns `SerialWriteError::Backpressure` when the mpsc fills), `available_ports`, `read_history_from_cursor`.
   - Reader and writer tasks split via `tokio::io::split` over the `tokio_serial::SerialStream`. Reader appends to history via `ArcSwap::rcu` + calls `SUBSCRIPTION_REGISTRY.next_seq` / `poke` / `record_bytes` (ADR 0006 Amendment 1 byte-threshold) — bit-identical to the `command://*/output` producer wiring.
 - **6 new MCP tools** (also documented in [docs/API.md](docs/API.md)):
-  - `ssh_serial_open` — open a port, return `SERIAL_ID` + `serial://<id>/output` URI.
-  - `ssh_serial_close` — idempotent cancel.
-  - `ssh_serial_write` — UTF-8 `text` OR base64 `bytes_base64` (RFC 4648 standard alphabet, inline decoder).
-  - `ssh_serial_send_key` — named keystrokes: `enter`/`cr` (`\r`), `lf` (`\n`), `crlf` (`\r\n`), `esc` (`\x1b`), `tab` (`\t`), `backspace` (`\x08`), `ctrl_c` / `ctrl_d` / `ctrl_z`. Optional `repeat` 1..=64.
-  - `ssh_serial_list_ports` — snapshot OS-visible serial devices.
-  - `ssh_serial_list_open` — snapshot ports currently held by this process.
+  - `serial_open` — open a port, return `SERIAL_ID` + `serial://<id>/output` URI.
+  - `serial_close` — idempotent cancel.
+  - `serial_write` — UTF-8 `text` OR base64 `bytes_base64` (RFC 4648 standard alphabet, inline decoder).
+  - `serial_press` — named keystrokes: `enter`/`cr` (`\r`), `lf` (`\n`), `crlf` (`\r\n`), `esc` (`\x1b`), `tab` (`\t`), `backspace` (`\x08`), `ctrl_c` / `ctrl_d` / `ctrl_z`. Optional `repeat` 1..=64.
+  - `serial_scan` — snapshot OS-visible serial devices.
+  - `serial_active` — snapshot ports currently held by this process.
 - **Resource-handler dispatch** — `try_serial_read` short-circuits `resources/read serial://<id>/output` directly against `SERIAL_REGISTRY` (the application read use case bypasses serial; serial state lives outside the application repositories, mirroring the forward-resource pattern).
-- **LLM-UX hooks** — `ssh_serial_open` `HINT: RECOMMENDED:` line steers the model to subscribe (debounce + 64 KiB byte-threshold flush, same pipeline as shell / command). `ssh_serial_write` / `ssh_serial_send_key` `HINT:` line tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.
+- **LLM-UX hooks** — `serial_open` `HINT: RECOMMENDED:` line steers the model to subscribe (debounce + 64 KiB byte-threshold flush, same pipeline as shell / command). `serial_write` / `serial_press` `HINT:` line tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.
 - **ADR 0009** — full design narrative, hexagonal layer map, lock-free contract, configuration surface, MCP tool table, cross-platform device-path notes, deferred-to-v5.3 list.
 - **`docs/RESOURCES.md`** — sixth push-resource scheme documented.
 - **`docs/CONFIGURATION.md`** — no new env vars (serial inherits `SSH_NOTIFY_*` knobs).
@@ -106,7 +198,7 @@ ADR 0009 — native serial / UART / TTY / COM transport. Adds a sixth push-resou
 
 ### Out of scope (deferred to v5.3)
 
-- **Per-call `flush_bytes` / `debounce` overrides on serial subscriptions** — same follow-up that gates the equivalent feature on `ssh_subscribe` for shell / command.
+- **Per-call `flush_bytes` / `debounce` overrides on serial subscriptions** — same follow-up that gates the equivalent feature on `sub_open` for shell / command.
 - **Hot reconfigure** (change baud / parity without close-reopen).
 - **Hardware breaks** (`tcsendbreak` via `ssh_serial_send_break`).
 - **Modem control mid-session** (toggle DTR / RTS at runtime — currently only `initial_dtr` / `initial_rts` on open).
@@ -133,14 +225,14 @@ ADR 0006 Amendment 1 — byte-threshold debouncer flush is now wired end-to-end.
   - `src/adapters/ssh/internal/client.rs::publish_stdout` and `publish_stderr` for `command://*/output`.
   - `src/adapters/sftp/internal/sftp.rs::upload_inner_loop` and `download_inner_loop` for `transfer://*/progress` (per-chunk SFTP delta).
 - **Stats** — `SubscriberStats.byte_triggered_flushes` field (serde `default = 0` for v5.0/v5.0.x compat). v5.1 populates the resource-level total via `MemoryRegistry::byte_triggered_flushes_total()` / `SubscriptionRegistry::byte_triggered_flushes_total()`. Per-lane attribution is reserved for v5.2 (see "Out of scope" below).
-- **`ssh_subscribe` HINT line** — wire HINT now mentions both knobs explicitly: "Push fires on whichever fires first: ~50ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 10-100ms local sleeps cover both budgets."
+- **`sub_open` HINT line** — wire HINT now mentions both knobs explicitly: "Push fires on whichever fires first: ~50ms debounce window (SSH_NOTIFY_DEBOUNCE_MS) OR 64KiB accumulated bytes (SSH_NOTIFY_FLUSH_BYTES). 10-100ms local sleeps cover both budgets."
 - **Local-sleep guidance** — same HINT line steers the LLM to wait passively for `notifications/resources/updated` and use Unix `sleep 0.05` / PowerShell `Start-Sleep -Milliseconds 50` for any local idling, never an MCP tool as a sleep primitive.
 - **`docs/CONFIGURATION.md`** — env-var reference table updated with the new knob and its semantics.
 
 ### Out of scope (deferred to v5.2)
 
-- **Per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe`** — ADR 0006 Amendment 1 documents the schema (oneOf integer | string) and first-subscriber-wins semantics, but implementing the per-resource override + `effective_*` stats requires touching the schema, validation, and shared-debouncer reconfiguration. v5.1 wires the env-var-only path; v5.2 layers the per-call overrides on top.
-- **Per-lane `byte_triggered_flushes` attribution** — v5.1 exposes the resource-level total; bridging the count into `LaneAtomics` so each `ssh_sub_stats` snapshot reflects which lanes saw fan-out increments lands alongside the per-call override work in v5.2.
+- **Per-call `flush_bytes` / `debounce` overrides on `sub_open`** — ADR 0006 Amendment 1 documents the schema (oneOf integer | string) and first-subscriber-wins semantics, but implementing the per-resource override + `effective_*` stats requires touching the schema, validation, and shared-debouncer reconfiguration. v5.1 wires the env-var-only path; v5.2 layers the per-call overrides on top.
+- **Per-lane `byte_triggered_flushes` attribution** — v5.1 exposes the resource-level total; bridging the count into `LaneAtomics` so each `sub_stats` snapshot reflects which lanes saw fan-out increments lands alongside the per-call override work in v5.2.
 - **Shell `shell://*/output` byte-threshold** — shell production uses the per-shell `output_tx` broadcast + `data_notify` rather than `SUBSCRIPTION_REGISTRY.next_seq` / `poke`. Wiring the byte-threshold into the shell flush path requires piping `shell_id` into `flush_shell_buffer`; deferred to v5.2.
 
 ### Verified gates
@@ -156,22 +248,22 @@ LLM UX patch — penalize `ssh_run`, steer shell drive ops to await push, and pr
 
 ### Penalize `ssh_run` (promote session reuse)
 
-- `ssh_run` description rewritten as `PENALIZED FALLBACK`. Spells out the per-call handshake cost (200–2000 ms + full session teardown) and the `DO NOT USE WHEN` matrix (any reuse possible, follow-up commands, output > a few KiB). Gives the preferred `ssh_connect(reuse=auto) → ssh_execute → ssh_subscribe` path step-by-step.
-- `ssh_execute` and `ssh_execute_batch` overlap guidance no longer steers atomic short commands toward `ssh_run`; both redirect to `ssh_connect(reuse=auto)` + `ssh_execute`.
+- `ssh_run` description rewritten as `PENALIZED FALLBACK`. Spells out the per-call handshake cost (200–2000 ms + full session teardown) and the `DO NOT USE WHEN` matrix (any reuse possible, follow-up commands, output > a few KiB). Gives the preferred `ssh_connect(reuse=auto) → ssh_exec → sub_open` path step-by-step.
+- `ssh_exec` and `ssh_exec_batch` overlap guidance no longer steers atomic short commands toward `ssh_run`; both redirect to `ssh_connect(reuse=auto)` + `ssh_exec`.
 - Root `Implementation.instructions` (both `port_forward` feature gates) demote `ssh_run` from happy-path #1 to penalized fallback #4. Push-first connect+execute+subscribe path becomes the default.
 - `docs/API.md` instructions snapshot synced.
 - `docs/LLM_GUIDE.md` updates: terse + 70B prompts, decision flowchart (red-classed P5 `ssh_run` node), decision table split into may-revisit vs single-touch rows, FALLBACK PATHS prose all reordered.
 
 ### Steer shell drive ops to await push (no `wait_for` chaining)
 
-- After `ssh_shell_write` / `ssh_shell_send_key`, the response arrives via push on the existing `shell://<id>/output` subscription. New `HINT: RECOMMENDED:` line on every drive response tells the LLM to wait on `notifications/resources/updated` and drain via `resources/read?cursor=auto`, with an explicit `Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex`.
-- `next_hint_for_shell_drive` reorders to lead with `ssh_subscribe (await push if not subscribed)` and `resources/read?cursor=auto (drain delta on push)`. `ssh_shell_wait_for` appears later qualified `(only for regex prompt sync)`. Polling reads stay last.
-- `next_hint_for_wait_for` leads with `ssh_subscribe` in BOTH `Matched` and `Timeout` states so the LLM stops chaining `wait_for` recursively. `Closed` remains terminal.
-- Tool descriptions: `ssh_shell_write`, `ssh_shell_send_key` get the `DO NOT chain ssh_shell_wait_for` block. `ssh_shell_wait_for` rewritten to lead with `PREFER ssh_subscribe`, lists `DO NOT USE WHEN` cases (post-write chaining, generic 'any output', repeated matches), and gives the preferred subscribe + push + drain path step-by-step.
+- After `ssh_shell_write` / `ssh_shell_press`, the response arrives via push on the existing `shell://<id>/output` subscription. New `HINT: RECOMMENDED:` line on every drive response tells the LLM to wait on `notifications/resources/updated` and drain via `resources/read?cursor=auto`, with an explicit `Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex`.
+- `next_hint_for_shell_drive` reorders to lead with `sub_open (await push if not subscribed)` and `resources/read?cursor=auto (drain delta on push)`. `ssh_shell_wait_for` appears later qualified `(only for regex prompt sync)`. Polling reads stay last.
+- `next_hint_for_wait_for` leads with `sub_open` in BOTH `Matched` and `Timeout` states so the LLM stops chaining `wait_for` recursively. `Closed` remains terminal.
+- Tool descriptions: `ssh_shell_write`, `ssh_shell_press` get the `DO NOT chain ssh_shell_wait_for` block. `ssh_shell_wait_for` rewritten to lead with `PREFER sub_open`, lists `DO NOT USE WHEN` cases (post-write chaining, generic 'any output', repeated matches), and gives the preferred subscribe + push + drain path step-by-step.
 
 ### Proposed (no code yet)
 
-- ADR 0006 Amendment 1 — byte-threshold debouncer flush. Adds a fourth wakeup source on the per-resource debouncer: flush whichever fires first between debounce window, force-flush tick, keepalive tick, or accumulated bytes since last broadcast. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold**. Switches env-var interface from raw `*_MS` / `*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy aliases stay accepted for one minor with a `DEPRECATED:` log nudge. Adds optional per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe` (oneOf `integer | string`), with precedence `tool > env > default` and first-subscriber-wins on the shared debouncer. See [ADR 0006 → Amendment 1](docs/adr/0006-backpressure-policies.md#status).
+- ADR 0006 Amendment 1 — byte-threshold debouncer flush. Adds a fourth wakeup source on the per-resource debouncer: flush whichever fires first between debounce window, force-flush tick, keepalive tick, or accumulated bytes since last broadcast. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold**. Switches env-var interface from raw `*_MS` / `*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy aliases stay accepted for one minor with a `DEPRECATED:` log nudge. Adds optional per-call `flush_bytes` / `debounce` overrides on `sub_open` (oneOf `integer | string`), with precedence `tool > env > default` and first-subscriber-wins on the shared debouncer. See [ADR 0006 → Amendment 1](docs/adr/0006-backpressure-policies.md#status).
 
 ### Verified gates
 
@@ -180,24 +272,24 @@ LLM UX patch — penalize `ssh_run`, steer shell drive ops to await push, and pr
 
 ## [5.0.1] — 2026-05-04
 
-LLM UX patch — closes the v5 narrative arc so every push-capable resource is `ssh_subscribe`-first across tool descriptions, NEXT chains, HINT lines, and discovery surfaces. No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
+LLM UX patch — closes the v5 narrative arc so every push-capable resource is `sub_open`-first across tool descriptions, NEXT chains, HINT lines, and discovery surfaces. No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
 
 ### Bidirectional-first narrative closure
 
-- `ssh_execute`, `ssh_get_command_output`, `ssh_shell_read`, `ssh_shell_wait_for`, `ssh_get_transfer_progress` descriptions now lead with `ssh_subscribe` as the preferred path; polling tools labelled `(poll fallback)` consistently across both server variants (port_forward on/off).
-- `next_hint_for_shell_drive` (post-write/send_key): `ssh_subscribe` listed FIRST so drive ops honour the subscribe contract opened by `ssh_shell_open`. Cursor poll and `ssh_shell_read` demoted to explicit `(poll fallback)` markers.
+- `ssh_exec`, `ssh_exec_output`, `ssh_shell_read`, `ssh_shell_wait_for`, `ssh_transfer_progress` descriptions now lead with `sub_open` as the preferred path; polling tools labelled `(poll fallback)` consistently across both server variants (port_forward on/off).
+- `next_hint_for_shell_drive` (post-write/send_key): `sub_open` listed FIRST so drive ops honour the subscribe contract opened by `ssh_shell_open`. Cursor poll and `ssh_shell_read` demoted to explicit `(poll fallback)` markers.
 - `next_hint_for_running_command` and `next_hint_for_in_flight_transfer`: explicit `(preferred)` and `(poll fallback)` labels — eliminates the self-loop where a polling tool would re-recommend itself.
 - `next_hint_for_wait_for` (Timeout branch): subscribe FIRST, poll fallback last.
-- `next_hint_for_session` (post-connect): trailing reminder `(each spawn returns an ID that ssh_subscribe streams as push)` so the LLM learns the bidirectional contract on call #1; adds `ssh_upload` to the spawn list for completeness.
-- `next_hint_for_list_sessions`: `ssh_subscribe session://<id>/health` now leads, with `ssh_disconnect_agent` / `ssh_disconnect` as cleanup fallbacks. Discovery flows terminate in a push lane, not in teardown.
-- `list_commands_render_with_warnings`: surfaces `ssh_subscribe command://<id>/output` for the first RUNNING entry — discovery → push, not discovery → poll.
+- `next_hint_for_session` (post-connect): trailing reminder `(each spawn returns an ID that sub_open streams as push)` so the LLM learns the bidirectional contract on call #1; adds `ssh_upload` to the spawn list for completeness.
+- `next_hint_for_list_sessions`: `sub_open session://<id>/health` now leads, with `ssh_disconnect_agent` / `ssh_disconnect` as cleanup fallbacks. Discovery flows terminate in a push lane, not in teardown.
+- `list_commands_render_with_warnings`: surfaces `sub_open command://<id>/output` for the first RUNNING entry — discovery → push, not discovery → poll.
 
 ### Overlap surfacing (zero-cookbook tool selection)
 
-- `ssh_run` description: when-each guidance vs `ssh_connect` + `ssh_execute` (>1 command) and vs `ssh_execute_batch` (>=3 sequential).
-- `ssh_execute_batch` description: cites ~70% wire savings over `N x ssh_execute` for `N >= 3`; cross-references `ssh_run` (single) and parallel `ssh_execute` patterns.
+- `ssh_run` description: when-each guidance vs `ssh_connect` + `ssh_exec` (>1 command) and vs `ssh_exec_batch` (>=3 sequential).
+- `ssh_exec_batch` description: cites ~70% wire savings over `N x ssh_exec` for `N >= 3`; cross-references `ssh_run` (single) and parallel `ssh_exec` patterns.
 - `ssh_disconnect_agent` vs `ssh_disconnect_many`: when-each matrix surfaced in both descriptions so the LLM picks the cheapest bulk-cleanup call without round-trips.
-- `ssh_shell_wait_for` description: surfaces overlap with `ssh_subscribe` + `filter` for streaming pattern matches; 1-shot pattern gating remains the local sweet spot.
+- `ssh_shell_wait_for` description: surfaces overlap with `sub_open` + `filter` for streaming pattern matches; 1-shot pattern gating remains the local sweet spot.
 
 ### Verified gates
 
@@ -239,9 +331,9 @@ flowchart LR
 
 ### Highlights
 
-- **Subscribe-first architecture** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). `ResourceLifecycle` CAS state machine (`Owned → Observed → Releasing → Closed`) + per-session cascade refcount; grace timer arms when last subscriber detaches; new subscribes within the window cancel it; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` opts in. Default preserves v4 semantics.
+- **Subscribe-first architecture** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). `ResourceLifecycle` CAS state machine (`Owned → Observed → Releasing → Closed`) + per-session cascade refcount; grace timer arms when last subscriber detaches; new subscribes within the window cancel it; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` opts in. Default preserves v4 semantics.
 - **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)). Cursor key shifts from `(PeerId, Uri)` to `(SubId, Uri)` (UUIDv7); each subscribe call gets its own bounded `mpsc::channel(N)`, `LagPolicy` (default `Snapshot`), filter pipeline, replay window, and `SubscriberStats` (8 atomics). `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy hosts get a synthesised `sub_id`.
-- **LLM UX overhaul** (Phase 3 — in flight; [ADR 0005](docs/adr/0005-llm-ux-priorities.md), [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md)). 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher (default `SSH_SUB_LEAK_RISK_WARN_S = 2 s`).
+- **LLM UX overhaul** (Phase 3 — in flight; [ADR 0005](docs/adr/0005-llm-ux-priorities.md), [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md)). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher (default `SSH_SUB_LEAK_RISK_WARN_S = 2 s`).
 - **NDJSON daemon binary** (Phase 4 — in flight; [ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), [docs/DAEMON.md](docs/DAEMON.md)). `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds in-process rmcp client + server across `tokio::io::duplex`; stdin NDJSON ops, stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable. For tier-2 / tier-3 hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model.
 - **38-code error taxonomy** ([ADR 0007](docs/adr/0007-error-taxonomy.md), [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook)). 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics; centralised one-sentence DETAIL phrasing.
 - **Lock-free invariants extended** ([docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants)). New atomics for lifecycle (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker) and lane / mux (per-lane mpsc, cursor, pause flag, 8 stats atomics, mux_waker). Loom coverage 8 → 16 (Phase 1 + Phase 2 each add 4). Production clippy gate stays exit-0.
@@ -282,17 +374,17 @@ Zero breaking changes on the wire; every delta is a new optional argument or env
 
 ### Highlights
 
-- **Fix: `ssh_get_transfer_progress` now reports live `bytes_transferred` during running uploads/downloads.** Prior behaviour: the snapshot always returned `bytes_transferred = 0` until the transfer reached terminal state, even though the file on disk was growing. Users had to poll local file size as a workaround. The fix is wire-compatible — the structured payload shape, env vars, and error codes are unchanged.
+- **Fix: `ssh_transfer_progress` now reports live `bytes_transferred` during running uploads/downloads.** Prior behaviour: the snapshot always returned `bytes_transferred = 0` until the transfer reached terminal state, even though the file on disk was growing. Users had to poll local file size as a workaround. The fix is wire-compatible — the structured payload shape, env vars, and error codes are unchanged.
 
 ### Fixed
 
-- **`ssh_get_transfer_progress` always returned `bytes_transferred = 0` mid-flight** (v4.8.1 BUG, reproducible on any non-instant upload or download). Root cause: the SFTP streaming task incremented the live `Arc<AtomicU64>` per chunk and emitted `ProgressEvent::Tick` on a `tokio::sync::broadcast`, but no listener pumped those ticks into the `TransferEntity` row in the repository — the row was born at `bytes_transferred = 0` (via `fresh_entity`) and only updated on the terminal frame by `spawn_status_watcher`. The use case `get_transfer_progress` reads from `TransferRepository::get(...)`, so it inherited the stale 0 throughout the running window. The same staleness affected `transfer://<id>/progress` resource reads (the broadcast notification fired correctly, but the subsequent `resources/read` returned the stale entity). Fix (`adapters/sftp/russh_sftp_adapter.rs`): a per-transfer progress watcher (`spawn_progress_watcher`) is spawned alongside the existing status watcher; it subscribes to the same broadcast and calls `TransferStatusSink::record_progress(...)` on each Tick, throttled by `PROGRESS_TICK_THROTTLE` (250 ms wall clock) to avoid hot-write per 32 KB chunk. The sink hook, the `RepoTransferStatusSink::record_progress` impl, the `NoopTransferStatusSink::record_progress` impl, and the `TransferEntity::with_progress(bytes)` projection were all already declared since v4.2 — the only missing piece was the producer task that consumed the broadcast. The progress watcher's close-flush guarantees the latest pending value lands before exit, and a terminal frame received before any Tick exits with zero `record_progress` calls so the existing terminal `mark_completed` write is never raced by a stale partial.
+- **`ssh_transfer_progress` always returned `bytes_transferred = 0` mid-flight** (v4.8.1 BUG, reproducible on any non-instant upload or download). Root cause: the SFTP streaming task incremented the live `Arc<AtomicU64>` per chunk and emitted `ProgressEvent::Tick` on a `tokio::sync::broadcast`, but no listener pumped those ticks into the `TransferEntity` row in the repository — the row was born at `bytes_transferred = 0` (via `fresh_entity`) and only updated on the terminal frame by `spawn_status_watcher`. The use case `get_transfer_progress` reads from `TransferRepository::get(...)`, so it inherited the stale 0 throughout the running window. The same staleness affected `transfer://<id>/progress` resource reads (the broadcast notification fired correctly, but the subsequent `resources/read` returned the stale entity). Fix (`adapters/sftp/russh_sftp_adapter.rs`): a per-transfer progress watcher (`spawn_progress_watcher`) is spawned alongside the existing status watcher; it subscribes to the same broadcast and calls `TransferStatusSink::record_progress(...)` on each Tick, throttled by `PROGRESS_TICK_THROTTLE` (250 ms wall clock) to avoid hot-write per 32 KB chunk. The sink hook, the `RepoTransferStatusSink::record_progress` impl, the `NoopTransferStatusSink::record_progress` impl, and the `TransferEntity::with_progress(bytes)` projection were all already declared since v4.2 — the only missing piece was the producer task that consumed the broadcast. The progress watcher's close-flush guarantees the latest pending value lands before exit, and a terminal frame received before any Tick exits with zero `record_progress` calls so the existing terminal `mark_completed` write is never raced by a stale partial.
 
 ### Audit (sibling bug class)
 
 The same shape (live counter incremented by a streaming task, never mirrored to the repo until terminal state) was checked across every subsystem with a streaming surface:
 
-- `ssh_get_command_output` — uses live `ArcSwap<OutputBuffer>` already (correct, not affected).
+- `ssh_exec_output` — uses live `ArcSwap<OutputBuffer>` already (correct, not affected).
 - `ssh_shell_read` — uses live `ArcSwap<RingBuffer>` already (correct, not affected).
 - `forward://<id>/events` — N/A (no live byte counter).
 
@@ -301,7 +393,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 ### Tests
 
 - **4 new Rust unit tests** in `progress_watcher_tests` (in `src/adapters/sftp/russh_sftp_adapter.rs`): first-tick is forwarded immediately + close-flush emits last pending value; 50-tick burst is throttled to fewer writes with monotonic non-decreasing values; 250 ms quiet window releases the throttle gate; terminal-before-tick exits with zero `record_progress` calls.
-- **2 new Python integration tests** in `scripts/test_transfer_progress.py` (`requires_sshd` mark, mirrors `test_v47_progress.py` / `test_stdio.py` conventions): `test_upload_progress_reports_live_partial_bytes` and `test_download_progress_reports_live_partial_bytes` upload/download a 5 MiB blob, poll `ssh_get_transfer_progress` at 100 ms cadence for up to 30 s, assert `0 < bytes_transferred < total_bytes` is observed at least once mid-flight (the exact pre-fix bug shape would fail this), assert monotonic non-decreasing `bytes_transferred` across polls, and assert terminal `bytes_transferred == total_bytes`.
+- **2 new Python integration tests** in `scripts/test_transfer_progress.py` (`requires_sshd` mark, mirrors `test_v47_progress.py` / `test_stdio.py` conventions): `test_upload_progress_reports_live_partial_bytes` and `test_download_progress_reports_live_partial_bytes` upload/download a 5 MiB blob, poll `ssh_transfer_progress` at 100 ms cadence for up to 30 s, assert `0 < bytes_transferred < total_bytes` is observed at least once mid-flight (the exact pre-fix bug shape would fail this), assert monotonic non-decreasing `bytes_transferred` across polls, and assert terminal `bytes_transferred == total_bytes`.
 - Lib tests: **1168 → 1172** (+4 progress watcher unit tests). Integration tests: 2 / 2 unchanged in `tests/`. Python integration tests: 2 new in `scripts/`.
 
 ### Compatibility
@@ -313,15 +405,15 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Highlights
 
-- **Full `output_schema` coverage on every MCP tool — 21 / 21.** v4.7 advertised typed `output_schema` on 9 tools (the 6 originals — `ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress` — plus the v4.7 step-3 additions `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`). v4.8 lifts the remaining 12 tools (`ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_wait_for`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`) to typed schemas mirroring their `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can now validate every tool response against a published schema without hard-coding any field names.
+- **Full `output_schema` coverage on every MCP tool — 21 / 21.** v4.7 advertised typed `output_schema` on 9 tools (the 6 originals — `ssh_connect`, `ssh_exec`, `ssh_exec_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_transfer_progress` — plus the v4.7 step-3 additions `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many`). v4.8 lifts the remaining 12 tools (`ssh_disconnect`, `ssh_sessions`, `ssh_disconnect_agent`, `ssh_commands`, `ssh_exec_cancel`, `ssh_shell_write`, `ssh_shell_press`, `ssh_shell_wait_for`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`) to typed schemas mirroring their `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can now validate every tool response against a published schema without hard-coding any field names.
 - **Strictly additive on the wire.** The text channel is byte-identical to v4.7.1; the `structured_content` payload shape is byte-identical to v4.7.1. Only `tools/list[].outputSchema` grows. v3 / v4.0 / v4.5 / v4.6 / v4.7 hosts work against v4.8 servers without any change.
 
 ### Added
 
 - **12 new typed result structs** in `src/infra/mcp/results.rs`, each `#[derive(Debug, Clone, Serialize, JsonSchema)] #[non_exhaustive]` mirroring the runtime `structured_content` payload of its tool's success path:
-  - `SshDisconnectResult`, `SshListSessionsResult` (with `SessionEntry`), `SshDisconnectAgentResult`
-  - `SshListCommandsResult` (with `CommandEntry`), `SshCancelCommandResult`
-  - `SshShellWriteResult`, `SshShellSendKeyResult`, `SshShellWaitForResult`, `SshShellCloseResult`
+  - `SshDisconnectResult`, `SshSessionsResult` (with `SessionEntry`), `SshDisconnectAgentResult`
+  - `SshCommandsResult` (with `CommandEntry`), `SshExecCancelResult`
+  - `SshShellWriteResult`, `SshShellPressResult`, `SshShellWaitForResult`, `SshShellCloseResult`
   - `SshUploadResult`, `SshDownloadResult`
   - `SshForwardResult`
 - **Typed schema advertisement on 24 new `#[tool]` sites** (12 with `port_forward`, 12 without) — one `output_schema = schema_for_type::<…Result>()` call per `#[tool]` macro invocation in `src/infra/mcp/tool_router.rs`.
@@ -355,7 +447,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 ### Fixed
 
 - **`max_buffer_size` tool argument on `ssh_shell_open` is now actually honoured** (v4.7.1 BUG #1, found by `chaos_v47_subscribe.py::cs2_lagged_recovery` and `cs6_buffer_overflow_compensation`). Prior to this patch the override reached the persisted `ShellEntity` but never flowed into the runtime `RunningShell.max_buffer_size: Arc<AtomicU64>` that the reader-task `flush_shell_buffer` helper consults. Result: the buffer cap was silently the adapter default (10 MiB) regardless of caller override, and slow-consumer workloads grew the buffer unbounded toward OOM territory — the most likely cause of the "MCP resetando em workload pesado" symptom. Fix: `SshClientPort::open_shell` gains a `max_buffer_size: Option<u64>` parameter; `OpenShellUseCase` threads it through; `RusshAdapter::do_open_shell` uses the override (or env-driven default) for both the entity AND the runtime atomic backing the reader-task flush threshold. Regression test `flush_shell_buffer_honours_supplied_cap_with_head_truncation` writes 2x the cap and asserts head truncation lands at the cap.
-- **`ssh_get_command_output` no longer returns `COMMAND_NOT_FOUND` after a successful `ssh_cancel_command`** (v4.7.1 BUG #2, found by `test_v47_llm_workflows.py::test_w11_cancel_mid_flight`). Prior behaviour: `RusshAdapter::cancel` removes the adapter-internal command record immediately; `RusshOutputAdapter::snapshot_command` then returns `CommandNotFound` even though the repo entity is alive in `Cancelled` status (and `ssh_list_commands` correctly reports it). `GetCommandOutputUseCase::execute` propagated that error verbatim, breaking the canonical LLM cancel-mid-flight workflow. Fix: when the entity is in a terminal state (`Cancelled` / `Completed` / `Failed`) and `snapshot_command` returns `CommandNotFound`, treat it as a benign "snapshot evicted; entity has the saved status" — return the entity's saved status with empty stdout/stderr. Added `CommandStatus::is_terminal()` helper. Four regression tests cover the three terminal states plus a negative case asserting that `Running` + missing snapshot still surfaces `CommandNotFound` (genuine inconsistencies stay visible).
+- **`ssh_exec_output` no longer returns `COMMAND_NOT_FOUND` after a successful `ssh_exec_cancel`** (v4.7.1 BUG #2, found by `test_v47_llm_workflows.py::test_w11_cancel_mid_flight`). Prior behaviour: `RusshAdapter::cancel` removes the adapter-internal command record immediately; `RusshOutputAdapter::snapshot_command` then returns `CommandNotFound` even though the repo entity is alive in `Cancelled` status (and `ssh_commands` correctly reports it). `GetCommandOutputUseCase::execute` propagated that error verbatim, breaking the canonical LLM cancel-mid-flight workflow. Fix: when the entity is in a terminal state (`Cancelled` / `Completed` / `Failed`) and `snapshot_command` returns `CommandNotFound`, treat it as a benign "snapshot evicted; entity has the saved status" — return the entity's saved status with empty stdout/stderr. Added `CommandStatus::is_terminal()` helper. Four regression tests cover the three terminal states plus a negative case asserting that `Running` + missing snapshot still surfaces `CommandNotFound` (genuine inconsistencies stay visible).
 - **`with_idempotency` purity invariant locked in CI** (v4.7.1 BUG #3 turned out to be a non-bug; flagged by `chaos_v47_subscribe.py::cs12_idempotency_with_subscribe` reporting `post_replay_count_strict_zero=false`). Trace confirmed the wrapper at `tool_router.rs:322-324` already runs the use case only on cache miss; on cache hit it returns the cached body verbatim with no side effects. The 2 post-replay notifications observed in the chaos script come from the subscription debouncer's force-flush ticker (`adapters/subscription/legacy.rs:432-434`, default 1000ms cadence) firing during the chaos script's 1-second observation window. Three regression tests now lock the invariant in case future refactors add a side-call to the replay path: `idempotency_replay_does_not_invoke_callback`, `idempotency_absent_key_runs_callback_every_time`, `idempotency_failed_response_is_not_cached`.
 
 ### Test infrastructure
@@ -387,14 +479,14 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Added
 
-- **`structured_content` JSON parallel to Markdown on every tool** — `CallToolResult` now carries both the existing block-style Markdown text and a typed JSON object. Smaller LLMs index by key without parsing Markdown. Mirrors the KEY: value pairs 1:1 with snake_case field names; surfaces the `NEXT:` hint as a `next: [...]` array; surfaces error responses as `{ tool, status: "error", code, reason, detail }`. Six tools advertise typed `output_schema` (`SshConnectResult`, `SshExecuteResult`, `SshGetCommandOutputResult`, `SshShellOpenResult`, `SshShellReadResult`, `SshGetTransferProgressResult`); the remaining 12 emit free-form structured payloads.
+- **`structured_content` JSON parallel to Markdown on every tool** — `CallToolResult` now carries both the existing block-style Markdown text and a typed JSON object. Smaller LLMs index by key without parsing Markdown. Mirrors the KEY: value pairs 1:1 with snake_case field names; surfaces the `NEXT:` hint as a `next: [...]` array; surfaces error responses as `{ tool, status: "error", code, reason, detail }`. Six tools advertise typed `output_schema` (`SshConnectResult`, `SshExecResult`, `SshExecOutputResult`, `SshShellOpenResult`, `SshShellReadResult`, `SshTransferProgressResult`); the remaining 12 emit free-form structured payloads.
 - **`resources/templates/list`** — server now advertises 4-5 RFC 6570 URI templates (`shell://{shell_id}/output{?cursor}`, `command://{command_id}/output{?cursor}`, `transfer://{transfer_id}/progress`, `session://{session_id}/health`, and `forward://{forward_id}/events{?cursor}` with `port_forward`). Smaller LLMs construct subscribe URIs without first calling `resources/list`.
-- **Progress notifications during long async** — `notifications/progress` fire mid-flight on `ssh_get_command_output(wait=true)` (5s cadence), `ssh_get_transfer_progress(wait=true)` (5s cadence), and `ssh_shell_wait_for` (1s cadence) when the request carries `_meta.progressToken`. Best-effort: notify errors are swallowed so the user-visible response is unchanged.
-- **`ssh_run` convenience tool** — one-shot connect + execute + (optional) disconnect. Three round-trips collapsed into one. Args mirror `ssh_connect` + `ssh_execute` with `disconnect_after=true` default. Cost: 1 SSH handshake + 1 channel + (optional) disconnect.
-- **`ssh_execute_batch` tool** — chains 1..=16 commands through one session with stop-on-failure semantics (default true). Returns aggregate Markdown plus structured `results[]` array.
+- **Progress notifications during long async** — `notifications/progress` fire mid-flight on `ssh_exec_output(wait=true)` (5s cadence), `ssh_transfer_progress(wait=true)` (5s cadence), and `ssh_shell_wait_for` (1s cadence) when the request carries `_meta.progressToken`. Best-effort: notify errors are swallowed so the user-visible response is unchanged.
+- **`ssh_run` convenience tool** — one-shot connect + execute + (optional) disconnect. Three round-trips collapsed into one. Args mirror `ssh_connect` + `ssh_exec` with `disconnect_after=true` default. Cost: 1 SSH handshake + 1 channel + (optional) disconnect.
+- **`ssh_exec_batch` tool** — chains 1..=16 commands through one session with stop-on-failure semantics (default true). Returns aggregate Markdown plus structured `results[]` array.
 - **`ssh_disconnect_many` tool** — best-effort batch disconnect of 1..=64 SESSION_IDs. Per-id failures don't abort the batch.
 - **MCP prompts catalog** — `prompts/list` + `prompts/get` with 5 canonical workflows: `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`. `prompts` capability advertised on the `initialize` handshake.
-- **Idempotency `_meta.idempotency_key`** — DashMap-backed LRU dedup cache (default 300s TTL, 1024 entries; configurable via `SSH_IDEMPOTENCY_TTL_SECS` / `SSH_IDEMPOTENCY_MAX_ENTRIES`). 15 mutating tools wrapped: `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_execute`, `ssh_cancel_command`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`, `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`. New error code `IDEMPOTENCY_KEY_TOO_LONG` for keys over 256 bytes. Read-only tools (`ssh_list_*`, `ssh_get_*` with read semantics, `ssh_shell_read`, `ssh_shell_wait_for`) ignore the key.
+- **Idempotency `_meta.idempotency_key`** — DashMap-backed LRU dedup cache (default 300s TTL, 1024 entries; configurable via `SSH_IDEMPOTENCY_TTL_SECS` / `SSH_IDEMPOTENCY_MAX_ENTRIES`). 15 mutating tools wrapped: `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_exec`, `ssh_exec_cancel`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_press`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`, `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many`. New error code `IDEMPOTENCY_KEY_TOO_LONG` for keys over 256 bytes. Read-only tools (`ssh_list_*`, `ssh_get_*` with read semantics, `ssh_shell_read`, `ssh_shell_wait_for`) ignore the key.
 - **NOT_FOUND closest-match suggestions** — when `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires and the relevant repo has live entries, the DETAIL line now appends `closest matches: <id1>, <id2>, <id3>` (top 3 byte-level Levenshtein neighbors). Smaller LLMs recover from typos without round-tripping `ssh_list_*`. Pure-Rust implementation, no `strsim` dependency.
 - **INITIAL_BUFFER on `ssh_shell_open`** — when the PTY emits stdout within ~100ms, the response carries an `INITIAL_BUFFER:` line (head-truncated to 4 KiB) plus `structured_content.initial_buffer`. Smaller LLMs that follow the `subscribe → read` pattern can sometimes skip the first round-trip. Tunable via `SSH_SHELL_OPEN_INITIAL_PEEK_MS` (default 100), `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS` (default 5), `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES` (default 4096).
 - **`Implementation.instructions` updated** — both `port_forward` and `not(port_forward)` few-shot blocks bumped to 21 / 20 tool count and call out `ssh_run`, INITIAL_BUFFER, and the idempotency convention.
@@ -406,7 +498,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 ### Behaviour notes
 
 - Wire byte-compat with v4.6 on the text channel. The structured_content channel is purely additive — clients that ignore it get the same v4.6 Markdown response.
-- `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many` are pure orchestration over existing use cases — no new domain entities.
+- `ssh_run`, `ssh_exec_batch`, `ssh_disconnect_many` are pure orchestration over existing use cases — no new domain entities.
 - Idempotency cache is per-process (not persisted). Server restart clears it. The cache is **lock-free** on the hot path (DashMap); GC runs lazy on insert plus an explicit `evict_expired()` accessor for opt-in periodic sweep.
 - Progress notifications obey the MCP spec — when the request omits `_meta.progressToken`, no notifications fire (matches v4.6 behaviour exactly).
 
@@ -419,18 +511,18 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Added
 
-- **`NEXT:` advisory line** — every response with a clear successor tool now ends with a `NEXT:` line listing pipe-separated concrete tool calls (e.g. `NEXT: ssh_get_command_output(command_id=c-X, wait=true) | ssh_cancel_command(command_id=c-X)`). 12 emission sites:
+- **`NEXT:` advisory line** — every response with a clear successor tool now ends with a `NEXT:` line listing pipe-separated concrete tool calls (e.g. `NEXT: ssh_exec_output(command_id=c-X, wait=true) | ssh_exec_cancel(command_id=c-X)`). 12 emission sites:
   - `SSH_CONNECT: OK / REUSED / SUGGESTED`
-  - `SSH_LIST_SESSIONS: OK` (only when non-empty)
-  - `SSH_EXECUTE: STARTED`
-  - `SSH_GET_COMMAND_OUTPUT: RUNNING`
+  - `SSH_SESSIONS: OK` (only when non-empty)
+  - `SSH_EXEC: STARTED`
+  - `SSH_EXEC_OUTPUT: RUNNING`
   - `SSH_SHELL_OPEN: OK`
-  - `SSH_SHELL_WRITE: OK` / `SSH_SHELL_SEND_KEY: OK`
+  - `SSH_SHELL_WRITE: OK` / `SSH_SHELL_PRESS: OK`
   - `SSH_SHELL_WAIT_FOR: MATCHED / TIMEOUT`
   - `SSH_UPLOAD: STARTED` / `SSH_DOWNLOAD: STARTED`
-  - `SSH_GET_TRANSFER_PROGRESS: RUNNING`
+  - `SSH_TRANSFER_PROGRESS: RUNNING`
   - `SSH_FORWARD: OK`
-- **Subscribe-first `HINT:` lines (4 new sites)** — `ssh_shell_open`, `ssh_execute` (async), `ssh_upload` / `ssh_download`, and `ssh_forward` now emit a one-line `HINT:` steering callers to the matching `resources/subscribe` URI ("subscribe to <scheme>://<id>/... for realtime ..."). Anti-leak `HINT:` on `ssh_list_sessions` (>5 sessions/agent, v4.4) is unchanged.
+- **Subscribe-first `HINT:` lines (4 new sites)** — `ssh_shell_open`, `ssh_exec` (async), `ssh_upload` / `ssh_download`, and `ssh_forward` now emit a one-line `HINT:` steering callers to the matching `resources/subscribe` URI ("subscribe to <scheme>://<id>/... for realtime ..."). Anti-leak `HINT:` on `ssh_sessions` (>5 sessions/agent, v4.4) is unchanged.
 - **JSON Schema `default` keyword visible on 27 optional fields** — `connection.rs` (7), `execute.rs` (8), `shell.rs` (10), `sftp.rs` (2). Smaller LLMs that read the schema mechanically now see the default value without parsing English from the description. Implemented via `#[schemars(default = "fn_name")]`.
 - **Cost / timing hints in tool descriptions** — every `#[tool(description = "...")]` ends with a `Cost: ...` line covering O() complexity, expected latency, blocking-vs-async, and pointer to subscribe paths where applicable. 35 description sites updated (18 with `port_forward` + 17 without).
 - **3 reserved error tags now emit live**:
@@ -442,7 +534,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Changed
 
-- **Wire key rename: `AGENT:` → `AGENT_ID:` (narrow breaking change)** — 7 render sites: `ssh_connect`, `ssh_list_sessions` (per-row), `ssh_execute` (async), `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. CLAUDE.md required all IDs to end with `_ID` — this closes the last drift. Hosts walking key-value lines generically: no change. Hosts grepping `^AGENT:` literally: update to `^AGENT_ID:`.
+- **Wire key rename: `AGENT:` → `AGENT_ID:` (narrow breaking change)** — 7 render sites: `ssh_connect`, `ssh_sessions` (per-row), `ssh_exec` (async), `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. CLAUDE.md required all IDs to end with `_ID` — this closes the last drift. Hosts walking key-value lines generically: no change. Hosts grepping `^AGENT:` literally: update to `^AGENT_ID:`.
 - `ssh_connect` description trimmed for token efficiency where redundant; cost line preserves the existing tip bullets.
 
 ### Tests
@@ -475,9 +567,9 @@ Only the SFTP transfer path was affected; this fix is the only required change.
   - `description = "Run remote commands, drive PTY shells, transfer files via SFTP, and forward TCP ports over SSH..."`
   - `website_url = "https://github.com/farchanjo/ssh-mcp"`
   - `icons = None` (TODO until the SVG asset lands at a hosted URL).
-- **Per-tool `title` + `ToolAnnotations`** — every one of the 18 tools (or 17 without `port_forward`) now declares a human-readable `title` and the `read_only_hint` / `destructive_hint` / `idempotent_hint` annotations so MCP hosts can rank, filter, and warn before destructive use. Read-only tools: `ssh_list_sessions`, `ssh_get_command_output`, `ssh_list_commands`, `ssh_shell_wait_for`, `ssh_get_transfer_progress`. Idempotent destructive: disconnect / cancel / shell_close. Open-world hint left unset (defaults to true).
+- **Per-tool `title` + `ToolAnnotations`** — every one of the 18 tools (or 17 without `port_forward`) now declares a human-readable `title` and the `read_only_hint` / `destructive_hint` / `idempotent_hint` annotations so MCP hosts can rank, filter, and warn before destructive use. Read-only tools: `ssh_sessions`, `ssh_exec_output`, `ssh_commands`, `ssh_shell_wait_for`, `ssh_transfer_progress`. Idempotent destructive: disconnect / cancel / shell_close. Open-world hint left unset (defaults to true).
 - **Few-shot `instructions` field** — replaces the previous one-liner with three canonical workflows (run command, interactive shell, upload) plus the v4.4 `EXPIRES_AT` / `HINT` / `agent_id` steering cues. Two flavours: `INSTRUCTIONS_WITH_FORWARD` (797 bytes) and `INSTRUCTIONS_WITHOUT_FORWARD` (785 bytes). The non-`port_forward` build advertises 17 tools and 4 streams.
-- **Schema documents per-key modifier policy** — `ssh_shell_send_key` `key` field now spells out the allowed modifier set per key class in its JsonSchema description (arrows / nav / F-keys accept any of `shift`/`alt`/`ctrl`; `tab` accepts only `shift`; control bytes reject every modifier). `ssh_shell_wait_for` `patterns` field documents the wire codes returned on validation failure.
+- **Schema documents per-key modifier policy** — `ssh_shell_press` `key` field now spells out the allowed modifier set per key class in its JsonSchema description (arrows / nav / F-keys accept any of `shift`/`alt`/`ctrl`; `tab` accepts only `shift`; control bytes reject every modifier). `ssh_shell_wait_for` `patterns` field documents the wire codes returned on validation failure.
 - **Doc surface** — `docs/LLM_GUIDE.md`, `docs/API.md`, `docs/ERRORS.md`, `docs/RESOURCES.md`, `docs/FLOWS.md`, `README.md`, and `CLAUDE.md` are now in sync with v4.5.0 behaviour. New LLM_GUIDE sections cover connection lifecycle (v4.4), granular error codes (v4.5), server identity (v4.5), and a smaller-LLM cookbook with three canonical workflows.
 
 ### Tests
@@ -501,7 +593,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 - **agent_id-aware ranking** — `connect_session` use case now ranks identity matches owned by the requesting `agent_id` ahead of foreign matches under both `reuse=auto` and `reuse=suggest`. Tiebreaker is the existing `connected_at desc` ordering. When the caller does not pass `agent_id`, ranking is a no-op (newest-first stays). Implemented in `src/application/connect_session.rs::rank_by_agent_affinity`.
 - **EXPIRES_AT line** — `SSH_CONNECT: OK` and `SSH_CONNECT: REUSED` blocks now emit `EXPIRES_AT: <rfc3339>` (computed as `connected_at + ConfigPort::inactivity_timeout`) so an LLM can ping (any cheap call) before the inactivity sweeper closes the session. When `persistent=true`, the renderer emits `PERSISTENT: true` and skips `EXPIRES_AT`. When the configured inactivity timeout is zero, `EXPIRES_AT` is also omitted (sweeper disabled). Renderer change in `src/infra/mcp/render/connection.rs::append_persistent_or_expiry` + `compute_expires_at`.
-- **anti-leak HINT** — `SSH_LIST_SESSIONS` now appends `HINT: agent '<id>' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` when any agent owns more than 5 healthy sessions in the rendered list. Threshold lives in `ANTI_LEAK_HINT_THRESHOLD` (`src/infra/mcp/render/connection.rs`).
+- **anti-leak HINT** — `SSH_SESSIONS` now appends `HINT: agent '<id>' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` when any agent owns more than 5 healthy sessions in the rendered list. Threshold lives in `ANTI_LEAK_HINT_THRESHOLD` (`src/infra/mcp/render/connection.rs`).
 - **`ssh_connect` description Tip bullets** — the tool description (both feature flavours of the `#[tool_router]` impl) now includes:
   - `Tip: pass reuse=auto to let the server pick the most recent healthy match in a single round-trip. Use reuse=suggest (default) when you want to inspect matches before reusing. Use reuse=force_new to bypass identity matching entirely.`
   - `Tip: pass agent_id so subsequent sessions are grouped and you can bulk-cleanup with ssh_disconnect_agent. When agent_id is set, reuse=auto/reuse=suggest rank sessions owned by the same agent first.`
@@ -566,11 +658,11 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Fixed
 
-- **Command status pump** — `ssh_get_command_output { wait=true }` no longer hangs on `RUNNING` after the SSH driver completes. The russh adapter now spawns a dedicated status watcher per async command that bridges the live `RunningCommand.status_rx` watcher channel into the domain `CommandRepository` via a new internal `CommandStatusSink` trait. The composition root pins a `RepoCommandStatusSink` over the shared `DashMapCommandRepo`; tests/fixtures keep the no-op default so no behavioural change reaches the use-case test surface.
-- **Cancel snapshot** — `ssh_cancel_command` no longer surfaces `COMMAND_NOT_FOUND` when the cancellation succeeds. The cancel use case now snapshots stdout/stderr **before** issuing `SshClientPort::cancel`, falling back to an empty snapshot if both pre- and post-cancel reads fail. The SSH adapter still tears its internal command record down inside `cancel`, but the use case no longer races that tear-down.
+- **Command status pump** — `ssh_exec_output { wait=true }` no longer hangs on `RUNNING` after the SSH driver completes. The russh adapter now spawns a dedicated status watcher per async command that bridges the live `RunningCommand.status_rx` watcher channel into the domain `CommandRepository` via a new internal `CommandStatusSink` trait. The composition root pins a `RepoCommandStatusSink` over the shared `DashMapCommandRepo`; tests/fixtures keep the no-op default so no behavioural change reaches the use-case test surface.
+- **Cancel snapshot** — `ssh_exec_cancel` no longer surfaces `COMMAND_NOT_FOUND` when the cancellation succeeds. The cancel use case now snapshots stdout/stderr **before** issuing `SshClientPort::cancel`, falling back to an empty snapshot if both pre- and post-cancel reads fail. The SSH adapter still tears its internal command record down inside `cancel`, but the use case no longer races that tear-down.
 - **Shell output flush** — `ssh_shell_read` / `ssh_shell_wait_for` long polls no longer time out with empty `data` after a write produced visible output. The shell reader task now flushes incoming PTY frames to `RunningShell.history` (and the broadcast channel) on every chunk (`SHELL_FLUSH_THRESHOLD = 1`) instead of waiting for a 4 KiB batch — interactive shells need per-frame visibility.
 - **Shell close pump** — `RusshAdapter::close_shell` now pumps an explicit `Closed` notification into the domain `ShellRepository` via a new internal `ShellStatusSink` trait. Mirrors the command sink path so subscribers / long-poll consumers observe the terminal state without waiting for an entity-removal sweep.
-- **Transfer status pump** — SFTP upload/download drivers now surface `Completed` / `Failed` / `Cancelled` and intermediate `record_progress` updates into the domain `TransferRepository` via a new internal `TransferStatusSink` trait. Wired in `composition::prod` over the shared `DashMapTransferRepo`. `ssh_get_transfer_progress { wait=true }` polls now observe the terminal state cleanly.
+- **Transfer status pump** — SFTP upload/download drivers now surface `Completed` / `Failed` / `Cancelled` and intermediate `record_progress` updates into the domain `TransferRepository` via a new internal `TransferStatusSink` trait. Wired in `composition::prod` over the shared `DashMapTransferRepo`. `ssh_transfer_progress { wait=true }` polls now observe the terminal state cleanly.
 - **Python integration parser** — `scripts/helpers/parse_block.py` now publishes wire-key aliases (`exit` → `exit_code`, `sessions` → `sessions_disconnected`, `commands` → `commands_cancelled`) so existing test assertions match the v3 short-form keys without any wire-format change. Test-only fix; the markdown response shape stays byte-identical.
 
 ### Internal
@@ -712,7 +804,7 @@ H0 `5a70845`, H1 `e96eca0`, H2 `bf4b446`, H3a `9c48fbc`, H3b `a220897`, H3c `327
 ### Breaking
 - Migrate MCP transport layer from `poem-mcpserver` 0.3.1 to `rmcp` 1.6 (official Anthropic Rust SDK). HTTP transport now uses `axum` + `rmcp::transport::streamable_http_server::StreamableHttpService` with `Mcp-Session-Id` header tracking. Stdio transport uses `rmcp::transport::io::stdio()`.
 - `ssh_connect.reuse` is now a typed enum `ReusePolicy { Suggest, Auto, ForceNew }` instead of `Option<String>`. Wire format unchanged for valid values; typos now produce a JSON-schema validation error.
-- `ssh_list_commands.status` is now a typed enum `CommandStatus { Running, Completed, Cancelled, Failed }` instead of `Option<String>`.
+- `ssh_commands.status` is now a typed enum `CommandStatus { Running, Completed, Cancelled, Failed }` instead of `Option<String>`.
 - All MCP responses are now block-style markdown only (drops the v2 inline `KEY: value | KEY: value` form).
 - Stdio binary's custom JSON-RPC quirks (cancel-id parser, fallback responses) removed — handled natively by rmcp. ~250 LOC of workarounds dropped.
 
@@ -723,7 +815,7 @@ H0 `5a70845`, H1 `e96eca0`, H2 `bf4b446`, H3a `9c48fbc`, H3b `a220897`, H3c `327
   - `transfer://<id>/progress` (SFTP point-in-time progress)
   - `session://<id>/health` (session health snapshot)
   - `forward://<id>/events` (port-forward event log, feature-gated)
-- `ssh_shell_send_key` MCP tool — semantic keystrokes (ctrl_a..ctrl_z, enter, tab, escape, backspace, space, delete, arrows, nav keys, F1-F12) with shift/alt/ctrl modifier support and 1..=64 repeat. Tab+Shift produces back-tab (`\x1b[Z`).
+- `ssh_shell_press` MCP tool — semantic keystrokes (ctrl_a..ctrl_z, enter, tab, escape, backspace, space, delete, arrows, nav keys, F1-F12) with shift/alt/ctrl modifier support and 1..=64 repeat. Tab+Shift produces back-tab (`\x1b[Z`).
 - `ssh_shell_wait_for` MCP tool — multi-pattern (up to 16) substring gate with timeout.
 - `ssh_shell_read` long-poll extension: `wait` / `wait_timeout_secs` / `min_bytes` parameters for fallback over subscribe.
 - Subscription registry (`src/mcp/subscription.rs`) with per-resource debouncer (50 ms coalesce, 1 s force-flush, 30 s keepalive), per-(peer,uri) cursor tracking, sequence numbers per event for gap detection, lagged auto-recovery via snapshot, periodic peer GC.
@@ -754,7 +846,7 @@ H0 `5a70845`, H1 `e96eca0`, H2 `bf4b446`, H3a `9c48fbc`, H3b `a220897`, H3c `327
 - Test count: 502 → 832 (lib + integration).
 
 ### Fixed
-- `ssh_get_command_output.command_id` doc no longer references the non-existent `ssh_execute_async` tool.
+- `ssh_exec_output.command_id` doc no longer references the non-existent `ssh_execute_async` tool.
 - `ssh_disconnect`/`ssh_shell_close` parameter docs now use the canonical "_ID returned from X" phrasing.
 
 ### Removed
@@ -772,7 +864,7 @@ See `docs/MIGRATION_v2_to_v3.md` for client upgrade instructions.
 - E7 `ce8497d` RunningCommand lock-free
 - E8 `4bee2c9` RunningShell lock-free
 - E9 `21b8fe1` RunningTransfer + Session/Forward broadcast
-- E10 `f9652c7` keys + ssh_shell_send_key
+- E10 `f9652c7` keys + ssh_shell_press
 - E11 `83aa193` long-poll + ssh_shell_wait_for
 - E12 `d87980d` subscription registry + backpressure
 - E13 `d2798ff` resources.rs URI handlers

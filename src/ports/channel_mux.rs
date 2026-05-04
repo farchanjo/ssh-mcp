@@ -1,6 +1,6 @@
 //! Round-robin channel mux port (v5 Phase 2).
 //!
-//! Provides aggregate stats for the `ssh_daemon_stats` tool surface
+//! Provides aggregate stats for the `sub_stats_all` tool surface
 //! (Phase 4). The mux itself runs as a background task driven by the
 //! adapter; the port surface is intentionally minimal so the use
 //! cases stay decoupled from the round-robin driver.

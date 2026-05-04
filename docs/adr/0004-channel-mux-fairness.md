@@ -19,7 +19,7 @@ Phase 4 of v5 introduces an embedded NDJSON daemon (`ssh-mcp-tail`) that runs an
 Two designs were on the table:
 
 1. **Keep `(PeerId, Uri)` and add per-peer fan-out client-side.** The peer (the daemon, the LLM host, …) receives one stream and is responsible for splitting it. Rejected because every consumer of the daemon would have to re-implement filter / lag / replay / pause; the server already has all the state; pushing fan-out client-side duplicates engineering and prevents server-side filtering optimisations.
-2. **Introduce `SubId` as the canonical channel key.** Each `resources/subscribe` call (or `ssh_subscribe` tool call — Phase 3) returns a UUIDv7 `sub_id`. Cursor, filter, lag policy, mpsc lane, and lifecycle handle key on `(SubId, Uri)`. Selected.
+2. **Introduce `SubId` as the canonical channel key.** Each `resources/subscribe` call (or `sub_open` tool call — Phase 3) returns a UUIDv7 `sub_id`. Cursor, filter, lag policy, mpsc lane, and lifecycle handle key on `(SubId, Uri)`. Selected.
 
 ## Decision
 
@@ -123,7 +123,7 @@ flowchart TD
 | `queue_high_watermark` | `AtomicUsize` | max observed depth |
 | `block_total_ms` | `AtomicU64` | cumulative time blocked (BlockSlow only) |
 
-Exposed via the new `ssh_sub_stats` MCP tool (Phase 3).
+Exposed via the new `sub_stats` MCP tool (Phase 3).
 
 ### Operations on a SubId
 
@@ -131,14 +131,14 @@ The new tool surface introduced in Phase 3:
 
 | Tool | Purpose |
 |---|---|
-| `ssh_subscribe` | Open a push channel. Returns `sub_id`. Accepts `lifetime` / `lag_policy` / `filter`. |
-| `ssh_unsubscribe` | Close a push channel. Triggers grace timer if last subscriber on the URI and `release_when_no_subs = true` (ADR 0003). |
-| `ssh_sub_pause` | Producer keeps emitting; consumer task suspends until resume. mpsc fills under the lane's lag policy. |
-| `ssh_sub_resume` | Resume drain. |
-| `ssh_sub_filter` | Hot-reload the lane's filter regex / level. |
-| `ssh_sub_replay` | Re-emit from a chosen cursor (within the ring buffer window). |
-| `ssh_sub_list` | Enumerate active sub_ids with summary stats. |
-| `ssh_sub_stats` | Per-sub_id counter snapshot. |
+| `sub_open` | Open a push channel. Returns `sub_id`. Accepts `lifetime` / `lag_policy` / `filter`. |
+| `sub_close` | Close a push channel. Triggers grace timer if last subscriber on the URI and `release_when_no_subs = true` (ADR 0003). |
+| `sub_pause` | Producer keeps emitting; consumer task suspends until resume. mpsc fills under the lane's lag policy. |
+| `sub_resume` | Resume drain. |
+| `sub_filter` | Hot-reload the lane's filter regex / level. |
+| `sub_replay` | Re-emit from a chosen cursor (within the ring buffer window). |
+| `sub_list` | Enumerate active sub_ids with summary stats. |
+| `sub_stats` | Per-sub_id counter snapshot. |
 
 The legacy `resources/subscribe` MCP path remains backward-compatible: it returns a `sub_id` synthesised by the registry, and the host can address the channel by sub_id going forward. Hosts that already use the v4 (PeerId-keyed) flow keep working — they receive notifications under `(PeerId, Uri)` semantics without addressing the new mux.
 

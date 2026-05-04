@@ -35,7 +35,7 @@ flowchart LR
     R5["Rule 5<br/>never hot-poll<br/>subscribe + drain"]
 
     C1["release_when_no_subs<br/>= true"]
-    C2["lifetime=auto-close<br/>+ ssh_unsubscribe"]
+    C2["lifetime=auto-close<br/>+ sub_close"]
     C3["lag_policy=snapshot<br/>(default)"]
     C4["stable agent_id<br/>+ try/finally"]
     C5["resources/subscribe<br/>+ cursor=auto"]
@@ -62,31 +62,31 @@ Long-running resources are `shell://<id>/output`, `command://<id>/output`, `tran
 
 **How to comply.**
 - Subscribe within 2 seconds of resource creation, OR
-- Pass `release_when_no_subs=true` when calling `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` so the server self-cleans after the configured grace window.
+- Pass `release_when_no_subs=true` when calling `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` so the server self-cleans after the configured grace window.
 
 ### Rule 2 — Always unsubscribe when done; track every `sub_id`
 
-Every `ssh_subscribe` (or legacy `resources/subscribe`) returns a `sub_id` keyed to a per-channel state bag (cursor, filter, lag policy, mpsc lane, stats). Forgetting `ssh_unsubscribe` keeps the lane alive until peer GC fires (default 30 s) or the parent session is disconnected. Multiplied across a long agent loop this leaks lanes and distorts `events_sent`.
+Every `sub_open` (or legacy `resources/subscribe`) returns a `sub_id` keyed to a per-channel state bag (cursor, filter, lag policy, mpsc lane, stats). Forgetting `sub_close` keeps the lane alive until peer GC fires (default 30 s) or the parent session is disconnected. Multiplied across a long agent loop this leaks lanes and distorts `events_sent`.
 
 **Violation.** Agent re-subscribes on every event-loop iteration without ever unsubscribing. After 100 turns the session has 100 `sub_id`s on a single URI, each with its own backlog and counters.
 
-**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscription its own bounded `mpsc::channel(N)` and a per-lane stats block. The server cannot reach into your conversation state to GC a stale `sub_id` — only explicit `ssh_unsubscribe` or peer-transport disconnect closes it.
+**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscription its own bounded `mpsc::channel(N)` and a per-lane stats block. The server cannot reach into your conversation state to GC a stale `sub_id` — only explicit `sub_close` or peer-transport disconnect closes it.
 
 **How to comply.**
-- After every `ssh_subscribe`, store the returned `sub_id` in conversation state until the matching `ssh_unsubscribe`.
-- On any error path that abandons the workflow, call `ssh_unsubscribe` for every outstanding `sub_id`, then `ssh_disconnect_agent`.
+- After every `sub_open`, store the returned `sub_id` in conversation state until the matching `sub_close`.
+- On any error path that abandons the workflow, call `sub_close` for every outstanding `sub_id`, then `ssh_disconnect_agent`.
 - Set `lifetime=auto-close` on the subscribe call so the server releases the resource cascade when the last consumer drops.
 
 ### Rule 3 — Watch `lag_drops` — switch to `lag_policy=snapshot` when drops > 0
 
-Every push lane carries atomic counters (`events_sent`, `bytes_sent`, `lagged_drops`, `lagged_recoveries`, `queue_depth`, `queue_high_watermark`, `block_total_ms`) exposed via `ssh_sub_stats`. Drops indicate the consumer cannot keep up. Ignoring them produces silent gaps.
+Every push lane carries atomic counters (`events_sent`, `bytes_sent`, `lagged_drops`, `lagged_recoveries`, `queue_depth`, `queue_high_watermark`, `block_total_ms`) exposed via `sub_stats`. Drops indicate the consumer cannot keep up. Ignoring them produces silent gaps.
 
 **Violation.** Agent sees `lagged_drops=42` on a lane, treats the marker as informational, keeps consuming as if nothing happened. Downstream logic that depends on strictly-monotonic event order silently corrupts.
 
 **Rationale.** [ADR 0006](./adr/0006-backpressure-policies.md) defines four lag policies. `Snapshot` (the default) bridges drops by dropping the lane backlog and rebuilding from the resource ring buffer. `BlockSlow` retains zero loss but blocks the producer; choose for forensic captures only.
 
 **How to comply.**
-- Query `ssh_sub_stats` periodically (or after a long-running phase).
+- Query `sub_stats` periodically (or after a long-running phase).
 - If `lagged_drops > 0` and the workflow tolerates a snapshot rebuild, ensure `lag_policy=snapshot` (the default).
 - If the workflow needs zero loss, switch to `lag_policy=block_slow` and adjust `SSH_BP_BLOCK_TIMEOUT_MS`.
 
@@ -112,7 +112,7 @@ The `agent_id` parameter passed at `ssh_connect` time scopes ownership of every 
 **Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscriber its own debounced push lane (200 ms coalesce, 1 s force flush, 30 s keepalive). Server does the work once; LLM consumes events as conversation context; cursor advances exactly as fast as the consumer needs.
 
 **How to comply.**
-- Use `resources/subscribe` (or `ssh_subscribe` once Phase 3 lands) immediately after `ssh_shell_open`.
+- Use `resources/subscribe` (or `sub_open` once Phase 3 lands) immediately after `ssh_shell_open`.
 - On each `notifications/resources/updated`, issue `resources/read?cursor=auto` and consume the delta.
 - Reserve `ssh_shell_read` for hosts that genuinely cannot subscribe; mark this in the agent's tool-selection logic.
 
@@ -128,36 +128,36 @@ SSH MCP v5.0. Subscribe-first. 28 tools.
 GOLDEN RULES:
  1. Long-running resource MUST have ≥1 subscriber.
     No subscriber? Pass release_when_no_subs=true.
- 2. ssh_unsubscribe(sub_id) when done. Track every sub_id.
- 3. lag_drops > 0 in ssh_sub_stats? Use lag_policy=snapshot.
+ 2. sub_close(sub_id) when done. Track every sub_id.
+ 3. lag_drops > 0 in sub_stats? Use lag_policy=snapshot.
  4. On error: ssh_disconnect_agent(agent_id) wipes your scope.
- 5. NEVER hot-poll ssh_shell_read. Use ssh_subscribe + drain.
+ 5. NEVER hot-poll ssh_shell_read. Use sub_open + drain.
 
 PUSH-FIRST HAPPY PATHS:
 1) Async cmd:
-   ssh_connect -> ssh_execute(release_when_no_subs=true)
-   -> ssh_subscribe(uri=command://<cid>/output, lifetime=auto-close)
+   ssh_connect -> ssh_exec(release_when_no_subs=true)
+   -> sub_open(uri=command://<cid>/output, lifetime=auto-close)
    -> drain events until ev=completed.
 2) Interactive shell:
    ssh_connect -> ssh_shell_open(release_when_no_subs=true)
-   -> ssh_subscribe(uri=shell://<sid>/output)
-   -> ssh_shell_write / ssh_shell_send_key.
+   -> sub_open(uri=shell://<sid>/output)
+   -> ssh_shell_write / ssh_shell_press.
 3) Upload + progress:
    ssh_upload(release_when_no_subs=true)
-   -> ssh_subscribe(uri=transfer://<tid>/progress).
+   -> sub_open(uri=transfer://<tid>/progress).
 
 FALLBACK:
-4) ssh_execute -> ssh_get_command_output(wait=true,
+4) ssh_exec -> ssh_exec_output(wait=true,
                                          wait_timeout_secs=30).
    (Use when host lacks subscribe support; reuses session.)
 5) ssh_run (PENALIZED: connect+exec+disconnect every call).
    Pays full handshake (200-2000 ms) + tears session. Only when
    you will NEVER touch this host again. Two ssh_run calls cost
-   as much as one ssh_connect + two ssh_execute calls.
+   as much as one ssh_connect + two ssh_exec calls.
 
 CLEANUP CHECKLIST (run at workflow end):
- [ ] ssh_unsubscribe every sub_id you opened
- [ ] ssh_shell_close / ssh_cancel_command if not auto-close
+ [ ] sub_close every sub_id you opened
+ [ ] ssh_shell_close / ssh_exec_cancel if not auto-close
  [ ] ssh_disconnect_agent(agent_id) on error
  [ ] ssh_disconnect for graceful single-session close
 
@@ -221,10 +221,10 @@ GOLDEN RULES:
    close. If you cannot guarantee a subscriber, set
    release_when_no_subs=true at creation time so the server
    self-cleans after the configured grace window.
-2. Track every sub_id returned by ssh_subscribe (or the legacy
-   resources/subscribe). Call ssh_unsubscribe(sub_id) before the
+2. Track every sub_id returned by sub_open (or the legacy
+   resources/subscribe). Call sub_close(sub_id) before the
    workflow ends. Forgotten subs leak lanes until peer GC fires.
-3. After every nontrivial workflow query ssh_sub_stats. If
+3. After every nontrivial workflow query sub_stats. If
    lagged_drops > 0, choose between lag_policy=snapshot (default,
    gap-bridging via ring buffer rebuild) and lag_policy=block_slow
    (zero loss, producer blocks; needs SSH_BP_BLOCK_TIMEOUT_MS).
@@ -232,7 +232,7 @@ GOLDEN RULES:
    idempotent and cascades through every owned session and resource.
    Pass a stable agent_id at ssh_connect time so the cleanup boundary
    is unambiguous.
-5. Never poll ssh_shell_read in a loop. Use ssh_subscribe and consume
+5. Never poll ssh_shell_read in a loop. Use sub_open and consume
    notifications/resources/updated events; issue resources/read?
    cursor=auto to drain the delta.
 
@@ -240,29 +240,29 @@ PUSH-FIRST HAPPY PATHS (preferred):
 
 1) Run an async command with push:
    ssh_connect(host, user, agent_id, reuse=Auto)
-   -> ssh_execute(session_id, command, release_when_no_subs=true)
-   -> ssh_subscribe(uri=command://<cid>/output,
+   -> ssh_exec(session_id, command, release_when_no_subs=true)
+   -> sub_open(uri=command://<cid>/output,
                     lifetime=auto-close, lag_policy=snapshot)
    -> consume push events until ev=completed (carries exit code).
-   -> ssh_unsubscribe(sub_id)  // optional with auto-close
+   -> sub_close(sub_id)  // optional with auto-close
 
 2) Drive an interactive PTY shell:
    ssh_connect(...) -> ssh_shell_open(release_when_no_subs=true)
-   -> ssh_subscribe(uri=shell://<sid>/output, lifetime=auto-close)
-   -> ssh_shell_write or ssh_shell_send_key
+   -> sub_open(uri=shell://<sid>/output, lifetime=auto-close)
+   -> ssh_shell_write or ssh_shell_press
    -> ssh_shell_wait_for(pattern) when synchronisation needed
    -> ssh_shell_close (or rely on auto-close when last sub drops)
 
 3) Upload with progress visibility:
    ssh_upload(release_when_no_subs=true) returns transfer_id
-   -> ssh_subscribe(uri=transfer://<tid>/progress, lifetime=auto-close)
+   -> sub_open(uri=transfer://<tid>/progress, lifetime=auto-close)
    -> consume bytes_transferred events until completion event.
 
 FALLBACK PATHS:
 
 4) Wait-on-result (PREFERRED FALLBACK — reuses session):
-   ssh_connect(reuse=auto) -> ssh_execute(...) returns command_id
-   -> ssh_get_command_output(command_id, wait=true,
+   ssh_connect(reuse=auto) -> ssh_exec(...) returns command_id
+   -> ssh_exec_output(command_id, wait=true,
                              wait_timeout_secs=30) blocks until
    completion or timeout. Use when host has no subscribe support.
    Keeps the session alive for the next call.
@@ -271,20 +271,20 @@ FALLBACK PATHS:
    ssh_run(address, username, command [, disconnect_after=true])
    pays a full SSH handshake (200-2000 ms) and tears the session
    down on every call. Two ssh_run calls cost as much as one
-   ssh_connect + two ssh_execute calls. Acceptable ONLY when you
+   ssh_connect + two ssh_exec calls. Acceptable ONLY when you
    will NEVER touch this host again (e.g. one-shot capability sniff
    across many distinct hosts, N=1 command per host). For any reuse
    default to path 1.
 
 TRADEOFF GUIDE:
 
-lifetime parameter on ssh_subscribe:
-- "manual"     -> ssh_unsubscribe required; no auto-close.
+lifetime parameter on sub_open:
+- "manual"     -> sub_close required; no auto-close.
                   Use for human-driven debugging where the resource
                   must outlive a transient agent.
 - "auto-close" -> last sub triggers grace timer; resource releases.
                   Use for one-off LLM workflows. Default for new code.
-- "lease"      -> bounded duration; renew with ssh_sub_resume.
+- "lease"      -> bounded duration; renew with sub_resume.
                   Use for budget-capped agents.
 
 lag_policy parameter (per sub_id):
@@ -299,8 +299,8 @@ lag_policy parameter (per sub_id):
                   too expensive (e.g. 16 MB ring buffers).
 
 CLEANUP CHECKLIST (run at every workflow boundary):
-- ssh_unsubscribe every sub_id you opened (or rely on lifetime=auto-close).
-- ssh_shell_close / ssh_cancel_command for any resource without auto-close.
+- sub_close every sub_id you opened (or rely on lifetime=auto-close).
+- ssh_shell_close / ssh_exec_cancel for any resource without auto-close.
 - ssh_disconnect_agent(agent_id) on any error path.
 - ssh_disconnect for graceful single-session close.
 
@@ -321,7 +321,7 @@ ERROR TAXONOMY:
 - REMOTE     decide based on remote exit code.
 - RESOURCE   never retry. The resource is gone or never existed.
 - POLICY     retry conditional on policy change (e.g. switch
-             lag_policy, raise SSH_LANE_BUFFER, audit ssh_sub_list).
+             lag_policy, raise SSH_LANE_BUFFER, audit sub_list).
 - STATE      retry only with a fresh _meta.idempotency_key.
 - INTERNAL   never retry; collect logs + report.
 
@@ -337,10 +337,10 @@ The single most important table. Pick the star-marked path whenever the host adv
 
 | What you want                                      | Tool / Pattern                                                |
 | -------------------------------------------------- | ------------------------------------------------------------- |
-| Run a one-shot remote command (host you may revisit) | `ssh_connect(reuse=auto)` -> `ssh_execute` -> `ssh_subscribe command://<id>/output` *  |
+| Run a one-shot remote command (host you may revisit) | `ssh_connect(reuse=auto)` -> `ssh_exec` -> `sub_open command://<id>/output` *  |
 | Run a one-shot remote command (single-touch host)  | `ssh_run` (PENALIZED: full handshake + teardown per call)     |
 | Open an interactive shell                          | `ssh_shell_open` + `resources/subscribe shell://<id>/output` * |
-| Send `Ctrl+C`, arrows, function keys               | `ssh_shell_send_key`                                          |
+| Send `Ctrl+C`, arrows, function keys               | `ssh_shell_press`                                          |
 | Send raw text input                                | `ssh_shell_write`                                             |
 | Watch shell output realtime                        | `resources/subscribe` + `resources/read?cursor=auto` *        |
 | Wait for a specific prompt (gate)                  | `ssh_shell_wait_for`                                          |
@@ -350,12 +350,12 @@ The single most important table. Pick the star-marked path whenever the host adv
 | Watch session health changes                       | `resources/subscribe session://<id>/health` *                 |
 | Watch port-forward events                          | `resources/subscribe forward://<id>/events` *                 |
 | Upload / download a file                           | `ssh_upload` / `ssh_download`                                 |
-| Cancel a long-running command                      | `ssh_cancel_command`                                          |
+| Cancel a long-running command                      | `ssh_exec_cancel`                                          |
 | Forward a TCP port                                 | `ssh_forward` (feature-gated)                                 |
 | Cleanup all sessions for an agent                  | `ssh_disconnect_agent`                                        |
 | Disconnect a single session cleanly                | `ssh_disconnect`                                              |
-| Discover existing SESSION_IDs                      | `ssh_list_sessions`                                           |
-| Check what is still running before disconnect      | `ssh_list_commands`                                           |
+| Discover existing SESSION_IDs                      | `ssh_sessions`                                           |
+| Check what is still running before disconnect      | `ssh_commands`                                           |
 
 \* = preferred path (lowest latency, lowest token cost).
 
@@ -449,7 +449,7 @@ sequenceDiagram
     Server-->>Host: text + _meta {kind, cursor, buffer_size, last_seq, status}
     Host-->>LLM: new bytes
 
-    LLM->>Host: ssh_shell_send_key ctrl_c
+    LLM->>Host: ssh_shell_press ctrl_c
     LLM->>Host: ssh_shell_close (shell_id)
     LLM->>Host: ssh_disconnect (session_id)
 ```
@@ -459,7 +459,7 @@ sequenceDiagram
 1. **Connect** with `ssh_connect`. Pass `agent_id` (groups sessions for bulk cleanup) and `reuse=auto` (pick the most recent healthy match in one round-trip). Capture `SESSION_ID`. Watch the response for an `EXPIRES_AT` line — RFC3339 deadline at which the inactivity sweeper will reap the session unless you ping it.
 2. **Open the PTY** with `ssh_shell_open`. Capture `SHELL_ID`.
 3. **Subscribe immediately** to `shell://<SHELL_ID>/output` — before sending any input. The very first byte the remote emits triggers `notifications/resources/updated` instead of polling.
-4. **Drive input** with `ssh_shell_write` (text) or `ssh_shell_send_key` (named keys). Both are non-blocking.
+4. **Drive input** with `ssh_shell_write` (text) or `ssh_shell_press` (named keys). Both are non-blocking.
 5. **Read the delta** with `resources/read?cursor=auto` whenever you receive `notifications/resources/updated`. Per-peer cursor on the server, so each read is just the new bytes.
 6. **Gate on prompts** with `ssh_shell_wait_for` only when you need a single-shot gate (for example before sending the next command). For continuous observation prefer the subscribe loop.
 7. **Close cleanly** with `ssh_shell_close`, then `ssh_disconnect` (or `ssh_disconnect_agent`).
@@ -470,8 +470,8 @@ Some hosts do not consume MCP notifications. Fallback paths:
 
 - **Continuous shell observation** -> `ssh_shell_read` with `wait=true` and `min_bytes` (default 1, cap = `max_output_bytes`).
 - **Single-shot prompt gating** -> `ssh_shell_wait_for` (always works regardless of subscribe support).
-- **Async command completion** -> `ssh_get_command_output` with `wait=true` (default 30 s, cap 300 s).
-- **Transfer completion** -> `ssh_get_transfer_progress` with `wait=true`.
+- **Async command completion** -> `ssh_exec_output` with `wait=true` (default 30 s, cap 300 s).
+- **Transfer completion** -> `ssh_transfer_progress` with `wait=true`.
 
 Even on the fallback path, prefer the long-poll `wait=true` variants over a tight loop of `wait=false` polls — long-poll wakes immediately on real activity and idles cheaply otherwise.
 
@@ -483,22 +483,22 @@ Three signals that small LLMs can use to keep a session pool tidy without leakin
 
 Pass `agent_id` on every `ssh_connect` to group sessions under a logical owner:
 
-- `ssh_list_sessions { agent_id }` filters to that owner.
+- `ssh_sessions { agent_id }` filters to that owner.
 - `ssh_disconnect_agent { agent_id }` bulk-disconnects every session owned by that agent — cancelling commands, closing shells, aborting transfers.
 - When `agent_id` is set on `ssh_connect`, `reuse=auto` and `reuse=suggest` rank sessions owned by the same agent first.
 
 ### `EXPIRES_AT` / `PERSISTENT`
 
-`ssh_connect` and `ssh_list_sessions` emit one of two mutually exclusive lines per session:
+`ssh_connect` and `ssh_sessions` emit one of two mutually exclusive lines per session:
 
 - `EXPIRES_AT: <RFC3339 UTC>` — deadline at which the inactivity sweeper will reap the session. Clock starts at `connected_at` and resets on activity.
 - `PERSISTENT: true` — the caller passed `persistent=true` on connect; the inactivity sweeper is disabled and `EXPIRES_AT` is omitted.
 
-Extend a session before `EXPIRES_AT` fires by running any cheap call (a colon ping `ssh_execute ":"`, `ssh_list_sessions`, etc.). Each touch resets the timer.
+Extend a session before `EXPIRES_AT` fires by running any cheap call (a colon ping `ssh_exec ":"`, `ssh_sessions`, etc.). Each touch resets the timer.
 
 ### `HINT:` lines
 
-When more than 5 sessions are owned by the same `agent_id` (anti-leak threshold), `ssh_list_sessions` and `ssh_connect SUGGESTED` append:
+When more than 5 sessions are owned by the same `agent_id` (anti-leak threshold), `ssh_sessions` and `ssh_connect SUGGESTED` append:
 
 ```
 HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup
@@ -527,35 +527,35 @@ AGENT_ID: claude-code-1
 RETRY: 0
 PERSISTENT: false
 EXPIRES_AT: 2026-05-03T18:30:00+00:00
-NEXT: ssh_execute(session_id=s-abc, command=...) | ssh_shell_open(session_id=s-abc) | ssh_disconnect(session_id=s-abc)
+NEXT: ssh_exec(session_id=s-abc, command=...) | ssh_shell_open(session_id=s-abc) | ssh_disconnect(session_id=s-abc)
 ```
 
 #### Coverage matrix
 
 | Status | NEXT: emitted? | Hint string |
 | --- | --- | --- |
-| `SSH_CONNECT: OK` / `REUSED` | yes | `ssh_execute` / `ssh_shell_open` / `ssh_disconnect` |
+| `SSH_CONNECT: OK` / `REUSED` | yes | `ssh_exec` / `ssh_shell_open` / `ssh_disconnect` |
 | `SSH_CONNECT: SUGGESTED` | yes | reuse existing `session_id` or retry with `force_new` |
-| `SSH_LIST_SESSIONS: OK` (non-empty) | yes | `ssh_disconnect_agent` (when agent owns sessions) / `ssh_disconnect` |
+| `SSH_SESSIONS: OK` (non-empty) | yes | `ssh_disconnect_agent` (when agent owns sessions) / `ssh_disconnect` |
 | `SSH_DISCONNECT: OK` / `SSH_DISCONNECT_AGENT: OK` | no (terminal) | — |
-| `SSH_EXECUTE: STARTED` | yes | `ssh_get_command_output(wait=true)` / `ssh_cancel_command` |
-| `SSH_EXECUTE: COMPLETED` | no (terminal) | — |
-| `SSH_GET_COMMAND_OUTPUT: RUNNING` | yes | `resources/subscribe command://<id>/output` / `ssh_get_command_output(wait=true)` |
-| `SSH_GET_COMMAND_OUTPUT: COMPLETED` | no (terminal) | — |
-| `SSH_LIST_COMMANDS: OK` | no | — |
-| `SSH_CANCEL_COMMAND: OK` / `NOOP` | no (terminal) | — |
-| `SSH_SHELL_OPEN: OK` | yes | `resources/subscribe shell://<id>/output` / `ssh_shell_write` / `ssh_shell_send_key` |
+| `SSH_EXEC: STARTED` | yes | `ssh_exec_output(wait=true)` / `ssh_exec_cancel` |
+| `SSH_EXEC: COMPLETED` | no (terminal) | — |
+| `SSH_EXEC_OUTPUT: RUNNING` | yes | `resources/subscribe command://<id>/output` / `ssh_exec_output(wait=true)` |
+| `SSH_EXEC_OUTPUT: COMPLETED` | no (terminal) | — |
+| `SSH_COMMANDS: OK` | no | — |
+| `SSH_EXEC_CANCEL: OK` / `NOOP` | no (terminal) | — |
+| `SSH_SHELL_OPEN: OK` | yes | `resources/subscribe shell://<id>/output` / `ssh_shell_write` / `ssh_shell_press` |
 | `SSH_SHELL_WRITE: OK` | yes | `resources/read shell://<id>/output?cursor=auto` / `ssh_shell_wait_for` / `ssh_shell_read` |
-| `SSH_SHELL_SEND_KEY: OK` | yes | `resources/read shell://<id>/output?cursor=auto` / `ssh_shell_wait_for` / `ssh_shell_read` |
+| `SSH_SHELL_PRESS: OK` | yes | `resources/read shell://<id>/output?cursor=auto` / `ssh_shell_wait_for` / `ssh_shell_read` |
 | `SSH_SHELL_READ: OK` | no | — |
-| `SSH_SHELL_WAIT_FOR: MATCHED` | yes | `ssh_shell_write` / `ssh_shell_send_key` / `ssh_shell_close` |
+| `SSH_SHELL_WAIT_FOR: MATCHED` | yes | `ssh_shell_write` / `ssh_shell_press` / `ssh_shell_close` |
 | `SSH_SHELL_WAIT_FOR: TIMEOUT` | yes | `ssh_shell_wait_for` / `ssh_shell_read` / `ssh_shell_close` |
 | `SSH_SHELL_WAIT_FOR: CLOSED` | no (terminal) | — |
 | `SSH_SHELL_CLOSE: OK` | no (terminal) | — |
-| `SSH_UPLOAD: STARTED` | yes | `ssh_get_transfer_progress(wait=true)` |
-| `SSH_DOWNLOAD: STARTED` | yes | `ssh_get_transfer_progress(wait=true)` |
-| `SSH_GET_TRANSFER_PROGRESS: RUNNING` | yes | `resources/subscribe transfer://<id>/progress` / `ssh_get_transfer_progress(wait=true)` |
-| `SSH_GET_TRANSFER_PROGRESS: COMPLETED` / `FAILED` / `CANCELLED` | no (terminal) | — |
+| `SSH_UPLOAD: STARTED` | yes | `ssh_transfer_progress(wait=true)` |
+| `SSH_DOWNLOAD: STARTED` | yes | `ssh_transfer_progress(wait=true)` |
+| `SSH_TRANSFER_PROGRESS: RUNNING` | yes | `resources/subscribe transfer://<id>/progress` / `ssh_transfer_progress(wait=true)` |
+| `SSH_TRANSFER_PROGRESS: COMPLETED` / `FAILED` / `CANCELLED` | no (terminal) | — |
 | `SSH_FORWARD: OK` | yes | `resources/subscribe forward://<id>/events` |
 
 Terminal statuses deliberately omit `NEXT:` — the model's next move depends entirely on the user prompt.
@@ -565,7 +565,7 @@ Terminal statuses deliberately omit `NEXT:` — the model's next move depends en
 Every async-spawn response carries a subscribe-first `HINT:` line steering toward push notifications:
 
 - `SSH_SHELL_OPEN: OK` -> `HINT: subscribe to shell://<id>/output for realtime output (preferred over polling)`
-- `SSH_EXECUTE: STARTED` -> `HINT: subscribe to command://<id>/output for realtime output (preferred over polling)`
+- `SSH_EXEC: STARTED` -> `HINT: subscribe to command://<id>/output for realtime output (preferred over polling)`
 - `SSH_UPLOAD: STARTED` and `SSH_DOWNLOAD: STARTED` -> `HINT: subscribe to transfer://<id>/progress for realtime progress`
 - `SSH_FORWARD: OK` -> `HINT: subscribe to forward://<id>/events for realtime event log`
 
@@ -586,7 +586,7 @@ Every tool response carries BOTH the existing block-style Markdown (`content[].t
   "port": 22,
   "username": "alice",
   "agent_id": "claude-code-1",
-  "next": ["ssh_execute(session_id=a3f2b1d7-..., command=...)",
+  "next": ["ssh_exec(session_id=a3f2b1d7-..., command=...)",
            "ssh_shell_open(session_id=a3f2b1d7-...)",
            "ssh_disconnect(session_id=a3f2b1d7-...)"]
 }
@@ -596,7 +596,7 @@ Error shape:
 
 ```json
 {
-  "tool": "ssh_execute",
+  "tool": "ssh_exec",
   "status": "error",
   "code": "SESSION_NOT_FOUND",
   "reason": "no session with id sess-x",
@@ -617,9 +617,9 @@ Defaults:
 - Key length cap: `256` bytes. Oversized keys raise `IDEMPOTENCY_KEY_TOO_LONG`.
 - Empty keys are treated as absent (idempotency OFF for that call).
 
-15 mutating tools honour the key: `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_disconnect_many`, `ssh_execute`, `ssh_execute_batch`, `ssh_run`, `ssh_cancel_command`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`.
+15 mutating tools honour the key: `ssh_connect`, `ssh_disconnect`, `ssh_disconnect_agent`, `ssh_disconnect_many`, `ssh_exec`, `ssh_exec_batch`, `ssh_run`, `ssh_exec_cancel`, `ssh_shell_open`, `ssh_shell_write`, `ssh_shell_press`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`.
 
-Read-only tools intentionally ignore the key: `ssh_list_sessions`, `ssh_list_commands`, `ssh_get_command_output`, `ssh_get_transfer_progress`, `ssh_shell_read`, `ssh_shell_wait_for`.
+Read-only tools intentionally ignore the key: `ssh_sessions`, `ssh_commands`, `ssh_exec_output`, `ssh_transfer_progress`, `ssh_shell_read`, `ssh_shell_wait_for`.
 
 Request envelope:
 
@@ -644,8 +644,8 @@ When a request includes `_meta.progressToken`, the server fires periodic `notifi
 
 | Tool | Cadence | Payload |
 | --- | --- | --- |
-| `ssh_get_command_output(wait=true)` | 5 s | `{ progress: <stdout_bytes>, total: null, message: "command running" }` |
-| `ssh_get_transfer_progress(wait=true)` | 5 s | `{ progress: <bytes_transferred>, total: <total_bytes>, message: "transfer running" }` |
+| `ssh_exec_output(wait=true)` | 5 s | `{ progress: <stdout_bytes>, total: null, message: "command running" }` |
+| `ssh_transfer_progress(wait=true)` | 5 s | `{ progress: <bytes_transferred>, total: <total_bytes>, message: "transfer running" }` |
 | `ssh_shell_wait_for` | 1 s | `{ progress: <elapsed_secs>, total: <timeout_secs>, message: "waiting for pattern" }` |
 
 Notification errors are swallowed (transport hiccup, peer closed). When `_meta.progressToken` is absent, every emit is a no-op.
@@ -655,7 +655,7 @@ Notification errors are swallowed (transport hiccup, peer closed). When `_meta.p
 When `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires and the relevant repo holds at least one live entry, the `DETAIL:` line carries `closest matches: <id1>, <id2>, <id3>` (top-3 Levenshtein neighbors). Smaller LLMs recover from typos without round-tripping `ssh_list_*`.
 
 ```
-SSH_EXECUTE: ERROR
+SSH_EXEC: ERROR
 REASON: [SESSION_NOT_FOUND] no session with id sess-abe
 DETAIL: closest matches: sess-abc, sess-abd, sess-abf
 ```
@@ -677,17 +677,17 @@ flowchart LR
     SID(SESSION_ID)
     Connect --> SID
 
-    SID --> Exec[ssh_execute]
+    SID --> Exec[ssh_exec]
     Exec --> CID(COMMAND_ID)
-    CID --> CmdOut[ssh_get_command_output]
+    CID --> CmdOut[ssh_exec_output]
     CID -.subscribe.-> CmdRes((command://CID/output))
-    CID --> Cancel[ssh_cancel_command]
+    CID --> Cancel[ssh_exec_cancel]
 
     SID --> ShellOpen[ssh_shell_open]
     ShellOpen --> ShID(SHELL_ID)
     ShID -.subscribe.-> ShRes((shell://ShID/output))
     ShID --> ShWrite[ssh_shell_write]
-    ShID --> ShKey[ssh_shell_send_key]
+    ShID --> ShKey[ssh_shell_press]
     ShID --> ShWait[ssh_shell_wait_for]
     ShID --> ShRead[ssh_shell_read]
     ShID --> ShClose[ssh_shell_close]
@@ -697,7 +697,7 @@ flowchart LR
     Up --> TID(TRANSFER_ID)
     Down --> TID
     TID -.subscribe.-> TRes((transfer://TID/progress))
-    TID --> TPoll[ssh_get_transfer_progress]
+    TID --> TPoll[ssh_transfer_progress]
 
     SID --> Fwd[ssh_forward]
     Fwd --> FID(FORWARD_ID)
@@ -713,8 +713,8 @@ flowchart LR
 - **Use `?cursor=auto`** on `resources/read` so the server tracks the per-peer delta — every read returns just the new bytes.
 - **Tune `max_output_bytes`** when falling back to `ssh_shell_read`. Default is 16 KiB; cap is 1 MiB (`SSH_MCP_OUTPUT_DEFAULT_BYTES` / `SSH_MCP_OUTPUT_MAX_BYTES_CAP`).
 - **Prefer `ssh_shell_wait_for` with multi-pattern** over multiple sequential reads when branching logic depends on which prompt appears. Example: `["password:", "Permission denied", "$ "]` resolves three login outcomes in one tool call.
-- **Use `ssh_list_sessions` once** at the start of a long task, then trust your `SESSION_ID`s for the rest of the session.
-- **Filter `ssh_list_commands` with `status="running"`** when you only care about live work — the response is shorter.
+- **Use `ssh_sessions` once** at the start of a long task, then trust your `SESSION_ID`s for the rest of the session.
+- **Filter `ssh_commands` with `status="running"`** when you only care about live work — the response is shorter.
 
 ---
 
@@ -782,15 +782,15 @@ Drive `ssh_run` with `reuse=auto` and `disconnect_after=true` to execute a short
 Snapshot async commands on a known session, read its health resource, then disconnect.
 
 - **Args**: `session_id` (required).
-- **Sequence**: `ssh_list_commands` → `resources/read session://<id>/health` → `ssh_disconnect`.
-- **Failure modes**: `[SESSION_NOT_FOUND]` (RESOURCE, never retry; use `ssh_list_sessions` to find the live id).
+- **Sequence**: `ssh_commands` → `resources/read session://<id>/health` → `ssh_disconnect`.
+- **Failure modes**: `[SESSION_NOT_FOUND]` (RESOURCE, never retry; use `ssh_sessions` to find the live id).
 
 #### `upload_and_verify`
 
 Run `ssh_upload`, wait for completion, then `ssh_run sha256sum` on the remote path.
 
 - **Args**: `address`, `username`, `local_path`, `remote_path` (all required).
-- **Sequence**: `ssh_upload` → `ssh_get_transfer_progress(wait=true)` → `ssh_run sha256sum <remote_path>`. v5.0 prefers `push_first_file_transfer` (subscribe instead of poll).
+- **Sequence**: `ssh_upload` → `ssh_transfer_progress(wait=true)` → `ssh_run sha256sum <remote_path>`. v5.0 prefers `push_first_file_transfer` (subscribe instead of poll).
 - **Failure modes**: `[SFTP_ERROR]` (REMOTE; permission denied vs disk full); `[TRANSFER_NOT_FOUND]` (RESOURCE).
 
 #### `interactive_shell_drive`
@@ -816,7 +816,7 @@ Call `ssh_disconnect_agent(agent_id)` to wipe every session and resource the age
 Execute a long-running async command with subscription-based event drain. Resource auto-closes when the last subscriber drops.
 
 - **Args**: `session_id`, `command` (required); `lag_policy` (default `"snapshot"`, one of `block_slow | drop_oldest | drop_newest | snapshot`).
-- **Sequence**: `ssh_execute(release_when_no_subs=true)` → `ssh_subscribe(uri=command://<cid>/output, lifetime=auto-close, lag_policy=<arg>)` → push events until `ev=completed{exit:N}`.
+- **Sequence**: `ssh_exec(release_when_no_subs=true)` → `sub_open(uri=command://<cid>/output, lifetime=auto-close, lag_policy=<arg>)` → push events until `ev=completed{exit:N}`.
 - **Failure modes**: `[SUB_LEAK_RISK]` (POLICY, warn — subscribe missing and `release_when_no_subs=true` not set); `[LANE_BUFFER_FULL]` (raise `SSH_LANE_BUFFER` or switch to `snapshot`); `[REMOTE_CMD_FAILED]` (exit code in `ev=completed`).
 
 ```ndjson
@@ -831,10 +831,10 @@ Execute a long-running async command with subscription-based event drain. Resour
 
 #### `push_first_interactive_shell`
 
-Open a PTY shell, subscribe before writing, drive it via `ssh_shell_write` / `ssh_shell_send_key`, synchronise on `ssh_shell_wait_for`. Resource auto-closes when the last subscriber drops.
+Open a PTY shell, subscribe before writing, drive it via `ssh_shell_write` / `ssh_shell_press`, synchronise on `ssh_shell_wait_for`. Resource auto-closes when the last subscriber drops.
 
 - **Args**: `session_id`, `prompt_pattern` (regex), `script` (array of strings — one per line to write between waits).
-- **Sequence**: `ssh_shell_open(release_when_no_subs=true)` → `ssh_subscribe(uri=shell://<sid>/output, lifetime=auto-close)` → for each script line: `ssh_shell_wait_for(prompt_pattern)` → `ssh_shell_write(line)` → consume push events. Final `ssh_unsubscribe` is optional under `lifetime=auto-close`.
+- **Sequence**: `ssh_shell_open(release_when_no_subs=true)` → `sub_open(uri=shell://<sid>/output, lifetime=auto-close)` → for each script line: `ssh_shell_wait_for(prompt_pattern)` → `ssh_shell_write(line)` → consume push events. Final `sub_close` is optional under `lifetime=auto-close`.
 - **Failure modes**: `[SHELL_NOT_FOUND]` (RESOURCE); `[SUB_LEAK_RISK]` (subscribe delayed past `SSH_SUB_LEAK_RISK_WARN_S`); `[LAG_DETECTED]` / `[LAG_BACKPRESSURE]` (tune `lag_policy` or consume faster).
 
 #### `push_first_file_transfer`
@@ -842,7 +842,7 @@ Open a PTY shell, subscribe before writing, drive it via `ssh_shell_write` / `ss
 Upload a file with subscription-based progress visibility; verify remotely when the transfer completes.
 
 - **Args**: `session_id`, `local_path`, `remote_path` (required); `verify` (default `true` — runs `sha256sum` after completion).
-- **Sequence**: `ssh_upload(release_when_no_subs=true)` → `ssh_subscribe(uri=transfer://<tid>/progress, lifetime=auto-close)` → consume `ev=transfer_progress` until `bytes_transferred == total_bytes` → optional `ssh_run sha256sum <remote_path>`.
+- **Sequence**: `ssh_upload(release_when_no_subs=true)` → `sub_open(uri=transfer://<tid>/progress, lifetime=auto-close)` → consume `ev=transfer_progress` until `bytes_transferred == total_bytes` → optional `ssh_run sha256sum <remote_path>`.
 - **Failure modes**: `[SFTP_ERROR]` (REMOTE — permission / disk / quota); `[TRANSFER_NOT_FOUND]` (RESOURCE); `[RING_BUFFER_OVERFLOW]` (rare).
 
 #### `subscription_hygiene_audit`
@@ -850,7 +850,7 @@ Upload a file with subscription-based progress visibility; verify remotely when 
 Enumerate every active `sub_id`, surface stale subscriptions, unsubscribe the leakers.
 
 - **Args**: `agent_id` (optional — restrict to subs owned by the agent); `stale_threshold_secs` (default 60).
-- **Sequence**: `ssh_sub_list` → client filters stale subs → `ssh_unsubscribe(sub_id)` for each.
+- **Sequence**: `sub_list` → client filters stale subs → `sub_close(sub_id)` for each.
 - **Failure modes**: `[SUB_NOT_FOUND]` — sub already cleaned; treat as success.
 
 #### `chaos_resume_after_disconnect`
@@ -858,8 +858,8 @@ Enumerate every active `sub_id`, surface stale subscriptions, unsubscribe the le
 Reconnect after an unexpected transport drop and replay the lost segment of a known resource from a recorded cursor. Useful for long shells or audit-log streams that survive transient host crashes.
 
 - **Args**: `address`, `username`, `agent_id` (same as prior session), `uri`, `from_cursor` (last confirmed cursor).
-- **Sequence**: `ssh_connect` (`reuse=Auto` short-circuits if the prior session is live) → `ssh_subscribe(uri, lifetime=auto-close)` → `ssh_sub_replay(sub_id, from_cursor)` re-emits buffered events → consumer drains forward.
-- **Failure modes**: `[RESOURCE_GONE]` (RESOURCE — released during disconnect window; recreate via `ssh_shell_open` / `ssh_execute` and resume from a fresh cursor); `[RING_BUFFER_OVERFLOW]` (POLICY, recover — cursor predates the available window).
+- **Sequence**: `ssh_connect` (`reuse=Auto` short-circuits if the prior session is live) → `sub_open(uri, lifetime=auto-close)` → `sub_replay(sub_id, from_cursor)` re-emits buffered events → consumer drains forward.
+- **Failure modes**: `[RESOURCE_GONE]` (RESOURCE — released during disconnect window; recreate via `ssh_shell_open` / `ssh_exec` and resume from a fresh cursor); `[RING_BUFFER_OVERFLOW]` (POLICY, recover — cursor predates the available window).
 
 ---
 
@@ -897,52 +897,52 @@ flowchart LR
 
 ### #2 — Open then forget
 
-**Symptom.** LLM opens a long-running resource (`ssh_shell_open`, `ssh_execute`, `ssh_upload`), never subscribes, never closes.
+**Symptom.** LLM opens a long-running resource (`ssh_shell_open`, `ssh_exec`, `ssh_upload`), never subscribes, never closes.
 **Why bad.** Pure leak. Remote PTY or process keeps consuming resources; per-resource ring buffer fills and head-drops. Inactivity TTL eventually fires, but operator-visible state diverges from LLM internal model.
 **Fix.** Either subscribe within `SSH_SUB_LEAK_RISK_WARN_S` (default 2 s) of resource creation, or pass `release_when_no_subs=true` so the server releases automatically after the configured grace window.
 **Detection.** A `WARN: SUB_LEAK_RISK` line appended to subsequent `ssh_list_*` responses naming the resource; same warning emitted as `{"ev":"warn","code":"SUB_LEAK_RISK",...}` on the daemon NDJSON channel.
 
 ### #3 — Re-subscribe on every iteration
 
-**Symptom.** LLM calls `ssh_subscribe` on the same URI for every iteration of an event loop, never tracks the returned `sub_id`, never unsubscribes.
+**Symptom.** LLM calls `sub_open` on the same URI for every iteration of an event loop, never tracks the returned `sub_id`, never unsubscribes.
 **Why bad.** Each call mints a fresh `sub_id` with its own state bag (cursor, filter, lag policy, mpsc lane, atomic counters). After 100 iterations the resource has 100 lanes, 100 cursors, 100 sets of stats. Memory grows linearly. Stats become useless because `events_sent` is split across N lanes the client cannot aggregate.
-**Fix.** Subscribe once per resource per workflow. Track the `sub_id` in the model's working state. Unsubscribe at workflow end. If the workflow rebinds the URI to a fresh consumer, call `ssh_unsubscribe(old_sub_id)` before the new `ssh_subscribe`.
-**Detection.** `ssh_sub_list` returns multiple subs for the same URI under the same agent. `MAX_SUBS_PER_URI_EXCEEDED` fires when the per-URI cap is hit.
+**Fix.** Subscribe once per resource per workflow. Track the `sub_id` in the model's working state. Unsubscribe at workflow end. If the workflow rebinds the URI to a fresh consumer, call `sub_close(old_sub_id)` before the new `sub_open`.
+**Detection.** `sub_list` returns multiple subs for the same URI under the same agent. `MAX_SUBS_PER_URI_EXCEEDED` fires when the per-URI cap is hit.
 
 ### #4 — Ignoring `lagged_drops`
 
-**Symptom.** LLM observes `lagged_drops > 0` in `ssh_sub_stats` and continues consuming events as if nothing happened. Downstream logic that relies on strictly-monotonic event order silently corrupts.
+**Symptom.** LLM observes `lagged_drops > 0` in `sub_stats` and continues consuming events as if nothing happened. Downstream logic that relies on strictly-monotonic event order silently corrupts.
 **Why bad.** Data loss masked by silent gap. Under `DropOldest` or `DropNewest`, the lane has emitted a `{"ev":"lagged",...}` marker but the consumer ignored it. Under `BlockSlow` (with timeout), the producer fell back to `Snapshot` and emitted a `LAG_BACKPRESSURE` warning that the consumer also ignored.
-**Fix.** Periodically query `ssh_sub_stats`. On `lagged_drops > 0`: switch to `lag_policy=snapshot` (gap bridged via ring-buffer rebuild) or `lag_policy=block_slow` (zero loss; raise `SSH_BP_BLOCK_TIMEOUT_MS` if needed).
-**Detection.** `lagged` and `snapshot` event types in the NDJSON stream; `ssh_sub_stats` shows `lagged_drops` or `lagged_recoveries` increasing; `LAG_DETECTED` / `LAG_BACKPRESSURE` codes on subsequent operations.
+**Fix.** Periodically query `sub_stats`. On `lagged_drops > 0`: switch to `lag_policy=snapshot` (gap bridged via ring-buffer rebuild) or `lag_policy=block_slow` (zero loss; raise `SSH_BP_BLOCK_TIMEOUT_MS` if needed).
+**Detection.** `lagged` and `snapshot` event types in the NDJSON stream; `sub_stats` shows `lagged_drops` or `lagged_recoveries` increasing; `LAG_DETECTED` / `LAG_BACKPRESSURE` codes on subsequent operations.
 
 ### #5 — Mid-workflow panic without `ssh_disconnect_agent`
 
 **Symptom.** LLM hits an unrecoverable error mid-workflow and abandons cleanup. Sessions, shells, commands, transfers tied to the agent persist until inactivity TTL fires.
 **Why bad.** Cascade leak. Agent owned multiple resources; abandoning cleanup leaves all of them dangling. Every leaked resource competes for the per-tenant resource cap, eventually triggering `MAX_*_EXCEEDED` on legitimate future calls.
 **Fix.** Wrap every workflow in a structured cleanup boundary. On any error path, call `ssh_disconnect_agent(agent_id)`. Idempotent and cascades through every owned session and resource via the lifecycle layer.
-**Detection.** `ssh_list_sessions` shows agent-bound sessions older than expected workflow lifetime. Operators set `SSH_SUB_LEAK_RISK_KILL_S` to a non-zero value to convert leaks into hard failures.
+**Detection.** `ssh_sessions` shows agent-bound sessions older than expected workflow lifetime. Operators set `SSH_SUB_LEAK_RISK_KILL_S` to a non-zero value to convert leaks into hard failures.
 
 ### #6 — Confusing unsubscribe with close
 
-**Symptom.** LLM calls `ssh_unsubscribe` and assumes the underlying resource is gone. Subsequent operations (`ssh_shell_write`, `ssh_get_command_output`) hit a stale resource that still occupies channel concurrency.
+**Symptom.** LLM calls `sub_close` and assumes the underlying resource is gone. Subsequent operations (`ssh_shell_write`, `ssh_exec_output`) hit a stale resource that still occupies channel concurrency.
 **Why bad.** Lifecycle confusion. v5 deliberately separates observability (subscription) from ownership (resource). Unsubscribing only closes the push channel — the remote PTY, async command, or in-flight transfer keeps running.
 **Fix.** When the workflow finishes, choose one of:
-- `release_when_no_subs=true` at resource creation -> last `ssh_unsubscribe` triggers grace timer (`LIFECYCLE_OWN_GRACE_MS`, default 2 s) -> resource auto-closes.
-- Manual: `ssh_unsubscribe` AND `ssh_shell_close` / `ssh_cancel_command`.
+- `release_when_no_subs=true` at resource creation -> last `sub_close` triggers grace timer (`LIFECYCLE_OWN_GRACE_MS`, default 2 s) -> resource auto-closes.
+- Manual: `sub_close` AND `ssh_shell_close` / `ssh_exec_cancel`.
 - Workflow-scoped: `ssh_disconnect_agent(agent_id)` cascades through everything.
 **Detection.** `ssh_list_*` returns the resource as still active after the agent's workflow has completed. `WARN: SUB_LEAK_RISK` surfaces if the resource sits in `Owned` past the warn threshold.
 
 ### #7 — Extending another consumer's resource lifetime
 
-**Symptom.** Subscriber A wants to keep alive a shell that subscriber B opened. A repeatedly calls `ssh_subscribe` to bump the refcount.
+**Symptom.** Subscriber A wants to keep alive a shell that subscriber B opened. A repeatedly calls `sub_open` to bump the refcount.
 **Why bad.** Subscribers should not own resource lifetime. Resource policy (`release_when_no_subs`, `grace_ms`, `cascade_session`) is set by the resource's creator at open time and is not subscriber-controlled.
-**Fix.** If A genuinely owns the lifetime decision, A should be the resource's creator. If multiple observers need to coordinate cleanup, use one shared agent_id for the resource owner and let `ssh_disconnect_agent` orchestrate the close. To extend a lease, use `lifetime=lease` and `ssh_sub_resume` from the resource owner — not from a passive observer.
-**Detection.** Long-lived `sub_id`s with low `events_sent` rate; auditable via `ssh_sub_list` ordered by age.
+**Fix.** If A genuinely owns the lifetime decision, A should be the resource's creator. If multiple observers need to coordinate cleanup, use one shared agent_id for the resource owner and let `ssh_disconnect_agent` orchestrate the close. To extend a lease, use `lifetime=lease` and `sub_resume` from the resource owner — not from a passive observer.
+**Detection.** Long-lived `sub_id`s with low `events_sent` rate; auditable via `sub_list` ordered by age.
 
 ### #8 — Mismatched `_meta.idempotency_key`
 
-**Symptom.** Two retries of the same mutating tool carry identical `_meta.idempotency_key` but different arguments (e.g. retry of `ssh_execute` with a different command string).
+**Symptom.** Two retries of the same mutating tool carry identical `_meta.idempotency_key` but different arguments (e.g. retry of `ssh_exec` with a different command string).
 **Why bad.** Idempotency cache stores the original response keyed by `idempotency_key`. A second call with the same key and different args triggers `IDEMPOTENCY_KEY_MISMATCH`.
 **Fix.** A `_meta.idempotency_key` must be paired one-to-one with a specific argument set. Use UUIDv7 (or a hash of the args) as the key. On a retry of a different operation, mint a new key.
 **Detection.** `[IDEMPOTENCY_KEY_MISMATCH]` in error responses. The `DETAIL` line names the conflicting key.
@@ -958,14 +958,14 @@ flowchart LR
 - `STATE` -> retry only with a fresh `_meta.idempotency_key`.
 - `AUTH` / `INTERNAL` -> never retry.
 For `RESOURCE_GONE` specifically: call the matching open/exec/upload tool, observe the new ID, and resubscribe.
-**Detection.** Telemetry shows repeated `RESOURCE_GONE` for the same URI with no intervening `ssh_shell_open` / `ssh_execute`.
+**Detection.** Telemetry shows repeated `RESOURCE_GONE` for the same URI with no intervening `ssh_shell_open` / `ssh_exec`.
 
-### #10 — Trusting `ssh_get_command_output(wait=true)` for long workflows
+### #10 — Trusting `ssh_exec_output(wait=true)` for long workflows
 
-**Symptom.** LLM uses the wait-on-result fallback (`ssh_execute` -> `ssh_get_command_output(wait=true, wait_timeout_secs=N)`) for commands that run longer than `N`, then loops on the wait call until the command finishes.
+**Symptom.** LLM uses the wait-on-result fallback (`ssh_exec` -> `ssh_exec_output(wait=true, wait_timeout_secs=N)`) for commands that run longer than `N`, then loops on the wait call until the command finishes.
 **Why bad.** Fallback is graceful degradation for hosts without subscribe support, not idiomatic flow for capable hosts. Each wait round-trip costs the same framing as a `ssh_shell_read` poll. For a 10-minute command, a 30-second wait loop produces 20 round-trips; the equivalent push-based path produces zero polls.
 **Fix.** On capable hosts, use `push_first_long_command` (above). Reserve the wait loop for the (decreasing) class of hosts that genuinely cannot subscribe.
-**Detection.** Multiple `ssh_get_command_output(wait=true)` calls for the same `command_id` with no matching subscribe.
+**Detection.** Multiple `ssh_exec_output(wait=true)` calls for the same `command_id` with no matching subscribe.
 
 ---
 
@@ -1120,7 +1120,7 @@ Failures originating on the remote host. Retry decisions depend on the specific 
 
 - **Category:** REMOTE
 - **Retryable:** LLM judges based on the exit code (e.g. `1` for "no match" vs `127` for "command not found")
-- **When:** `ssh_execute` / `ssh_run` completed but the command exited non-zero.
+- **When:** `ssh_exec` / `ssh_run` completed but the command exited non-zero.
 - **Why:** The command's own logic. ssh-mcp does not interpret remote semantics.
 - **Cure:** Inspect `exit_code` and the captured stdout/stderr; decide whether the result is a workflow success or a recoverable error.
 - **Prevention:** Use sentinel exit codes the workflow understands; capture stderr explicitly.
@@ -1138,13 +1138,13 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 - **Retryable:** no
 - **When:** A tool call referenced a `session_id` that was never created or has been disconnected.
 - **Why:** Stale ID in the caller's state.
-- **Cure:** `ssh_list_sessions` to enumerate live sessions; recreate via `ssh_connect` if needed.
+- **Cure:** `ssh_sessions` to enumerate live sessions; recreate via `ssh_connect` if needed.
 - **Prevention:** Track `session_id` lifecycle in the caller's state; clear on disconnect events.
 - **Example:**
 
   ```ndjson
   {"op":"exec","sid":"sess-stale","cmd":"id","id":"corr-1"}
-  {"ev":"err","id":"corr-1","code":"SESSION_NOT_FOUND","reason":"Session not found.","detail":"Use ssh_list_sessions; recreate via ssh_connect. Closest: sess-3 (open since 14:32:07)."}
+  {"ev":"err","id":"corr-1","code":"SESSION_NOT_FOUND","reason":"Session not found.","detail":"Use ssh_sessions; recreate via ssh_connect. Closest: sess-3 (open since 14:32:07)."}
   ```
 
 - **Related:** [SHELL_NOT_FOUND], [COMMAND_NOT_FOUND], [TRANSFER_NOT_FOUND].
@@ -1163,9 +1163,9 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** `ssh_get_command_output` / `ssh_cancel_command` referenced a stale or never-existed `command_id`.
+- **When:** `ssh_exec_output` / `ssh_exec_cancel` referenced a stale or never-existed `command_id`.
 - **Why:** The command finished and was reaped, or the ID is wrong.
-- **Cure:** `ssh_list_commands` to enumerate live commands; re-issue `ssh_execute` if needed.
+- **Cure:** `ssh_commands` to enumerate live commands; re-issue `ssh_exec` if needed.
 - **Prevention:** Subscribe to `command://<id>/output` and consume the `completed` event.
 - **Related:** [SESSION_NOT_FOUND].
 
@@ -1173,7 +1173,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** `ssh_get_transfer_progress` referenced a finished or unknown transfer.
+- **When:** `ssh_transfer_progress` referenced a finished or unknown transfer.
 - **Why:** The transfer completed and was reaped, or the ID is wrong.
 - **Cure:** Re-issue the upload/download to obtain a fresh ID.
 - **Prevention:** Subscribe to `transfer://<id>/progress` so completion is observed in-stream.
@@ -1195,7 +1195,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 - **Retryable:** no
 - **When:** A subscribe attempt or operation hit a resource whose lifecycle state is `Releasing` or `Closed`. The resource has been released by the lifecycle layer (manual close, grace timer fired, or cascade).
 - **Why:** [ADR 0003 — Lifecycle Binding](./adr/0003-lifecycle-binding.md) defines `Closed` as a terminal state; new subscriptions are refused.
-- **Cure:** Recreate via `ssh_shell_open` / `ssh_execute` / `ssh_upload` and resume from a fresh cursor.
+- **Cure:** Recreate via `ssh_shell_open` / `ssh_exec` / `ssh_upload` and resume from a fresh cursor.
 - **Prevention:** Subscribe before the grace window expires; respect `release_when_no_subs=true` semantics; use `lifetime=manual` if the resource must outlive a transient agent.
 - **Related:** [SHELL_NOT_FOUND], [GRACE_TIMER_EXPIRED].
 
@@ -1203,9 +1203,9 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** `ssh_unsubscribe` / `ssh_sub_pause` / `ssh_sub_resume` / `ssh_sub_filter` / `ssh_sub_replay` / `ssh_sub_stats` referenced a stale or never-existed `sub_id`.
+- **When:** `sub_close` / `sub_pause` / `sub_resume` / `sub_filter` / `sub_replay` / `sub_stats` referenced a stale or never-existed `sub_id`.
 - **Why:** The sub was already closed (manual or peer GC), or the ID is wrong.
-- **Cure:** `ssh_sub_list` to enumerate active subs; the closest-match suggestion in DETAIL helps with typos.
+- **Cure:** `sub_list` to enumerate active subs; the closest-match suggestion in DETAIL helps with typos.
 - **Prevention:** Track `sub_id` lifetime in the caller's state; consume `resource_closed` events.
 - **Related:** [RESOURCE_GONE].
 
@@ -1231,7 +1231,7 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 - **Retryable:** conditional (after closing a session)
 - **When:** `ssh_connect` would exceed `SSH_MAX_SESSIONS` (or per-agent cap).
 - **Why:** Session leak, or legitimate fan-out beyond the configured budget.
-- **Cure:** `ssh_list_sessions` to find disposable sessions; `ssh_disconnect` or `ssh_disconnect_agent` and retry.
+- **Cure:** `ssh_sessions` to find disposable sessions; `ssh_disconnect` or `ssh_disconnect_agent` and retry.
 - **Prevention:** Apply Rule 4 (golden rules); raise the cap if the workload requires.
 - **Related:** [MAX_SHELLS_EXCEEDED], [MAX_COMMANDS_EXCEEDED].
 
@@ -1249,9 +1249,9 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 
 - **Category:** POLICY
 - **Retryable:** conditional (after a command finishes or is cancelled)
-- **When:** `ssh_execute` would exceed `SSH_MAX_COMMANDS_PER_SESSION`.
+- **When:** `ssh_exec` would exceed `SSH_MAX_COMMANDS_PER_SESSION`.
 - **Why:** Command leak, or fan-out beyond budget.
-- **Cure:** `ssh_cancel_command` or wait for completions; retry.
+- **Cure:** `ssh_exec_cancel` or wait for completions; retry.
 - **Prevention:** Subscribe to `command://<id>/output` and consume `completed` events promptly.
 - **Related:** [MAX_SHELLS_EXCEEDED].
 
@@ -1271,7 +1271,7 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 - **Retryable:** conditional
 - **When:** A subscribe would exceed the per-URI sub cap (typical anti-pattern: re-subscribe-on-every-iteration loop).
 - **Why:** Lane explosion under repeat subscribes.
-- **Cure:** `ssh_sub_list` to find redundant subs; `ssh_unsubscribe` stale ones; retry.
+- **Cure:** `sub_list` to find redundant subs; `sub_close` stale ones; retry.
 - **Prevention:** Subscribe once per resource; track `sub_id`s in conversation state.
 - **Related:** [MAX_SUBS_TOTAL_EXCEEDED], [SUB_LEAK_RISK].
 
@@ -1281,7 +1281,7 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 - **Retryable:** conditional
 - **When:** A subscribe would exceed the global sub cap (e.g. `SSH_MAX_SUBS_TOTAL`).
 - **Why:** Aggregate sub leak across resources.
-- **Cure:** Audit `ssh_sub_list`; close stale subs; retry.
+- **Cure:** Audit `sub_list`; close stale subs; retry.
 - **Prevention:** Apply Rule 2 (golden rules).
 - **Related:** [MAX_SUBS_PER_URI_EXCEEDED].
 
@@ -1322,14 +1322,14 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 - **When:** Under `LagPolicy::BlockSlow`, the producer waited longer than `SSH_BP_BLOCK_TIMEOUT_MS` (default 5000 ms).
 - **Why:** The consumer is genuinely stuck. The server falls back to snapshot semantics rather than deadlock.
 - **Cure:** Consume stdout faster; raise `SSH_BP_BLOCK_TIMEOUT_MS` if the workload tolerates higher latency.
-- **Prevention:** Reserve `BlockSlow` for forensic / audit captures; monitor `block_total_ms` in `ssh_sub_stats`.
+- **Prevention:** Reserve `BlockSlow` for forensic / audit captures; monitor `block_total_ms` in `sub_stats`.
 - **Related:** [LAG_DETECTED].
 
 #### [RING_BUFFER_OVERFLOW] Per-resource ring buffer dropped head bytes
 
 - **Category:** POLICY
 - **Retryable:** recover
-- **When:** A consumer reading via `ssh_sub_replay(sub_id, from_cursor)` requested a cursor that predates the ring buffer's available window (`SSH_SHELL_MAX_BUFFER` or `SSH_COMMAND_MAX_BUFFER_SIZE`).
+- **When:** A consumer reading via `sub_replay(sub_id, from_cursor)` requested a cursor that predates the ring buffer's available window (`SSH_SHELL_MAX_BUFFER` or `SSH_COMMAND_MAX_BUFFER_SIZE`).
 - **Why:** The resource produced more bytes than the ring buffer can hold.
 - **Cure:** Accept the gap (the cursor is advanced to the start of the available window) or raise the buffer size.
 - **Prevention:** Tune `SSH_SHELL_MAX_BUFFER` for high-volume shells; consume push events promptly so the ring buffer never overflows.
@@ -1365,7 +1365,7 @@ Argument validation and idempotency cache failures. Retry only after changing th
 
 - **Category:** STATE
 - **Retryable:** no
-- **When:** `ssh_shell_send_key(repeat=N)` exceeded the configured cap.
+- **When:** `ssh_shell_press(repeat=N)` exceeded the configured cap.
 - **Why:** Caller asked for an unreasonable repeat count.
 - **Cure:** Reduce the repeat count; chain multiple calls if a higher count is genuinely required.
 - **Prevention:** Cap at the bound documented in the tool description.
@@ -1375,7 +1375,7 @@ Argument validation and idempotency cache failures. Retry only after changing th
 
 - **Category:** STATE
 - **Retryable:** no
-- **When:** `ssh_subscribe(lifetime=...)` received an unsupported value.
+- **When:** `sub_open(lifetime=...)` received an unsupported value.
 - **Why:** Caller misspelled or invented a value.
 - **Cure:** Pick from the documented enum.
 - **Prevention:** Pin the enum in the host's typed schema.
@@ -1385,7 +1385,7 @@ Argument validation and idempotency cache failures. Retry only after changing th
 
 - **Category:** STATE
 - **Retryable:** no
-- **When:** `ssh_subscribe(lag_policy=...)` received an unsupported value.
+- **When:** `sub_open(lag_policy=...)` received an unsupported value.
 - **Why:** Misspelled or invented value.
 - **Cure:** Pick from `block_slow | drop_oldest | drop_newest | snapshot`.
 - **Prevention:** Pin the enum in the host's typed schema.

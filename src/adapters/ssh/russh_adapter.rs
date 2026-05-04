@@ -252,7 +252,7 @@ pub struct RusshAdapter {
     /// the domain `CommandRepository`. Defaults to a no-op when the
     /// adapter is built without a composition root (tests, fixtures).
     /// The composition root replaces it via
-    /// [`Self::with_command_status_sink`] so `ssh_get_command_output`
+    /// [`Self::with_command_status_sink`] so `ssh_exec_output`
     /// can observe terminal state.
     command_status_sink: SharedCommandStatusSink,
     /// Bridge that pumps explicit shell `Closed` notifications into the

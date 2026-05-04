@@ -11,9 +11,9 @@
 //!
 //! v4.8 lifts schema coverage to **all 21 MCP tools** (or 20 without the
 //! `port_forward` Cargo feature). v4.7 shipped only six (`ssh_connect`,
-//! `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`,
-//! `ssh_shell_read`, `ssh_get_transfer_progress`) plus the three
-//! v4.7-step3 additions (`ssh_run`, `ssh_execute_batch`,
+//! `ssh_exec`, `ssh_exec_output`, `ssh_shell_open`,
+//! `ssh_shell_read`, `ssh_transfer_progress`) plus the three
+//! v4.7-step3 additions (`ssh_run`, `ssh_exec_batch`,
 //! `ssh_disconnect_many`); the remaining 12 tools now advertise typed
 //! schemas mirroring their `structured_content` payload byte-for-byte.
 //! The Markdown body is unchanged.
@@ -29,7 +29,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-/// One per-session entry surfaced in `ssh_list_sessions` (and embedded
+/// One per-session entry surfaced in `ssh_sessions` (and embedded
 /// in [`SshConnectResult`] when `status = "suggested"`).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
@@ -131,12 +131,12 @@ pub struct SshDisconnectResult {
     pub transfers_aborted: usize,
 }
 
-/// `ssh_list_sessions` payload — current healthy sessions plus an
+/// `ssh_sessions` payload — current healthy sessions plus an
 /// optional bulk-cleanup hint.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshListSessionsResult {
-    /// Discriminator: always `"ssh_list_sessions"`.
+pub struct SshSessionsResult {
+    /// Discriminator: always `"ssh_sessions"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
@@ -180,11 +180,11 @@ pub struct SshDisconnectAgentResult {
     pub transfers_aborted: usize,
 }
 
-/// `ssh_execute` started payload.
+/// `ssh_exec` started payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshExecuteResult {
-    /// Discriminator: always `"ssh_execute"`.
+pub struct SshExecResult {
+    /// Discriminator: always `"ssh_exec"`.
     pub tool: String,
     /// Lifecycle status; `"started"` for the async path.
     pub status: String,
@@ -199,11 +199,11 @@ pub struct SshExecuteResult {
     pub next: Vec<String>,
 }
 
-/// `ssh_get_command_output` payload.
+/// `ssh_exec_output` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshGetCommandOutputResult {
-    /// Discriminator: always `"ssh_get_command_output"`.
+pub struct SshExecOutputResult {
+    /// Discriminator: always `"ssh_exec_output"`.
     pub tool: String,
     /// One of `"running"`, `"completed"`, `"timeout"`, `"cancelled"`,
     /// `"failed"`.
@@ -234,7 +234,7 @@ pub struct SshGetCommandOutputResult {
     pub next: Option<Vec<String>>,
 }
 
-/// One per-command entry surfaced by [`SshListCommandsResult`].
+/// One per-command entry surfaced by [`SshCommandsResult`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
 pub struct CommandEntry {
@@ -250,11 +250,11 @@ pub struct CommandEntry {
     pub started_at: String,
 }
 
-/// `ssh_list_commands` payload — async command inventory snapshot.
+/// `ssh_commands` payload — async command inventory snapshot.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshListCommandsResult {
-    /// Discriminator: always `"ssh_list_commands"`.
+pub struct SshCommandsResult {
+    /// Discriminator: always `"ssh_commands"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
@@ -267,13 +267,13 @@ pub struct SshListCommandsResult {
     pub total: usize,
 }
 
-/// `ssh_cancel_command` payload — covers both the `ok` path
+/// `ssh_exec_cancel` payload — covers both the `ok` path
 /// (cancelled with partial stdout/stderr capture) and the `noop` path
 /// (command already terminal).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshCancelCommandResult {
-    /// Discriminator: always `"ssh_cancel_command"`.
+pub struct SshExecCancelResult {
+    /// Discriminator: always `"ssh_exec_cancel"`.
     pub tool: String,
     /// `"ok"` when the command was running and got cancelled, `"noop"`
     /// when the command had already reached a terminal state.
@@ -348,11 +348,11 @@ pub struct SshShellWriteResult {
     pub next: Vec<String>,
 }
 
-/// `ssh_shell_send_key` payload.
+/// `ssh_shell_press` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshShellSendKeyResult {
-    /// Discriminator: always `"ssh_shell_send_key"`.
+pub struct SshShellPressResult {
+    /// Discriminator: always `"ssh_shell_press"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
@@ -480,11 +480,11 @@ pub struct SshDownloadResult {
     pub next: Vec<String>,
 }
 
-/// `ssh_get_transfer_progress` payload.
+/// `ssh_transfer_progress` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshGetTransferProgressResult {
-    /// Discriminator: always `"ssh_get_transfer_progress"`.
+pub struct SshTransferProgressResult {
+    /// Discriminator: always `"ssh_transfer_progress"`.
     pub tool: String,
     /// One of `"running"`, `"completed"`, `"failed"`, `"cancelled"`.
     pub status: String,
@@ -573,7 +573,7 @@ pub struct SshRunResult {
     pub error: Option<String>,
 }
 
-/// One per-command entry surfaced by [`SshExecuteBatchResult`].
+/// One per-command entry surfaced by [`SshExecBatchResult`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
 #[allow(
@@ -611,12 +611,12 @@ pub struct SshExecuteBatchEntry {
     pub error: Option<String>,
 }
 
-/// `ssh_execute_batch` payload — sequential execution of multiple
+/// `ssh_exec_batch` payload — sequential execution of multiple
 /// commands against a single session.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshExecuteBatchResult {
-    /// Discriminator: always `"ssh_execute_batch"`.
+pub struct SshExecBatchResult {
+    /// Discriminator: always `"ssh_exec_batch"`.
     pub tool: String,
     /// `"ok"` when every command ran (regardless of exit code) or
     /// `"halted"` when stop-on-failure short-circuited the loop.
@@ -668,16 +668,16 @@ pub struct SshDisconnectManyResult {
 // v5.2 — Serial transport (ADR 0009)
 // ---------------------------------------------------------------------------
 
-/// `ssh_serial_open` payload.
+/// `serial_open` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialOpenResult {
-    /// Discriminator: always `"ssh_serial_open"`.
+pub struct SerialOpenResult {
+    /// Discriminator: always `"serial_open"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
     /// `SERIAL_ID` minted for this open port. Pass to
-    /// `ssh_serial_close`, `ssh_serial_write`, `ssh_serial_send_key`.
+    /// `serial_close`, `serial_write`, `serial_press`.
     pub serial_id: String,
     /// Echoed device path.
     pub path: String,
@@ -695,11 +695,11 @@ pub struct SshSerialOpenResult {
     pub uri: String,
 }
 
-/// `ssh_serial_close` payload.
+/// `serial_close` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialCloseResult {
-    /// Discriminator: always `"ssh_serial_close"`.
+pub struct SerialCloseResult {
+    /// Discriminator: always `"serial_close"`.
     pub tool: String,
     /// `"ok"` when a port matched and was closed; `"noop"` when no port
     /// matched the given id.
@@ -708,11 +708,11 @@ pub struct SshSerialCloseResult {
     pub serial_id: String,
 }
 
-/// `ssh_serial_write` payload.
+/// `serial_write` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialWriteResult {
-    /// Discriminator: always `"ssh_serial_write"`.
+pub struct SerialWriteResult {
+    /// Discriminator: always `"serial_write"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
@@ -722,11 +722,11 @@ pub struct SshSerialWriteResult {
     pub bytes_sent: usize,
 }
 
-/// `ssh_serial_send_key` payload.
+/// `serial_press` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialSendKeyResult {
-    /// Discriminator: always `"ssh_serial_send_key"`.
+pub struct SerialPressResult {
+    /// Discriminator: always `"serial_press"`.
     pub tool: String,
     /// Always `"ok"` on the success path.
     pub status: String,
@@ -740,10 +740,10 @@ pub struct SshSerialSendKeyResult {
     pub bytes_sent: usize,
 }
 
-/// Per-port entry on `ssh_serial_list_open`.
+/// Per-port entry on `serial_active`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialOpenEntry {
+pub struct SerialOpenEntry {
     /// `SERIAL_ID`.
     pub serial_id: String,
     /// Device path.
@@ -757,25 +757,25 @@ pub struct SshSerialOpenEntry {
     pub uri: String,
 }
 
-/// `ssh_serial_list_open` payload.
+/// `serial_active` payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialListOpenResult {
-    /// Discriminator: always `"ssh_serial_list_open"`.
+pub struct SerialListOpenResult {
+    /// Discriminator: always `"serial_active"`.
     pub tool: String,
     /// Always `"ok"`.
     pub status: String,
     /// Open ports.
-    pub ports: Vec<SshSerialOpenEntry>,
+    pub ports: Vec<SerialOpenEntry>,
     /// Total open count.
     pub total: usize,
 }
 
-/// `ssh_serial_list_ports` payload — OS-visible serial devices.
+/// `serial_scan` payload — OS-visible serial devices.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-pub struct SshSerialListPortsResult {
-    /// Discriminator: always `"ssh_serial_list_ports"`.
+pub struct SerialListPortsResult {
+    /// Discriminator: always `"serial_scan"`.
     pub tool: String,
     /// Always `"ok"`.
     pub status: String,

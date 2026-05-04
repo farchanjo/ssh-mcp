@@ -168,13 +168,13 @@ pub struct SshShellWriteArgs {
 
     /// Bytes to send to the PTY. Append `\n` to submit a typed command.
     /// Use control sequences directly (e.g. `\x03` for Ctrl+C, `\x1b[A`
-    /// for arrow up). Prefer `ssh_shell_send_key` for named keystrokes.
+    /// for arrow up). Prefer `ssh_shell_press` for named keystrokes.
     pub input: String,
 }
 
-/// Arguments for the `ssh_shell_send_key` MCP tool.
+/// Arguments for the `ssh_shell_press` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SshShellSendKeyArgs {
+pub struct SshShellPressArgs {
     /// `SHELL_ID` returned from `ssh_shell_open`.
     pub shell_id: String,
 
@@ -298,7 +298,7 @@ pub struct SshShellCloseArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshShellOpenArgs, SshShellReadArgs, SshShellSendKeyArgs, SshShellWaitForArgs};
+    use super::{SshShellOpenArgs, SshShellReadArgs, SshShellPressArgs, SshShellWaitForArgs};
     use schemars::schema_for;
     use serde_json::Value;
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn ssh_shell_send_key_schema_emits_modifier_and_repeat_defaults() {
-        let schema = schema_for!(SshShellSendKeyArgs);
+        let schema = schema_for!(SshShellPressArgs);
         let schema_json = serde_json::to_value(&schema).expect("schema -> json");
         assert_eq!(
             property_default(&schema_json, "shift"),

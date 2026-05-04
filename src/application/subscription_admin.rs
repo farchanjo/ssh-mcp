@@ -29,7 +29,7 @@ use crate::ports::subscriber_registry::ResourceKind;
 // Subscribe
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_subscribe`.
+/// Inbound DTO for `sub_open`.
 #[derive(Debug, Clone)]
 pub struct SubscribeRequest {
     /// Caller-supplied resource URI.
@@ -46,7 +46,7 @@ pub struct SubscribeRequest {
     pub peer: Option<Arc<dyn PeerHandle>>,
 }
 
-/// Outbound DTO for `ssh_subscribe`.
+/// Outbound DTO for `sub_open`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeOutcome {
     /// Newly minted lane id.
@@ -61,7 +61,7 @@ pub struct SubscribeOutcome {
     pub grace_ms: u32,
 }
 
-/// `ssh_subscribe` use case.
+/// `sub_open` use case.
 #[derive(Debug, Clone)]
 pub struct SubscribeUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -82,7 +82,7 @@ impl SubscribeUseCase {
 
     /// Build the use case with both the lane handle and the debouncer
     /// activator port. Production composition uses this constructor so
-    /// the `ssh_subscribe`-only flow wakes the same per-resource
+    /// the `sub_open`-only flow wakes the same per-resource
     /// debouncer the legacy `resources/subscribe` path uses.
     #[must_use]
     pub const fn with_activator(
@@ -142,14 +142,14 @@ const fn grace_ms_from(lifetime: SubscriptionLifetime) -> u32 {
 // Unsubscribe
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_unsubscribe`.
+/// Inbound DTO for `sub_close`.
 #[derive(Debug, Clone)]
 pub struct UnsubscribeRequest {
     /// `SubId` to close.
     pub sub_id: SubId,
 }
 
-/// Outbound DTO for `ssh_unsubscribe`.
+/// Outbound DTO for `sub_close`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsubscribeOutcome {
     /// Closed lane id.
@@ -165,7 +165,7 @@ pub struct UnsubscribeOutcome {
     pub grace_remaining_ms: Option<u32>,
 }
 
-/// `ssh_unsubscribe` use case.
+/// `sub_close` use case.
 #[derive(Debug, Clone)]
 pub struct UnsubscribeUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -212,7 +212,7 @@ impl UnsubscribeUseCase {
 // Pause / Resume
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_sub_pause` / `ssh_sub_resume`.
+/// Inbound DTO for `sub_pause` / `sub_resume`.
 #[derive(Debug, Clone)]
 pub struct SubToggleRequest {
     /// Lane id to mutate.
@@ -228,7 +228,7 @@ pub struct SubToggleOutcome {
     pub paused: bool,
 }
 
-/// `ssh_sub_pause` use case.
+/// `sub_pause` use case.
 #[derive(Debug, Clone)]
 pub struct PauseSubUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -255,7 +255,7 @@ impl PauseSubUseCase {
     }
 }
 
-/// `ssh_sub_resume` use case.
+/// `sub_resume` use case.
 #[derive(Debug, Clone)]
 pub struct ResumeSubUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -286,7 +286,7 @@ impl ResumeSubUseCase {
 // Set filter
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_sub_filter`.
+/// Inbound DTO for `sub_filter`.
 #[derive(Debug, Clone)]
 pub struct SetFilterRequest {
     /// Lane id whose filter is changing.
@@ -295,7 +295,7 @@ pub struct SetFilterRequest {
     pub filter: FilterRule,
 }
 
-/// Outbound DTO for `ssh_sub_filter`.
+/// Outbound DTO for `sub_filter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetFilterOutcome {
     /// Affected lane id.
@@ -304,7 +304,7 @@ pub struct SetFilterOutcome {
     pub filter: FilterRule,
 }
 
-/// `ssh_sub_filter` use case.
+/// `sub_filter` use case.
 #[derive(Debug, Clone)]
 pub struct SetFilterUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -339,7 +339,7 @@ impl SetFilterUseCase {
 // Replay
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_sub_replay`.
+/// Inbound DTO for `sub_replay`.
 #[derive(Debug, Clone)]
 pub struct ReplayRequest {
     /// Lane id to replay.
@@ -348,7 +348,7 @@ pub struct ReplayRequest {
     pub from_cursor: u64,
 }
 
-/// Outbound DTO for `ssh_sub_replay`.
+/// Outbound DTO for `sub_replay`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayOutcome {
     /// Affected lane id.
@@ -357,7 +357,7 @@ pub struct ReplayOutcome {
     pub from_cursor: u64,
 }
 
-/// `ssh_sub_replay` use case.
+/// `sub_replay` use case.
 #[derive(Debug, Clone)]
 pub struct ReplaySubUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -388,7 +388,7 @@ impl ReplaySubUseCase {
 // List
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_sub_list`.
+/// Inbound DTO for `sub_list`.
 #[derive(Debug, Clone, Default)]
 pub struct ListSubsRequest {
     /// Optional URI prefix filter (e.g. `shell://`).
@@ -398,14 +398,14 @@ pub struct ListSubsRequest {
     pub peer_id: Option<String>,
 }
 
-/// Outbound DTO for `ssh_sub_list`.
+/// Outbound DTO for `sub_list`.
 #[derive(Debug, Clone)]
 pub struct ListSubsOutcome {
     /// Filtered lane summaries.
     pub subs: Vec<SubSummary>,
 }
 
-/// `ssh_sub_list` use case.
+/// `sub_list` use case.
 #[derive(Debug, Clone)]
 pub struct ListSubsUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -442,14 +442,14 @@ impl ListSubsUseCase {
 // Stats
 // ---------------------------------------------------------------------------
 
-/// Inbound DTO for `ssh_sub_stats`.
+/// Inbound DTO for `sub_stats`.
 #[derive(Debug, Clone)]
 pub struct SubStatsRequest {
     /// Lane id to inspect.
     pub sub_id: SubId,
 }
 
-/// Outbound DTO for `ssh_sub_stats`.
+/// Outbound DTO for `sub_stats`.
 #[derive(Debug, Clone)]
 pub struct SubStatsOutcome {
     /// Affected lane id.
@@ -458,7 +458,7 @@ pub struct SubStatsOutcome {
     pub stats: SubscriberStats,
 }
 
-/// `ssh_sub_stats` use case.
+/// `sub_stats` use case.
 #[derive(Debug, Clone)]
 pub struct SubStatsUseCase {
     lane: Arc<dyn LaneAdmin>,
@@ -493,7 +493,7 @@ impl SubStatsUseCase {
 // Daemon stats
 // ---------------------------------------------------------------------------
 
-/// Outbound DTO for `ssh_daemon_stats`.
+/// Outbound DTO for `sub_stats_all`.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonStatsOutcome {
     /// Total lanes currently open.
@@ -510,7 +510,7 @@ pub struct DaemonStatsOutcome {
     pub queue_high_watermark_max: usize,
 }
 
-/// `ssh_daemon_stats` use case.
+/// `sub_stats_all` use case.
 #[derive(Debug, Clone)]
 pub struct DaemonStatsUseCase {
     lane: Arc<dyn LaneAdmin>,

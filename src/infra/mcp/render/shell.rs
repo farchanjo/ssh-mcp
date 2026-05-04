@@ -60,7 +60,7 @@ pub fn shell_open_render_with_initial(
     append_subscribe_hint(
         &mut out,
         &format!(
-            "RECOMMENDED: ssh_subscribe uri=shell://{shell_id}/output. Falls back gracefully if you skip (use ssh_shell_read)."
+            "RECOMMENDED: sub_open uri=shell://{shell_id}/output. Falls back gracefully if you skip (use ssh_shell_read)."
         ),
     );
     append_next_line(&mut out, &next_hint_for_shell_open(&shell_id));
@@ -107,13 +107,13 @@ fn append_initial_buffer_line(out: &mut String, bytes: &[u8]) {
 
 /// Successor tools after `ssh_shell_open`.
 ///
-/// v5 Phase 3 ordering: `ssh_subscribe` FIRST (push), then drive the
+/// v5 Phase 3 ordering: `sub_open` FIRST (push), then drive the
 /// shell, with the polling fallback (`ssh_shell_read`) listed last.
 fn next_hint_for_shell_open(shell_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=shell://{shell_id}/output | \
+        "sub_open uri=shell://{shell_id}/output | \
          ssh_shell_write | \
-         ssh_shell_send_key | \
+         ssh_shell_press | \
          ssh_shell_read (poll fallback)"
     )
 }
@@ -136,7 +136,7 @@ pub fn shell_write_render(outcome: WriteShellOutcome) -> String {
     out
 }
 
-/// Render a [`SendKeyOutcome`] as the v3 `SSH_SHELL_SEND_KEY` block.
+/// Render a [`SendKeyOutcome`] as the v3 `SSH_SHELL_PRESS` block.
 #[must_use]
 pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
     let SendKeyOutcome {
@@ -148,7 +148,7 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
         sent_at: _,
     } = outcome;
     let mut out = String::with_capacity(256);
-    out.push_str("SSH_SHELL_SEND_KEY: OK\nSHELL_ID: ");
+    out.push_str("SSH_SHELL_PRESS: OK\nSHELL_ID: ");
     out.push_str(shell_id.as_str());
     out.push_str("\nKEY: ");
     out.push_str(&key_label);
@@ -166,9 +166,9 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
 }
 
 /// Successor tools after a shell drive call (`ssh_shell_write` /
-/// `ssh_shell_send_key`) — read the buffered response.
+/// `ssh_shell_press`) — read the buffered response.
 ///
-/// v5 Phase 3 narrative closure: `ssh_subscribe` listed FIRST so the
+/// v5 Phase 3 narrative closure: `sub_open` listed FIRST so the
 /// drive ops honour the subscribe-first contract established by
 /// `ssh_shell_open`. After a write, the response arrives via push on
 /// the existing subscription — the LLM should await
@@ -178,7 +178,7 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
 /// regex prompt-gating; polling alternatives appear last as fallbacks.
 fn next_hint_for_shell_drive(shell_id: &str) -> String {
     format!(
-        "ssh_subscribe uri=shell://{shell_id}/output (await push if not subscribed) | \
+        "sub_open uri=shell://{shell_id}/output (await push if not subscribed) | \
          resources/read shell://{shell_id}/output?cursor=auto (drain delta on push) | \
          ssh_shell_wait_for (only for regex prompt sync) | \
          ssh_shell_read (poll fallback)"
@@ -275,7 +275,7 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
 }
 
 /// Successor advisory after `ssh_shell_wait_for`. Every non-terminal
-/// state leads with `ssh_subscribe` so the LLM stops chaining
+/// state leads with `sub_open` so the LLM stops chaining
 /// poll-style `wait_for` calls back-to-back. After a `Matched`, the
 /// caller usually wants to drive the shell again — but the response
 /// to that drive should arrive via push, not via another `wait_for`.
@@ -283,13 +283,13 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
 fn next_hint_for_wait_for(status: WaitForPatternStatus, shell_id: &str) -> Option<String> {
     match status {
         WaitForPatternStatus::Matched => Some(format!(
-            "ssh_subscribe uri=shell://{shell_id}/output (await push for the next response) | \
+            "sub_open uri=shell://{shell_id}/output (await push for the next response) | \
              ssh_shell_write(shell_id={shell_id}, ...) | \
-             ssh_shell_send_key(shell_id={shell_id}, ...) | \
+             ssh_shell_press(shell_id={shell_id}, ...) | \
              ssh_shell_close(shell_id={shell_id})"
         )),
         WaitForPatternStatus::Timeout => Some(format!(
-            "ssh_subscribe uri=shell://{shell_id}/output (PREFERRED — push-first, no further wait_for chain) | \
+            "sub_open uri=shell://{shell_id}/output (PREFERRED — push-first, no further wait_for chain) | \
              ssh_shell_wait_for(shell_id={shell_id}, ...) (only with explicit regex + bigger timeout) | \
              ssh_shell_read(shell_id={shell_id}) (poll fallback) | \
              ssh_shell_close(shell_id={shell_id})"
@@ -340,7 +340,7 @@ pub fn shell_open_structured_with_initial(
         "next": [
             "resources/subscribe shell://<shell_id>/output",
             "ssh_shell_write",
-            "ssh_shell_send_key",
+            "ssh_shell_press",
         ],
     });
     if let Some(bytes) = initial_buffer.filter(|b| !b.is_empty())
@@ -363,7 +363,7 @@ pub fn shell_write_structured(outcome: &WriteShellOutcome) -> Value {
         "shell_id":   outcome.shell_id.as_str(),
         "bytes_sent": outcome.bytes_written,
         "next": [
-            "ssh_subscribe uri=shell://<shell_id>/output (await push if not subscribed)",
+            "sub_open uri=shell://<shell_id>/output (await push if not subscribed)",
             "resources/read shell://<shell_id>/output?cursor=auto (drain delta on push)",
             "ssh_shell_wait_for (only for regex prompt sync)",
             "ssh_shell_read (poll fallback)",
@@ -380,7 +380,7 @@ pub fn shell_send_key_structured(outcome: &SendKeyOutcome) -> Value {
         .map(|label| label.split('+').map(str::to_string).collect())
         .unwrap_or_default();
     json!({
-        "tool":   "ssh_shell_send_key",
+        "tool":   "ssh_shell_press",
         "status": "ok",
         "shell_id":   outcome.shell_id.as_str(),
         "key":        outcome.key_label,
@@ -388,7 +388,7 @@ pub fn shell_send_key_structured(outcome: &SendKeyOutcome) -> Value {
         "repeat":     outcome.repeat,
         "bytes_sent": outcome.bytes_sent,
         "next": [
-            "ssh_subscribe uri=shell://<shell_id>/output (await push if not subscribed)",
+            "sub_open uri=shell://<shell_id>/output (await push if not subscribed)",
             "resources/read shell://<shell_id>/output?cursor=auto (drain delta on push)",
             "ssh_shell_wait_for (only for regex prompt sync)",
             "ssh_shell_read (poll fallback)",
@@ -437,13 +437,13 @@ pub fn shell_wait_for_structured(outcome: &WaitForPatternOutcome) -> Value {
     let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
     let next = match outcome.status {
         WaitForPatternStatus::Matched => Some(json!([
-            "ssh_subscribe uri=shell://<shell_id>/output (await push for the next response)",
+            "sub_open uri=shell://<shell_id>/output (await push for the next response)",
             "ssh_shell_write",
-            "ssh_shell_send_key",
+            "ssh_shell_press",
             "ssh_shell_close",
         ])),
         WaitForPatternStatus::Timeout => Some(json!([
-            "ssh_subscribe uri=shell://<shell_id>/output (PREFERRED — push-first, no further wait_for chain)",
+            "sub_open uri=shell://<shell_id>/output (PREFERRED — push-first, no further wait_for chain)",
             "ssh_shell_wait_for (only with explicit regex + bigger timeout)",
             "ssh_shell_read (poll fallback)",
             "ssh_shell_close",
@@ -517,7 +517,7 @@ mod tests {
         );
         assert!(
             m.contains(
-                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push if not subscribed)"
+                "\nNEXT: sub_open uri=shell://shell-1/output (await push if not subscribed)"
             ),
             "body: {m}"
         );
@@ -547,7 +547,7 @@ mod tests {
         );
         assert!(
             m.contains(
-                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push if not subscribed)"
+                "\nNEXT: sub_open uri=shell://shell-1/output (await push if not subscribed)"
             ),
             "body: {m}"
         );
@@ -564,7 +564,7 @@ mod tests {
         });
         assert!(
             m.contains(
-                "\nNEXT: ssh_subscribe uri=shell://shell-1/output (await push for the next response)"
+                "\nNEXT: sub_open uri=shell://shell-1/output (await push for the next response)"
             ),
             "body: {m}"
         );
@@ -580,7 +580,7 @@ mod tests {
             last_seq: 0,
         });
         assert!(
-            m.contains("\nNEXT: ssh_subscribe uri=shell://shell-1/output (PREFERRED — push-first"),
+            m.contains("\nNEXT: sub_open uri=shell://shell-1/output (PREFERRED — push-first"),
             "body: {m}"
         );
         assert!(

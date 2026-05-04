@@ -43,7 +43,7 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 | Variable | Type | Default | Range | Description |
 |----------|------|---------|-------|-------------|
 | `SSH_CONNECT_TIMEOUT` | `u64` (s) | `30` | `>= 1` | Connection timeout used by `ssh_connect`. |
-| `SSH_COMMAND_TIMEOUT` | `u64` (s) | `180` | `>= 1` | Default per-command execution timeout. Override per call via `ssh_execute.timeout_secs`. |
+| `SSH_COMMAND_TIMEOUT` | `u64` (s) | `180` | `>= 1` | Default per-command execution timeout. Override per call via `ssh_exec.timeout_secs`. |
 | `SSH_MAX_RETRIES` | `u32` | `3` | `>= 0` | Retry attempts on transient handshake failures. |
 | `SSH_RETRY_DELAY_MS` | `u64` (ms) | `1000` | capped at `10 000` | Initial retry delay. Exponential backoff capped at 10 s. |
 | `SSH_INACTIVITY_TIMEOUT` | `u64` (s) | `300` | `>= 0` | Session inactivity timeout. Ignored when `persistent=true` on `ssh_connect`. |
@@ -57,7 +57,7 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 | `SSH_COMMAND_MAX_BUFFER_SIZE` | bytes (`b/k/m/g/t`) | `10m` | `>= 1` | Per-command stdout/stderr cap. Oldest bytes are head-drained when exceeded. |
 | `SSH_MCP_OUTPUT_DEFAULT_BYTES` | `usize` | `16384` | `>= 1` | Default `max_output_bytes` applied to output-returning tools. |
 | `SSH_MCP_OUTPUT_MAX_BYTES_CAP` | `usize` | `1048576` | `>= 1` | Hard cap on `max_output_bytes` regardless of caller request. |
-| `SSH_MCP_LIST_MAX_ITEMS` | `usize` | `500` | `>= 1` | Default `max_items` returned by `ssh_list_sessions` and `ssh_list_commands`. |
+| `SSH_MCP_LIST_MAX_ITEMS` | `usize` | `500` | `>= 1` | Default `max_items` returned by `ssh_sessions` and `ssh_commands`. |
 | `SSH_MCP_LIST_MAX_ITEMS_CAP` | `usize` | `10000` | `>= 1` | Hard cap on `max_items`. |
 
 ## Shell sessions

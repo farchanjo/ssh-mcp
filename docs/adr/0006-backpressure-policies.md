@@ -4,7 +4,7 @@
 
 Proposed (v5.0.0). Implementation tracked under Phase 2 of the v5 roadmap. Depends on ADR 0004 (Channel Mux).
 
-**Amendment 1 (v5.1.0 — proposed):** Adds byte-threshold flush trigger to the debouncer fronteira plus per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe`. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold** and switches env-var interface from raw `*_MS`/`*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy `*_MS` aliases remain accepted for one minor with a `DEPRECATED:` log nudge. See [Byte-threshold flush trigger](#byte-threshold-flush-trigger) and [Per-call overrides on `ssh_subscribe`](#per-call-overrides-on-ssh_subscribe).
+**Amendment 1 (v5.1.0 — proposed):** Adds byte-threshold flush trigger to the debouncer fronteira plus per-call `flush_bytes` / `debounce` overrides on `sub_open`. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold** and switches env-var interface from raw `*_MS`/`*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy `*_MS` aliases remain accepted for one minor with a `DEPRECATED:` log nudge. See [Byte-threshold flush trigger](#byte-threshold-flush-trigger) and [Per-call overrides on `sub_open`](#per-call-overrides-on-sub_open).
 
 ## Context
 
@@ -115,7 +115,7 @@ stateDiagram-v2
 |---|---|---|---|
 | russh recv | TCP window | n/a | Backpressure propagates to remote sshd. |
 | ring buffer | `max_buffer_size` head-drop + `compensate_truncation` | `SSH_SHELL_MAX_BUFFER`, `SSH_COMMAND_MAX_BUFFER_SIZE` | Cursor monotonicity preserved; head bytes lost. |
-| debouncer | 200 ms coalesce, 1 s force flush, 30 s keepalive, 64 KiB byte-threshold | `SSH_NOTIFY_DEBOUNCE`, `SSH_NOTIFY_FORCE_FLUSH`, `SSH_NOTIFY_KEEPALIVE`, `SSH_NOTIFY_FLUSH_BYTES` (also per-call `debounce` / `flush_bytes` on `ssh_subscribe`) | Flush whichever fires first: debounce window expiry, force-flush tick, keepalive tick, **or** accumulated bytes since last broadcast crossing `SSH_NOTIFY_FLUSH_BYTES`. |
+| debouncer | 200 ms coalesce, 1 s force flush, 30 s keepalive, 64 KiB byte-threshold | `SSH_NOTIFY_DEBOUNCE`, `SSH_NOTIFY_FORCE_FLUSH`, `SSH_NOTIFY_KEEPALIVE`, `SSH_NOTIFY_FLUSH_BYTES` (also per-call `debounce` / `flush_bytes` on `sub_open`) | Flush whichever fires first: debounce window expiry, force-flush tick, keepalive tick, **or** accumulated bytes since last broadcast crossing `SSH_NOTIFY_FLUSH_BYTES`. |
 | **lane mpsc (per sub_id)** | `Snapshot` | `SSH_LAG_POLICY_DEFAULT`, per-call `lag_policy` | Per LagPolicy table above. |
 | **mux mpsc (global)** | bounded; round-robin yields when full | `SSH_MUX_BUFFER` (default 8192) | Mux yields back to dispatcher via `try_send` failure handling; lane producer detects this and follows its lag policy. |
 | stdout writer | OS pipe buffer; `SIGPIPE` triggers daemon shutdown grace | n/a | Daemon detects pipe broken, drains pending events, exits cleanly. |
@@ -138,7 +138,7 @@ Every drop / block / recovery increments an atomic counter on the lane's `Subscr
 | `queue_high_watermark` | `fetch_max` on every `send`. |
 | `block_total_ms` | Cumulative time spent in `BlockSlow` waits. |
 
-The `ssh_sub_stats` MCP tool exposes these per sub_id; the global `ssh_daemon_stats` aggregates across all subs.
+The `sub_stats` MCP tool exposes these per sub_id; the global `sub_stats_all` aggregates across all subs.
 
 ### Mux mpsc handling
 
@@ -192,13 +192,13 @@ flowchart LR
 - **Duration** — uses `humantime::parse_duration` semantics: bare integer with unit suffix `ms`/`s`/`m`/`h`. Bare integer (no unit) is rejected on the new env vars to avoid the "is this ms or s?" ambiguity that bit operators on `SSH_NOTIFY_KEEPALIVE_S` (seconds) vs. `SSH_NOTIFY_DEBOUNCE_MS` (ms).
 - **Bytesize** — uses `bytesize::ByteSize::from_str` semantics: bare integer = bytes; suffixes `k`/`m`/`g` = decimal (1k = 1000); `kib`/`mib`/`gib` = binary (1kib = 1024); `kb`/`mb` accepted as decimal aliases. Default and clamps quoted in **kib/mib** for predictability (`64k` parses as 65 000 bytes, `64kib` as 65 536; the canonical default is `64kib`, but the docs and CLI examples use `64k` because LLM-host configs are forgiving).
 
-### Per-call overrides on `ssh_subscribe`
+### Per-call overrides on `sub_open`
 
-Both knobs are also exposed as optional fields on the `ssh_subscribe` tool. Accept either typed primitives or the same human-readable strings as the env vars — the LLM picks whichever its prompt happens to surface:
+Both knobs are also exposed as optional fields on the `sub_open` tool. Accept either typed primitives or the same human-readable strings as the env vars — the LLM picks whichever its prompt happens to surface:
 
 ```jsonc
 {
-  "name": "ssh_subscribe",
+  "name": "sub_open",
   "arguments": {
     "uri": "shell://<id>/output",
     // Either form is valid:
@@ -217,11 +217,11 @@ Both knobs are also exposed as optional fields on the `ssh_subscribe` tool. Acce
 
 **Scope.** A per-call override is recorded on the **resource debouncer**, not on the lane. Because the debouncer is shared across all subscribers of `(kind, resource_id)`, the **first subscriber's override wins for the lifetime of the debouncer**. Subsequent subscribers may pass different values, but they are stored as a hint only and surface a wire-level `HINT: NOTIFY_OVERRIDE_IGNORED` informational line — the debouncer is not reconfigured mid-flight to avoid races on the byte counter and the `tokio::time::interval` ticks.
 
-When the last subscriber detaches and the debouncer task exits (Phase 1 lifecycle policy `release_when_no_subs = true`) or the resource closes, the next `ssh_subscribe` resets the values from the new caller's override. This matches the existing "first subscriber owns the resource debouncer" invariant from v4.
+When the last subscriber detaches and the debouncer task exits (Phase 1 lifecycle policy `release_when_no_subs = true`) or the resource closes, the next `sub_open` resets the values from the new caller's override. This matches the existing "first subscriber owns the resource debouncer" invariant from v4.
 
 **Validation.** Tool arguments are clamped to the same `[min, max]` range as the env vars; out-of-range values return `[CFG_INVALID]` with `DETAIL` pointing at the violated field and the parsed canonical form (e.g. `DETAIL: debounce "10000ms" exceeds max 5s; clamp or pass <=5s`). `flush_bytes: 0` (or `"0"`) is accepted — disables byte-threshold for this resource. `debounce` below 5 ms is rejected. Parser failures (`"24x"`, `"fast"`, `"-1k"`) return `[CFG_PARSE]` with the offending substring quoted.
 
-**Stats.** `ssh_sub_stats` returns the *effective* values (`effective_flush_bytes`, `effective_debounce_ms`) for the resource the lane attaches to, so the LLM can verify its override took effect or reason about why it was overridden by a prior subscriber.
+**Stats.** `sub_stats` returns the *effective* values (`effective_flush_bytes`, `effective_debounce_ms`) for the resource the lane attaches to, so the LLM can verify its override took effect or reason about why it was overridden by a prior subscriber.
 
 **Implementation contract.**
 
@@ -233,7 +233,7 @@ When the last subscriber detaches and the debouncer task exits (Phase 1 lifecycl
 
 **LagPolicy interaction.** None. Byte-threshold lives at fronteira 3 (debouncer); LagPolicy lives at fronteira 4 (lane mpsc). A byte-triggered flush enqueues to the lane mpsc exactly like a time-triggered one; the lane's policy takes over on `try_send` failure.
 
-**Counter on `SubscriberStats`.** Add `byte_triggered_flushes: AtomicU64` (per-resource fan-out, attributed to every lane on the resource — so one byte-triggered broadcast bumps the counter on every active sub on that URI). Exposed via `ssh_sub_stats` and aggregated in `ssh_daemon_stats`.
+**Counter on `SubscriberStats`.** Add `byte_triggered_flushes: AtomicU64` (per-resource fan-out, attributed to every lane on the resource — so one byte-triggered broadcast bumps the counter on every active sub on that URI). Exposed via `sub_stats` and aggregated in `sub_stats_all`.
 
 **Disable path.** `SSH_NOTIFY_FLUSH_BYTES=0` skips the `record_bytes` increment branch entirely (early return) and the debouncer never installs the `flush_now` branch in `select!`. Zero overhead vs. v5.0 behaviour.
 

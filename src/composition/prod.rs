@@ -326,7 +326,7 @@ pub fn build_use_cases() -> ProdWiring {
     //
     // v5.3 — install the lane-fanout bridge so the legacy
     // [`MemoryRegistry::broadcast`] pipeline also delivers
-    // `notifications/resources/updated` to every `ssh_subscribe`
+    // `notifications/resources/updated` to every `sub_open`
     // lane bound to the broadcast URI. Lane stats (events_sent /
     // bytes_sent) increment on each successful peer notify.
     let lane_bridge = LaneFanoutBridge::new(
@@ -542,7 +542,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);
     // Producer-side forwarder: legacy `SUBSCRIPTION_REGISTRY` mirrors
     // every poke / record_bytes into the hexagonal `MemoryRegistry`
-    // so `ssh_subscribe` lanes track real producer events (not just
+    // so `sub_open` lanes track real producer events (not just
     // the 1 s force-flush keepalive tick).
     let forwarder: Arc<dyn ProducerForwarder> =
         Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);

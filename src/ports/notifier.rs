@@ -44,7 +44,7 @@ pub trait LocalNotifierPort: Sync {
 
 /// Sync, dyn-safe activator for the per-resource debouncer task.
 ///
-/// Lets `ssh_subscribe`-only flows wake the same debouncer the
+/// Lets `sub_open`-only flows wake the same debouncer the
 /// legacy `resources/subscribe` path uses, so producer pokes /
 /// byte-threshold flushes drive the URI broadcast pipeline. Composition
 /// root wires the production [`MemoryRegistry`] as the impl.
@@ -59,7 +59,7 @@ pub trait DebouncerActivator: Send + Sync + Debug + 'static {
 /// The runtime-side adapters (russh, sftp, serial) feed the legacy
 /// `SUBSCRIPTION_REGISTRY` singleton via `poke` / `record_bytes`. The
 /// hexagonal [`MemoryRegistry`] runs alongside — without forwarding,
-/// `ssh_subscribe` lanes only see the 1 s force-flush tick. Composition
+/// `sub_open` lanes only see the 1 s force-flush tick. Composition
 /// root installs an implementation backed by the hexagonal registry so
 /// every legacy producer event also wakes the lane bridge.
 pub trait ProducerForwarder: Send + Sync + Debug + 'static {
@@ -82,7 +82,7 @@ pub trait ProducerForwarder: Send + Sync + Debug + 'static {
 /// Fans `resources/updated` notifications out to every per-`SubId`
 /// lane bound to a URI. Composition root installs an implementation
 /// on the `MemoryRegistry` so legacy broadcast wakes up
-/// `ssh_subscribe`-created lanes without a dedicated Phase 4 drain
+/// `sub_open`-created lanes without a dedicated Phase 4 drain
 /// task. Implementations also increment per-lane atomics
 /// (`events_sent`, `bytes_sent`). Boxed-future return so the trait
 /// stays dyn-safe — `MemoryRegistry` stores it as

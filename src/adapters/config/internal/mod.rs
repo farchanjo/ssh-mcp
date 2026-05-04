@@ -205,7 +205,7 @@ pub const FILTER_REGEX_MAX_MIN: usize = 16;
 /// v5 Phase 2 — cap for the filter regex char-length.
 pub const FILTER_REGEX_MAX_CAP: usize = 65_536;
 
-/// v5 Phase 2 — default replay window (bytes) for `ssh_sub_replay`.
+/// v5 Phase 2 — default replay window (bytes) for `sub_replay`.
 pub const DEFAULT_REPLAY_WINDOW_BYTES: usize = 1_048_576;
 /// v5 Phase 2 — floor for the replay window (bytes).
 pub const REPLAY_WINDOW_BYTES_MIN: usize = 4_096;

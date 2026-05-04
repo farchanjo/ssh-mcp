@@ -23,7 +23,7 @@ Add `serial://<id>/output` as a sixth push-resource scheme, served by a new lock
 
 | Scheme | Suffix | Producer | Consumer |
 |---|---|---|---|
-| `serial://<serial_id>/output` | `output` | OS read half (via `tokio_serial::SerialStream`, `tokio::io::ReadHalf`) | `ssh_subscribe` lane → rmcp `notifications/resources/updated` |
+| `serial://<serial_id>/output` | `output` | OS read half (via `tokio_serial::SerialStream`, `tokio::io::ReadHalf`) | `sub_open` lane → rmcp `notifications/resources/updated` |
 
 Mirrors `shell://<id>/output` and `command://<id>/output` exactly — the `/output` suffix tells the existing `parse_uri` / `format_uri` helpers and the v4 read use case dispatcher that this resource carries an append-only byte stream.
 
@@ -47,7 +47,7 @@ flowchart LR
     Reg -->|"debounce | force_flush | keepalive | byte-threshold"| Lane
     Lane --> Peer
     Peer -.->|"resources/read?cursor=auto"| History
-    Peer -.->|"ssh_serial_write payload"| Writer
+    Peer -.->|"serial_write payload"| Writer
     Writer --> OS
 
     classDef ext fill:#21262d,color:#8b949e,stroke:#30363d
@@ -61,7 +61,7 @@ flowchart LR
 ### Lock-free contract
 
 - **History** lives on `ArcSwap<RingBuffer>` — `ArcSwap::load()` is `O(1)` and never blocks. Subscribers reading `serial://<id>/output?cursor=auto` snapshot the buffer once and slice from `cursor` onward; they never contend with the OS reader.
-- **Writes** funnel through a bounded `mpsc::channel(64)` between any caller (HTTP / stdio request handler) and the writer task. The writer task owns the OS `WriteHalf<SerialStream>` exclusively, so a slow remote sink fills the mpsc first; subsequent `ssh_serial_write` calls return `SERIAL_BACKPRESSURE` instead of stalling the request.
+- **Writes** funnel through a bounded `mpsc::channel(64)` between any caller (HTTP / stdio request handler) and the writer task. The writer task owns the OS `WriteHalf<SerialStream>` exclusively, so a slow remote sink fills the mpsc first; subsequent `serial_write` calls return `SERIAL_BACKPRESSURE` instead of stalling the request.
 - **Reader** owns `ReadHalf<SerialStream>` exclusively. After every flush threshold it rotates the local staging buffer into the history via `ArcSwap::rcu` — atomic, copy-on-write, no `Mutex`.
 - **Cancellation** is cooperative via `tokio_util::sync::CancellationToken`. Cancel cascades to both reader and writer tasks; reader unwinds its in-flight staging buffer to history before exiting; the registry entry is removed (idempotent — `serial_close` is also idempotent).
 
@@ -97,19 +97,19 @@ pub struct SerialConfig {
 
 | Tool | Read-only | Idempotent | Description |
 |---|---|---|---|
-| `ssh_serial_open` | no | no | Open a port → `SERIAL_ID` + subscribe URI |
-| `ssh_serial_close` | no | yes | Cancel reader / writer + drop registry entry |
-| `ssh_serial_write` | no | no | Enqueue UTF-8 `text` OR base64 `bytes_base64` |
-| `ssh_serial_send_key` | no | no | Named keystroke (`enter` / `cr` / `lf` / `crlf` / `esc` / `tab` / `backspace` / `ctrl_c`/`d`/`z`) with optional `repeat` 1..=64 |
-| `ssh_serial_list_ports` | yes | yes | Snapshot OS-visible serial devices |
-| `ssh_serial_list_open` | yes | yes | Snapshot ports currently held by this process |
+| `serial_open` | no | no | Open a port → `SERIAL_ID` + subscribe URI |
+| `serial_close` | no | yes | Cancel reader / writer + drop registry entry |
+| `serial_write` | no | no | Enqueue UTF-8 `text` OR base64 `bytes_base64` |
+| `serial_press` | no | no | Named keystroke (`enter` / `cr` / `lf` / `crlf` / `esc` / `tab` / `backspace` / `ctrl_c`/`d`/`z`) with optional `repeat` 1..=64 |
+| `serial_scan` | yes | yes | Snapshot OS-visible serial devices |
+| `serial_active` | yes | yes | Snapshot ports currently held by this process |
 
-Wire shape mirrors the rest of the catalogue: markdown body (`KEY: value` lines, `HINT:`/`NEXT:` advisories, 8-hex nonce on output blocks) plus a parallel `structured_content` JSON. Subscribe via the existing `ssh_subscribe uri=serial://<SERIAL_ID>/output` — no new subscribe primitive.
+Wire shape mirrors the rest of the catalogue: markdown body (`KEY: value` lines, `HINT:`/`NEXT:` advisories, 8-hex nonce on output blocks) plus a parallel `structured_content` JSON. Subscribe via the existing `sub_open uri=serial://<SERIAL_ID>/output` — no new subscribe primitive.
 
 ### LLM-UX hooks
 
-- `ssh_serial_open` `HINT: RECOMMENDED` line steers the model to `ssh_subscribe uri=serial://...` for push (debounce + 64 KiB byte-threshold flush, same pipeline as shell / command).
-- `ssh_serial_write` / `ssh_serial_send_key` `HINT: RECOMMENDED` line tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto` — never poll.
+- `serial_open` `HINT: RECOMMENDED` line steers the model to `sub_open uri=serial://...` for push (debounce + 64 KiB byte-threshold flush, same pipeline as shell / command).
+- `serial_write` / `serial_press` `HINT: RECOMMENDED` line tells the model to wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto` — never poll.
 
 ### Cross-platform notes
 
@@ -119,9 +119,9 @@ Wire shape mirrors the rest of the catalogue: markdown body (`KEY: value` lines,
 
 ### Out of scope (deferred)
 
-- **Per-call `flush_bytes` / `debounce` overrides on serial subscriptions** — same v5.2 follow-up that gates the equivalent feature on `ssh_subscribe` for shell / command.
+- **Per-call `flush_bytes` / `debounce` overrides on serial subscriptions** — same v5.2 follow-up that gates the equivalent feature on `sub_open` for shell / command.
 - **Hot reconfigure** (change baud / parity without close-reopen) — reserved for v5.3.
-- **Hardware breaks (`tcsendbreak`)** — `ssh_serial_send_break` lands when there is a real workflow needing it.
+- **Hardware breaks (`tcsendbreak`)** — `serial_break` lands when there is a real workflow needing it.
 - **Modem control mid-session** (toggle DTR / RTS at runtime) — currently only the `initial_dtr` / `initial_rts` fields on open. Mid-session toggle reserved for v5.3.
 
 ## Consequences
@@ -129,7 +129,7 @@ Wire shape mirrors the rest of the catalogue: markdown body (`KEY: value` lines,
 ### Positive
 
 - LLM workflows can drive UART-attached hardware (GPS, RS-485 sensors, debug consoles, programmer interfaces) end-to-end with the same subscribe-first ergonomics they already have for SSH shells.
-- Zero changes to the existing wire format, structured-content schema, error taxonomy, or `ssh_subscribe` surface — drop-in for any v3 / v4 / v5.0 / v5.1 host.
+- Zero changes to the existing wire format, structured-content schema, error taxonomy, or `sub_open` surface — drop-in for any v3 / v4 / v5.0 / v5.1 host.
 - Lock-free contract preserved: no new `Mutex` on the hot path; lint baseline (`mutex_atomic = deny`, `await_holding_lock = deny`) keeps regressions out.
 - Byte-threshold flush already wired — chatty serial workloads inherit the v5.1 latency win for free.
 
@@ -137,7 +137,7 @@ Wire shape mirrors the rest of the catalogue: markdown body (`KEY: value` lines,
 
 - New transitive dependency: `tokio-serial = "5"` (≈400 KiB compiled, MIT-licensed, mature). `cargo deny check` accepts it under the existing transitive-versions allowance.
 - `ResourceKind::Serial` enum variant breaks any external crate that exhaustively matches the enum without a wildcard. None known in this workspace; the lint baseline (`wildcard_enum_match_arm = "deny"`) means in-tree matches are exhaustive and were updated atomically.
-- An open serial port holds an OS file descriptor and the corresponding kernel TTY for as long as the process lives or `ssh_serial_close` is called. Operators that rely on the host being able to release the device on demand should set `release_when_no_subs=true` semantics at the lifecycle layer (Phase 1 ADR 0003) — landing alongside per-call overrides in v5.3.
+- An open serial port holds an OS file descriptor and the corresponding kernel TTY for as long as the process lives or `serial_close` is called. Operators that rely on the host being able to release the device on demand should set `release_when_no_subs=true` semantics at the lifecycle layer (Phase 1 ADR 0003) — landing alongside per-call overrides in v5.3.
 
 ### Neutral
 

@@ -57,12 +57,12 @@ fn append_forward_advisories(out: &mut String, forward: &str) {
     append_subscribe_hint(
         out,
         &format!(
-            "RECOMMENDED: ssh_subscribe uri=forward://{forward}/events. Falls back gracefully if you skip (no polling alternative)."
+            "RECOMMENDED: sub_open uri=forward://{forward}/events. Falls back gracefully if you skip (no polling alternative)."
         ),
     );
     append_next_line(
         out,
-        &format!("ssh_subscribe uri=forward://{forward}/events"),
+        &format!("sub_open uri=forward://{forward}/events"),
     );
 }
 
@@ -127,7 +127,7 @@ mod tests {
              REMOTE: localhost:3306\n\
              ACTIVE: true\n"
         ));
-        assert!(m.contains("HINT: RECOMMENDED: ssh_subscribe uri=forward://fwd-1/events"));
-        assert!(m.contains("NEXT: ssh_subscribe uri=forward://fwd-1/events"));
+        assert!(m.contains("HINT: RECOMMENDED: sub_open uri=forward://fwd-1/events"));
+        assert!(m.contains("NEXT: sub_open uri=forward://fwd-1/events"));
     }
 }

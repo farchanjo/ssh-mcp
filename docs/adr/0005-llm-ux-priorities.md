@@ -95,33 +95,33 @@ GOLDEN RULES:
   1. Every long-running resource MUST have at least one active subscriber
      between creation and close. If you will not subscribe, set
      release_when_no_subs=true.
-  2. Always ssh_unsubscribe(sub_id) when done. Track sub_ids in your state.
-  3. Watch lag_drops in ssh_sub_stats. Switch to lag_policy=snapshot
+  2. Always sub_close(sub_id) when done. Track sub_ids in your state.
+  3. Watch lag_drops in sub_stats. Switch to lag_policy=snapshot
      if you see drops > 0.
   4. Cleanup on error: ssh_disconnect_agent(agent_id) wipes everything you own.
-  5. NEVER hot-poll ssh_shell_read in a loop. Use ssh_subscribe + drain events.
+  5. NEVER hot-poll ssh_shell_read in a loop. Use sub_open + drain events.
 ```
 
 ### Push-first happy paths (root prompt)
 
 ```
 1) Run async w/ push:
-     ssh_connect -> ssh_execute(release_when_no_subs=true)
-     -> ssh_subscribe(uri=command://<cid>/output, lifetime=auto-close)
+     ssh_connect -> ssh_exec(release_when_no_subs=true)
+     -> sub_open(uri=command://<cid>/output, lifetime=auto-close)
      -> drain events until ev=completed.
 
 2) Interactive shell:
      ssh_connect -> ssh_shell_open(release_when_no_subs=true)
-     -> ssh_subscribe(uri=shell://<sid>/output)
-     -> ssh_shell_write / ssh_shell_send_key.
+     -> sub_open(uri=shell://<sid>/output)
+     -> ssh_shell_write / ssh_shell_press.
 
 3) Upload w/ progress:
      ssh_upload(release_when_no_subs=true)
-     -> ssh_subscribe(uri=transfer://<tid>/progress).
+     -> sub_open(uri=transfer://<tid>/progress).
 
 Fallback (only when host has no resources/subscribe support):
 4) ssh_run (one-shot connect+exec+disconnect).
-5) ssh_execute -> ssh_get_command_output(wait=true, wait_timeout_secs=30).
+5) ssh_exec -> ssh_exec_output(wait=true, wait_timeout_secs=30).
 ```
 
 ### Per-tool description revamp
@@ -152,7 +152,7 @@ Hygiene: Subscribe to shell://<id>/output BEFORE writing — first bytes arrive 
 
 | Severity | Phrasing | When |
 |---|---|---|
-| Required | `HINT: REQUIRED NEXT STEP: <call>. Skip and the resource becomes a zombie.` | After `ssh_shell_open` / `ssh_execute` / long-running tools that benefit from push. |
+| Required | `HINT: REQUIRED NEXT STEP: <call>. Skip and the resource becomes a zombie.` | After `ssh_shell_open` / `ssh_exec` / long-running tools that benefit from push. |
 | Recommended | `HINT: RECOMMENDED: <call>. Falls back gracefully if you skip.` | After `ssh_upload` / `ssh_download` (progress is informational). |
 | Informational | `HINT: <call> available.` | On idempotent or single-shot tools. |
 
@@ -161,7 +161,7 @@ Hygiene: Subscribe to shell://<id>/output BEFORE writing — first bytes arrive 
 Lists 2–3 successor calls in **push-first** priority order:
 
 ```
-NEXT: ssh_subscribe shell://<id>/output | ssh_shell_write | ssh_shell_send_key
+NEXT: sub_open shell://<id>/output | ssh_shell_write | ssh_shell_press
 ```
 
 ### Prompts catalog (10 workflows in v5.0)
@@ -197,10 +197,10 @@ Every error code carries a `DETAIL:` line tuned for direct LLM consumption:
 
 | Code | DETAIL |
 |---|---|
-| `SUB_LEAK_RISK` | "Resource has no observers. Either ssh_subscribe or recreate with release_when_no_subs=true." |
+| `SUB_LEAK_RISK` | "Resource has no observers. Either sub_open or recreate with release_when_no_subs=true." |
 | `LAG_BACKPRESSURE` | "Lane buffer full. Consume faster or switch lag_policy to snapshot." |
-| `RESOURCE_GONE` | "Resource already released. Recreate via ssh_shell_open / ssh_execute." |
-| `SUB_NOT_FOUND` | "Use ssh_sub_list to see active subscriptions." |
+| `RESOURCE_GONE` | "Resource already released. Recreate via ssh_shell_open / ssh_exec." |
+| `SUB_NOT_FOUND` | "Use sub_list to see active subscriptions." |
 
 The full taxonomy lives in ADR 0007.
 

@@ -102,7 +102,7 @@ where
     /// `ssh_disconnect` / `ssh_disconnect_agent`. Optional so test
     /// fixtures can construct without the full lifecycle adapter.
     lifecycle: Option<Arc<dyn LifecyclePolicyPort>>,
-    /// v5.3.2 lane cascade — closes orphaned `ssh_subscribe` lanes
+    /// v5.3.2 lane cascade — closes orphaned `sub_open` lanes
     /// bound to the resources owned by this session so they don't
     /// outlive their producer. Optional for the same fixture reason.
     lane_admin: Option<Arc<dyn LaneAdmin>>,
@@ -163,7 +163,7 @@ where
         }
     }
 
-    /// Close every `ssh_subscribe` lane bound to a resource id.
+    /// Close every `sub_open` lane bound to a resource id.
     /// Best-effort: per-lane close failures are swallowed so one bad
     /// lane does not abort the wider cleanup.
     async fn close_lanes_for_resource(&self, resource_id: &str) {

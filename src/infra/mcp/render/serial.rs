@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::adapters::serial::state::SerialPortState;
-use crate::infra::mcp::results::{SshSerialOpenEntry, SshSerialOpenResult};
+use crate::infra::mcp::results::{SerialOpenEntry, SerialOpenResult};
 
 /// Append a `NEXT:` advisory.
 fn next_line(out: &mut String, hint: &str) {
@@ -17,11 +17,11 @@ fn hint_line(out: &mut String, body: &str) {
     out.push_str(body);
 }
 
-/// Render the body of a successful `ssh_serial_open`.
+/// Render the body of a successful `serial_open`.
 #[must_use]
-pub fn serial_open_render(result: &SshSerialOpenResult) -> String {
+pub fn serial_open_render(result: &SerialOpenResult) -> String {
     let mut out = String::with_capacity(384);
-    out.push_str("SSH_SERIAL_OPEN: OK\nSERIAL_ID: ");
+    out.push_str("SERIAL_OPEN: OK\nSERIAL_ID: ");
     out.push_str(&result.serial_id);
     out.push_str("\nPATH: ");
     out.push_str(&result.path);
@@ -38,23 +38,23 @@ pub fn serial_open_render(result: &SshSerialOpenResult) -> String {
     hint_line(
         &mut out,
         &format!(
-            "RECOMMENDED: ssh_subscribe uri={} for push (debounce + 64 KiB byte-threshold flush; same pipeline as shell:// / command://). Read deltas via resources/read?cursor=auto. Do NOT poll.",
+            "RECOMMENDED: sub_open uri={} for push (debounce + 64 KiB byte-threshold flush; same pipeline as shell:// / command://). Read deltas via resources/read?cursor=auto. Do NOT poll.",
             result.uri
         ),
     );
     next_line(
         &mut out,
         &format!(
-            "ssh_subscribe uri={} | ssh_serial_write serial_id={} | ssh_serial_send_key serial_id={} | ssh_serial_close serial_id={}",
+            "sub_open uri={} | serial_write serial_id={} | serial_press serial_id={} | serial_close serial_id={}",
             result.uri, result.serial_id, result.serial_id, result.serial_id
         ),
     );
     out
 }
 
-/// Build the structured JSON for `ssh_serial_open`.
+/// Build the structured JSON for `serial_open`.
 #[must_use]
-pub fn serial_open_structured(result: &SshSerialOpenResult) -> Value {
+pub fn serial_open_structured(result: &SerialOpenResult) -> Value {
     json!({
         "tool":         result.tool,
         "status":       result.status,
@@ -67,30 +67,30 @@ pub fn serial_open_structured(result: &SshSerialOpenResult) -> Value {
         "flow_control": result.flow_control,
         "uri":          result.uri,
         "next": [
-            format!("ssh_subscribe uri={}", result.uri),
-            "ssh_serial_write".to_string(),
-            "ssh_serial_send_key".to_string(),
-            "ssh_serial_close".to_string(),
+            format!("sub_open uri={}", result.uri),
+            "serial_write".to_string(),
+            "serial_press".to_string(),
+            "serial_close".to_string(),
         ],
     })
 }
 
-/// Render `ssh_serial_close`.
+/// Render `serial_close`.
 #[must_use]
 pub fn serial_close_render(serial_id: &str, closed: bool) -> String {
     let mut out = String::with_capacity(96);
-    out.push_str("SSH_SERIAL_CLOSE: ");
+    out.push_str("SERIAL_CLOSE: ");
     out.push_str(if closed { "OK" } else { "NOOP" });
     out.push_str("\nSERIAL_ID: ");
     out.push_str(serial_id);
     out
 }
 
-/// Render `ssh_serial_write`.
+/// Render `serial_write`.
 #[must_use]
 pub fn serial_write_render(serial_id: &str, bytes_sent: usize) -> String {
     let mut out = String::with_capacity(192);
-    out.push_str("SSH_SERIAL_WRITE: OK\nSERIAL_ID: ");
+    out.push_str("SERIAL_WRITE: OK\nSERIAL_ID: ");
     out.push_str(serial_id);
     out.push_str("\nBYTES_SENT: ");
     out.push_str(&bytes_sent.to_string());
@@ -103,13 +103,13 @@ pub fn serial_write_render(serial_id: &str, bytes_sent: usize) -> String {
     next_line(
         &mut out,
         &format!(
-            "ssh_subscribe uri=serial://{serial_id}/output | resources/read serial://{serial_id}/output?cursor=auto | ssh_serial_send_key serial_id={serial_id}"
+            "sub_open uri=serial://{serial_id}/output | resources/read serial://{serial_id}/output?cursor=auto | serial_press serial_id={serial_id}"
         ),
     );
     out
 }
 
-/// Render `ssh_serial_send_key`.
+/// Render `serial_press`.
 #[must_use]
 pub fn serial_send_key_render(
     serial_id: &str,
@@ -118,7 +118,7 @@ pub fn serial_send_key_render(
     bytes_sent: usize,
 ) -> String {
     let mut out = String::with_capacity(192);
-    out.push_str("SSH_SERIAL_SEND_KEY: OK\nSERIAL_ID: ");
+    out.push_str("SERIAL_PRESS: OK\nSERIAL_ID: ");
     out.push_str(serial_id);
     out.push_str("\nKEY: ");
     out.push_str(key);
@@ -129,11 +129,11 @@ pub fn serial_send_key_render(
     out
 }
 
-/// Render `ssh_serial_list_ports`.
+/// Render `serial_scan`.
 #[must_use]
 pub fn serial_list_ports_render(paths: &[String]) -> String {
     let mut out = String::with_capacity(64 + paths.len() * 32);
-    out.push_str("SSH_SERIAL_LIST_PORTS: OK\nTOTAL: ");
+    out.push_str("SERIAL_SCAN: OK\nTOTAL: ");
     out.push_str(&paths.len().to_string());
     for p in paths {
         out.push_str("\nPORT: ");
@@ -142,11 +142,11 @@ pub fn serial_list_ports_render(paths: &[String]) -> String {
     out
 }
 
-/// Render `ssh_serial_list_open`.
+/// Render `serial_active`.
 #[must_use]
-pub fn serial_list_open_render(entries: &[SshSerialOpenEntry]) -> String {
+pub fn serial_list_open_render(entries: &[SerialOpenEntry]) -> String {
     let mut out = String::with_capacity(128 + entries.len() * 64);
-    out.push_str("SSH_SERIAL_LIST_OPEN: OK\nTOTAL: ");
+    out.push_str("SERIAL_ACTIVE: OK\nTOTAL: ");
     out.push_str(&entries.len().to_string());
     for e in entries {
         out.push_str("\nSERIAL_ID: ");
@@ -165,8 +165,8 @@ pub fn serial_list_open_render(entries: &[SshSerialOpenEntry]) -> String {
 
 /// Snapshot a [`SerialPortState`] into the wire-level entry shape.
 #[must_use]
-pub fn open_entry_from_state(state: &SerialPortState) -> SshSerialOpenEntry {
-    SshSerialOpenEntry {
+pub fn open_entry_from_state(state: &SerialPortState) -> SerialOpenEntry {
+    SerialOpenEntry {
         serial_id: state.id.as_str().to_string(),
         path: state.config.path.clone(),
         baud_rate: state.config.baud_rate,

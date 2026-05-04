@@ -1,6 +1,6 @@
 //! Lane-fanout bridge for the legacy broadcast pipeline.
 //!
-//! Wakes up `ssh_subscribe`-created lanes from the URI broadcast path
+//! Wakes up `sub_open`-created lanes from the URI broadcast path
 //! so stdio/HTTP transports get `notifications/resources/updated`
 //! push delivery without a dedicated channel-mux drain task.
 //! Composition root constructs one [`LaneFanoutBridge`] holding the

@@ -33,16 +33,16 @@ use crate::embed::parser::Op;
 pub const fn op_tool_name(op: &Op) -> &'static str {
     match op {
         Op::Connect { .. } => "ssh_connect",
-        Op::Exec { .. } => "ssh_execute",
+        Op::Exec { .. } => "ssh_exec",
         Op::Subscribe { .. } => "_resources_subscribe",
         Op::Unsubscribe { .. } => "_resources_unsubscribe",
         Op::Read { .. } => "_resources_read",
         Op::ShellOpen { .. } => "ssh_shell_open",
         Op::ShellWrite { .. } => "ssh_shell_write",
-        Op::ShellKey { .. } => "ssh_shell_send_key",
+        Op::ShellKey { .. } => "ssh_shell_press",
         Op::Upload { .. } => "ssh_upload",
         Op::Download { .. } => "ssh_download",
-        Op::Cancel { .. } => "ssh_cancel_command",
+        Op::Cancel { .. } => "ssh_exec_cancel",
         Op::Disconnect { .. } => "ssh_disconnect",
         Op::Shutdown { .. } => "_shutdown",
     }
@@ -604,7 +604,7 @@ mod tests {
                 cid: CommandId::new("c".to_string()),
                 id: None,
             }),
-            "ssh_cancel_command"
+            "ssh_exec_cancel"
         );
         assert_eq!(
             op_tool_name(&Op::Subscribe {

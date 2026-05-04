@@ -168,7 +168,7 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 
 ### `src/application/` — use cases
 
-22 files, one per business operation. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 (in flight) will add 9 new use case files for the new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`).
+22 files, one per business operation. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 (in flight) will add 9 new use case files for the new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`).
 
 | Domain | Use cases |
 |--------|-----------|
@@ -344,7 +344,7 @@ LifecyclePolicy { release_when_no_subs: false, grace_ms: 2_000, cascade_session:
 SessionPolicy   { persistent: false, idle_grace_ms: 5_000 }
 ```
 
-`release_when_no_subs` is exposed on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` (Phase 3 surfaces it in the MCP tool schema). Phase 1 wired the layer with the v4-compat default; existing MCP hosts see no behaviour change.
+`release_when_no_subs` is exposed on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` (Phase 3 surfaces it in the MCP tool schema). Phase 1 wired the layer with the v4-compat default; existing MCP hosts see no behaviour change.
 
 Loom coverage: 4 new interleavings in `tests/lockfree_invariants.rs` (subscribe / unsubscribe race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity). Full lock-free invariants summary: [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants).
 
@@ -421,7 +421,7 @@ Subscribers cannot extend or shorten a resource's lifetime — only its creator 
 flowchart LR
     subgraph TOOLS["Long-running tools"]
         TShell["ssh_shell_open"]
-        TExec["ssh_execute"]
+        TExec["ssh_exec"]
         TSftp["ssh_upload<br/>ssh_download"]
         TFwd["ssh_forward<br/>(feature-gated)"]
     end
@@ -432,7 +432,7 @@ flowchart LR
         Ssession["session://&lt;id&gt;/health<br/>(snapshot)"]
         Sforward["forward://&lt;id&gt;/events<br/>(cursor, gated)"]
     end
-    Sub["ssh_subscribe<br/>(SubId, Uri) lane"]
+    Sub["sub_open<br/>(SubId, Uri) lane"]
     Push["resources/updated<br/>push events"]
 
     TShell --> Sshell
@@ -465,7 +465,7 @@ Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(Su
 
 ## Phase 3 — LLM UX surface (in flight)
 
-ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
+ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
 
 This document tracks names; the canonical LLM reference is [LLM_GUIDE.md](./LLM_GUIDE.md) (golden rules, prompts catalogue, anti-patterns, error handbook).
 

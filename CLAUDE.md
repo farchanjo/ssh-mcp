@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-ssh-mcp **v5.0** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus four v5 layers: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — in flight), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue.
+ssh-mcp **v6.0.0** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus four v5 layers: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). v6.0 splits the 36-tool catalogue across three semantic eixos: **`ssh_*`** (21 tools, ops over SSH), **`sub_*`** (9 tools, lane management — cross-resource), **`serial_*`** (6 tools, local UART/TTY/COM — no SSH). Wire-breaking on tool name strings only; resource URIs / push narrative / error taxonomy / structured-content payloads are byte-identical to v5.x.
 
 Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
 
@@ -84,7 +84,7 @@ The four v5 deltas in one line each:
 
 - **Lifecycle binding** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — every long-lived resource is wrapped in a CAS state machine (`Owned → Observed → Releasing → Closed`) plus a per-session refcount. Grace timer arms when last subscriber detaches; new subscribes within the window cancel it. Cascade through `SessionLifecycle.active_refs` so a session with active resources is never reaped by inactivity TTL alone.
 - **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) — push lanes key on `(SubId, Uri)` (UUIDv7). Each subscription owns its own `mpsc::channel(N)`, `LagPolicy`, filter pipeline, replay window, and `SubscriberStats`. A `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy `(PeerId, Uri)` hosts get a synthesised `sub_id`.
-- **LLM UX overhaul** ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — in flight) — 9 net-new MCP tools (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause/resume/filter/replay/list/stats`, `ssh_daemon_stats`); `HINT:` line severity escalation; 10-prompt catalog; `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](docs/adr/0007-error-taxonomy.md)).
+- **LLM UX overhaul** ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — in flight) — 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause/resume/filter/replay/list/stats`, `sub_stats_all`); `HINT:` line severity escalation; 10-prompt catalog; `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](docs/adr/0007-error-taxonomy.md)).
 - **NDJSON daemon binary** ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight) — `ssh-mcp-tail` embeds rmcp server + in-process rmcp client across `tokio::io::duplex` and translates stdin NDJSON ops into MCP tool calls + stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable.
 
 The text channel stays byte-identical to v4.7.1 / v4.8 on the 21 carry-over tools. The 9 new tools follow the same `KEY: value` + 8-hex nonce + `--- name [nonce] ---` envelope.
@@ -117,11 +117,11 @@ stateDiagram-v2
     class Closed closed
 ```
 
-Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download`. Field table, memory ordering, cascade orchestration: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#phase-1--lifecycle-binding-merged) and [docs/DEVELOPMENT.md → Lifecycle adapter invariants](docs/DEVELOPMENT.md#lifecycle-adapter-invariants-phase-1).
+Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download`. Field table, memory ordering, cascade orchestration: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#phase-1--lifecycle-binding-merged) and [docs/DEVELOPMENT.md → Lifecycle adapter invariants](docs/DEVELOPMENT.md#lifecycle-adapter-invariants-phase-1).
 
 ### Channel mux pipeline
 
-Each `resources/subscribe` (legacy) or `ssh_subscribe` (new tool) call mints a `SubId` (UUIDv7) and creates a `MultiplexLane` (`byte_cursor`, `tx`, `policy`, `filter`, `lifecycle` link, `stats`, `pause_flag`). The `ChannelMux` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin draining. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain.
+Each `resources/subscribe` (legacy) or `sub_open` (new tool) call mints a `SubId` (UUIDv7) and creates a `MultiplexLane` (`byte_cursor`, `tx`, `policy`, `filter`, `lifecycle` link, `stats`, `pause_flag`). The `ChannelMux` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin draining. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -177,9 +177,9 @@ All three binaries are thin shells over `composition::prod` (and, for the daemon
 
 ### MCP tools
 
-30 tools with `port_forward` / 29 without. Catalogue and per-tool schemas: [docs/API.md](docs/API.md). Phase 3 adds the 9 subscription primitives (`ssh_subscribe`, `ssh_unsubscribe`, `ssh_sub_pause`, `ssh_sub_resume`, `ssh_sub_filter`, `ssh_sub_replay`, `ssh_sub_list`, `ssh_sub_stats`, `ssh_daemon_stats`).
+30 tools with `port_forward` / 29 without. Catalogue and per-tool schemas: [docs/API.md](docs/API.md). Phase 3 adds the 9 subscription primitives (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`).
 
-> **Lane fanout (v5.3)**: `ssh_subscribe` lanes carry the rmcp peer captured at tool-invocation time and receive `notifications/resources/updated` push delivery on stdio/HTTP transports through `LaneFanoutBridge` (in `src/adapters/subscription/lane_bridge.rs`). The bridge is installed on `MemoryRegistry` at composition; legacy `broadcast` walks the lane snapshot for the URI before the v4 peer fan-out, calls `notifier.notify_resource_updated` per lane peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The Phase 4 NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
+> **Lane fanout (v5.3)**: `sub_open` lanes carry the rmcp peer captured at tool-invocation time and receive `notifications/resources/updated` push delivery on stdio/HTTP transports through `LaneFanoutBridge` (in `src/adapters/subscription/lane_bridge.rs`). The bridge is installed on `MemoryRegistry` at composition; legacy `broadcast` walks the lane snapshot for the URI before the v4 peer fan-out, calls `notifier.notify_resource_updated` per lane peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The Phase 4 NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
 
 Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
 
@@ -244,7 +244,7 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 
 - Public MCP API is **wire-compatible** with v3 / v4. v3 / v4 hosts work against v5 servers without any change to wire format, tool catalogue, env vars, or markdown response shape.
 - 9 net-new MCP tools (Phase 3) and a third binary `ssh-mcp-tail` (Phase 4). Both additive.
-- `release_when_no_subs: bool` (default `false` — v4 semantics preserved) on `ssh_shell_open` / `ssh_execute` / `ssh_upload` / `ssh_download` per [ADR 0003](docs/adr/0003-lifecycle-binding.md).
+- `release_when_no_subs: bool` (default `false` — v4 semantics preserved) on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` per [ADR 0003](docs/adr/0003-lifecycle-binding.md).
 - Cursors rekey from `(PeerId, Uri)` to `(SubId, Uri)` per [ADR 0004](docs/adr/0004-channel-mux-fairness.md). Legacy hosts get a synthesised `sub_id` — no host-side change required.
 - Default lane LagPolicy is `Snapshot` (was: implicit broadcast `RecvError::Lagged` recovery in v4). Behaviour matches v4 semantics — [ADR 0006](docs/adr/0006-backpressure-policies.md).
 - MSRV bumped to Rust **1.95** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.95).

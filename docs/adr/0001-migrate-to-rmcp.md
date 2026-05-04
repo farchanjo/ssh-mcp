@@ -49,7 +49,7 @@ Migrate to **`rmcp` 1.6**, the official Anthropic Rust SDK for the Model Context
 - **Response shape** unified to a single markdown `String` wrapped in `CallToolResult::success(vec![Content::text(s)])`. The legacy `Text<String>` adapter is gone; `commands.rs` was retired and parked at `commands_legacy.rs.txt` for reference.
 - **Five subscribe schemes** implemented in `src/mcp/resources.rs` (URI parser + reader) and `src/mcp/subscription.rs` (registry + debouncer). Producers (shell reader, command reader, transfer task, health probe, forward task) call `SUBSCRIPTION_REGISTRY.poke(kind, id)` after each chunk; the per-resource debouncer task fans out one notification per debounce window.
 - **Stdio quirks dropped.** v2 carried a hand-rolled `notifications/cancelled` parser inside `src/bin/ssh_mcp_stdio.rs` (~250 LOC) that intercepted both `camelCase` and `snake_case` and dropped responses for cancelled IDs. rmcp handles cancellation natively; the stdio binary now consists of `serve_stdio(McpSshServer::new())` plus a peer-GC task.
-- **Two new tools added** during the migration: `ssh_shell_send_key` (E10) and `ssh_shell_wait_for` (E11). Total tool count: 18.
+- **Two new tools added** during the migration: `ssh_shell_press` (E10) and `ssh_shell_wait_for` (E11). Total tool count: 18.
 
 ### Wire-format changes
 
@@ -94,7 +94,7 @@ mutex_integer                   = "deny"
 - E1 (rmcp foundation): commit `3f65152` — `feat(v3): E1 rmcp foundation — dep swap + transport rewrite`.
 - E3 (canary `ssh_connect`): commit `a956191` — `feat(v3): E3 ssh_connect canary migrated to rmcp`.
 - E4 (full tool migration): commit `e17be5d` — `feat(v3): E4 migrate remaining 15 tools to rmcp`.
-- E10 (`ssh_shell_send_key`): commit `f9652c7`.
+- E10 (`ssh_shell_press`): commit `f9652c7`.
 - E11 (`ssh_shell_wait_for`): commit `83aa193`.
 - E12 (subscription registry + debouncer): commit `d87980d`.
 - E13 (`resources.rs` parser + handlers): commit `d2798ff`.

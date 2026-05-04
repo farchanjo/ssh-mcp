@@ -45,7 +45,7 @@ pub struct LanePolicy {
     pub peer: Option<Arc<dyn PeerHandle>>,
 }
 
-/// Read-only summary for `ssh_sub_list` / `ssh_daemon_stats`.
+/// Read-only summary for `sub_list` / `sub_stats_all`.
 #[derive(Debug, Clone)]
 pub struct SubSummary {
     /// Lane id.
@@ -133,7 +133,7 @@ pub trait LaneAdmin: fmt::Debug + Send + Sync + 'static {
     /// Snapshot per-lane statistics. Returns `None` for unknown lanes.
     fn stats(&self, sub_id: &SubId) -> Option<SubscriberStats>;
 
-    /// Read-only summary list for `ssh_sub_list`.
+    /// Read-only summary list for `sub_list`.
     fn list(&self) -> Vec<SubSummary>;
 }
 

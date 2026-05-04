@@ -76,13 +76,13 @@ const fn detail_for_remote(code: &str) -> Option<&'static str> {
 const fn detail_for_resource(code: &str) -> Option<&'static str> {
     Some(match code.as_bytes() {
         b"SESSION_NOT_FOUND" => {
-            "Use ssh_list_sessions; recreate via ssh_connect if the id is stale."
+            "Use ssh_sessions; recreate via ssh_connect if the id is stale."
         }
         b"SHELL_NOT_FOUND" => {
             "Recreate via ssh_shell_open; subscribe to shell://<id>/output to track lifecycle."
         }
         b"COMMAND_NOT_FOUND" => {
-            "Use ssh_list_commands; subscribe to command://<id>/output for completion events."
+            "Use ssh_commands; subscribe to command://<id>/output for completion events."
         }
         b"TRANSFER_NOT_FOUND" => {
             "Re-issue ssh_upload or ssh_download to obtain a fresh transfer_id."
@@ -91,9 +91,9 @@ const fn detail_for_resource(code: &str) -> Option<&'static str> {
             "Re-issue ssh_forward; verify the binary was built with the port_forward feature."
         }
         b"RESOURCE_GONE" => {
-            "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_execute / ssh_upload."
+            "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_exec / ssh_upload."
         }
-        b"SUB_NOT_FOUND" => "Use ssh_sub_list to enumerate active subscriptions.",
+        b"SUB_NOT_FOUND" => "Use sub_list to enumerate active subscriptions.",
         b"GRACE_TIMER_EXPIRED" => "Recreate the resource and resubscribe within the grace window.",
         _ => return None,
     })
@@ -109,7 +109,7 @@ const fn detail_for_policy(code: &str) -> Option<&'static str> {
 const fn detail_for_policy_max(code: &str) -> Option<&'static str> {
     Some(match code.as_bytes() {
         b"MAX_SESSIONS_EXCEEDED" => {
-            "Audit ssh_list_sessions; ssh_disconnect_agent stale agents; raise SSH_MAX_SESSIONS if needed."
+            "Audit ssh_sessions; ssh_disconnect_agent stale agents; raise SSH_MAX_SESSIONS if needed."
         }
         b"MAX_SHELLS_EXCEEDED" => {
             "ssh_shell_close stale shells; consider release_when_no_subs=true so shells self-clean."
@@ -123,7 +123,7 @@ const fn detail_for_policy_max(code: &str) -> Option<&'static str> {
         b"MAX_SUBS_PER_URI_EXCEEDED" => {
             "Share an existing sub via fan-out client-side, or unsubscribe stale ones."
         }
-        b"MAX_SUBS_TOTAL_EXCEEDED" => "Audit ssh_sub_list and unsubscribe stale subscriptions.",
+        b"MAX_SUBS_TOTAL_EXCEEDED" => "Audit sub_list and unsubscribe stale subscriptions.",
         b"PORT_IN_USE" => {
             "Pick another local port or stop the conflicting listener and retry ssh_forward."
         }
@@ -142,10 +142,10 @@ const fn detail_for_policy_lag(code: &str) -> Option<&'static str> {
         }
         b"LAG_BACKPRESSURE" => "Consume stdout faster or raise SSH_BP_BLOCK_TIMEOUT_MS.",
         b"RING_BUFFER_OVERFLOW" => {
-            "Head bytes dropped; use ssh_sub_replay from a more recent cursor."
+            "Head bytes dropped; use sub_replay from a more recent cursor."
         }
         b"SUB_LEAK_RISK" => {
-            "Resource has no observers. Either ssh_subscribe or recreate with release_when_no_subs=true."
+            "Resource has no observers. Either sub_open or recreate with release_when_no_subs=true."
         }
         _ => return None,
     })
@@ -157,7 +157,7 @@ const fn detail_for_state(code: &str) -> Option<&'static str> {
             "Inspect the offending field; correct against the tools/list schema and retry."
         }
         b"INVALID_REPEAT" => {
-            "repeat must be in 1..=64; chain multiple ssh_shell_send_key calls if higher counts are required."
+            "repeat must be in 1..=64; chain multiple ssh_shell_press calls if higher counts are required."
         }
         b"INVALID_LIFETIME" => "lifetime must be one of {manual, auto_close, lease}.",
         b"INVALID_LAG_POLICY" => {
@@ -175,7 +175,7 @@ const fn detail_for_state(code: &str) -> Option<&'static str> {
         }
         b"PATTERN_TOO_LONG" => "Each pattern must fit within 1024 bytes.",
         b"MODIFIER_NOT_ALLOWED" => {
-            "The chosen key does not accept the supplied modifier; consult ssh_shell_send_key docs."
+            "The chosen key does not accept the supplied modifier; consult ssh_shell_press docs."
         }
         _ => return None,
     })

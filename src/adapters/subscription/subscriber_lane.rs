@@ -240,7 +240,7 @@ impl LaneState {
         **self.policy.load()
     }
 
-    /// Build a [`SubSummary`] for `ssh_sub_list` rendering.
+    /// Build a [`SubSummary`] for `sub_list` rendering.
     fn summary(&self) -> SubSummary {
         SubSummary {
             sub_id: self.sub_id.clone(),
