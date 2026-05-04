@@ -395,6 +395,11 @@ async fn upload_chunks(
 
         write_to_sftp_file(remote_file, &buf[..n], remote_path).await?;
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
+        // ADR 0006 Amendment 1 — feed the byte-threshold counter
+        // with the per-chunk delta so a fast transfer can flush the
+        // push channel as soon as it produces `SSH_NOTIFY_FLUSH_BYTES`
+        // since the last broadcast.
+        SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Transfer, transfer_id, n);
         emit_tick(
             transfer_id,
             progress_tx,
@@ -578,6 +583,9 @@ async fn download_chunks(
         })?;
 
         bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
+        // ADR 0006 Amendment 1 — per-chunk delta into the
+        // byte-threshold counter (mirror of the upload path).
+        SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Transfer, transfer_id, n);
         emit_tick(
             transfer_id,
             progress_tx,

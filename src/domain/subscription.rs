@@ -196,6 +196,14 @@ pub struct SubscriberStats {
     pub queue_high_watermark: usize,
     /// Cumulative time spent blocked in [`LagPolicy::BlockSlow`].
     pub block_total_ms: u64,
+    /// ADR 0006 Amendment 1 — number of broadcasts triggered by the
+    /// per-resource byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`)
+    /// crossing instead of by the time-based debouncer wakeup.
+    /// Aggregated across the resource fan-out: every active lane on a
+    /// URI sees the increment for each byte-triggered broadcast on
+    /// that URI.
+    #[serde(default)]
+    pub byte_triggered_flushes: u64,
 }
 
 #[cfg(test)]
@@ -451,6 +459,7 @@ mod tests {
             queue_depth: 7,
             queue_high_watermark: 12,
             block_total_ms: 250,
+            byte_triggered_flushes: 9,
         };
         let json = serde_json::to_string(&s).expect("ser");
         let back: SubscriberStats = serde_json::from_str(&json).expect("de");

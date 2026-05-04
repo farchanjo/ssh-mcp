@@ -147,6 +147,18 @@ pub const NOTIFY_FORCE_FLUSH_MS_MIN: u64 = 100;
 /// Cap for the force-flush interval.
 pub const NOTIFY_FORCE_FLUSH_MS_MAX: u64 = 60_000;
 
+/// Default byte-threshold for the subscription debouncer.
+///
+/// ADR 0006 Amendment 1 — when the per-resource accumulated bytes
+/// since the last broadcast cross this threshold, the debouncer
+/// flushes immediately regardless of the time window.
+pub const DEFAULT_NOTIFY_FLUSH_BYTES: usize = 65_536;
+/// Floor for the byte-threshold (`0` is the special "disabled" value
+/// handled separately by the resolver — see [`resolve_notify_flush_bytes`]).
+pub const NOTIFY_FLUSH_BYTES_MIN: usize = 1_024;
+/// Cap for the byte-threshold (1 MiB).
+pub const NOTIFY_FLUSH_BYTES_MAX: usize = 1_048_576;
+
 /// Default keepalive interval (seconds) for the subscription registry.
 pub const DEFAULT_NOTIFY_KEEPALIVE_S: u64 = 30;
 /// Floor for the keepalive interval.
@@ -212,6 +224,12 @@ pub const PEER_GC_INTERVAL_S_MAX: u64 = 300;
 pub const NOTIFY_DEBOUNCE_MS_ENV_VAR: &str = "SSH_NOTIFY_DEBOUNCE_MS";
 /// Environment variable name for the subscription force-flush interval.
 pub const NOTIFY_FORCE_FLUSH_MS_ENV_VAR: &str = "SSH_NOTIFY_FORCE_FLUSH_MS";
+/// Environment variable name for the subscription byte-threshold flush.
+///
+/// ADR 0006 Amendment 1 — accepts a bare integer (bytes) or a
+/// `bytesize` suffix string (`8k`, `64k`, `1m`, `2mb`, `1mib`).
+/// `0` disables the byte-threshold (debouncer reverts to time-only).
+pub const NOTIFY_FLUSH_BYTES_ENV_VAR: &str = "SSH_NOTIFY_FLUSH_BYTES";
 /// Environment variable name for the subscription keepalive interval.
 pub const NOTIFY_KEEPALIVE_S_ENV_VAR: &str = "SSH_NOTIFY_KEEPALIVE_S";
 /// Environment variable name for the binary peer-GC scan interval.
@@ -668,6 +686,64 @@ pub fn resolve_notify_force_flush_ms() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_NOTIFY_FORCE_FLUSH_MS);
     raw.clamp(NOTIFY_FORCE_FLUSH_MS_MIN, NOTIFY_FORCE_FLUSH_MS_MAX)
+}
+
+/// Resolve the subscription byte-threshold flush (bytes).
+///
+/// ADR 0006 Amendment 1 — the per-resource debouncer flushes immediately
+/// once the accumulated bytes since the last broadcast cross this
+/// threshold. Reads `SSH_NOTIFY_FLUSH_BYTES` (default `65_536` / `64KiB`).
+///
+/// Accepts:
+/// - bare integer bytes (`65536`)
+/// - `bytesize` suffix string (`8k`, `64k`, `1m`, `2mb`, `1mib`)
+///
+/// `0` (or `"0"`) returns `0`, signalling the debouncer to skip the
+/// byte-threshold branch entirely (time-only debouncer, v5.0 behaviour).
+/// Any non-zero value is clamped to
+/// `[NOTIFY_FLUSH_BYTES_MIN, NOTIFY_FLUSH_BYTES_MAX]`.
+#[must_use]
+pub fn resolve_notify_flush_bytes() -> usize {
+    let Ok(raw) = env::var(NOTIFY_FLUSH_BYTES_ENV_VAR) else {
+        return DEFAULT_NOTIFY_FLUSH_BYTES;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_NOTIFY_FLUSH_BYTES;
+    }
+    let parsed = parse_bytesize(trimmed).unwrap_or(DEFAULT_NOTIFY_FLUSH_BYTES);
+    if parsed == 0 {
+        0
+    } else {
+        parsed.clamp(NOTIFY_FLUSH_BYTES_MIN, NOTIFY_FLUSH_BYTES_MAX)
+    }
+}
+
+/// Minimal bytesize parser — enough for `123`, `8k`, `64k`, `1m`, `2mb`,
+/// `1mib`. Decimal suffixes (`k`, `kb`, `m`, `mb`, `g`, `gb`) use
+/// powers of 1000; binary suffixes (`kib`, `mib`, `gib`) use powers of
+/// 1024. Whitespace between number and unit is allowed. Returns `None`
+/// on any parse error.
+fn parse_bytesize(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let split_at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, suffix_raw) = s.split_at(split_at);
+    if digits.is_empty() {
+        return None;
+    }
+    let n: usize = digits.parse().ok()?;
+    let suffix = suffix_raw.trim().to_ascii_lowercase();
+    let multiplier: usize = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "kib" => 1_024,
+        "mib" => 1_048_576,
+        "gib" => 1_073_741_824,
+        _ => return None,
+    };
+    n.checked_mul(multiplier)
 }
 
 /// Resolve the subscription keepalive interval (seconds).
@@ -2214,6 +2290,104 @@ mod tests {
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe { remove_env(NOTIFY_KEEPALIVE_S_ENV_VAR) };
                 assert_eq!(result, NOTIFY_KEEPALIVE_S_MAX);
+            }
+        }
+
+        mod notify_flush_bytes {
+            use super::*;
+
+            #[test]
+            fn default_when_env_unset() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex, no concurrent env access
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(resolve_notify_flush_bytes(), DEFAULT_NOTIFY_FLUSH_BYTES);
+            }
+
+            #[test]
+            fn parses_bare_integer_bytes() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex, no concurrent env access
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "32768") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex, no concurrent env access
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, 32_768);
+            }
+
+            #[test]
+            fn parses_decimal_kilobyte_suffix() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "8k") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, 8_000);
+            }
+
+            #[test]
+            fn parses_binary_kib_suffix() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "64kib") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, 65_536);
+            }
+
+            #[test]
+            fn zero_disables_byte_threshold() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "0") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, 0);
+            }
+
+            #[test]
+            fn below_floor_clamps_up() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "100") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, NOTIFY_FLUSH_BYTES_MIN);
+            }
+
+            #[test]
+            fn above_cap_clamps_down() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "10mib") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, NOTIFY_FLUSH_BYTES_MAX);
+            }
+
+            #[test]
+            fn unknown_suffix_falls_back_to_default() {
+                let _guard = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: held mutex
+                unsafe { set_env(NOTIFY_FLUSH_BYTES_ENV_VAR, "8x") };
+                let result = resolve_notify_flush_bytes();
+                // SAFETY: held mutex
+                unsafe { remove_env(NOTIFY_FLUSH_BYTES_ENV_VAR) };
+                assert_eq!(result, DEFAULT_NOTIFY_FLUSH_BYTES);
+            }
+
+            #[test]
+            fn constants_are_consistent() {
+                assert!(NOTIFY_FLUSH_BYTES_MIN <= DEFAULT_NOTIFY_FLUSH_BYTES);
+                assert!(DEFAULT_NOTIFY_FLUSH_BYTES <= NOTIFY_FLUSH_BYTES_MAX);
+                assert_eq!(DEFAULT_NOTIFY_FLUSH_BYTES, 65_536);
+                assert_eq!(NOTIFY_FLUSH_BYTES_MIN, 1_024);
+                assert_eq!(NOTIFY_FLUSH_BYTES_MAX, 1_048_576);
             }
         }
 

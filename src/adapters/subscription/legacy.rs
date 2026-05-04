@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -47,7 +47,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::adapters::config::internal::{
-    resolve_notify_debounce_ms, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
+    resolve_notify_debounce_ms, resolve_notify_flush_bytes, resolve_notify_force_flush_ms,
+    resolve_notify_keepalive_s,
 };
 use crate::adapters::notifier::rmcp_peer::PeerTable;
 
@@ -122,6 +123,20 @@ pub struct SubscriptionRegistry {
     sequence_counters: DashMap<ResourceKey, Arc<AtomicU64>>,
     /// `(kind, resource_id)` -> wakeup notify shared with the debouncer.
     wakers: DashMap<ResourceKey, Arc<Notify>>,
+    /// ADR 0006 Amendment 1 — `(kind, resource_id)` -> immediate-flush
+    /// notify. Fired by [`Self::record_bytes`] when the per-resource
+    /// byte counter crosses `SSH_NOTIFY_FLUSH_BYTES`.
+    flush_now: DashMap<ResourceKey, Arc<Notify>>,
+    /// ADR 0006 Amendment 1 — `(kind, resource_id)` ->
+    /// bytes-since-last-broadcast counter (`Relaxed` ordering — this
+    /// is a coalescing hint).
+    bytes_since_flush: DashMap<ResourceKey, Arc<AtomicUsize>>,
+    /// Cached byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). Resolved
+    /// once at construction. `0` disables byte-threshold entirely.
+    flush_bytes_threshold: usize,
+    /// ADR 0006 Amendment 1 — process-wide count of byte-triggered
+    /// broadcasts.
+    byte_triggered_flushes: AtomicU64,
 }
 
 impl SubscriptionRegistry {
@@ -134,6 +149,10 @@ impl SubscriptionRegistry {
             debounce_tasks: DashMap::new(),
             sequence_counters: DashMap::new(),
             wakers: DashMap::new(),
+            flush_now: DashMap::new(),
+            bytes_since_flush: DashMap::new(),
+            flush_bytes_threshold: resolve_notify_flush_bytes(),
+            byte_triggered_flushes: AtomicU64::new(0),
         }
     }
 
@@ -338,7 +357,12 @@ impl SubscriptionRegistry {
             return;
         }
         let waker = Arc::new(Notify::new());
+        let flush_now = Arc::new(Notify::new());
+        let bytes_counter = Arc::new(AtomicUsize::new(0));
         self.wakers.insert(key.clone(), Arc::clone(&waker));
+        self.flush_now.insert(key.clone(), Arc::clone(&flush_now));
+        self.bytes_since_flush
+            .insert(key.clone(), Arc::clone(&bytes_counter));
         let uri = format_uri(kind, resource_id);
         let debounce_ms = resolve_notify_debounce_ms();
         let force_flush_ms = resolve_notify_force_flush_ms();
@@ -346,6 +370,8 @@ impl SubscriptionRegistry {
         let task = tokio::spawn(debouncer_task(
             uri,
             waker,
+            flush_now,
+            bytes_counter,
             debounce_ms,
             force_flush_ms,
             keepalive_s,
@@ -359,6 +385,50 @@ impl SubscriptionRegistry {
             handle.abort();
         }
         self.wakers.remove(&key);
+        self.flush_now.remove(&key);
+        self.bytes_since_flush.remove(&key);
+    }
+
+    /// ADR 0006 Amendment 1 — record `bytes_added` newly produced
+    /// bytes for `(kind, id)`. Forces an immediate debouncer flush
+    /// when the per-resource counter crosses
+    /// `SSH_NOTIFY_FLUSH_BYTES`. Disabled (`0` threshold) /
+    /// no-debouncer paths return immediately.
+    pub fn record_bytes(&self, kind: ResourceKind, id: &str, bytes_added: usize) {
+        if self.flush_bytes_threshold == 0 || bytes_added == 0 {
+            return;
+        }
+        let key: ResourceKey = (kind, id.to_string());
+        if !self.bytes_since_flush.contains_key(&key) {
+            return;
+        }
+        let Some(counter_entry) = self.bytes_since_flush.get(&key) else {
+            return;
+        };
+        let counter = Arc::clone(counter_entry.value());
+        drop(counter_entry);
+        let prev = counter.fetch_add(bytes_added, Ordering::Relaxed);
+        let new = prev.saturating_add(bytes_added);
+        if prev < self.flush_bytes_threshold
+            && new >= self.flush_bytes_threshold
+            && let Some(notify) = self.flush_now.get(&key)
+        {
+            notify.notify_one();
+        }
+    }
+
+    /// Process-wide count of byte-threshold-triggered broadcasts.
+    /// Surfaced via `ssh_daemon_stats`.
+    #[must_use]
+    pub fn byte_triggered_flushes_total(&self) -> u64 {
+        self.byte_triggered_flushes.load(Ordering::Relaxed)
+    }
+
+    /// Cached byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). `0` means
+    /// disabled.
+    #[must_use]
+    pub const fn flush_bytes_threshold(&self) -> usize {
+        self.flush_bytes_threshold
     }
 }
 
@@ -408,9 +478,16 @@ pub fn parse_uri(uri: &str) -> Option<(ResourceKind, String)> {
 pub static SUBSCRIPTION_REGISTRY: LazyLock<SubscriptionRegistry> =
     LazyLock::new(SubscriptionRegistry::new);
 
+async fn legacy_broadcast_and_reset(uri: &str, bytes_counter: &AtomicUsize) {
+    bytes_counter.store(0, Ordering::Relaxed);
+    broadcast_resource_updated(uri).await;
+}
+
 async fn debouncer_task(
     uri: String,
     waker: Arc<Notify>,
+    flush_now: Arc<Notify>,
+    bytes_counter: Arc<AtomicUsize>,
     debounce_ms: u64,
     force_flush_ms: u64,
     keepalive_s: u64,
@@ -418,25 +495,28 @@ async fn debouncer_task(
     let mut keepalive_tick = interval(Duration::from_secs(keepalive_s));
     keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     keepalive_tick.tick().await; // initial tick fires immediately — drain.
-
     let mut force_flush_tick = interval(Duration::from_millis(force_flush_ms));
     force_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     force_flush_tick.tick().await;
-
     let debounce = Duration::from_millis(debounce_ms);
-
     loop {
         tokio::select! {
             biased;
+            () = flush_now.notified() => {
+                SUBSCRIPTION_REGISTRY
+                    .byte_triggered_flushes
+                    .fetch_add(1, Ordering::Relaxed);
+                legacy_broadcast_and_reset(&uri, &bytes_counter).await;
+            }
             () = waker.notified() => {
                 time::sleep(debounce).await;
-                broadcast_resource_updated(&uri).await;
+                legacy_broadcast_and_reset(&uri, &bytes_counter).await;
             }
             _ = force_flush_tick.tick() => {
-                broadcast_resource_updated(&uri).await;
+                legacy_broadcast_and_reset(&uri, &bytes_counter).await;
             }
             _ = keepalive_tick.tick() => {
-                broadcast_resource_updated(&uri).await;
+                legacy_broadcast_and_reset(&uri, &bytes_counter).await;
             }
         }
     }

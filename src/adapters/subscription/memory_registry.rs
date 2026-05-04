@@ -32,7 +32,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::adapters::config::internal::{
     resolve_max_subs_per_uri, resolve_max_subs_total, resolve_notify_debounce_ms,
-    resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
+    resolve_notify_flush_bytes, resolve_notify_force_flush_ms, resolve_notify_keepalive_s,
 };
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
@@ -123,6 +123,26 @@ pub struct MemoryRegistry<N> {
     sequence_counters: DashMap<ResourceKey, Arc<AtomicU64>>,
     /// `(kind, resource_id)` -> wakeup notify shared with the debouncer.
     wakers: DashMap<ResourceKey, Arc<Notify>>,
+    /// `(kind, resource_id)` -> immediate-flush notify shared with the
+    /// debouncer. ADR 0006 Amendment 1 — fired by
+    /// [`MemoryRegistry::record_bytes`] when the per-resource byte
+    /// counter crosses the configured threshold. Distinct from
+    /// `wakers` so the debouncer can branch on the wakeup kind and
+    /// skip the debounce sleep.
+    flush_now: DashMap<ResourceKey, Arc<Notify>>,
+    /// `(kind, resource_id)` -> bytes-since-last-broadcast counter.
+    /// `Relaxed` ordering throughout — this is a coalescing hint, not
+    /// a synchronisation primitive. See ADR 0006 Amendment 1.
+    bytes_since_flush: DashMap<ResourceKey, Arc<AtomicUsize>>,
+    /// Cached byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). Resolved
+    /// once at construction so the per-`record_bytes` path stays
+    /// lock-free. `0` disables byte-threshold entirely.
+    flush_bytes_threshold: usize,
+    /// ADR 0006 Amendment 1 — process-wide count of broadcasts
+    /// triggered by the byte-threshold branch. Surfaced via
+    /// `ssh_daemon_stats`. Wire-compat: also returned by
+    /// [`MemoryRegistry::byte_triggered_flushes_total`].
+    byte_triggered_flushes: AtomicU64,
     /// Notifier the debouncer fans out over.
     notifier: Arc<N>,
     /// Per-URI subscriber cap (`SSH_MAX_SUBS_PER_URI`). When the cap
@@ -188,6 +208,7 @@ where
     pub fn with_caps(notifier: Arc<N>, max_per_uri: u16, max_total: u16) -> Arc<Self> {
         let per_uri = max_per_uri.max(1);
         let total = max_total.max(1);
+        let flush_bytes_threshold = resolve_notify_flush_bytes();
         Arc::new_cyclic(|weak| Self {
             subscribers: DashMap::new(),
             peer_progress: DashMap::new(),
@@ -195,6 +216,10 @@ where
             debounce_tasks: DashMap::new(),
             sequence_counters: DashMap::new(),
             wakers: DashMap::new(),
+            flush_now: DashMap::new(),
+            bytes_since_flush: DashMap::new(),
+            flush_bytes_threshold,
+            byte_triggered_flushes: AtomicU64::new(0),
             notifier,
             max_per_uri: per_uri,
             max_total: total,
@@ -290,14 +315,26 @@ where
             return;
         };
         let waker = Arc::new(Notify::new());
+        let flush_now = Arc::new(Notify::new());
+        let bytes_counter = Arc::new(AtomicUsize::new(0));
         self.wakers.insert(key.clone(), Arc::clone(&waker));
+        self.flush_now.insert(key.clone(), Arc::clone(&flush_now));
+        self.bytes_since_flush
+            .insert(key.clone(), Arc::clone(&bytes_counter));
         let uri = format_uri(kind, resource_id);
         let cfg = DebouncerConfig {
             debounce_ms: resolve_notify_debounce_ms(),
             force_flush_ms: resolve_notify_force_flush_ms(),
             keepalive_s: resolve_notify_keepalive_s(),
         };
-        let task = tokio::spawn(debouncer_task(registry, uri, waker, cfg));
+        let task = tokio::spawn(debouncer_task(
+            registry,
+            uri,
+            waker,
+            flush_now,
+            bytes_counter,
+            cfg,
+        ));
         self.debounce_tasks.insert(key, task);
     }
 
@@ -307,6 +344,8 @@ where
             handle.abort();
         }
         self.wakers.remove(&key);
+        self.flush_now.remove(&key);
+        self.bytes_since_flush.remove(&key);
     }
 
     /// Sync flavour of `drop_peer` used by `gc_closed_peers` (which is
@@ -394,6 +433,21 @@ where
         self.subscribers
             .get(uri)
             .map_or(0, |entry| entry.value().len())
+    }
+
+    /// Process-wide count of byte-threshold-triggered broadcasts
+    /// (ADR 0006 Amendment 1). Used by `ssh_daemon_stats` to surface
+    /// the cross-resource flush rate to the LLM.
+    #[must_use]
+    pub fn byte_triggered_flushes_total(&self) -> u64 {
+        self.byte_triggered_flushes.load(Ordering::Relaxed)
+    }
+
+    /// Cached byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). `0` means
+    /// disabled.
+    #[must_use]
+    pub const fn flush_bytes_threshold(&self) -> usize {
+        self.flush_bytes_threshold
     }
 
     /// Pre-check the per-URI / total caps for a peer that wants to
@@ -494,6 +548,34 @@ where
     fn poke(&self, kind: ResourceKind, resource_id: &str) {
         if let Some(entry) = self.wakers.get(&(kind, resource_id.to_string())) {
             entry.notify_one();
+        }
+    }
+
+    fn record_bytes(&self, kind: ResourceKind, resource_id: &str, bytes_added: usize) {
+        // Disabled by env (`SSH_NOTIFY_FLUSH_BYTES=0`) or no-op call.
+        if self.flush_bytes_threshold == 0 || bytes_added == 0 {
+            return;
+        }
+        let key: ResourceKey = (kind, resource_id.to_string());
+        // No debouncer running for this resource → nothing to flush.
+        // Cheaper than acquiring the bytes_since_flush entry first.
+        if !self.bytes_since_flush.contains_key(&key) {
+            return;
+        }
+        let Some(counter_entry) = self.bytes_since_flush.get(&key) else {
+            return;
+        };
+        let counter = Arc::clone(counter_entry.value());
+        drop(counter_entry);
+        let prev = counter.fetch_add(bytes_added, Ordering::Relaxed);
+        let new = prev.saturating_add(bytes_added);
+        // First crosser wins — `notify_one` only wakes the debouncer
+        // once even under contention.
+        if prev < self.flush_bytes_threshold
+            && new >= self.flush_bytes_threshold
+            && let Some(notify) = self.flush_now.get(&key)
+        {
+            notify.notify_one();
         }
     }
 
@@ -666,6 +748,8 @@ async fn debouncer_task<N>(
     registry: Arc<MemoryRegistry<N>>,
     uri: String,
     waker: Arc<Notify>,
+    flush_now: Arc<Notify>,
+    bytes_counter: Arc<AtomicUsize>,
     cfg: DebouncerConfig,
 ) where
     N: NotifierPort + Send + Sync + 'static,
@@ -683,18 +767,35 @@ async fn debouncer_task<N>(
     loop {
         tokio::select! {
             biased;
+            () = flush_now.notified() => {
+                registry
+                    .byte_triggered_flushes
+                    .fetch_add(1, Ordering::Relaxed);
+                broadcast_and_reset(&registry, &uri, &bytes_counter).await;
+            }
             () = waker.notified() => {
                 time::sleep(debounce).await;
-                broadcast(&registry, &uri).await;
+                broadcast_and_reset(&registry, &uri, &bytes_counter).await;
             }
             _ = force_flush_tick.tick() => {
-                broadcast(&registry, &uri).await;
+                broadcast_and_reset(&registry, &uri, &bytes_counter).await;
             }
             _ = keepalive_tick.tick() => {
-                broadcast(&registry, &uri).await;
+                broadcast_and_reset(&registry, &uri, &bytes_counter).await;
             }
         }
     }
+}
+
+async fn broadcast_and_reset<N>(
+    registry: &Arc<MemoryRegistry<N>>,
+    uri: &str,
+    bytes_counter: &Arc<AtomicUsize>,
+) where
+    N: NotifierPort + Send + Sync + 'static,
+{
+    bytes_counter.store(0, Ordering::Relaxed);
+    broadcast(registry, uri).await;
 }
 
 async fn broadcast<N>(registry: &Arc<MemoryRegistry<N>>, uri: &str)
@@ -824,6 +925,76 @@ mod tests {
     fn poke_without_subscribers_is_noop() {
         let reg = registry();
         reg.poke(ResourceKind::Shell, "missing");
+    }
+
+    #[test]
+    fn record_bytes_without_debouncer_is_noop() {
+        let reg = registry();
+        // No debouncer attached for this resource yet.
+        reg.record_bytes(ResourceKind::Command, "ghost", 65_536);
+        assert_eq!(reg.byte_triggered_flushes_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_bytes_does_not_fire_below_threshold() {
+        // Default threshold is 64 KiB; sub-threshold writes must NOT
+        // increment the byte-triggered counter.
+        let reg = registry();
+        let _outcome = reg
+            .subscribe(
+                ResourceKind::Command,
+                "cmd-sub-threshold".to_string(),
+                "command://cmd-sub-threshold/output".to_string(),
+                StubPeer::new("peer-a") as Arc<dyn PeerHandle>,
+            )
+            .await;
+        assert!(_outcome.is_ok(), "subscribe must succeed");
+        // Walk close to the threshold but stop short.
+        for _ in 0..7 {
+            reg.record_bytes(ResourceKind::Command, "cmd-sub-threshold", 8 * 1024);
+        }
+        // 56 KiB < 64 KiB → no byte-triggered flush.
+        assert_eq!(reg.byte_triggered_flushes_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_bytes_fires_at_threshold_boundary() {
+        let reg = registry();
+        let _outcome = reg
+            .subscribe(
+                ResourceKind::Command,
+                "cmd-flush".to_string(),
+                "command://cmd-flush/output".to_string(),
+                StubPeer::new("peer-b") as Arc<dyn PeerHandle>,
+            )
+            .await;
+        assert!(_outcome.is_ok(), "subscribe must succeed");
+        // First chunk: still under the threshold.
+        reg.record_bytes(ResourceKind::Command, "cmd-flush", 60 * 1024);
+        // Second chunk crosses 64 KiB → exactly one byte-triggered
+        // flush must fire (counted by the debouncer task).
+        reg.record_bytes(ResourceKind::Command, "cmd-flush", 8 * 1024);
+        // Yield so the debouncer task observes the notify_one.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            reg.byte_triggered_flushes_total() >= 1,
+            "byte-triggered flush should have fired (got {})",
+            reg.byte_triggered_flushes_total()
+        );
+    }
+
+    #[test]
+    fn flush_bytes_threshold_getter_reports_default() {
+        let reg = registry();
+        // The default registry resolves the env var at construction.
+        // With no env override the value must equal the documented
+        // default (64 KiB) or be `0` if a previous test left the env
+        // set — guard against env leakage by only asserting >= floor.
+        let value = reg.flush_bytes_threshold();
+        assert!(
+            value == 0 || value >= 1_024,
+            "threshold must be 0 (disabled) or >= 1024 (clamped); got {value}"
+        );
     }
 
     #[test]

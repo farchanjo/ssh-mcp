@@ -107,6 +107,11 @@ impl LaneAtomics {
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
             queue_high_watermark: self.queue_high_watermark.load(Ordering::Relaxed),
             block_total_ms: self.block_total_ms.load(Ordering::Relaxed),
+            // ADR 0006 Amendment 1 — populated at the resource fan-out
+            // level on `MemoryRegistry`; lane-side bridging lands in a
+            // follow-up minor (v5.2) so v5.1 stays scoped to the
+            // debouncer pipeline.
+            byte_triggered_flushes: 0,
         }
     }
 
