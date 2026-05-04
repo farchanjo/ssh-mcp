@@ -8,6 +8,7 @@
 
 use serde_json::{Value, json};
 
+use crate::adapters::lifecycle::leak_watcher::LeakRiskAlert;
 use crate::application::cancel_command::CancelCommandOutcome;
 use crate::application::execute_command::ExecuteOutcome;
 use crate::application::get_command_output::GetCommandOutputResult;
@@ -18,6 +19,7 @@ use crate::infra::mcp::helpers::nonce::generate_nonce;
 use crate::infra::mcp::helpers::output::{
     render_output_block, sanitize_value, truncate_utf8_safe_tail,
 };
+use crate::infra::mcp::render::connection::{append_sub_leak_risk_warnings, warnings_value};
 
 /// Default byte cap applied to output blocks when the request did not
 /// supply one. Mirrors the v3 `output_default_bytes` config knob (16
@@ -172,13 +174,26 @@ const fn classify_state(
 }
 
 /// Render a [`ListCommandsOutcome`] as the v3 `SSH_LIST_COMMANDS` block.
+///
+/// Equivalent to [`list_commands_render_with_warnings`] with no
+/// [`LeakRiskAlert`] entries. Kept for legacy callers.
 #[must_use]
 pub fn list_commands_render(outcome: ListCommandsOutcome) -> String {
+    list_commands_render_with_warnings(outcome, &[])
+}
+
+/// Render a [`ListCommandsOutcome`] and append a `WARN: SUB_LEAK_RISK
+/// <uri>` line per supplied [`LeakRiskAlert`].
+#[must_use]
+pub fn list_commands_render_with_warnings(
+    outcome: ListCommandsOutcome,
+    alerts: &[LeakRiskAlert],
+) -> String {
     let ListCommandsOutcome { commands, total } = outcome;
-    if commands.is_empty() && total == 0 {
+    if commands.is_empty() && total == 0 && alerts.is_empty() {
         return String::from("SSH_LIST_COMMANDS: OK\nCOUNT: 0");
     }
-    let mut out = String::with_capacity(64 + commands.len() * 128);
+    let mut out = String::with_capacity(64 + commands.len() * 128 + alerts.len() * 96);
     out.push_str("SSH_LIST_COMMANDS: OK\nCOUNT: ");
     out.push_str(&commands.len().to_string());
     if total > commands.len() {
@@ -192,6 +207,7 @@ pub fn list_commands_render(outcome: ListCommandsOutcome) -> String {
         out.push_str("\n- ");
         append_command_item(&mut out, c);
     }
+    append_sub_leak_risk_warnings(&mut out, alerts);
     out
 }
 
@@ -361,9 +377,19 @@ fn command_json(c: &CommandEntity) -> Value {
 }
 
 /// Build the list-commands structured payload mirroring
-/// [`list_commands_render`].
+/// [`list_commands_render`]. Empty warnings — kept for legacy callers.
 #[must_use]
 pub fn list_commands_structured(outcome: &ListCommandsOutcome) -> Value {
+    list_commands_structured_with_warnings(outcome, &[])
+}
+
+/// Build the list-commands structured payload mirroring
+/// [`list_commands_render_with_warnings`]. Adds a `warnings` array.
+#[must_use]
+pub fn list_commands_structured_with_warnings(
+    outcome: &ListCommandsOutcome,
+    alerts: &[LeakRiskAlert],
+) -> Value {
     let commands: Vec<Value> = outcome.commands.iter().map(command_json).collect();
     json!({
         "tool":   "ssh_list_commands",
@@ -371,6 +397,7 @@ pub fn list_commands_structured(outcome: &ListCommandsOutcome) -> Value {
         "commands": commands,
         "count":   outcome.commands.len(),
         "total":   outcome.total,
+        "warnings": warnings_value(alerts),
     })
 }
 
@@ -855,5 +882,59 @@ mod tests {
         assert_eq!(json["index"], 3);
         assert_eq!(json["status"], "skipped");
         assert_eq!(json["command"], "tail -n 3");
+    }
+
+    // -- v5 Phase 3 — SUB_LEAK_RISK warnings -----------------------------
+
+    use super::{list_commands_render_with_warnings, list_commands_structured_with_warnings};
+    use crate::adapters::lifecycle::leak_watcher::{LeakRiskAlert, LeakRiskSeverity};
+    use crate::ports::subscriber_registry::ResourceKind;
+
+    fn warn_alert(kind: ResourceKind, id: &str, age_ms: u64) -> LeakRiskAlert {
+        LeakRiskAlert {
+            kind,
+            resource_id: id.to_string(),
+            age_ms,
+            severity: LeakRiskSeverity::Warn,
+        }
+    }
+
+    #[test]
+    fn list_commands_render_with_warnings_appends_warn_line() {
+        let outcome = ListCommandsOutcome {
+            commands: vec![],
+            total: 0,
+        };
+        let alerts = vec![warn_alert(ResourceKind::Command, "leaky-cmd", 4_500)];
+        let body = list_commands_render_with_warnings(outcome, &alerts);
+        assert!(
+            body.contains("WARN: SUB_LEAK_RISK command://leaky-cmd/output age_ms=4500"),
+            "missing WARN line, body: {body}"
+        );
+    }
+
+    #[test]
+    fn list_commands_render_with_no_alerts_matches_legacy() {
+        let outcome = ListCommandsOutcome {
+            commands: vec![],
+            total: 0,
+        };
+        let body = list_commands_render_with_warnings(outcome, &[]);
+        assert_eq!(body, "SSH_LIST_COMMANDS: OK\nCOUNT: 0");
+    }
+
+    #[test]
+    fn list_commands_structured_with_warnings_includes_array() {
+        let outcome = ListCommandsOutcome {
+            commands: vec![],
+            total: 0,
+        };
+        let alerts = vec![warn_alert(ResourceKind::Command, "leaky", 3_000)];
+        let json = list_commands_structured_with_warnings(&outcome, &alerts);
+        let arr = json["warnings"].as_array().expect("warnings");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["code"], "SUB_LEAK_RISK");
+        assert_eq!(arr[0]["resource"], "command://leaky/output");
+        assert_eq!(arr[0]["severity"], "warn");
     }
 }
