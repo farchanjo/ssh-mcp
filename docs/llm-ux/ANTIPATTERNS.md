@@ -4,6 +4,27 @@ Ten failure modes that v5.0 explicitly engineers against. Each entry maps a beha
 
 The list is informed by [ADR 0005](../adr/0005-llm-ux-priorities.md), the lifecycle layer in [ADR 0003](../adr/0003-lifecycle-binding.md), and the channel-mux invariants in [ADR 0004](../adr/0004-channel-mux-fairness.md). The error codes referenced below are catalogued in [`ERROR_HANDBOOK.md`](./ERROR_HANDBOOK.md).
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    A1["Anti-pattern #1<br/>hot-poll<br/>ssh_shell_read"]
+    A2["Anti-pattern #2<br/>open then forget<br/>(no subscriber)"]
+    A6["Anti-pattern #6<br/>unsubscribe ≠<br/>close"]
+
+    C1["resources/subscribe<br/>+ cursor=auto<br/>(push-first)"]
+    C2["release_when_no_subs<br/>= true<br/>(auto-cleanup)"]
+    C6["release_when_no_subs<br/>OR ssh_shell_close<br/>OR disconnect_agent"]
+
+    A1 -->|cure| C1
+    A2 -->|cure| C2
+    A6 -->|cure| C6
+
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef good fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class A1,A2,A6 bad
+    class C1,C2,C6 good
+```
+
 ## Anti-pattern #1: hot-poll loop on `ssh_shell_read`
 
 **Symptom.** The LLM emits `ssh_shell_read(shell_id, wait=true, wait_timeout_secs=1)` in a tight loop instead of subscribing once and consuming `notifications/resources/updated` events.

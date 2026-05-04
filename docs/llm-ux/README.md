@@ -17,6 +17,40 @@ Forward-looking note. The files here describe the v5.0 design defined by ADRs 00
 - [`ANTIPATTERNS.md`](./ANTIPATTERNS.md) — 10 documented failure modes (hot-poll, leak, cascade, lag-blindness, …) with symptom, consequence, fix, and detection signal.
 - [`ERROR_HANDBOOK.md`](./ERROR_HANDBOOK.md) — the canonical reference for the 38 wire codes defined by [ADR 0007](../adr/0007-error-taxonomy.md), grouped by category, with retry policy, cure, prevention, and an NDJSON example per code.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    R["llm-ux/<br/>(this directory)"]
+    GR["GOLDEN_RULES.md<br/>5 inviolable rules"]
+    I27["INSTRUCTIONS_27B.md<br/>compact prompt"]
+    I70["INSTRUCTIONS_70B.md<br/>detailed prompt"]
+    PC["PROMPTS_CATALOG.md<br/>10 workflows"]
+    AP["ANTIPATTERNS.md<br/>10 failure modes"]
+    EH["ERROR_HANDBOOK.md<br/>38 wire codes"]
+
+    R --> GR
+    R --> I27
+    R --> I70
+    R --> PC
+    R --> AP
+    R --> EH
+    GR -.invariants.-> AP
+    GR -.invariants.-> PC
+    AP -.codes.-> EH
+    PC -.codes.-> EH
+
+    classDef root fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef rule fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef prompt fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef bad fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    classDef ref fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    class R root
+    class GR rule
+    class I27,I70 prompt
+    class PC,EH ref
+    class AP bad
+```
+
 ## Driving ADRs
 
 These ADRs are the source of truth. Read them when this directory is ambiguous or when you need the rationale.

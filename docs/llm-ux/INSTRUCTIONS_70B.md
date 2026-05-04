@@ -2,6 +2,33 @@
 
 Detailed root prompt. Embedded verbatim into `Implementation.instructions` when the host signals a ≥70B-class model (Claude 3.5+, GPT-4-class, Llama 3.1 70B+, Qwen 2.5 72B). Larger budget allows full sentences and tradeoff guidance. Phase 3 wires the dispatch; for now the canonical text lives here. Source: [ADR 0005](../adr/0005-llm-ux-priorities.md). Compact 27B variant: [`INSTRUCTIONS_27B.md`](./INSTRUCTIONS_27B.md). Full rules: [`GOLDEN_RULES.md`](./GOLDEN_RULES.md).
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    Q{"host has<br/>resources/subscribe<br/>support?"}
+    K{"workflow shape?"}
+    P1["Path 1: async cmd<br/>connect -> execute<br/>(release_when_no_subs)<br/>-> subscribe command://<br/>-> drain until completed"]
+    P2["Path 2: shell<br/>connect -> shell_open<br/>(release_when_no_subs)<br/>-> subscribe shell://<br/>-> write / send_key"]
+    P3["Path 3: upload<br/>upload<br/>(release_when_no_subs)<br/>-> subscribe transfer://<br/>-> drain progress"]
+    P4["Path 4 (fallback): one-shot<br/>ssh_run(addr, user, cmd)<br/>returns exit_code"]
+    P5["Path 5 (fallback): wait<br/>execute<br/>-> get_command_output<br/>(wait=true, timeout)"]
+
+    Q -->|yes| K
+    Q -->|no| K2{"workflow shape?"}
+    K -->|"long async cmd"| P1
+    K -->|"interactive shell"| P2
+    K -->|"file transfer"| P3
+    K2 -->|"short one-shot"| P4
+    K2 -->|"any other"| P5
+
+    classDef push fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef fallback fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef branch fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    class P1,P2,P3 push
+    class P4,P5 fallback
+    class Q,K,K2 branch
+```
+
 ```text
 SSH MCP v5.0. Subscribe-first. 28 tools (20 without port_forward + 8 sub
 operations). All responses: KEY: value markdown + structured_content JSON.

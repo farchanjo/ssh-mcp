@@ -4,6 +4,33 @@ Five inviolable rules every LLM driving ssh-mcp v5.0 must respect. They are sour
 
 These rules are advisory at the protocol level — the server will not refuse a violating request — but breaking them produces zombie remote state, leaked subscriptions, dropped events, or token waste. The server is engineered to make compliance the easy path; treat the rules as preconditions, not as suggestions.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    R1["Rule 1<br/>resource MUST<br/>have ≥1 sub"]
+    R2["Rule 2<br/>track + unsubscribe<br/>every sub_id"]
+    R3["Rule 3<br/>watch lag_drops<br/>switch policy"]
+    R4["Rule 4<br/>cleanup on error<br/>disconnect_agent"]
+    R5["Rule 5<br/>never hot-poll<br/>subscribe + drain"]
+
+    C1["release_when_no_subs<br/>= true"]
+    C2["lifetime=auto-close<br/>+ ssh_unsubscribe"]
+    C3["lag_policy=snapshot<br/>(default)"]
+    C4["stable agent_id<br/>+ try/finally"]
+    C5["resources/subscribe<br/>+ cursor=auto"]
+
+    R1 --> C1
+    R2 --> C2
+    R3 --> C3
+    R4 --> C4
+    R5 --> C5
+
+    classDef rule fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef cure fill:#238636,color:#f0f6fc,stroke:#2ea043
+    class R1,R2,R3,R4,R5 rule
+    class C1,C2,C3,C4,C5 cure
+```
+
 ## Rule 1: Every long-running resource MUST have at least one active subscriber
 
 A long-running resource is anything addressable by a push URI: `shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `forward://<id>/events`. A bare resource without an observer accumulates output in the per-resource ring buffer until eviction; the operator never knows the resource exists; the LLM never sees the events.

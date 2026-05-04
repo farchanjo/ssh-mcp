@@ -4,6 +4,47 @@ The ten canonical workflows advertised via `prompts/list` in v5.0. Five carry ov
 
 Each entry records description, arguments, expected event sequence, failure modes, and (for the v5.0 entries that involve subscriptions) an example NDJSON exchange routed through `ssh-mcp-tail daemon`. NDJSON examples assume the daemon mode defined by [ADR 0008](../adr/0008-ndjson-daemon-protocol.md) and are forthcoming behaviour for Phase 4.
 
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TD
+    Q{"What do you need?"}
+    Q1{"command<br/>type?"}
+    Q2{"resource<br/>type?"}
+    Q3{"hygiene /<br/>recovery?"}
+
+    P1["run_one_shot_command<br/>(short, single round-trip)"]
+    P6["push_first_long_command<br/>(async + drain until completed)"]
+    P4["interactive_shell_drive<br/>(v4 carryover)"]
+    P7["push_first_interactive_shell<br/>(v5 push-first shell)"]
+    P3["upload_and_verify<br/>(v4 carryover)"]
+    P8["push_first_file_transfer<br/>(v5 sub progress + verify)"]
+    P9["subscription_hygiene_audit<br/>(stale subs cleanup)"]
+    P10["chaos_resume_after_disconnect<br/>(replay from cursor)"]
+    P5["cleanup_agent<br/>(blast-radius wipe)"]
+    P2["investigate_session<br/>(list + drill-down)"]
+
+    Q -->|run a command| Q1
+    Q -->|drive a resource| Q2
+    Q -->|maintenance| Q3
+    Q1 -->|short| P1
+    Q1 -->|long async| P6
+    Q2 -->|shell, v4| P4
+    Q2 -->|shell, v5 push| P7
+    Q2 -->|upload, v4| P3
+    Q2 -->|upload, v5 push| P8
+    Q3 -->|audit subs| P9
+    Q3 -->|reconnect + replay| P10
+    Q3 -->|wipe agent| P5
+    Q3 -->|inspect session| P2
+
+    classDef carry fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef new fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef branch fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    class P1,P2,P3,P4,P5 carry
+    class P6,P7,P8,P9,P10 new
+    class Q,Q1,Q2,Q3 branch
+```
+
 ## Carryovers from v4
 
 The five prompts that already ship in v4 keep their semantics. v5.0 only modifies their description text to align with [`GOLDEN_RULES.md`](./GOLDEN_RULES.md).
