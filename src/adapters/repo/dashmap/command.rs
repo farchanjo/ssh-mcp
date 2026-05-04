@@ -279,7 +279,12 @@ mod tests {
             | DomainError::Sftp(_)
             | DomainError::PortInUse(_)
             | DomainError::Transport(_)
-            | DomainError::Storage(_) => panic!("unexpected error variant: {err:?}"),
+            | DomainError::Storage(_)
+            | DomainError::ResourceGone(_)
+            | DomainError::LifecycleStateConflict { .. }
+            | DomainError::SessionRefcountUnderflow(_) => {
+                panic!("unexpected error variant: {err:?}")
+            }
         }
     }
 
