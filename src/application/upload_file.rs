@@ -44,6 +44,7 @@ use tokio::fs;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId, TransferId};
+use crate::domain::session::SessionEntity;
 use crate::domain::transfer::TransferEntity;
 use crate::ports::clock::ClockPort;
 use crate::ports::config::ConfigPort;
@@ -218,10 +219,7 @@ where
 
     /// Resolve the session entity, mapping `Ok(None)` to
     /// [`DomainError::SessionNotFound`].
-    async fn lookup_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<crate::domain::session::SessionEntity, DomainError> {
+    async fn lookup_session(&self, session_id: &SessionId) -> Result<SessionEntity, DomainError> {
         self.sessions
             .get(session_id)
             .await?

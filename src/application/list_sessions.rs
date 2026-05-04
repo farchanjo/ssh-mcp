@@ -36,6 +36,7 @@
 //! port returns owned values so no shard-spanning borrows escape, and the SSH
 //! client port consumes / returns owned types only.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use crate::domain::error::DomainError;
@@ -126,7 +127,7 @@ where
             .await?;
         let (mut healthy, removed_dead) = self.partition_by_health(candidates).await?;
         // Newest first matches the v3 ordering used by the rmcp builder.
-        healthy.sort_by_key(|entry| std::cmp::Reverse(entry.connected_at));
+        healthy.sort_by_key(|entry| Reverse(entry.connected_at));
         let total = healthy.len();
         let cap = self.resolve_max_items(req.max_items);
         healthy.truncate(cap);
@@ -200,13 +201,13 @@ where
     async fn purge_dead_session(&self, candidate: &SessionEntity) {
         let _ = self.ssh.disconnect(&candidate.id).await;
         let removed = self.sessions.remove(&candidate.id).await;
-        if let Ok(Some(removed_entity)) = removed {
-            if let Some(agent_id) = removed_entity.agent_id.as_ref() {
-                let _ = self
-                    .sessions
-                    .unregister_agent(agent_id, &candidate.id)
-                    .await;
-            }
+        if let Ok(Some(removed_entity)) = removed
+            && let Some(agent_id) = removed_entity.agent_id.as_ref()
+        {
+            let _ = self
+                .sessions
+                .unregister_agent(agent_id, &candidate.id)
+                .await;
         }
     }
 

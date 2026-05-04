@@ -236,7 +236,7 @@ fn build_terminal(req: &OpenShellRequest) -> ShellTerminal {
 
 /// Apply caller-supplied `inactivity_ttl_secs` / `max_buffer_size`
 /// overrides on top of whatever the SSH adapter stamped on the entity.
-fn apply_overrides(mut entity: ShellEntity, req: &OpenShellRequest) -> ShellEntity {
+const fn apply_overrides(mut entity: ShellEntity, req: &OpenShellRequest) -> ShellEntity {
     if let Some(secs) = req.inactivity_ttl_secs {
         entity.inactivity_ttl = Duration::from_secs(secs);
     }
