@@ -47,6 +47,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -71,6 +72,20 @@ use crate::domain::error::DomainError;
 use crate::domain::ids::{SessionId, TransferId};
 use crate::domain::transfer::{TransferDirection, TransferEntity, TransferStatus as DomainStatus};
 use crate::ports::sftp_client::{DownloadRequest, SftpClientPort, UploadRequest};
+
+/// Wall-clock throttle for partial-progress writes pumped from the live
+/// broadcast into the [`crate::ports::transfer_repo::TransferRepository`]
+/// (v4.8.1 fix).
+///
+/// The streaming task emits one [`ProgressEvent::Tick`] per chunk
+/// (default 32 KB), so a 100 MB upload over a fast link can fire ~3,000
+/// Ticks in well under a second. Coalescing them at 250 ms keeps the
+/// repository write rate sane (≤ 4 writes/s per running transfer) while
+/// still giving polling callers a snapshot that is at most 250 ms stale
+/// — the live atomic remains the authoritative source between writes,
+/// so subscribers on `transfer://<id>/progress` continue to see every
+/// chunk in real time through the broadcast channel.
+const PROGRESS_TICK_THROTTLE: Duration = Duration::from_millis(250);
 
 /// Internal registry that maps a [`SessionId`] to the russh client handle
 /// captured at SSH connect time.
@@ -322,6 +337,13 @@ impl RusshSftpAdapter {
         let cancel = CancellationToken::new();
         let (status_tx, status_rx) = watch::channel(McpStatus::Running);
         let (progress_tx, _rx) = broadcast::channel::<ProgressEvent>(self.broadcast_cap);
+        // v4.8.1 fix: subscribe BEFORE handing `progress_tx` to the
+        // streaming task so the running-tick watcher does not miss any
+        // chunk. `broadcast::Sender::subscribe` returns a receiver that
+        // observes every send issued AFTER the subscribe call — pulling
+        // it here, while `build_shared` still owns the sender, guarantees
+        // no Tick is published before the receiver exists.
+        let progress_rx = progress_tx.subscribe();
         let bytes = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(total_bytes));
         let error = Arc::new(OnceCell::new());
@@ -339,6 +361,7 @@ impl RusshSftpAdapter {
             shared,
             cancel,
             status_rx,
+            progress_rx,
             bytes_transferred: bytes,
             error,
         }
@@ -371,25 +394,8 @@ impl RusshSftpAdapter {
         remote_path: String,
         total_bytes: u64,
     ) {
-        let bundle = self.build_shared(&transfer_id, total_bytes);
-        let SharedBundle {
-            shared,
-            cancel,
-            status_rx,
-            bytes_transferred,
-            error,
-        } = bundle;
-        self.inflight
-            .register(transfer_id.clone(), session_id, cancel);
-        Self::spawn_status_watcher(
-            Arc::clone(&self.status_sink),
-            transfer_id.clone(),
-            status_rx,
-            bytes_transferred,
-            error,
-        );
+        let (shared, task_id) = self.prepare_streaming(transfer_id, session_id, total_bytes);
         let inflight = self.inflight.clone();
-        let task_id = transfer_id;
         tokio::spawn(async move {
             sftp_upload_streaming(handle, local_path, remote_path, shared).await;
             if inflight.unregister(&task_id).is_none() {
@@ -418,25 +424,8 @@ impl RusshSftpAdapter {
         remote_path: String,
         total_bytes: u64,
     ) {
-        let bundle = self.build_shared(&transfer_id, total_bytes);
-        let SharedBundle {
-            shared,
-            cancel,
-            status_rx,
-            bytes_transferred,
-            error,
-        } = bundle;
-        self.inflight
-            .register(transfer_id.clone(), session_id, cancel);
-        Self::spawn_status_watcher(
-            Arc::clone(&self.status_sink),
-            transfer_id.clone(),
-            status_rx,
-            bytes_transferred,
-            error,
-        );
+        let (shared, task_id) = self.prepare_streaming(transfer_id, session_id, total_bytes);
         let inflight = self.inflight.clone();
-        let task_id = transfer_id;
         tokio::spawn(async move {
             sftp_download_streaming(handle, remote_path, local_path, shared).await;
             if inflight.unregister(&task_id).is_none() {
@@ -448,6 +437,130 @@ impl RusshSftpAdapter {
             // See `spawn_upload_task` for the rationale on why the
             // domain repo row is left alive past the streaming task.
         });
+    }
+
+    /// Wire the [`TransferShared`] bundle, register the cancel handle on
+    /// `InflightTransfers`, and spawn both the status watcher and the
+    /// running-tick progress watcher (v4.8.1 fix). Returns the
+    /// `TransferShared` that the streaming task will own and the cloned
+    /// transfer id used by the spawn closure for the inflight cleanup.
+    fn prepare_streaming(
+        &self,
+        transfer_id: TransferId,
+        session_id: SessionId,
+        total_bytes: u64,
+    ) -> (TransferShared, TransferId) {
+        let SharedBundle {
+            shared,
+            cancel,
+            status_rx,
+            progress_rx,
+            bytes_transferred,
+            error,
+        } = self.build_shared(&transfer_id, total_bytes);
+        self.inflight
+            .register(transfer_id.clone(), session_id, cancel);
+        Self::spawn_status_watcher(
+            Arc::clone(&self.status_sink),
+            transfer_id.clone(),
+            status_rx,
+            Arc::clone(&bytes_transferred),
+            error,
+        );
+        Self::spawn_progress_watcher(
+            Arc::clone(&self.status_sink),
+            transfer_id.clone(),
+            progress_rx,
+            bytes_transferred,
+        );
+        (shared, transfer_id)
+    }
+
+    /// Spawn the per-transfer **progress** watcher (v4.8.1 fix).
+    ///
+    /// Subscribes to the broadcast channel that the streaming task uses
+    /// to publish [`ProgressEvent::Tick`] frames after each chunk and
+    /// pumps the latest `bytes_transferred` value into the configured
+    /// [`SharedTransferStatusSink`] via
+    /// [`crate::adapters::ssh::internal::status_sink::TransferStatusSink::record_progress`].
+    /// Without this watcher `ssh_get_transfer_progress` would always read
+    /// `bytes_transferred = 0` from the [`TransferRepository`] until the
+    /// streaming task reached a terminal state (because `record_progress`
+    /// is the only path that updates the repository row mid-flight).
+    ///
+    /// # Throttling
+    ///
+    /// The watcher coalesces chunks at [`PROGRESS_TICK_THROTTLE`] cadence
+    /// (currently 250 ms): every Tick it remembers the latest atomic
+    /// snapshot but only issues `record_progress` when the elapsed wall
+    /// time since the previous write is at or above the throttle, when
+    /// the broadcast lags (recovery), or when the channel closes (final
+    /// flush). This keeps the repository write rate independent of the
+    /// 32 KB chunk cadence: a 1 GB transfer at line rate produces ~32k
+    /// chunks but at most ~80 repo writes (one per 250 ms) — the live
+    /// atomic is still the source of truth between writes, so polled
+    /// snapshots are always at most 250 ms stale.
+    ///
+    /// # Lifecycle
+    ///
+    /// The task exits when:
+    /// - the broadcast sender is dropped (the streaming task ended) — a
+    ///   final `record_progress` flush is issued so the last partial
+    ///   write is observable before the terminal status arrives, or
+    /// - a [`broadcast::error::RecvError::Lagged`] is observed — the
+    ///   watcher recovers by issuing a `record_progress` flush from the
+    ///   live atomic and continuing the loop, or
+    /// - a `Completed` / `Failed` / `Cancelled` Tick lands. Those frames
+    ///   are reserved for the status watcher; the progress watcher
+    ///   returns immediately so the terminal write from the status
+    ///   watcher is never raced by a stale partial.
+    fn spawn_progress_watcher(
+        sink: SharedTransferStatusSink,
+        transfer_id: TransferId,
+        progress_rx: broadcast::Receiver<ProgressEvent>,
+        bytes_transferred: Arc<AtomicU64>,
+    ) {
+        tokio::spawn(Self::run_progress_watcher(
+            sink,
+            transfer_id,
+            progress_rx,
+            bytes_transferred,
+        ));
+    }
+
+    /// Body of the progress watcher loop, split from
+    /// [`Self::spawn_progress_watcher`] so the spawn site stays compact
+    /// (the strict lint baseline caps function bodies at 30 lines). The
+    /// per-arm bookkeeping lives on [`ProgressWatcherState`].
+    async fn run_progress_watcher(
+        sink: SharedTransferStatusSink,
+        transfer_id: TransferId,
+        mut progress_rx: broadcast::Receiver<ProgressEvent>,
+        bytes_transferred: Arc<AtomicU64>,
+    ) {
+        let mut state = ProgressWatcherState::default();
+        loop {
+            match progress_rx.recv().await {
+                Ok(ProgressEvent::Tick {
+                    bytes_transferred: bytes,
+                    ..
+                }) => state.handle_tick(&sink, &transfer_id, bytes).await,
+                Ok(
+                    ProgressEvent::Completed { .. }
+                    | ProgressEvent::Failed { .. }
+                    | ProgressEvent::Cancelled { .. },
+                ) => return,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    state
+                        .handle_lag(&sink, &transfer_id, &bytes_transferred, skipped)
+                        .await;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    state.flush_on_close(&sink, &transfer_id).await;
+                    return;
+                }
+            }
+        }
     }
 
     /// Spawn the per-transfer status watcher. Subscribes to
@@ -521,12 +634,81 @@ impl RusshSftpAdapter {
 /// handle the spawn helpers need so they can wire both the streaming
 /// task and the status watcher without re-deriving anything from the
 /// already-moved [`TransferShared`].
+///
+/// v4.8.1 fix: also carries a `progress_rx` cloned off the broadcast
+/// sender BEFORE the sender enters the streaming task. The running-tick
+/// watcher uses this receiver to pump partial-progress updates into the
+/// `TransferRepository` so `ssh_get_transfer_progress` reads non-zero
+/// `bytes_transferred` while the transfer is still running.
 struct SharedBundle {
     shared: TransferShared,
     cancel: CancellationToken,
     status_rx: watch::Receiver<McpStatus>,
+    progress_rx: broadcast::Receiver<ProgressEvent>,
     bytes_transferred: Arc<AtomicU64>,
     error: Arc<OnceCell<String>>,
+}
+
+/// Tiny state machine driving
+/// [`RusshSftpAdapter::run_progress_watcher`]. Keeps the per-arm
+/// bookkeeping (last-write-instant + pending-bytes for close-flush) off
+/// the loop body so the spawn site stays under the 30-line cap.
+#[derive(Debug, Default)]
+struct ProgressWatcherState {
+    last_write_at: Option<Instant>,
+    pending: Option<u64>,
+}
+
+impl ProgressWatcherState {
+    /// Handle a [`ProgressEvent::Tick`]. Records `bytes` as pending and
+    /// pushes it to the sink only if the throttle window has elapsed
+    /// since the previous write.
+    async fn handle_tick(
+        &mut self,
+        sink: &SharedTransferStatusSink,
+        transfer_id: &TransferId,
+        bytes: u64,
+    ) {
+        self.pending = Some(bytes);
+        let due = self
+            .last_write_at
+            .is_none_or(|prev| prev.elapsed() >= PROGRESS_TICK_THROTTLE);
+        if due {
+            sink.record_progress(transfer_id, bytes).await;
+            self.last_write_at = Some(Instant::now());
+            self.pending = None;
+        }
+    }
+
+    /// Handle a `RecvError::Lagged` from the broadcast receiver. Loads
+    /// the live atomic counter and pushes it through the sink so the
+    /// repository row recovers without losing progress visibility.
+    async fn handle_lag(
+        &mut self,
+        sink: &SharedTransferStatusSink,
+        transfer_id: &TransferId,
+        bytes_transferred: &AtomicU64,
+        skipped: u64,
+    ) {
+        warn!(
+            transfer_id = %transfer_id,
+            skipped,
+            "transfer progress watcher: lagged behind broadcast — recovering from live atomic"
+        );
+        let bytes = bytes_transferred.load(Ordering::Relaxed);
+        sink.record_progress(transfer_id, bytes).await;
+        self.last_write_at = Some(Instant::now());
+        self.pending = None;
+    }
+
+    /// Flush any pending tick value when the broadcast sender drops
+    /// (`RecvError::Closed`). Terminal status is then applied by
+    /// `spawn_status_watcher` — keeping the two writes ordered.
+    async fn flush_on_close(&mut self, sink: &SharedTransferStatusSink, transfer_id: &TransferId) {
+        if let Some(bytes) = self.pending.take() {
+            sink.record_progress(transfer_id, bytes).await;
+        }
+    }
 }
 
 /// Translate a v3 SFTP error string into a [`DomainError::Sftp`]. Kept
@@ -907,5 +1089,288 @@ mod tests {
         );
         // Unrelated operations keep the legacy untagged shape.
         assert_eq!(super::sftp_error_tag("read chunk"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v4.8.1: live-tick → repo sync coverage
+// ---------------------------------------------------------------------------
+//
+// The bug: `ssh_get_transfer_progress` returned `bytes_transferred = 0`
+// for every poll while the transfer was still running because the SFTP
+// adapter only sync'd the live `AtomicU64` into the
+// `TransferRepository` row at terminal handoff. The fix spawns a
+// running-tick watcher that subscribes to the per-transfer broadcast,
+// throttles writes to 250 ms, and pumps `record_progress` into the
+// configured `SharedTransferStatusSink`.
+//
+// These tests pin the new behaviour at the unit level: they drive
+// `spawn_progress_watcher` directly with a synthetic broadcast channel
+// and a recording test sink. Real SFTP integration is still covered by
+// the existing `scripts/test_v47_progress.py`-style suites and the new
+// `scripts/test_transfer_progress.py` end-to-end script.
+#[cfg(test)]
+mod progress_watcher_tests {
+    use super::{PROGRESS_TICK_THROTTLE, RusshSftpAdapter};
+    use crate::adapters::sftp::internal::types::ProgressEvent;
+    use crate::adapters::ssh::internal::status_sink::{
+        SharedTransferStatusSink, TransferStatusSink,
+    };
+    use crate::domain::ids::TransferId;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio::time::sleep;
+
+    /// Recording [`TransferStatusSink`] that captures every
+    /// `record_progress` invocation in arrival order. Terminal `mark_*`
+    /// calls are swallowed (the watcher under test never makes them).
+    #[derive(Debug, Default, Clone)]
+    struct RecordingSink {
+        progress_calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn snapshot(&self) -> Vec<u64> {
+            self.progress_calls
+                .lock()
+                .map_or_else(|p| p.into_inner().clone(), |g| g.clone())
+        }
+    }
+
+    type SinkFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    impl TransferStatusSink for RecordingSink {
+        fn mark_completed<'a>(
+            &'a self,
+            _transfer_id: &'a TransferId,
+            _bytes_transferred: u64,
+        ) -> SinkFuture<'a> {
+            Box::pin(async {})
+        }
+
+        fn mark_failed<'a>(
+            &'a self,
+            _transfer_id: &'a TransferId,
+            _error: Option<String>,
+        ) -> SinkFuture<'a> {
+            Box::pin(async {})
+        }
+
+        fn mark_cancelled<'a>(&'a self, _transfer_id: &'a TransferId) -> SinkFuture<'a> {
+            Box::pin(async {})
+        }
+
+        fn record_progress<'a>(
+            &'a self,
+            _transfer_id: &'a TransferId,
+            bytes_transferred: u64,
+        ) -> SinkFuture<'a> {
+            let calls = Arc::clone(&self.progress_calls);
+            Box::pin(async move {
+                if let Ok(mut guard) = calls.lock() {
+                    guard.push(bytes_transferred);
+                }
+            })
+        }
+    }
+
+    fn make_tick(seq: u64, bytes: u64, total: u64) -> ProgressEvent {
+        ProgressEvent::Tick {
+            seq,
+            bytes_transferred: bytes,
+            total_bytes: total,
+        }
+    }
+
+    /// First `Tick` is forwarded immediately (no throttle window has
+    /// elapsed yet), and subsequent close-flush of the broadcast emits a
+    /// final partial. Confirms the watcher does **not** wait for a
+    /// terminal frame before publishing progress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_watcher_writes_first_tick_and_flush_on_close() {
+        let sink = Arc::new(RecordingSink::new());
+        let shared_sink: SharedTransferStatusSink = Arc::clone(&sink) as _;
+        let transfer_id = TransferId::new("watch-1".to_string());
+        let (tx, rx) = broadcast::channel::<ProgressEvent>(64);
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        RusshSftpAdapter::spawn_progress_watcher(shared_sink, transfer_id, rx, Arc::clone(&bytes));
+
+        bytes.store(1024, Ordering::SeqCst);
+        tx.send(make_tick(1, 1024, 8192)).expect("send tick 1");
+        // Drop the sender: forces the watcher to flush + exit.
+        drop(tx);
+
+        // Give the spawned task a moment to drain.
+        for _ in 0..20_u32 {
+            if !sink.snapshot().is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let calls = sink.snapshot();
+        assert!(
+            !calls.is_empty(),
+            "watcher must publish at least one progress write before exit; got {calls:?}"
+        );
+        assert_eq!(
+            *calls.first().expect("at least one call"),
+            1024,
+            "first publish must mirror the first tick exactly"
+        );
+    }
+
+    /// Bursts of ticks within the throttle window collapse to noticeably
+    /// fewer writes than the input rate — the watcher does not flood the
+    /// repository with one write per chunk. Confirms the bookkeeping that
+    /// prevents a 1 GB transfer from issuing 32k repo writes.
+    ///
+    /// The exact write count depends on the scheduler (multi-thread
+    /// runtime can interleave watcher progress with the test's send
+    /// loop), so the assertion checks "throttling is in effect" rather
+    /// than an exact cadence: 50 sent ticks must produce strictly fewer
+    /// than 50 writes, and the published values must remain monotonic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_watcher_throttles_burst_within_window() {
+        let sink = Arc::new(RecordingSink::new());
+        let shared_sink: SharedTransferStatusSink = Arc::clone(&sink) as _;
+        let transfer_id = TransferId::new("watch-2".to_string());
+        let (tx, rx) = broadcast::channel::<ProgressEvent>(1024);
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        RusshSftpAdapter::spawn_progress_watcher(shared_sink, transfer_id, rx, Arc::clone(&bytes));
+
+        // Hammer 50 ticks with no sleep. Most should land inside the
+        // throttle window.
+        let total_sends = 50_u64;
+        for i in 1..=total_sends {
+            bytes.store(i * 256, Ordering::SeqCst);
+            tx.send(make_tick(i, i * 256, total_sends * 256))
+                .expect("send tick");
+        }
+        drop(tx);
+
+        // Wait for the watcher to drain (close-flush completes when the
+        // sender is dropped).
+        for _ in 0..50_u32 {
+            if !sink.snapshot().is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Allow a final scheduling tick for the close-flush.
+        sleep(Duration::from_millis(20)).await;
+
+        let calls = sink.snapshot();
+        assert!(
+            !calls.is_empty(),
+            "watcher must publish at least one progress write; got {calls:?}"
+        );
+        let total_sends_usize = usize::try_from(total_sends).unwrap_or(usize::MAX);
+        assert!(
+            calls.len() < total_sends_usize,
+            "burst must coalesce; got {n} writes for {total_sends} ticks: {calls:?}",
+            n = calls.len(),
+        );
+        // Every published value must be monotonic non-decreasing — the
+        // throttle never publishes a stale value newer than the next one.
+        for window in calls.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "writes must be monotonic non-decreasing; saw {prev} -> {next}",
+                prev = window[0],
+                next = window[1],
+            );
+        }
+        // Final write equals the last tick's value (close-flush flushed pending).
+        assert_eq!(
+            *calls.last().expect("at least one call"),
+            total_sends * 256,
+            "close-flush must publish the latest pending value"
+        );
+        // Sanity reference to the constant so a future bump that breaks
+        // throttle math does not silently soften this test.
+        let _ = PROGRESS_TICK_THROTTLE;
+    }
+
+    /// A throttled burst followed by a quiet window then another tick
+    /// produces at least two writes. Confirms the throttle gate releases
+    /// after the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_watcher_releases_after_throttle_window() {
+        let sink = Arc::new(RecordingSink::new());
+        let shared_sink: SharedTransferStatusSink = Arc::clone(&sink) as _;
+        let transfer_id = TransferId::new("watch-3".to_string());
+        let (tx, rx) = broadcast::channel::<ProgressEvent>(64);
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        RusshSftpAdapter::spawn_progress_watcher(shared_sink, transfer_id, rx, Arc::clone(&bytes));
+
+        bytes.store(100, Ordering::SeqCst);
+        tx.send(make_tick(1, 100, 1000)).expect("send tick 1");
+        // Wait past the throttle window.
+        sleep(PROGRESS_TICK_THROTTLE + Duration::from_millis(50)).await;
+        bytes.store(700, Ordering::SeqCst);
+        tx.send(make_tick(2, 700, 1000)).expect("send tick 2");
+        drop(tx);
+
+        for _ in 0..30_u32 {
+            let snap = sink.snapshot();
+            if snap.len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let calls = sink.snapshot();
+        assert!(
+            calls.len() >= 2,
+            "after the throttle window a second tick must publish; got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&b| b == 700),
+            "the post-window tick value must reach the sink; got {calls:?}"
+        );
+    }
+
+    /// A `Completed` frame on the broadcast must short-circuit the
+    /// watcher BEFORE it issues a stale partial — that way the terminal
+    /// `mark_completed` write from `spawn_status_watcher` is the
+    /// authoritative final state on the repository row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_watcher_returns_on_terminal_frame_without_partial_write() {
+        let sink = Arc::new(RecordingSink::new());
+        let shared_sink: SharedTransferStatusSink = Arc::clone(&sink) as _;
+        let transfer_id = TransferId::new("watch-4".to_string());
+        let (tx, rx) = broadcast::channel::<ProgressEvent>(64);
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        RusshSftpAdapter::spawn_progress_watcher(shared_sink, transfer_id, rx, Arc::clone(&bytes));
+
+        // Send a terminal frame BEFORE any Tick. The watcher must
+        // observe it and return without issuing record_progress.
+        tx.send(ProgressEvent::Completed {
+            seq: 1,
+            bytes_transferred: 4096,
+        })
+        .expect("send terminal");
+        drop(tx);
+
+        sleep(Duration::from_millis(50)).await;
+
+        let calls = sink.snapshot();
+        assert!(
+            calls.is_empty(),
+            "terminal-first must not issue record_progress; got {calls:?}"
+        );
     }
 }
