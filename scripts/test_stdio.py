@@ -40,13 +40,13 @@ def test_stdio_tools_list_returns_v47_catalogue(stdio_client: McpClient) -> None
     assert len(tools) in {20, 21}, f"expected 20 or 21 tools, got {len(tools)}: {sorted(names)}"
     # v4.7 additions
     assert "ssh_run" in names
-    assert "ssh_execute_batch" in names
+    assert "ssh_exec_batch" in names
     assert "ssh_disconnect_many" in names
     # v4.6 carry-overs (sample — full set is asserted in test_v47_structured_content.py)
     for legacy in (
         "ssh_connect",
         "ssh_disconnect",
-        "ssh_execute",
+        "ssh_exec",
         "ssh_shell_open",
         "ssh_shell_read",
         "ssh_upload",
@@ -58,7 +58,7 @@ def test_stdio_tools_list_returns_v47_catalogue(stdio_client: McpClient) -> None
 def test_stdio_invalid_session_id_returns_error(stdio_client: McpClient) -> None:
     text = call_tool_text(
         stdio_client,
-        "ssh_execute",
+        "ssh_exec",
         {"session_id": make_session_id(), "command": "echo nope"},
     )
     parsed = parse_block(text)
@@ -81,7 +81,7 @@ def test_stdio_connect_disconnect_roundtrip(stdio_client: McpClient, ssh_target)
     sid = parsed.get("session_id")
     assert sid
 
-    listed = parse_block(call_tool_text(stdio_client, "ssh_list_sessions", {"agent_id": "stdio-rt"}))
+    listed = parse_block(call_tool_text(stdio_client, "ssh_sessions", {"agent_id": "stdio-rt"}))
     assert listed.get("count", 0) == 1
 
     text = call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
@@ -113,13 +113,13 @@ def test_stdio_execute_wait_completed(stdio_client: McpClient, ssh_target) -> No
 
     text = call_tool_text(
         stdio_client,
-        "ssh_execute",
+        "ssh_exec",
         {"session_id": sid, "command": "uname -s && whoami && echo STDIO_OK"},
     )
     cid = parse_block(text).get("command_id")
     text = call_tool_text(
         stdio_client,
-        "ssh_get_command_output",
+        "ssh_exec_output",
         {"command_id": cid, "wait": True, "wait_timeout_secs": 15},
         timeout=30,
     )
@@ -136,13 +136,13 @@ def test_stdio_execute_polling(stdio_client: McpClient, ssh_target) -> None:
         call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-poll"))
     ).get("session_id")
     text = call_tool_text(
-        stdio_client, "ssh_execute", {"session_id": sid, "command": "sleep 1 && echo POLL_OK"}
+        stdio_client, "ssh_exec", {"session_id": sid, "command": "sleep 1 && echo POLL_OK"}
     )
     cid = parse_block(text).get("command_id")
     parsed = {}
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        text = call_tool_text(stdio_client, "ssh_get_command_output", {"command_id": cid})
+        text = call_tool_text(stdio_client, "ssh_exec_output", {"command_id": cid})
         parsed = parse_block(text)
         if parsed.get("__status") == "COMPLETED":
             break
@@ -158,10 +158,10 @@ def test_stdio_cancel_running_command(stdio_client: McpClient, ssh_target) -> No
         call_tool_text(stdio_client, "ssh_connect", ssh_target.connect_args(agent_id="stdio-cancel"))
     ).get("session_id")
     cid = parse_block(
-        call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "sleep 60"})
+        call_tool_text(stdio_client, "ssh_exec", {"session_id": sid, "command": "sleep 60"})
     ).get("command_id")
     time.sleep(0.5)
-    parsed = parse_block(call_tool_text(stdio_client, "ssh_cancel_command", {"command_id": cid}))
+    parsed = parse_block(call_tool_text(stdio_client, "ssh_exec_cancel", {"command_id": cid}))
     assert parsed.get("__status") in {"CANCELLED", "NOOP"}
     call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
 
@@ -206,7 +206,7 @@ def test_stdio_shell_send_key_ctrl_c(stdio_client: McpClient, ssh_target) -> Non
     call_tool_text(stdio_client, "ssh_shell_write", {"shell_id": shell_id, "input": "yes\n"})
     time.sleep(0.5)
     parsed = parse_block(
-        call_tool_text(stdio_client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+        call_tool_text(stdio_client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
     )
     assert parsed.get("__status") == "OK"
     assert parsed.get("key") == "ctrl_c"
@@ -263,12 +263,12 @@ def test_stdio_upload_download(stdio_client: McpClient, ssh_target, tmp_path) ->
     cid = parse_block(
         call_tool_text(
             stdio_client,
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": f"mkdir -p {remote_dir} && rm -f {remote_path}"},
         )
     ).get("command_id")
     call_tool_text(
-        stdio_client, "ssh_get_command_output", {"command_id": cid, "wait": True}, timeout=15
+        stdio_client, "ssh_exec_output", {"command_id": cid, "wait": True}, timeout=15
     )
     upload_xfer = parse_block(
         call_tool_text(
@@ -280,7 +280,7 @@ def test_stdio_upload_download(stdio_client: McpClient, ssh_target, tmp_path) ->
     parsed = parse_block(
         call_tool_text(
             stdio_client,
-            "ssh_get_transfer_progress",
+            "ssh_transfer_progress",
             {"transfer_id": upload_xfer, "wait": True, "wait_timeout_secs": 60},
             timeout=90,
         )
@@ -299,7 +299,7 @@ def test_stdio_upload_download(stdio_client: McpClient, ssh_target, tmp_path) ->
     parsed = parse_block(
         call_tool_text(
             stdio_client,
-            "ssh_get_transfer_progress",
+            "ssh_transfer_progress",
             {"transfer_id": dl_xfer, "wait": True, "wait_timeout_secs": 60},
             timeout=90,
         )

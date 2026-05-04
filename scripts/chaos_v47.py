@@ -98,7 +98,7 @@ def scenario_idempotency_thrash() -> dict:
             errors = 0
             for k in keys:
                 result = client.call_tool_with_meta(
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": "true"},
                     meta={"idempotency_key": k},
                     timeout=10,
@@ -109,7 +109,7 @@ def scenario_idempotency_thrash() -> dict:
                     errors += 1
             elapsed = time.monotonic() - started
             # Server still responsive.
-            sanity_text = call_tool_text(client, "ssh_list_sessions", {})
+            sanity_text = call_tool_text(client, "ssh_sessions", {})
             sanity = parse_block(sanity_text)
             ok = (
                 not transport.panicked()
@@ -154,7 +154,7 @@ def scenario_progress_flood() -> dict:
             for _ in range(10):
                 text = call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {"session_id": sid, "command": "sleep 4"},
                 )
                 cid = parse_block(text).get("command_id")
@@ -169,7 +169,7 @@ def scenario_progress_flood() -> dict:
             def waiter(cid: str, token: str) -> None:
                 try:
                     result = client.call_tool_with_meta(
-                        "ssh_get_command_output",
+                        "ssh_exec_output",
                         {"command_id": cid, "wait": True, "wait_timeout_secs": 8},
                         meta={"progressToken": token},
                         timeout=15,
@@ -337,7 +337,7 @@ def scenario_prompts_get_spam() -> dict:
                 mismatches += 1
         elapsed = time.monotonic() - started
         # Sanity ping
-        sanity = parse_block(call_tool_text(client, "ssh_list_sessions", {}))
+        sanity = parse_block(call_tool_text(client, "ssh_sessions", {}))
         ok = (
             not transport.panicked()
             and mismatches == 0
@@ -434,7 +434,7 @@ def scenario_batch_cancel_mid_flight() -> dict:
             def runner() -> None:
                 try:
                     r = client.call_tool(
-                        "ssh_execute_batch",
+                        "ssh_exec_batch",
                         {
                             "session_id": sid,
                             "commands": ["sleep 2"] * 16,

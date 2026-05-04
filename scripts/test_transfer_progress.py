@@ -75,7 +75,7 @@ def _read_progress(stdio_client: McpClient, transfer_id: str) -> dict:
     return parse_block(
         call_tool_text(
             stdio_client,
-            "ssh_get_transfer_progress",
+            "ssh_transfer_progress",
             {"transfer_id": transfer_id},
             timeout=10,
         )
@@ -108,7 +108,7 @@ def test_upload_progress_reports_live_partial_bytes(
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {
                     "session_id": sid,
                     "command": f"mkdir -p {remote_dir} && rm -f {remote_path}",
@@ -117,7 +117,7 @@ def test_upload_progress_reports_live_partial_bytes(
         ).get("command_id")
         call_tool_text(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True},
             timeout=15,
         )
@@ -236,7 +236,7 @@ def test_download_progress_reports_live_partial_bytes(
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {
                     "session_id": sid,
                     "command": f"mkdir -p {remote_dir} && rm -f {remote_path}",
@@ -245,7 +245,7 @@ def test_download_progress_reports_live_partial_bytes(
         ).get("command_id")
         call_tool_text(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True},
             timeout=15,
         )
@@ -265,7 +265,7 @@ def test_download_progress_reports_live_partial_bytes(
         seed_status = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_get_transfer_progress",
+                "ssh_transfer_progress",
                 {"transfer_id": seed_xfer, "wait": True, "wait_timeout_secs": 60},
                 timeout=90,
             )

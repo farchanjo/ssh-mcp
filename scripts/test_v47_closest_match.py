@@ -126,14 +126,14 @@ def test_command_not_found_with_close_match_lists_closest(
         cid = parse_block(
             call_tool_text(
                 stdio_client,
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "sleep 5"},
             )
         ).get("command_id")
         try:
             typo = _typo(cid, idx=0, replacement="Z")
             text, structured, _ = call_tool_pair(
-                stdio_client, "ssh_get_command_output", {"command_id": typo}
+                stdio_client, "ssh_exec_output", {"command_id": typo}
             )
             parsed = parse_block(text)
             assert parsed.get("__status") == "ERROR"
@@ -141,7 +141,7 @@ def test_command_not_found_with_close_match_lists_closest(
             assert "closest matches" in detail.lower(), text
             assert cid in detail, (cid, detail)
         finally:
-            call_tool_text(stdio_client, "ssh_cancel_command", {"command_id": cid})
+            call_tool_text(stdio_client, "ssh_exec_cancel", {"command_id": cid})
     finally:
         call_tool_text(stdio_client, "ssh_disconnect", {"session_id": sid})
 
@@ -154,7 +154,7 @@ def test_command_not_found_with_close_match_lists_closest(
 def test_transfer_not_found_no_match_when_no_transfers(stdio_client: McpClient) -> None:
     """With no live transfers, the closest-match clause is omitted."""
     text, structured, _ = call_tool_pair(
-        stdio_client, "ssh_get_transfer_progress", {"transfer_id": "ghost-transfer-id"}
+        stdio_client, "ssh_transfer_progress", {"transfer_id": "ghost-transfer-id"}
     )
     parsed = parse_block(text)
     assert parsed.get("__status") == "ERROR"

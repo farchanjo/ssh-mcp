@@ -42,27 +42,27 @@ def test_tools_list_returns_v47_catalogue(http_client: McpClient) -> None:
     names = sorted(t["name"] for t in tools)
     assert len(names) in {20, 21}, f"expected 20 or 21 tools, got {len(names)}: {names}"
     # v4.7 additions
-    for new in ("ssh_run", "ssh_execute_batch", "ssh_disconnect_many"):
+    for new in ("ssh_run", "ssh_exec_batch", "ssh_disconnect_many"):
         assert new in names, f"missing v4.7 tool {new}: {names}"
     # v4.6 carry-overs
     expected_subset = {
         "ssh_connect",
         "ssh_disconnect",
         "ssh_disconnect_agent",
-        "ssh_list_sessions",
-        "ssh_execute",
-        "ssh_get_command_output",
-        "ssh_list_commands",
-        "ssh_cancel_command",
+        "ssh_sessions",
+        "ssh_exec",
+        "ssh_exec_output",
+        "ssh_commands",
+        "ssh_exec_cancel",
         "ssh_shell_open",
         "ssh_shell_write",
-        "ssh_shell_send_key",
+        "ssh_shell_press",
         "ssh_shell_wait_for",
         "ssh_shell_read",
         "ssh_shell_close",
         "ssh_upload",
         "ssh_download",
-        "ssh_get_transfer_progress",
+        "ssh_transfer_progress",
     }
     assert expected_subset.issubset(set(names)), names
 
@@ -77,7 +77,7 @@ def test_resources_list_initially_empty(http_client: McpClient) -> None:
 def test_invalid_session_id_returns_error(http_client: McpClient) -> None:
     text = call_tool_text(
         http_client,
-        "ssh_execute",
+        "ssh_exec",
         {"session_id": make_session_id(), "command": "echo nope"},
     )
     parsed = parse_block(text)
@@ -100,7 +100,7 @@ def test_connect_disconnect_roundtrip(http_client: McpClient, ssh_target) -> Non
     sid = parsed.get("session_id")
     assert sid
 
-    text = call_tool_text(http_client, "ssh_list_sessions", {"agent_id": "http-rt"})
+    text = call_tool_text(http_client, "ssh_sessions", {"agent_id": "http-rt"})
     listed = parse_block(text)
     assert listed.get("count", 0) == 1
 
@@ -134,7 +134,7 @@ def test_execute_and_get_output_wait(http_client: McpClient, ssh_target) -> None
 
     text = call_tool_text(
         http_client,
-        "ssh_execute",
+        "ssh_exec",
         {"session_id": sid, "command": "uname -s && whoami && echo HTTP_OK"},
     )
     cid = parse_block(text).get("command_id")
@@ -142,7 +142,7 @@ def test_execute_and_get_output_wait(http_client: McpClient, ssh_target) -> None
 
     text = call_tool_text(
         http_client,
-        "ssh_get_command_output",
+        "ssh_exec_output",
         {"command_id": cid, "wait": True, "wait_timeout_secs": 15},
         timeout=30,
     )
@@ -163,7 +163,7 @@ def test_execute_polling_and_list_commands(http_client: McpClient, ssh_target) -
     assert sid
 
     text = call_tool_text(
-        http_client, "ssh_execute", {"session_id": sid, "command": "sleep 1 && echo POLLED"}
+        http_client, "ssh_exec", {"session_id": sid, "command": "sleep 1 && echo POLLED"}
     )
     cid = parse_block(text).get("command_id")
 
@@ -171,7 +171,7 @@ def test_execute_polling_and_list_commands(http_client: McpClient, ssh_target) -
     deadline = time.monotonic() + 10
     parsed = {}
     while time.monotonic() < deadline:
-        text = call_tool_text(http_client, "ssh_get_command_output", {"command_id": cid})
+        text = call_tool_text(http_client, "ssh_exec_output", {"command_id": cid})
         parsed = parse_block(text)
         if parsed.get("__status") == "COMPLETED":
             break
@@ -179,7 +179,7 @@ def test_execute_polling_and_list_commands(http_client: McpClient, ssh_target) -
     assert parsed.get("__status") == "COMPLETED"
     assert "POLLED" in (parsed.get("stdout") or "")
 
-    listed = parse_block(call_tool_text(http_client, "ssh_list_commands", {"session_id": sid}))
+    listed = parse_block(call_tool_text(http_client, "ssh_commands", {"session_id": sid}))
     assert listed.get("count", 0) >= 1
 
     call_tool_text(http_client, "ssh_disconnect", {"session_id": sid})
@@ -194,12 +194,12 @@ def test_cancel_running_command(http_client: McpClient, ssh_target) -> None:
     assert sid
 
     text = call_tool_text(
-        http_client, "ssh_execute", {"session_id": sid, "command": "sleep 60"}
+        http_client, "ssh_exec", {"session_id": sid, "command": "sleep 60"}
     )
     cid = parse_block(text).get("command_id")
 
     time.sleep(0.5)
-    text = call_tool_text(http_client, "ssh_cancel_command", {"command_id": cid})
+    text = call_tool_text(http_client, "ssh_exec_cancel", {"command_id": cid})
     parsed = parse_block(text)
     assert parsed.get("__status") in {"CANCELLED", "NOOP"}, text
 
@@ -266,7 +266,7 @@ def test_shell_send_key_ctrl_c_breaks_yes(http_client: McpClient, ssh_target) ->
 
     call_tool_text(http_client, "ssh_shell_write", {"shell_id": shell_id, "input": "yes\n"})
     time.sleep(0.5)
-    text = call_tool_text(http_client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+    text = call_tool_text(http_client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
     parsed = parse_block(text)
     assert parsed.get("__status") == "OK"
     assert parsed.get("key") == "ctrl_c"
@@ -337,12 +337,12 @@ def test_upload_download_progress(http_client: McpClient, ssh_target, tmp_path) 
     cid = parse_block(
         call_tool_text(
             http_client,
-            "ssh_execute",
+            "ssh_exec",
             {"session_id": sid, "command": f"mkdir -p {remote_dir} && rm -f {remote_path}"},
         )
     ).get("command_id")
     call_tool_text(
-        http_client, "ssh_get_command_output", {"command_id": cid, "wait": True}, timeout=15
+        http_client, "ssh_exec_output", {"command_id": cid, "wait": True}, timeout=15
     )
 
     text = call_tool_text(
@@ -355,7 +355,7 @@ def test_upload_download_progress(http_client: McpClient, ssh_target, tmp_path) 
 
     text = call_tool_text(
         http_client,
-        "ssh_get_transfer_progress",
+        "ssh_transfer_progress",
         {"transfer_id": upload_xfer, "wait": True, "wait_timeout_secs": 60},
         timeout=90,
     )
@@ -372,7 +372,7 @@ def test_upload_download_progress(http_client: McpClient, ssh_target, tmp_path) 
 
     text = call_tool_text(
         http_client,
-        "ssh_get_transfer_progress",
+        "ssh_transfer_progress",
         {"transfer_id": dl_xfer, "wait": True, "wait_timeout_secs": 60},
         timeout=90,
     )

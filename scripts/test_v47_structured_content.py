@@ -137,9 +137,9 @@ def test_ssh_list_sessions_dual_channel(stdio_client: McpClient, ssh_target) -> 
     sid = _connect_session(stdio_client, ssh_target, agent="sc-list")
     try:
         text, structured, _ = call_tool_pair(
-            stdio_client, "ssh_list_sessions", {"agent_id": "sc-list"}
+            stdio_client, "ssh_sessions", {"agent_id": "sc-list"}
         )
-        assert structured["tool"] == "ssh_list_sessions"
+        assert structured["tool"] == "ssh_sessions"
         assert structured["status"] == "ok"
         sessions = structured.get("sessions") or []
         assert isinstance(sessions, list)
@@ -191,9 +191,9 @@ def test_ssh_execute_dual_channel(stdio_client: McpClient, ssh_target) -> None:
     sid = _connect_session(stdio_client, ssh_target, agent="sc-exec")
     try:
         text, structured, _ = call_tool_pair(
-            stdio_client, "ssh_execute", {"session_id": sid, "command": "echo OK"}
+            stdio_client, "ssh_exec", {"session_id": sid, "command": "echo OK"}
         )
-        assert structured["tool"] == "ssh_execute"
+        assert structured["tool"] == "ssh_exec"
         assert structured["status"] == "started"
         assert structured.get("command_id"), structured
         assert structured.get("session_id") == sid
@@ -204,15 +204,15 @@ def test_ssh_execute_dual_channel(stdio_client: McpClient, ssh_target) -> None:
 def test_ssh_get_command_output_dual_channel(stdio_client: McpClient, ssh_target) -> None:
     sid = _connect_session(stdio_client, ssh_target, agent="sc-getout")
     try:
-        text = call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "echo HELLO"})
+        text = call_tool_text(stdio_client, "ssh_exec", {"session_id": sid, "command": "echo HELLO"})
         cid = parse_block(text).get("command_id")
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_get_command_output",
+            "ssh_exec_output",
             {"command_id": cid, "wait": True, "wait_timeout_secs": 10},
             timeout=20,
         )
-        assert structured["tool"] == "ssh_get_command_output"
+        assert structured["tool"] == "ssh_exec_output"
         assert structured["status"] in {"completed", "running"}
         if structured["status"] == "completed":
             assert structured.get("exit_code") == 0
@@ -224,11 +224,11 @@ def test_ssh_get_command_output_dual_channel(stdio_client: McpClient, ssh_target
 def test_ssh_list_commands_dual_channel(stdio_client: McpClient, ssh_target) -> None:
     sid = _connect_session(stdio_client, ssh_target, agent="sc-listcmds")
     try:
-        call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "echo X"})
+        call_tool_text(stdio_client, "ssh_exec", {"session_id": sid, "command": "echo X"})
         text, structured, _ = call_tool_pair(
-            stdio_client, "ssh_list_commands", {"session_id": sid}
+            stdio_client, "ssh_commands", {"session_id": sid}
         )
-        assert structured["tool"] == "ssh_list_commands"
+        assert structured["tool"] == "ssh_commands"
         assert structured["status"] == "ok"
         commands = structured.get("commands") or []
         assert isinstance(commands, list)
@@ -239,11 +239,11 @@ def test_ssh_list_commands_dual_channel(stdio_client: McpClient, ssh_target) -> 
 def test_ssh_cancel_command_dual_channel(stdio_client: McpClient, ssh_target) -> None:
     sid = _connect_session(stdio_client, ssh_target, agent="sc-cancel")
     try:
-        text = call_tool_text(stdio_client, "ssh_execute", {"session_id": sid, "command": "sleep 30"})
+        text = call_tool_text(stdio_client, "ssh_exec", {"session_id": sid, "command": "sleep 30"})
         cid = parse_block(text).get("command_id")
         time.sleep(0.5)
-        text, structured, _ = call_tool_pair(stdio_client, "ssh_cancel_command", {"command_id": cid})
-        assert structured["tool"] == "ssh_cancel_command"
+        text, structured, _ = call_tool_pair(stdio_client, "ssh_exec_cancel", {"command_id": cid})
+        assert structured["tool"] == "ssh_exec_cancel"
         # v4.7: cancel returns `ok` for the cancelled-running path, `noop` for
         # already-terminal commands. The Markdown header still shows
         # `CANCELLED` / `NOOP` for backwards compatibility.
@@ -270,7 +270,7 @@ def test_ssh_execute_batch_dual_channel(stdio_client: McpClient, ssh_target) -> 
     try:
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_execute_batch",
+            "ssh_exec_batch",
             {
                 "session_id": sid,
                 "commands": ["echo one", "echo two", "echo three"],
@@ -278,7 +278,7 @@ def test_ssh_execute_batch_dual_channel(stdio_client: McpClient, ssh_target) -> 
             },
             timeout=60,
         )
-        assert structured["tool"] == "ssh_execute_batch"
+        assert structured["tool"] == "ssh_exec_batch"
         assert structured["status"] in {"ok", "halted"}
         assert structured.get("session_id") == sid
         assert structured.get("total") == 3
@@ -341,9 +341,9 @@ def test_ssh_shell_send_key_dual_channel(stdio_client: McpClient, ssh_target) ->
             call_tool_text(stdio_client, "ssh_shell_open", {"session_id": sid})
         )["shell_id"]
         text, structured, _ = call_tool_pair(
-            stdio_client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"}
+            stdio_client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"}
         )
-        assert structured["tool"] == "ssh_shell_send_key"
+        assert structured["tool"] == "ssh_shell_press"
         assert structured["status"] == "ok"
         assert structured.get("key") == "ctrl_c"
         assert structured.get("bytes_sent", 0) >= 1
@@ -440,11 +440,11 @@ def test_ssh_upload_download_progress_dual_channel(
         # Get progress (wait for completion)
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_get_transfer_progress",
+            "ssh_transfer_progress",
             {"transfer_id": upload_xfer, "wait": True, "wait_timeout_secs": 30},
             timeout=45,
         )
-        assert structured["tool"] == "ssh_get_transfer_progress"
+        assert structured["tool"] == "ssh_transfer_progress"
         if structured["status"] == "failed" and "TIMEOUT" in str(structured.get("reason", "")):
             pytest.skip("SFTP subsystem timed out (paramiko fixture)")
         assert structured["status"] in {"completed", "running", "failed"}
@@ -466,11 +466,11 @@ def test_ssh_upload_download_progress_dual_channel(
         assert dl_xfer
         text, structured, _ = call_tool_pair(
             stdio_client,
-            "ssh_get_transfer_progress",
+            "ssh_transfer_progress",
             {"transfer_id": dl_xfer, "wait": True, "wait_timeout_secs": 30},
             timeout=45,
         )
-        assert structured["tool"] == "ssh_get_transfer_progress"
+        assert structured["tool"] == "ssh_transfer_progress"
         if structured["status"] == "failed":
             pytest.skip(f"SFTP fixture flake: {structured}")
         assert structured["status"] == "completed"

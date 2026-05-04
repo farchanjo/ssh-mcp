@@ -95,12 +95,12 @@ def _call_text(client: McpClient, name: str, args: dict,
 
 def _subscribe(client: McpClient, uri: str, **extra) -> str | None:
     args = {"uri": uri, **extra}
-    text = _call_text(client, "ssh_subscribe", args)
+    text = _call_text(client, "sub_open", args)
     return parse_block(text).get("sub_id")
 
 
 def _unsubscribe(client: McpClient, sub_id: str) -> str:
-    return _call_text(client, "ssh_unsubscribe", {"sub_id": sub_id})
+    return _call_text(client, "sub_close", {"sub_id": sub_id})
 
 
 def _join_all(threads: list[threading.Thread], deadline: float) -> None:
@@ -114,9 +114,9 @@ def _join_all(threads: list[threading.Thread], deadline: float) -> None:
 
 def _final_sanity(client: McpClient) -> None:
     """The daemon must be responsive after the storm."""
-    text = _call_text(client, "ssh_sub_list", {})
+    text = _call_text(client, "sub_list", {})
     assert "SSH_SUB_LIST: OK" in text, text
-    text = _call_text(client, "ssh_daemon_stats", {})
+    text = _call_text(client, "sub_stats_all", {})
     assert "SSH_DAEMON_STATS: OK" in text, text
 
 
@@ -201,8 +201,8 @@ def test_chaos_concurrent_pause_resume_5_subs() -> None:
         def toggler(sub_id: str) -> None:
             try:
                 for _ in range(50):
-                    _call_text(client, "ssh_sub_pause", {"sub_id": sub_id})
-                    _call_text(client, "ssh_sub_resume", {"sub_id": sub_id})
+                    _call_text(client, "sub_pause", {"sub_id": sub_id})
+                    _call_text(client, "sub_resume", {"sub_id": sub_id})
             except Exception as exc:
                 with lock:
                     errors.append(f"{sub_id}: {exc!r}")
@@ -217,7 +217,7 @@ def test_chaos_concurrent_pause_resume_5_subs() -> None:
 
         # Verify every sub_id is still listed and shows a stable
         # paused= flag (no torn reads).
-        text = _call_text(client, "ssh_sub_list", {})
+        text = _call_text(client, "sub_list", {})
         for sub_id in sub_ids:
             assert sub_id in text, f"sub_id {sub_id} missing from list: {text}"
         for sub_id in sub_ids:
@@ -247,7 +247,7 @@ def test_chaos_filter_hot_reload_under_emission(
             pytest.skip(f"local sshd connect failed: {text!r}")
 
         cid = parse_block(
-            _call_text(client, "ssh_execute",
+            _call_text(client, "ssh_exec",
                        {"session_id": sid,
                         "command": "for i in $(seq 1 100); do echo MARKER-$i; sleep 0.05; done"})
         ).get("command_id")
@@ -268,7 +268,7 @@ def test_chaos_filter_hot_reload_under_emission(
                     for i in range(100):
                         regex = patterns[i % len(patterns)]
                         _call_text(
-                            client, "ssh_sub_filter",
+                            client, "sub_filter",
                             {"sub_id": sub_id, "regex": regex},
                         )
                 except Exception as exc:
@@ -281,11 +281,11 @@ def test_chaos_filter_hot_reload_under_emission(
             assert not errors, errors
 
             # Lane stats still readable.
-            stats = _call_text(client, "ssh_sub_stats", {"sub_id": sub_id})
+            stats = _call_text(client, "sub_stats", {"sub_id": sub_id})
             assert "SSH_SUB_STATS: OK" in stats, stats
             _unsubscribe(client, sub_id)
         finally:
-            _call_text(client, "ssh_cancel_command", {"command_id": cid})
+            _call_text(client, "ssh_exec_cancel", {"command_id": cid})
             _call_text(client, "ssh_disconnect", {"session_id": sid})
         _final_sanity(client)
 
@@ -314,7 +314,7 @@ def test_chaos_replay_during_active_producer(
             pytest.skip(f"local sshd connect failed: {text!r}")
         try:
             cid = parse_block(
-                _call_text(client, "ssh_execute",
+                _call_text(client, "ssh_exec",
                            {"session_id": sid,
                             "command": "for i in $(seq 1 200); do echo R-$i; done"})
             ).get("command_id")
@@ -331,7 +331,7 @@ def test_chaos_replay_during_active_producer(
                 try:
                     for cursor in range(50):
                         text = _call_text(
-                            client, "ssh_sub_replay",
+                            client, "sub_replay",
                             {"sub_id": sub_id, "from_cursor": cursor},
                         )
                         with lock:
@@ -352,7 +352,7 @@ def test_chaos_replay_during_active_producer(
                 assert s in {"OK", "ERROR"}, s
             _unsubscribe(client, sub_id)
         finally:
-            _call_text(client, "ssh_cancel_command", {"command_id": cid})
+            _call_text(client, "ssh_exec_cancel", {"command_id": cid})
             _call_text(client, "ssh_disconnect", {"session_id": sid})
         _final_sanity(client)
 
@@ -387,7 +387,7 @@ def test_chaos_idempotency_replay_collision(
             def worker(idx: int) -> None:
                 try:
                     result = client.call_tool_with_meta(
-                        "ssh_execute", args,
+                        "ssh_exec", args,
                         meta={"idempotency_key": key},
                         timeout=15,
                     )
@@ -494,7 +494,7 @@ def test_chaos_daemon_signal_storm_during_subs() -> None:
                     with lock:
                         targets = sub_ids[-5:]
                     for sub_id in targets:
-                        _call_text(client, "ssh_sub_stats",
+                        _call_text(client, "sub_stats",
                                    {"sub_id": sub_id})
             except Exception as exc:
                 with lock:
@@ -503,8 +503,8 @@ def test_chaos_daemon_signal_storm_during_subs() -> None:
         def aggregator() -> None:
             try:
                 while not stop.is_set():
-                    _call_text(client, "ssh_sub_list", {})
-                    _call_text(client, "ssh_daemon_stats", {})
+                    _call_text(client, "sub_list", {})
+                    _call_text(client, "sub_stats_all", {})
             except Exception as exc:
                 with lock:
                     errors.append(f"agg: {exc!r}")

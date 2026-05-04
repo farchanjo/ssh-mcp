@@ -226,7 +226,7 @@ def _run(transport: str) -> int:
         deadlock = any(t.is_alive() for t in threads)
 
         # Final liveness probe.
-        liveness = parse_block(call_tool_text(coordinator, "ssh_list_sessions", {})).get("count", 0)
+        liveness = parse_block(call_tool_text(coordinator, "ssh_sessions", {})).get("count", 0)
 
         for shell_id in shells:
             call_tool_text(coordinator, "ssh_shell_close", {"shell_id": shell_id})

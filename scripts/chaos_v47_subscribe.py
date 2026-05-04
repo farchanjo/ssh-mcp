@@ -708,7 +708,7 @@ def _scenario_cs7_dead_subscriber_gced(target: ChaosSshTarget) -> dict:
         # hit retry timeouts under macOS port pressure and slow this
         # scenario from 5s to 35s).
         live = _http_client(port)
-        listing = parse_block(call_tool_text(live, "ssh_list_sessions", {}))
+        listing = parse_block(call_tool_text(live, "ssh_sessions", {}))
         live_count = listing.get("count", 0)
         # ssh_list_sessions returning a structured response IS the
         # liveness signal. The full SSH connect path is exercised in
@@ -765,7 +765,7 @@ def _scenario_cs8_cross_scheme_isolation(target: ChaosSshTarget) -> dict:
                 cid = parse_block(
                     call_tool_text(
                         client,
-                        "ssh_execute",
+                        "ssh_exec",
                         {"session_id": sid, "command": "for i in 1 2 3; do echo cs8; sleep 0.2; done"},
                     )
                 ).get("command_id")
@@ -1152,7 +1152,7 @@ def _scenario_cs12_idempotency_with_subscribe(target: ChaosSshTarget) -> dict:
             idem_key = f"cs12-idem-{uuid.uuid4()}"
             # First call: emits a real command_id.
             first = client.call_tool_with_meta(
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo cs12_FIRST"},
                 meta={"idempotency_key": idem_key},
                 timeout=15,
@@ -1172,7 +1172,7 @@ def _scenario_cs12_idempotency_with_subscribe(target: ChaosSshTarget) -> dict:
             # Wait for the real command output to land.
             call_tool_text(
                 client,
-                "ssh_get_command_output",
+                "ssh_exec_output",
                 {"command_id": cid_first, "wait": True, "wait_timeout_secs": 5},
                 timeout=10,
             )
@@ -1181,7 +1181,7 @@ def _scenario_cs12_idempotency_with_subscribe(target: ChaosSshTarget) -> dict:
 
             # Replay with same key: must return the CACHED markdown.
             second = client.call_tool_with_meta(
-                "ssh_execute",
+                "ssh_exec",
                 {"session_id": sid, "command": "echo cs12_FIRST"},
                 meta={"idempotency_key": idem_key},
                 timeout=15,

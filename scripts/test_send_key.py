@@ -37,7 +37,7 @@ def test_ctrl_c_breaks_cat(open_shell) -> None:
     call_tool_text(client, "ssh_shell_write", {"shell_id": shell_id, "input": "cat\n"})
     time.sleep(0.4)
     parsed = parse_block(
-        call_tool_text(client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+        call_tool_text(client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
     )
     assert parsed.get("__status") == "OK"
     assert parsed.get("key") == "ctrl_c"
@@ -65,7 +65,7 @@ def test_arrow_up_after_history(open_shell) -> None:
         client, "ssh_shell_read", {"shell_id": shell_id, "clear": True, "max_output_bytes": 65536}
     )
     parsed = parse_block(
-        call_tool_text(client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "arrow_up"})
+        call_tool_text(client, "ssh_shell_press", {"shell_id": shell_id, "key": "arrow_up"})
     )
     assert parsed.get("__status") == "OK"
     assert parsed.get("key") == "arrow_up"
@@ -89,13 +89,13 @@ def test_f1_no_modifier_emits_bytes(open_shell) -> None:
         client, "ssh_shell_read", {"shell_id": shell_id, "clear": True, "max_output_bytes": 65536}
     )
     parsed = parse_block(
-        call_tool_text(client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "f1"})
+        call_tool_text(client, "ssh_shell_press", {"shell_id": shell_id, "key": "f1"})
     )
     assert parsed.get("__status") == "OK"
     # F1 = ESC O P (xterm) or ESC [ 1 1 ~ (some terms).
     assert parsed.get("bytes_sent", 0) >= 3
     # Send Ctrl+C to leave cat.
-    call_tool_text(client, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+    call_tool_text(client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
 
 
 def test_shift_tab_emits_back_tab(open_shell) -> None:
@@ -103,7 +103,7 @@ def test_shift_tab_emits_back_tab(open_shell) -> None:
     parsed = parse_block(
         call_tool_text(
             client,
-            "ssh_shell_send_key",
+            "ssh_shell_press",
             {"shell_id": shell_id, "key": "tab", "shift": True},
         )
     )
@@ -117,7 +117,7 @@ def test_modifier_rejected_on_ctrl_c(open_shell) -> None:
     parsed = parse_block(
         call_tool_text(
             client,
-            "ssh_shell_send_key",
+            "ssh_shell_press",
             {"shell_id": shell_id, "key": "ctrl_c", "shift": True},
         )
     )

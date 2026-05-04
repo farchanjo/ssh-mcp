@@ -86,7 +86,7 @@ def _scenario_push_100mb_upload(target: ChaosSshTarget, tmp_dir: Path) -> dict:
             mkdir = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_execute",
+                    "ssh_exec",
                     {
                         "session_id": sid,
                         "command": f"mkdir -p /tmp/ssh-mcp-chaos-{sid}",
@@ -96,7 +96,7 @@ def _scenario_push_100mb_upload(target: ChaosSshTarget, tmp_dir: Path) -> dict:
             if mkdir:
                 call_tool_text(
                     client,
-                    "ssh_get_command_output",
+                    "ssh_exec_output",
                     {"command_id": mkdir, "wait": True, "wait_timeout_secs": 10},
                     timeout=15,
                 )
@@ -125,7 +125,7 @@ def _scenario_push_100mb_upload(target: ChaosSshTarget, tmp_dir: Path) -> dict:
             terminal = parse_block(
                 call_tool_text(
                     client,
-                    "ssh_get_transfer_progress",
+                    "ssh_transfer_progress",
                     {"transfer_id": tid, "wait": True, "wait_timeout_secs": 120},
                     timeout=130,
                 )

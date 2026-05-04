@@ -124,7 +124,7 @@ def _run(transport: str) -> int:
                     pool.submit(
                         call_tool_text,
                         clients[i],
-                        "ssh_shell_send_key",
+                        "ssh_shell_press",
                         {"shell_id": shell_id, "key": "arrow_up"},
                     )
                     for i in range(CONCURRENT_SENDS)
@@ -160,7 +160,7 @@ def _run(transport: str) -> int:
         substring_count = rendered.count("[A")
 
         # Send Ctrl+C to leave cat.
-        call_tool_text(coordinator, "ssh_shell_send_key", {"shell_id": shell_id, "key": "ctrl_c"})
+        call_tool_text(coordinator, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
         call_tool_text(coordinator, "ssh_shell_close", {"shell_id": shell_id})
         call_tool_text(coordinator, "ssh_disconnect", {"session_id": sid})
         coordinator.close()
