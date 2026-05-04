@@ -29,6 +29,7 @@ pub mod args;
 pub mod error_detail;
 pub mod helpers;
 pub mod idempotency;
+pub mod leak_warn_bridge;
 pub mod peer_handle;
 pub mod progress;
 pub mod prompts;

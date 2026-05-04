@@ -31,6 +31,7 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::adapters::lifecycle::leak_watcher::LeakWatcher;
 use crate::application::cancel_command::CancelCommandRequest;
 use crate::application::close_shell::CloseShellRequest;
 use crate::application::connect_session::{ConnectOutcome, ConnectRequest, ConnectSessionUseCase};
@@ -67,16 +68,17 @@ use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
-use crate::domain::lifecycle::LifecyclePolicy;
-use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::domain::keys::KeyModifiers;
+use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
+use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::idempotency::{
     IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, KeyOutcome, extract_idempotency_key, replay,
 };
+use crate::infra::mcp::leak_warn_bridge::{LeakWarnBridgeHandle, spawn_bridge};
 use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
 use crate::infra::mcp::prompts;
 use crate::infra::mcp::render;
@@ -620,6 +622,23 @@ fn parse_address(input: &str) -> Result<Address, DomainError> {
         Address::with_default_port(input.to_string())
             .map_err(|e| DomainError::InvalidArgument(e.to_string()))
     }
+}
+
+/// Spawn the v5 Phase 3 leak-warn bridge when the request supplies a
+/// `progressToken` AND the server has a watcher wired. Returns a
+/// [`LeakWarnBridgeHandle`] the caller flips on tool exit so stale
+/// alerts never bleed into the next call. The handle is a no-op when
+/// either side is missing — same shape regardless of wiring state.
+fn spawn_leak_warn_bridge_if_wired(
+    emitter: &ProgressEmitter,
+    watcher: Option<&Arc<LeakWatcher>>,
+) -> LeakWarnBridgeHandle {
+    if !emitter.is_enabled() {
+        return LeakWarnBridgeHandle::noop();
+    }
+    watcher.map_or_else(LeakWarnBridgeHandle::noop, |w| {
+        spawn_bridge(emitter.clone(), w.as_ref())
+    })
 }
 
 /// Drive a long-running command-output use case under a bounded
@@ -1259,9 +1278,17 @@ where
             .await
         {
             Ok(outcome) => {
-                let structured =
-                    render::connection::list_sessions_structured(&outcome, filter.as_deref());
-                let body = render::connection::list_sessions_render(outcome);
+                let alerts = self
+                    .leak_probe
+                    .as_ref()
+                    .map(|p| p.current_alerts())
+                    .unwrap_or_default();
+                let structured = render::connection::list_sessions_structured_with_warnings(
+                    &outcome,
+                    filter.as_deref(),
+                    &alerts,
+                );
+                let body = render::connection::list_sessions_render_with_warnings(outcome, &alerts);
                 Ok(ok_text_and_structured(body, structured))
             }
             Err(err) => Ok(render_tool_error("SSH_LIST_SESSIONS", &err)),
@@ -1364,9 +1391,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let use_case = self.use_cases.get_command_output.as_ref();
         let streams = use_case.streams();
         let outcome = drive_with_command_progress(use_case, streams, req, emitter).await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(result) => {
                 let structured = render::execute::get_command_output_structured(&result);
@@ -1405,8 +1434,14 @@ where
         };
         match self.use_cases.list_commands.execute(req).await {
             Ok(outcome) => {
-                let structured = render::execute::list_commands_structured(&outcome);
-                let body = render::execute::list_commands_render(outcome);
+                let alerts = self
+                    .leak_probe
+                    .as_ref()
+                    .map(|p| p.current_alerts())
+                    .unwrap_or_default();
+                let structured =
+                    render::execute::list_commands_structured_with_warnings(&outcome, &alerts);
+                let body = render::execute::list_commands_render_with_warnings(outcome, &alerts);
                 Ok(ok_text_and_structured(body, structured))
             }
             Err(err) => Ok(render_tool_error("SSH_LIST_COMMANDS", &err)),
@@ -1632,9 +1667,11 @@ where
             clear: args.clear.unwrap_or(true),
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let outcome =
             drive_with_wait_for_progress(self.use_cases.wait_for_pattern.as_ref(), req, emitter)
                 .await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(outcome) => {
                 let structured = render::shell::shell_wait_for_structured(&outcome);
@@ -1788,9 +1825,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let use_case = self.use_cases.get_transfer_progress.as_ref();
         let transfers = use_case.transfers();
         let outcome = drive_with_transfer_progress(use_case, transfers, req, emitter).await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(result) => {
                 let structured = render::sftp::transfer_progress_structured(&result);
@@ -2218,9 +2257,17 @@ where
             .await
         {
             Ok(outcome) => {
-                let structured =
-                    render::connection::list_sessions_structured(&outcome, filter.as_deref());
-                let body = render::connection::list_sessions_render(outcome);
+                let alerts = self
+                    .leak_probe
+                    .as_ref()
+                    .map(|p| p.current_alerts())
+                    .unwrap_or_default();
+                let structured = render::connection::list_sessions_structured_with_warnings(
+                    &outcome,
+                    filter.as_deref(),
+                    &alerts,
+                );
+                let body = render::connection::list_sessions_render_with_warnings(outcome, &alerts);
                 Ok(ok_text_and_structured(body, structured))
             }
             Err(err) => Ok(render_tool_error("SSH_LIST_SESSIONS", &err)),
@@ -2323,9 +2370,11 @@ where
             max_output_bytes: args.max_output_bytes,
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let use_case = self.use_cases.get_command_output.as_ref();
         let streams = use_case.streams();
         let outcome = drive_with_command_progress(use_case, streams, req, emitter).await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(result) => {
                 let structured = render::execute::get_command_output_structured(&result);
@@ -2364,8 +2413,14 @@ where
         };
         match self.use_cases.list_commands.execute(req).await {
             Ok(outcome) => {
-                let structured = render::execute::list_commands_structured(&outcome);
-                let body = render::execute::list_commands_render(outcome);
+                let alerts = self
+                    .leak_probe
+                    .as_ref()
+                    .map(|p| p.current_alerts())
+                    .unwrap_or_default();
+                let structured =
+                    render::execute::list_commands_structured_with_warnings(&outcome, &alerts);
+                let body = render::execute::list_commands_render_with_warnings(outcome, &alerts);
                 Ok(ok_text_and_structured(body, structured))
             }
             Err(err) => Ok(render_tool_error("SSH_LIST_COMMANDS", &err)),
@@ -2591,9 +2646,11 @@ where
             clear: args.clear.unwrap_or(true),
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let outcome =
             drive_with_wait_for_progress(self.use_cases.wait_for_pattern.as_ref(), req, emitter)
                 .await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(outcome) => {
                 let structured = render::shell::shell_wait_for_structured(&outcome);
@@ -2747,9 +2804,11 @@ where
             wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
         };
         let emitter = ProgressEmitter::new(&ctx);
+        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
         let use_case = self.use_cases.get_transfer_progress.as_ref();
         let transfers = use_case.transfers();
         let outcome = drive_with_transfer_progress(use_case, transfers, req, emitter).await;
+        leak_bridge.shutdown().await;
         match outcome {
             Ok(result) => {
                 let structured = render::sftp::transfer_progress_structured(&result);
@@ -3843,7 +3902,11 @@ where
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        resource_handlers::list_resources_impl(&self.use_cases.list_resources).await
+        resource_handlers::list_resources_impl(
+            &self.use_cases.list_resources,
+            self.leak_probe.as_ref(),
+        )
+        .await
     }
 
     async fn list_resource_templates(
@@ -3947,7 +4010,11 @@ where
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        resource_handlers::list_resources_impl(&self.use_cases.list_resources).await
+        resource_handlers::list_resources_impl(
+            &self.use_cases.list_resources,
+            self.leak_probe.as_ref(),
+        )
+        .await
     }
 
     async fn list_resource_templates(
@@ -4092,11 +4159,7 @@ mod tests {
 
     #[test]
     fn lifetime_from_args_auto_close_uses_grace_ms() {
-        let lt = lifetime_from_args(
-            Some(super::LifetimeKind::AutoClose),
-            Some(1_500),
-            None,
-        );
+        let lt = lifetime_from_args(Some(super::LifetimeKind::AutoClose), Some(1_500), None);
         assert_eq!(
             lt,
             crate::domain::subscription::SubscriptionLifetime::AutoClose { grace_ms: 1_500 }
