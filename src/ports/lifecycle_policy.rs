@@ -34,6 +34,8 @@
 //! port surface; this layer therefore stays peer-keyed and only
 //! exposes resource-keyed operations.
 
+use std::fmt;
+
 use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
 use crate::domain::lifecycle::{LifecyclePolicy, LifecycleSnapshot};
@@ -45,7 +47,11 @@ use crate::ports::subscriber_registry::ResourceKind;
 /// every state mutation that does not need to spawn a runtime task is
 /// expressed as a sync method so use cases never hold a guard across a
 /// `.await` boundary.
-pub trait LifecyclePolicyPort: Send + Sync + 'static {
+///
+/// `Debug` is a supertrait so the [`crate::composition::UseCases`]
+/// container can derive `Debug` even when the lifecycle handle is
+/// erased behind `Arc<dyn LifecyclePolicyPort>`.
+pub trait LifecyclePolicyPort: fmt::Debug + Send + Sync + 'static {
     /// Register a new resource and pin its policy. Initial state is
     /// [`crate::domain::lifecycle::LifecycleState::Owned`].
     ///
@@ -130,11 +136,73 @@ pub trait LocalLifecyclePolicyAsync: Sync {
     async fn cancel_grace_timer(&self, kind: ResourceKind, resource_id: &str);
 }
 
+/// No-op [`LifecyclePolicyPort`] adapter.
+///
+/// Used as the constructor default by use cases that opt in to the v5
+/// lifecycle binding via the `with_lifecycle` builder. Keeps every
+/// call a silent success so callers that have not migrated to the v5
+/// wiring observe the same behaviour as v4.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopLifecycle;
+
+impl LifecyclePolicyPort for NoopLifecycle {
+    fn track_resource(
+        &self,
+        _kind: ResourceKind,
+        _resource_id: &str,
+        _session_id: &SessionId,
+        _policy: LifecyclePolicy,
+    ) {
+    }
+
+    fn on_subscribe(&self, _kind: ResourceKind, _resource_id: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    fn on_unsubscribe(&self, _kind: ResourceKind, _resource_id: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    fn force_close(&self, _kind: ResourceKind, _resource_id: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    fn snapshot(&self, _kind: ResourceKind, _resource_id: &str) -> Option<LifecycleSnapshot> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LifecyclePolicyAsync, LifecyclePolicyPort};
+    use std::sync::Arc;
+
+    use super::{LifecyclePolicyAsync, LifecyclePolicyPort, NoopLifecycle};
+    use crate::domain::ids::SessionId;
+    use crate::domain::lifecycle::LifecyclePolicy;
+    use crate::ports::subscriber_registry::ResourceKind;
 
     fn _assert_sync_dyn_safe(_p: &dyn LifecyclePolicyPort) {}
 
     fn _assert_async_port<T: LifecyclePolicyAsync>() {}
+
+    #[test]
+    fn noop_lifecycle_returns_ok_on_every_call() {
+        let n = NoopLifecycle;
+        n.track_resource(
+            ResourceKind::Shell,
+            "x",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+        assert!(n.on_subscribe(ResourceKind::Shell, "x").is_ok());
+        assert!(n.on_unsubscribe(ResourceKind::Shell, "x").is_ok());
+        assert!(n.force_close(ResourceKind::Shell, "x").is_ok());
+        assert!(n.snapshot(ResourceKind::Shell, "x").is_none());
+    }
+
+    #[test]
+    fn noop_lifecycle_implements_dyn_safe_trait() {
+        let n: Arc<dyn LifecyclePolicyPort> = Arc::new(NoopLifecycle);
+        assert!(n.snapshot(ResourceKind::Shell, "x").is_none());
+    }
 }

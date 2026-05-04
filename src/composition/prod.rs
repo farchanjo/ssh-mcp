@@ -34,6 +34,8 @@ use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::env::EnvConfig;
 use crate::adapters::config::internal::resolve_peer_gc_interval_s;
 use crate::adapters::id_generator::uuid::UuidIds;
+use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
@@ -80,6 +82,7 @@ use crate::infra::mcp::idempotency::IdempotencyCache;
 use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 use crate::infra::mcp::tool_router::IdLister;
+use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
 /// as the legacy v3 `RuntimeError` so binaries do not need to change.
@@ -254,6 +257,16 @@ pub fn build_use_cases() -> ProdWiring {
     // so the sink shares the same handle as every downstream use case.
     let ids = Arc::new(UuidIds);
 
+    // v5 lifecycle adapter: cascade coordinator + refcounted state
+    // machine. Held as `Arc<dyn LifecyclePolicyPort>` so use cases stay
+    // generics-stable while the v5 wiring rolls out incrementally.
+    // Phase 1 leaves the auto-disconnect hook uninstalled — Phase 3
+    // wires the DisconnectSessionUseCase callback once the use cases
+    // expose a Send + Sync 'static driver.
+    let cascade = CascadeCoordinator::new();
+    let lifecycle: Arc<dyn LifecyclePolicyPort> =
+        RefcountedLifecycleAdapter::new(Arc::clone(&cascade), Arc::clone(&clock));
+
     let connect = Arc::new(ConnectSessionUseCase::new(
         Arc::clone(&ssh),
         Arc::clone(&sessions),
@@ -282,15 +295,18 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&transfers),
     ));
 
-    let execute = Arc::new(ExecuteCommandUseCase::new(
-        Arc::clone(&ssh),
-        Arc::clone(&sessions),
-        Arc::clone(&commands),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
+    let execute = Arc::new(
+        ExecuteCommandUseCase::new(
+            Arc::clone(&ssh),
+            Arc::clone(&sessions),
+            Arc::clone(&commands),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
     let get_command_output = Arc::new(GetCommandOutputUseCase::new(
         Arc::clone(&commands),
         Arc::clone(&output),
@@ -303,6 +319,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&ssh),
         Arc::clone(&commands),
         Arc::clone(&output),
+        Arc::clone(&lifecycle),
     ));
 
     let open_shell = Arc::new(OpenShellUseCase::new(
@@ -312,6 +329,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&clock),
         Arc::clone(&ids),
         Arc::clone(&config),
+        Arc::clone(&lifecycle),
     ));
     let write_shell = Arc::new(WriteShellUseCase::new(
         Arc::clone(&ssh),
@@ -338,26 +356,33 @@ pub fn build_use_cases() -> ProdWiring {
     let close_shell = Arc::new(CloseShellUseCase::new(
         Arc::clone(&ssh),
         Arc::clone(&shells),
+        Arc::clone(&lifecycle),
     ));
 
-    let upload_file = Arc::new(UploadFileUseCase::new(
-        Arc::clone(&sftp),
-        Arc::clone(&sessions),
-        Arc::clone(&transfers),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
-    let download_file = Arc::new(DownloadFileUseCase::new(
-        Arc::clone(&sftp),
-        Arc::clone(&sessions),
-        Arc::clone(&transfers),
-        Arc::clone(&clock),
-        Arc::clone(&ids),
-        Arc::clone(&config),
-        Arc::clone(&subscribers),
-    ));
+    let upload_file = Arc::new(
+        UploadFileUseCase::new(
+            Arc::clone(&sftp),
+            Arc::clone(&sessions),
+            Arc::clone(&transfers),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
+    let download_file = Arc::new(
+        DownloadFileUseCase::new(
+            Arc::clone(&sftp),
+            Arc::clone(&sessions),
+            Arc::clone(&transfers),
+            Arc::clone(&clock),
+            Arc::clone(&ids),
+            Arc::clone(&config),
+            Arc::clone(&subscribers),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle)),
+    );
     let get_transfer_progress = Arc::new(GetTransferProgressUseCase::new(Arc::clone(&transfers)));
 
     #[cfg(feature = "port_forward")]
@@ -414,6 +439,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&sessions),
         Arc::clone(&forwards),
         Arc::clone(&subscribers),
+        Arc::clone(&lifecycle),
     ));
     #[cfg(not(feature = "port_forward"))]
     let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
@@ -422,9 +448,13 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&transfers),
         Arc::clone(&sessions),
         Arc::clone(&subscribers),
+        Arc::clone(&lifecycle),
     ));
 
-    let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(Arc::clone(&subscribers)));
+    let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(
+        Arc::clone(&subscribers),
+        Arc::clone(&lifecycle),
+    ));
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
 
     let idempotency = Arc::new(IdempotencyCache::from_env());
@@ -472,6 +502,7 @@ pub fn build_use_cases() -> ProdWiring {
         peer_gc,
         auth,
         notifier,
+        lifecycle_policy: Arc::clone(&lifecycle),
     });
 
     (use_cases, peer_table, idempotency, id_lister)
