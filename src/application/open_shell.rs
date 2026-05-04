@@ -86,6 +86,9 @@ pub struct OpenShellRequest {
     /// Optional rolling output-buffer size override in bytes. Same
     /// semantics as [`Self::inactivity_ttl_secs`].
     pub max_buffer_size: Option<u64>,
+    /// v5 Phase 3 — optional lifecycle policy override. `None` keeps
+    /// the v4 default ([`LifecyclePolicy::default()`]).
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing the freshly opened shell entity together with
@@ -187,14 +190,15 @@ where
             .await?;
         let entity = apply_overrides(entity, &req);
         self.shells.insert(entity.clone()).await?;
-        // v5 lifecycle binding (Phase 1): register the freshly opened
-        // shell with the default policy. Phase 3 will add a per-call
-        // override on the inbound DTO.
+        // v5 lifecycle binding: register the freshly opened shell. The
+        // policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
         self.lifecycle.track_resource(
             ResourceKind::Shell,
             entity.id.as_str(),
             &req.session_id,
-            LifecyclePolicy::default(),
+            req.lifecycle_policy.unwrap_or_default(),
         );
 
         Ok(OpenShellOutcome {
@@ -275,12 +279,12 @@ mod tests {
     use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
     use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
     use crate::adapters::ssh::fake::{FakeSshCall, FakeSshClient};
-    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::domain::error::DomainError;
     use crate::domain::identity::Address;
     use crate::domain::ids::{AgentId, SessionId, ShellId};
     use crate::domain::session::SessionEntity;
     use crate::domain::shell::ShellStatus;
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::ports::session_repo::SessionRepository;
     use crate::ports::shell_repo::ShellRepository;
     use chrono::Utc;
@@ -380,6 +384,7 @@ mod tests {
             rows: None,
             inactivity_ttl_secs: None,
             max_buffer_size: None,
+            lifecycle_policy: None,
         }
     }
 

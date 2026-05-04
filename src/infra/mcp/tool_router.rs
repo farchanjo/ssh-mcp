@@ -67,6 +67,7 @@ use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
 use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
+use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
@@ -947,6 +948,25 @@ async fn run_sub_subscribe(
     }
 }
 
+/// Translate the v5 Phase 3 args fields (`release_when_no_subs`,
+/// `grace_ms`) into a [`LifecyclePolicy`].
+///
+/// Returns `None` when both fields are absent — keeps the v4 default
+/// (no auto-release) so the existing behaviour stays byte-identical.
+fn lifecycle_from_args(
+    release_when_no_subs: Option<bool>,
+    grace_ms: Option<u32>,
+) -> Option<LifecyclePolicy> {
+    if release_when_no_subs.is_none() && grace_ms.is_none() {
+        return None;
+    }
+    Some(LifecyclePolicy {
+        release_when_no_subs: release_when_no_subs.unwrap_or(false),
+        grace_ms: grace_ms.unwrap_or(2_000),
+        cascade_session: false,
+    })
+}
+
 fn lifetime_from_args(
     kind: Option<LifetimeKind>,
     grace_ms: Option<u32>,
@@ -1306,6 +1326,7 @@ where
                 command: args.command,
                 timeout: args.timeout_secs.map(Duration::from_secs),
                 use_pty: args.pty.unwrap_or(false),
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.execute.execute(req).await {
                 Ok(outcome) => {
@@ -1454,6 +1475,7 @@ where
                 rows: args.rows,
                 inactivity_ttl_secs: args.inactivity_ttl,
                 max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.open_shell.execute(req).await {
                 Ok(outcome) => {
@@ -1690,6 +1712,7 @@ where
                 session_id: SessionId::new(args.session_id),
                 local_path: args.local_path,
                 remote_path: args.remote_path,
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.upload_file.execute(req).await {
                 Ok(outcome) => {
@@ -1725,6 +1748,7 @@ where
                 session_id: SessionId::new(args.session_id),
                 remote_path: args.remote_path,
                 local_path: args.local_path,
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.download_file.execute(req).await {
                 Ok(outcome) => {
@@ -2261,6 +2285,7 @@ where
                 command: args.command,
                 timeout: args.timeout_secs.map(Duration::from_secs),
                 use_pty: args.pty.unwrap_or(false),
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.execute.execute(req).await {
                 Ok(outcome) => {
@@ -2409,6 +2434,7 @@ where
                 rows: args.rows,
                 inactivity_ttl_secs: args.inactivity_ttl,
                 max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.open_shell.execute(req).await {
                 Ok(outcome) => {
@@ -2645,6 +2671,7 @@ where
                 session_id: SessionId::new(args.session_id),
                 local_path: args.local_path,
                 remote_path: args.remote_path,
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.upload_file.execute(req).await {
                 Ok(outcome) => {
@@ -2680,6 +2707,7 @@ where
                 session_id: SessionId::new(args.session_id),
                 remote_path: args.remote_path,
                 local_path: args.local_path,
+                lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
             };
             match self.use_cases.download_file.execute(req).await {
                 Ok(outcome) => {
@@ -3182,6 +3210,7 @@ where
             command,
             timeout: Some(timeout),
             use_pty: pty,
+            lifecycle_policy: None,
         })
         .await?;
     output

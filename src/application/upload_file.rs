@@ -67,6 +67,8 @@ pub struct UploadRequest {
     pub local_path: String,
     /// Remote destination path.
     pub remote_path: String,
+    /// v5 Phase 3 — optional lifecycle policy override.
+    pub lifecycle_policy: Option<LifecyclePolicy>,
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
@@ -195,13 +197,15 @@ where
         let started_at = entity.started_at;
 
         self.persist_or_rollback(&transfer_id, entity).await?;
-        // v5 lifecycle binding (Phase 1): register the freshly spawned
-        // upload with the default policy.
+        // v5 lifecycle binding: register the freshly spawned upload.
+        // The policy comes from the inbound DTO when set (Phase 3
+        // release_when_no_subs / grace_ms knobs); `None` falls back to
+        // [`LifecyclePolicy::default()`] for byte-identical v4 behaviour.
         self.lifecycle.track_resource(
             ResourceKind::Transfer,
             transfer_id.as_str(),
             &req.session_id,
-            LifecyclePolicy::default(),
+            req.lifecycle_policy.unwrap_or_default(),
         );
         self.subscribers
             .poke(ResourceKind::Transfer, transfer_id.as_str());
@@ -536,6 +540,7 @@ mod tests {
             session_id,
             local_path: seed_local_file("base"),
             remote_path: "/srv/dest.bin".to_string(),
+            lifecycle_policy: None,
         }
     }
 
