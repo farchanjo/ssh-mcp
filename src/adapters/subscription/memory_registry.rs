@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -50,7 +51,9 @@ use crate::adapters::config::internal::{
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
 use crate::domain::subscription::SubId;
-use crate::ports::notifier::{NotifierPort, PeerHandle};
+use crate::ports::notifier::{
+    DebouncerActivator, LaneNotifierBridge, NotifierPort, PeerHandle, ProducerForwarder,
+};
 use crate::ports::subscriber_registry::{
     ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,
 };
@@ -158,6 +161,12 @@ pub struct MemoryRegistry<N> {
     /// can still spawn it from `&self`. Set once at construction via
     /// [`Arc::new_cyclic`] and never overwritten.
     self_ref: Weak<Self>,
+    /// Optional lane-fanout bridge installed by the composition root.
+    /// Wakes up `ssh_subscribe` lanes from the legacy URI broadcast
+    /// path so stdio/HTTP transports get push delivery without a
+    /// dedicated channel-mux drain task. Lock-free swap via
+    /// [`ArcSwap`].
+    lane_bridge: ArcSwap<Option<Arc<dyn LaneNotifierBridge>>>,
 }
 
 impl<N> fmt::Debug for MemoryRegistry<N> {
@@ -224,7 +233,16 @@ where
             max_per_uri: per_uri,
             max_total: total,
             self_ref: Weak::clone(weak),
+            lane_bridge: ArcSwap::from_pointee(None),
         })
+    }
+
+    /// Install (or replace) the lane-fanout bridge. The bridge is
+    /// consulted by [`broadcast`] after the legacy peer fan-out so
+    /// `ssh_subscribe`-created lanes also receive push notifications
+    /// on stdio/HTTP transports.
+    pub fn install_lane_bridge(&self, bridge: Arc<dyn LaneNotifierBridge>) {
+        self.lane_bridge.store(Arc::new(Some(bridge)));
     }
 
     /// Get-or-create the cursor entry for `(sub_id, uri)`. Phase 2
@@ -304,6 +322,10 @@ where
         Arc::clone(inserted.value())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "lazy-insert + spawn + bookkeeping; extracting helpers fragments a single linear init"
+    )]
     fn ensure_debouncer(&self, kind: ResourceKind, resource_id: &str) {
         let key = (kind, resource_id.to_string());
         if self.debounce_tasks.contains_key(&key) {
@@ -316,11 +338,18 @@ where
         };
         let waker = Arc::new(Notify::new());
         let flush_now = Arc::new(Notify::new());
-        let bytes_counter = Arc::new(AtomicUsize::new(0));
+        // Reuse the existing counter when the producer already wrote
+        // bytes pre-subscribe (lazy-inserted by `record_bytes`).
+        // Overwriting would lose the pre-subscribe accumulation and
+        // leave `bytes_sent` permanently lagging real producer wire.
+        let bytes_counter = Arc::clone(
+            self.bytes_since_flush
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .value(),
+        );
         self.wakers.insert(key.clone(), Arc::clone(&waker));
         self.flush_now.insert(key.clone(), Arc::clone(&flush_now));
-        self.bytes_since_flush
-            .insert(key.clone(), Arc::clone(&bytes_counter));
         let uri = format_uri(kind, resource_id);
         let cfg = DebouncerConfig {
             debounce_ms: resolve_notify_debounce_ms(),
@@ -530,6 +559,37 @@ where
     }
 }
 
+impl<N> ProducerForwarder for MemoryRegistry<N>
+where
+    N: NotifierPort + Send + Sync + 'static,
+{
+    fn forward_poke(&self, kind: ResourceKind, id: &str) {
+        // Mirror legacy producer pokes into the hexagonal debouncer
+        // so `ssh_subscribe` lanes wake up alongside legacy peer subs.
+        self.poke(kind, id);
+    }
+
+    fn forward_record_bytes(&self, kind: ResourceKind, id: &str, bytes_added: usize) {
+        // Record bytes on the hexagonal counter. The hexagonal
+        // debouncer will swap + emit through the lane bridge on the
+        // next flush, attributing the byte delta to lane `bytes_sent`.
+        self.record_bytes(kind, id, bytes_added);
+    }
+}
+
+impl<N> DebouncerActivator for MemoryRegistry<N>
+where
+    N: NotifierPort + Send + Sync + 'static,
+{
+    fn ensure_for_uri(&self, uri: &str) {
+        // Best-effort URI parse via the local helper. Any malformed
+        // URI is a no-op (producer side will never broadcast for it).
+        if let Some((kind, id)) = parse_uri(uri) {
+            self.ensure_debouncer(kind, &id);
+        }
+    }
+}
+
 impl<N> SubscriberRegistryPort for MemoryRegistry<N>
 where
     N: NotifierPort + Send + Sync + 'static,
@@ -557,14 +617,14 @@ where
             return;
         }
         let key: ResourceKey = (kind, resource_id.to_string());
-        // No debouncer running for this resource → nothing to flush.
-        // Cheaper than acquiring the bytes_since_flush entry first.
-        if !self.bytes_since_flush.contains_key(&key) {
-            return;
-        }
-        let Some(counter_entry) = self.bytes_since_flush.get(&key) else {
-            return;
-        };
+        // Lazy-insert the counter — the producer may write bytes
+        // before any subscriber registers (and therefore before
+        // `ensure_debouncer` runs). Bytes accumulate regardless; the
+        // debouncer drains the counter on its first flush.
+        let counter_entry = self
+            .bytes_since_flush
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
         let counter = Arc::clone(counter_entry.value());
         drop(counter_entry);
         let prev = counter.fetch_add(bytes_added, Ordering::Relaxed);
@@ -796,14 +856,23 @@ async fn broadcast_and_reset<N>(
 ) where
     N: NotifierPort + Send + Sync + 'static,
 {
-    bytes_counter.store(0, Ordering::Relaxed);
-    broadcast(registry, uri).await;
+    let bytes_added = bytes_counter.swap(0, Ordering::Relaxed);
+    broadcast(registry, uri, bytes_added).await;
 }
 
-async fn broadcast<N>(registry: &Arc<MemoryRegistry<N>>, uri: &str)
+async fn broadcast<N>(registry: &Arc<MemoryRegistry<N>>, uri: &str, bytes_added: usize)
 where
     N: NotifierPort + Send + Sync + 'static,
 {
+    // Phase 4-equivalent fanout for stdio/HTTP transports: also
+    // notify every `ssh_subscribe`-created lane bound to this URI
+    // through the installed [`LaneNotifierBridge`]. The bridge runs
+    // BEFORE the legacy peer fanout so lane stats stay in lock-step
+    // even when the legacy subscriber set is empty.
+    let bridge_arc = registry.lane_bridge.load_full();
+    if let Some(bridge) = bridge_arc.as_ref() {
+        bridge.notify_lanes(uri, bytes_added).await;
+    }
     // Snapshot subscribers BEFORE awaiting so we never hold a DashMap
     // shard guard across `.await`.
     let subs: Vec<Arc<dyn PeerHandle>> = registry
