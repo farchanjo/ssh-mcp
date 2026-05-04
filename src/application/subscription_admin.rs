@@ -957,6 +957,333 @@ mod tests {
         assert_eq!(stats.events_sent_total, 0);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_with_lease_lifetime_carries_zero_grace_ms() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "shell://l/output".to_string(),
+                lifetime: SubscriptionLifetime::Lease { ttl_secs: 60 },
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.grace_ms, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_with_drop_oldest_lag_policy_round_trips() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "shell://o/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::DropOldest,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.lag_policy, LagPolicy::DropOldest);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_with_block_slow_lag_policy_round_trips() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "shell://b/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::BlockSlow,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.lag_policy, LagPolicy::BlockSlow);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_carries_canonical_uri_after_query_strip() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "shell://q/output?cursor=auto".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri, "shell://q/output");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_command_uri_succeeds() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "command://c/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri, "command://c/output");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_transfer_uri_succeeds() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "transfer://t/progress".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri, "transfer://t/progress");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_session_uri_succeeds() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "session://s/health".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri, "session://s/health");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_forward_uri_succeeds() {
+        let uc = SubscribeUseCase::new(lane_admin());
+        let outcome = uc
+            .execute(SubscribeRequest {
+                uri: "forward://f/events".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri, "forward://f/events");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_max_subs_total_returns_typed_error() {
+        // Tiny adapter: max_total = 2 so the third subscribe fails.
+        let adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 16, 2);
+        let lane: Arc<dyn LaneAdmin> = adapter as Arc<dyn LaneAdmin>;
+        let uc = SubscribeUseCase::new(Arc::clone(&lane));
+        let _ = uc
+            .execute(SubscribeRequest {
+                uri: "shell://x1/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        let _ = uc
+            .execute(SubscribeRequest {
+                uri: "shell://x2/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        let err = uc
+            .execute(SubscribeRequest {
+                uri: "shell://x3/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::MaxSubsTotalExceeded { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_max_subs_per_uri_returns_typed_error() {
+        let adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 1, 64);
+        let lane: Arc<dyn LaneAdmin> = adapter as Arc<dyn LaneAdmin>;
+        let uc = SubscribeUseCase::new(Arc::clone(&lane));
+        let _ = uc
+            .execute(SubscribeRequest {
+                uri: "shell://same/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        let err = uc
+            .execute(SubscribeRequest {
+                uri: "shell://same/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::MaxSubsPerUriExceeded { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsubscribe_outcome_carries_uri_when_lane_known() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let sub_id = adapter
+            .open_lane(
+                "shell://uri/output".to_string(),
+                ResourceKind::Shell,
+                "uri".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let uc = UnsubscribeUseCase::new(lane);
+        let outcome = uc
+            .execute(UnsubscribeRequest {
+                sub_id: sub_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.uri.as_deref(), Some("shell://uri/output"));
+        assert_eq!(outcome.lifecycle_state, "closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_idempotent_when_called_twice() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let sub_id = adapter
+            .open_lane(
+                "shell://2x/output".to_string(),
+                ResourceKind::Shell,
+                "2x".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let uc = PauseSubUseCase::new(Arc::clone(&lane));
+        let r1 = uc
+            .execute(SubToggleRequest {
+                sub_id: sub_id.clone(),
+            })
+            .await
+            .unwrap();
+        let r2 = uc
+            .execute(SubToggleRequest {
+                sub_id: sub_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(r1.paused && r2.paused);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_filter_clear_with_none_round_trips() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let sub_id = adapter
+            .open_lane(
+                "shell://clear/output".to_string(),
+                ResourceKind::Shell,
+                "clear".to_string(),
+                LanePolicy {
+                    lag_policy: LagPolicy::Snapshot,
+                    lifetime: SubscriptionLifetime::Manual,
+                    filter: FilterRule::Regex("ERR".to_string()),
+                    buffer_size: 16,
+                },
+            )
+            .await
+            .unwrap();
+        let uc = SetFilterUseCase::new(lane);
+        let outcome = uc
+            .execute(SetFilterRequest {
+                sub_id,
+                filter: FilterRule::None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.filter, FilterRule::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_at_zero_cursor_is_a_noop() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let sub_id = adapter
+            .open_lane(
+                "shell://z/output".to_string(),
+                ResourceKind::Shell,
+                "z".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let uc = ReplaySubUseCase::new(lane);
+        let outcome = uc
+            .execute(ReplayRequest {
+                sub_id: sub_id.clone(),
+                from_cursor: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.from_cursor, 0);
+        assert_eq!(adapter.current_cursor(&sub_id, ""), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_subs_returns_empty_when_registry_is_empty() {
+        let uc = ListSubsUseCase::new(lane_admin());
+        let outcome = uc.execute(&ListSubsRequest::default()).unwrap();
+        assert!(outcome.subs.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_stats_returns_zero_when_registry_is_empty() {
+        let uc = DaemonStatsUseCase::new(lane_admin());
+        let outcome = uc.execute().unwrap();
+        assert_eq!(outcome.lanes_total, 0);
+        assert_eq!(outcome.events_sent_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_subs_with_unmatched_prefix_returns_empty_set() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        adapter
+            .open_lane(
+                "shell://x/output".to_string(),
+                ResourceKind::Shell,
+                "x".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let uc = ListSubsUseCase::new(lane);
+        let outcome = uc
+            .execute(&ListSubsRequest {
+                uri_prefix: Some("transfer://".to_string()),
+                peer_id: None,
+            })
+            .unwrap();
+        assert!(outcome.subs.is_empty());
+    }
+
     #[test]
     fn summary_kind_str_returns_lowercase_label() {
         let s = crate::ports::subscriber_lane::SubSummary {
@@ -970,5 +1297,28 @@ mod tests {
             stats: crate::domain::subscription::SubscriberStats::default(),
         };
         assert_eq!(summary_kind_str(&s), "shell");
+    }
+
+    #[test]
+    fn summary_kind_str_covers_every_resource_kind() {
+        for (kind, expected) in [
+            (ResourceKind::Shell, "shell"),
+            (ResourceKind::Command, "command"),
+            (ResourceKind::Transfer, "transfer"),
+            (ResourceKind::Session, "session"),
+            (ResourceKind::Forward, "forward"),
+        ] {
+            let s = crate::ports::subscriber_lane::SubSummary {
+                sub_id: SubId::new("x".to_string()),
+                kind,
+                resource_id: "r".to_string(),
+                uri: "x".to_string(),
+                lag_policy: LagPolicy::Snapshot,
+                lifetime: SubscriptionLifetime::Manual,
+                paused: false,
+                stats: crate::domain::subscription::SubscriberStats::default(),
+            };
+            assert_eq!(summary_kind_str(&s), expected);
+        }
     }
 }

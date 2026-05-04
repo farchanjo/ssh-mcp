@@ -687,6 +687,108 @@ mod tests {
     }
 
     #[test]
+    fn list_render_with_zero_subs_emits_zero_total() {
+        let outcome = ListSubsOutcome { subs: Vec::new() };
+        let body = list_render(&outcome);
+        assert!(body.contains("SUBS_TOTAL: 0"));
+        let json = list_structured(&outcome);
+        assert_eq!(json["subs_total"], 0);
+        assert_eq!(json["subs"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn unsubscribe_render_omits_uri_when_unknown() {
+        let outcome = UnsubscribeOutcome {
+            sub_id: sub_id("u"),
+            uri: None,
+            lifecycle_state: "closed",
+            grace_remaining_ms: None,
+        };
+        let body = unsubscribe_render(&outcome);
+        assert!(!body.contains("URI:"));
+        assert!(!body.contains("GRACE_REMAINING_MS:"));
+    }
+
+    #[test]
+    fn lifetime_label_covers_every_variant() {
+        assert_eq!(super::lifetime_label(SubscriptionLifetime::Manual), "manual");
+        assert_eq!(
+            super::lifetime_label(SubscriptionLifetime::AutoClose { grace_ms: 1 }),
+            "auto_close"
+        );
+        assert_eq!(
+            super::lifetime_label(SubscriptionLifetime::Lease { ttl_secs: 1 }),
+            "lease"
+        );
+    }
+
+    #[test]
+    fn filter_label_covers_every_variant() {
+        assert_eq!(super::filter_label(&FilterRule::None), "none");
+        assert_eq!(
+            super::filter_label(&FilterRule::Regex("X".to_string())),
+            "regex:X"
+        );
+        let label = super::filter_label(&FilterRule::Level(
+            crate::domain::subscription::LogLevel::Warn,
+        ));
+        assert!(label.starts_with("level:"));
+    }
+
+    #[test]
+    fn subscribe_render_lag_policy_is_lowercase_wire_form() {
+        for (variant, wire) in [
+            (LagPolicy::BlockSlow, "block_slow"),
+            (LagPolicy::DropOldest, "drop_oldest"),
+            (LagPolicy::DropNewest, "drop_newest"),
+            (LagPolicy::Snapshot, "snapshot"),
+        ] {
+            let outcome = SubscribeOutcome {
+                sub_id: sub_id("x"),
+                uri: "shell://x/output".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: variant,
+                grace_ms: 0,
+            };
+            let body = subscribe_render(&outcome);
+            assert!(
+                body.contains(&format!("LAG_POLICY: {wire}")),
+                "missing wire form {wire}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_structured_paused_is_true() {
+        let outcome = SubToggleOutcome {
+            sub_id: sub_id("p"),
+            paused: true,
+        };
+        let json = pause_structured(&outcome);
+        assert_eq!(json["paused"], true);
+    }
+
+    #[test]
+    fn resume_structured_paused_is_false() {
+        let outcome = SubToggleOutcome {
+            sub_id: sub_id("r"),
+            paused: false,
+        };
+        let json = resume_structured(&outcome);
+        assert_eq!(json["paused"], false);
+    }
+
+    #[test]
+    fn replay_render_carries_zero_cursor_when_unset() {
+        let outcome = ReplayOutcome {
+            sub_id: sub_id("z"),
+            from_cursor: 0,
+        };
+        let body = replay_render(&outcome);
+        assert!(body.contains("FROM_CURSOR: 0"));
+    }
+
+    #[test]
     fn next_line_ordering_pushes_subscribe_first_in_subscribe_render() {
         let outcome = SubscribeOutcome {
             sub_id: sub_id("019"),

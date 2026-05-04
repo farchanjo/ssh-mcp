@@ -431,4 +431,81 @@ mod tests {
     fn leak_broadcast_capacity_is_documented() {
         assert_eq!(LEAK_BROADCAST_CAPACITY, 256);
     }
+
+    #[test]
+    fn classify_kill_takes_priority_over_warn() {
+        // Kill has priority when both thresholds are crossed.
+        let e = entry(LifecycleState::Owned, 0, 30_000, false);
+        let alert = classify(&e, 2_000, 10_000).expect("kill");
+        assert_eq!(alert.severity, LeakRiskSeverity::Kill);
+    }
+
+    #[test]
+    fn classify_age_at_exact_warn_threshold_fires() {
+        // age_ms == warn_ms must trigger (>= comparison).
+        let e = entry(LifecycleState::Owned, 0, 2_000, false);
+        let alert = classify(&e, 2_000, 0).expect("warn");
+        assert_eq!(alert.severity, LeakRiskSeverity::Warn);
+    }
+
+    #[test]
+    fn classify_age_at_exact_kill_threshold_fires() {
+        let e = entry(LifecycleState::Owned, 0, 10_000, false);
+        let alert = classify(&e, 2_000, 10_000).expect("kill");
+        assert_eq!(alert.severity, LeakRiskSeverity::Kill);
+    }
+
+    #[test]
+    fn leak_risk_alert_eq_is_field_wise() {
+        let a = super::LeakRiskAlert {
+            kind: ResourceKind::Shell,
+            resource_id: "x".to_string(),
+            age_ms: 1_000,
+            severity: LeakRiskSeverity::Warn,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn classify_returns_none_when_resource_has_one_subscriber() {
+        // sub_count > 0 means the resource is observed; no leak risk.
+        let e = entry(LifecycleState::Observed, 1, 30_000, false);
+        assert!(classify(&e, 2_000, 0).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watcher_fires_kill_after_kill_threshold_and_force_closes() {
+        let adapter = build_adapter();
+        adapter.track_resource(
+            ResourceKind::Shell,
+            "kill-me",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+        let handle = LeakWatcher::spawn(
+            &adapter,
+            LeakWatcherConfig {
+                warn_after_s: 1,
+                kill_after_s: 1,
+                scan_interval: Duration::from_millis(50),
+            },
+        );
+        let mut rx = handle.watcher.subscribe();
+        // First alert is Warn or Kill — both acceptable; we only assert
+        // that *eventually* a Kill alert lands.
+        let alert = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next = rx.recv().await.expect("alert ok");
+                if matches!(next.severity, LeakRiskSeverity::Kill) {
+                    return next;
+                }
+            }
+        })
+        .await
+        .expect("kill in time");
+        assert_eq!(alert.severity, LeakRiskSeverity::Kill);
+        handle.cancel.cancel();
+        let _ = handle.task.await;
+    }
 }
