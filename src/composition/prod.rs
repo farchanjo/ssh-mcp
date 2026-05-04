@@ -342,12 +342,13 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&ids),
         Arc::clone(&config),
     ));
-    let disconnect = Arc::new(DisconnectSessionUseCase::new(
+    let disconnect = Arc::new(DisconnectSessionUseCase::with_lifecycle(
         Arc::clone(&ssh),
         Arc::clone(&sessions),
         Arc::clone(&commands),
         Arc::clone(&shells),
         Arc::clone(&transfers),
+        Arc::clone(&lifecycle),
     ));
     let list_sessions = Arc::new(ListSessionsUseCase::new(
         Arc::clone(&ssh),
