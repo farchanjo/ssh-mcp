@@ -1302,7 +1302,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Disconnect an SSH session.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- Cancels every async command, closes every PTY, and aborts every in-flight SFTP transfer for the session.\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds.",
+        description = "Disconnect an SSH session. Cancels every async command, closes every PTY, aborts every in-flight SFTP transfer, tears down every port-forward listener, and decrements the SessionLifecycle refcount per ADR 0003 cascade.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- For BULK cleanup of an agent's sessions, prefer ssh_disconnect_agent (one call per agent_id).\n- For multiple unrelated sessions, prefer ssh_disconnect_many (batched).\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n3. Open subscription lanes on child resources (shell://, command://) emit a final `closed` event before unsubscribing.\n\nLifecycle interaction: SessionLifecycle.active_refs is decremented once per child resource closed during teardown. The session reaper consults active_refs > 0 before honouring the inactivity TTL — refcount supersedes TTL.\n\nStatus values: OK, NOOP (already closed by reaper).\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(N) over child resources. Always succeeds locally; TRANSPORT_ERROR only on dead-transport teardown races.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
         output_schema = schema_for_type::<SshDisconnectResult>()
     )]
     async fn ssh_disconnect(
@@ -1555,7 +1555,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Cancel an asynchronous command.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_exec.\n- Returns the partial stdout/stderr captured so far when the command was running.\n\nStatus values: CANCELLED, NOOP.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).",
+        description = "Cancel an asynchronous command. Sends SIGINT (or closes the channel for non-PTY) and marks the command Cancelled.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_exec.\n- Returns the partial stdout/stderr captured so far at the time of cancel.\n\nPush interaction: if a `command://<COMMAND_ID>/output` lane is open, the lane drains the partial buffer and emits a final `cancelled` status event before unsubscribing. The cursor at cancel is preserved for sub_replay.\n\nWorkflow:\n1. ssh_exec_cancel command_id=<COMMAND_ID>.\n2. Drain remaining lane events via the existing subscription (no extra polling needed).\n3. sub_close when done.\n\nStatus values: CANCELLED, NOOP (already finished — terminal status preserved).\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
         output_schema = schema_for_type::<SshExecCancelResult>()
     )]
     async fn ssh_exec_cancel(
@@ -1820,7 +1820,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Close a PTY shell and free its resources.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds.",
+        description = "Close a PTY shell and free its resources. Cancels the russh channel, drops the per-shell registry entry, and cascades to any open shell:// subscription lanes.\n\nWhen to use:\n- Tearing down a PTY allocated by ssh_shell_open.\n- Aborting an interactive program stuck on a prompt.\n\nLifecycle interaction: when the shell was opened with `release_when_no_subs=true`, ssh_shell_close fires before the grace window — open lanes transition straight to Closed. Otherwise, lanes survive the close and emit a final `closed` event before unsubscribing.\n\nStatus values: OK, NOOP (already closed).\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds locally; TRANSPORT_ERROR only if russh teardown races a dead transport.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
         output_schema = schema_for_type::<SshShellCloseResult>()
     )]
     async fn ssh_shell_close(
@@ -2141,7 +2141,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://` without polling.\n- Strictly preferred over polling tools (ssh_shell_read, ssh_exec_output, ssh_transfer_progress) for any stream with >1 expected delta.\n\nLag policies (decision matrix):\n- `snapshot` (default) — drop lane backlog, rebuild from per-resource ring buffer on next push. Zero loss while ring covers the gap; emits `LAG_DETECTED` otherwise. Pick for general observation.\n- `drop_oldest` — FIFO rotation when lane mpsc full. Marks `lagged`. Pick for tail logs / monitoring with gap tolerance.\n- `drop_newest` — drop new event when full. Pick when start-of-stream matters more than current.\n- `block_slow` — producer awaits drain. Zero loss, latency cost. Pick for audit / every-event-matters workloads.\n\nLifetime knobs:\n- `manual` (default) — close via sub_close.\n- `auto_close` — closes after `grace_ms` of consumer inactivity (default 2000).\n- `lease` — hard cap via `ttl_secs`.\n\nFilter:\n- Optional Rust-regex compiled at subscribe time; mutate live via sub_filter without re-opening.\n\nReplay:\n- sub_replay re-emits from `from_cursor` within the per-resource ring window. Independent of what the lane already dropped.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nStatus values: OK.\n\nErrors: SUB_INVALID_FILTER (regex compile), SUB_LIMIT_EXCEEDED, RESOURCE_NOT_FOUND.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie (watcher emits SUB_LEAK_RISK).\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn sub_open(
         &self,
@@ -2169,7 +2169,7 @@ where
             destructive_hint = true,
             idempotent_hint = true
         ),
-        description = "Close a Channel Mux lane previously opened with sub_open.\n\nCleanup: this IS the cleanup tool — call it for every SUB_ID you obtained.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: tolerate `SUB_NOT_FOUND` — lifetime auto-close may have closed the lane already."
+        description = "Close a Channel Mux lane previously opened with sub_open. Detaches the SubId, drops the mpsc, releases the per-resource subscriber refcount, and (if last subscriber) arms the resource grace timer per ADR 0003.\n\nWhen to use:\n- Cleanup after subscription work completes.\n- This IS the cleanup tool — call it for every SUB_ID you obtained.\n\nLifecycle interaction: when the resource was opened with `release_when_no_subs=true`, the last sub_close transitions Observed → Releasing and starts the grace window. A new sub_open for the same URI within the window cancels the timer (Releasing → Observed).\n\nStatus values: OK, NOOP (already closed).\n\nErrors: SUB_NOT_FOUND — tolerate silently; lifetime auto_close / lease may have closed the lane already.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: tolerate `SUB_NOT_FOUND`; never re-open the same URI without first unsubscribing."
     )]
     async fn sub_close(
         &self,
@@ -2193,7 +2193,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Suspend lane drain. Subsequent events accumulate in the lane mpsc until sub_resume.\n\nCost: O(1)."
+        description = "Suspend lane drain. Subsequent events accumulate in the lane mpsc until sub_resume; lag_policy still applies — `drop_oldest` rotates the queue while paused.\n\nWhen to use:\n- Pause delivery to a slow consumer without losing the SubId / cursor / filter / lifetime state.\n- Combine with sub_resume to gate batched processing.\n\nInteraction: pause does NOT freeze the producer; events still hit the lane and get queued (or rotated, per lag_policy). High-frequency streams may exhaust the mpsc — monitor via sub_stats.\n\nStatus values: OK, NOOP (already paused).\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1) atomic flag flip.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries."
     )]
     async fn sub_pause(
         &self,
@@ -2217,7 +2217,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Resume lane drain after a previous sub_pause.\n\nCost: O(1)."
+        description = "Resume lane drain after a previous sub_pause. Queued events flush in order, subject to lag_policy.\n\nWhen to use:\n- Re-enable push delivery on a paused lane.\n\nInteraction: if `lag_policy=snapshot` and the ring buffer rotated past the lane cursor during pause, the next push emits `LAG_DETECTED`. Inspect via sub_stats.\n\nStatus values: OK, NOOP (not paused).\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries."
     )]
     async fn sub_resume(
         &self,
@@ -2241,7 +2241,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Replace the lane regex filter without re-opening the lane. Empty regex clears the filter.\n\nCost: 1 regex compile + atomic swap."
+        description = "Replace the lane regex filter without re-opening the lane. Empty regex clears the filter (forward all events).\n\nWhen to use:\n- Mutate match criteria mid-stream (e.g. tighten a tail to ERROR-only after seeing the boot phase).\n- Strictly cheaper than sub_close + sub_open + sub_replay.\n\nSyntax: Rust `regex` crate (RE2-style; no lookaround / backref). Compiled at call time and atomically swapped — events in flight before the swap may still match the previous filter.\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND, SUB_INVALID_FILTER (regex compile).\n\nCost: 1 regex compile + atomic swap.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries."
     )]
     async fn sub_filter(
         &self,
@@ -2265,7 +2265,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Re-emit lane events from `from_cursor` (within the replay window).\n\nCost: O(window-bytes) snapshot rebuild."
+        description = "Re-emit lane events from `from_cursor` (byte offset) within the per-resource ring-buffer window. Independent of `lag_policy` — sources from the ring, not the lane mpsc.\n\nWhen to use:\n- Recover events dropped by `drop_oldest` / `drop_newest` / `snapshot` policies.\n- Resume from a known cursor after consumer restart.\n- `from_cursor=0` (default) replays from the start of the available window.\n\nWindow size is per-resource (see RESOURCES.md). Cursors past the window head return whatever the ring still holds.\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND, RESOURCE_GONE.\n\nCost: O(window-bytes) snapshot rebuild + N push deliveries.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries."
     )]
     async fn sub_replay(
         &self,
@@ -2289,7 +2289,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Snapshot the per-`SubId` lane registry. Optional `uri_prefix` filter narrows the result.\n\nCost: O(N) over open lanes."
+        description = "Snapshot the per-`SubId` lane registry. Returns sub_id, uri, lag_policy, lifetime, filter (if any), state (active/paused), creation_at, last_push_at.\n\nWhen to use:\n- Discover SubIds on reconnect / debugging.\n- Audit pre-cleanup before sub_close batches.\n- Pair with sub_stats / sub_stats_all for live counters.\n\nOptional `uri_prefix` filter narrows the result (e.g. `shell://` for PTY lanes only).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over open lanes. Cheap."
     )]
     async fn sub_list(
         &self,
@@ -2305,7 +2305,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Per-lane atomic counter snapshot — events_sent, bytes_sent, lagged_*, queue depth/high-watermark.\n\nCost: O(1) atomic loads."
+        description = "Per-lane atomic counter snapshot — `events_sent`, `bytes_sent`, `lagged_snapshot`, `lagged_drop_oldest`, `lagged_drop_newest`, `lagged_block`, `queue_depth`, `queue_high_watermark`, `replay_count`.\n\nWhen to use:\n- Diagnose drops (compare lagged_* counters against the lag_policy chosen at sub_open).\n- Detect mpsc pressure (queue_high_watermark approaching channel size = consumer too slow → consider drop_oldest or block_slow).\n- Validate filter efficacy (events_sent vs source rate).\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1) atomic loads."
     )]
     async fn sub_stats(
         &self,
@@ -2321,7 +2321,7 @@ where
             destructive_hint = false,
             idempotent_hint = true
         ),
-        description = "Sum / max of every per-lane atomic counter across the whole channel mux.\n\nCost: O(N) over open lanes."
+        description = "Aggregate snapshot across every open lane in the channel mux. Returns sum (events_sent, bytes_sent, lagged_*) and max (queue_depth, queue_high_watermark) plus open lane count.\n\nWhen to use:\n- Cluster-wide health check before scaling decisions.\n- SUB_LEAK_RISK investigation (lane count drifting up over time).\n- Compare with sub_stats per-lane to find outliers.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over open lanes."
     )]
     async fn sub_stats_all(
         &self,
@@ -2353,7 +2353,7 @@ where
     #[tool(
         title = "Close a serial port",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true),
-        description = "Cancel reader / writer tasks for the given SERIAL_ID and remove the registry entry. Idempotent — a second call returns NOOP.\n\nStatus values: OK, NOOP.\n\nCost: O(1).",
+        description = "Cancel reader / writer tasks for the given SERIAL_ID, drop the lock-free buffers, release the OS handle, and remove the registry entry. Cascades to any open serial:// subscription lanes (they emit a final `closed` event before unsubscribing).\n\nWhen to use:\n- Releasing a UART / TTY / COM port allocated by serial_open.\n- Idempotent — a second call returns NOOP.\n\nWorkflow:\n1. Optional: sub_close any serial://<SERIAL_ID>/output lanes first (or rely on cascade).\n2. serial_close serial_id=...\n\nStatus values: OK, NOOP.\n\nErrors: SERIAL_NOT_FOUND (tolerate — already closed).\n\nCost: O(1) + 1 OS close().\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
         output_schema = schema_for_type::<SerialCloseResult>()
     )]
     async fn serial_close(
@@ -2392,7 +2392,7 @@ where
     #[tool(
         title = "List OS-visible serial devices",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
-        description = "Snapshot the OS-visible serial devices. Returns `path` strings the caller can pass to serial_open. No state mutation.\n\nCost: 1 OS enumeration (typically <5 ms).",
+        description = "Snapshot the OS-visible serial devices. Returns `path` strings the caller can pass to serial_open. No state mutation.\n\nWhen to use:\n- Discover available UART / TTY / COM ports before serial_open.\n- Diagnose missing-device cases (USB-serial unplugged, permission denied at the kernel layer).\n\nPath format by OS:\n- Linux: `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*`.\n- macOS: `/dev/tty.usbserial-*`, `/dev/tty.usbmodem*`, `/dev/cu.*` (callout side preferred for clients).\n- Windows: `COM1`, `COM2`, ...\n\nStatus values: OK.\n\nErrors: SERIAL_ERROR (rare — OS enumeration failed).\n\nCost: 1 OS enumeration (typically <5 ms).",
         output_schema = schema_for_type::<SerialListPortsResult>()
     )]
     async fn serial_scan(
@@ -2405,7 +2405,7 @@ where
     #[tool(
         title = "List currently open serial ports",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
-        description = "Snapshot every serial port currently held by this process. Returns SERIAL_ID, path, baud_rate, optional label, and the subscribe URI for each. No state mutation.\n\nCost: O(N) over the per-process registry.",
+        description = "Snapshot every serial port currently held by this process. Returns SERIAL_ID, path, baud_rate, optional label, and the subscribe URI (`serial://<SERIAL_ID>/output`) for each. No state mutation.\n\nWhen to use:\n- Inventory before reconnect / cleanup decisions.\n- Pair with sub_list to correlate active ports with their subscription lanes.\n- Detect SUB_LEAK_RISK candidates (active port without a corresponding lane in sub_list).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over the per-process registry.",
         output_schema = schema_for_type::<SerialListOpenResult>()
     )]
     async fn serial_active(
@@ -3280,7 +3280,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of a resource (shell://, command://, transfer://, session://, forward://) without polling.\n- Lifetime/lag/filter knobs let smaller LLMs match the resource budget.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie.\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
+        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://` without polling.\n- Strictly preferred over polling tools (ssh_shell_read, ssh_exec_output, ssh_transfer_progress) for any stream with >1 expected delta.\n\nLag policies (decision matrix):\n- `snapshot` (default) — drop lane backlog, rebuild from per-resource ring buffer on next push. Zero loss while ring covers the gap; emits `LAG_DETECTED` otherwise. Pick for general observation.\n- `drop_oldest` — FIFO rotation when lane mpsc full. Marks `lagged`. Pick for tail logs / monitoring with gap tolerance.\n- `drop_newest` — drop new event when full. Pick when start-of-stream matters more than current.\n- `block_slow` — producer awaits drain. Zero loss, latency cost. Pick for audit / every-event-matters workloads.\n\nLifetime knobs:\n- `manual` (default) — close via sub_close.\n- `auto_close` — closes after `grace_ms` of consumer inactivity (default 2000).\n- `lease` — hard cap via `ttl_secs`.\n\nFilter:\n- Optional Rust-regex compiled at subscribe time; mutate live via sub_filter without re-opening.\n\nReplay:\n- sub_replay re-emits from `from_cursor` within the per-resource ring window. Independent of what the lane already dropped.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nStatus values: OK.\n\nErrors: SUB_INVALID_FILTER (regex compile), SUB_LIMIT_EXCEEDED, RESOURCE_NOT_FOUND.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie (watcher emits SUB_LEAK_RISK).\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
     )]
     async fn sub_open(
         &self,
