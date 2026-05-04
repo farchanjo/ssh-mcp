@@ -65,7 +65,7 @@ const MAX_PATTERN_BYTES: usize = 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard cap on the wait timeout (5 minutes).
-const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Cooperative polling cadence between snapshot scans. Small enough to keep
 /// matched-prompt latency under one human tick while avoiding a tight spin.
