@@ -29,3 +29,4 @@ pub mod execute;
 pub mod forward;
 pub mod sftp;
 pub mod shell;
+pub mod subscription;
