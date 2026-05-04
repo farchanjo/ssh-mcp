@@ -1,8 +1,8 @@
 # Troubleshooting ssh-mcp v5
 
-This guide is **operator-facing**: if you run `ssh-mcp` (HTTP), `ssh-mcp-stdio`, or `ssh-mcp-tail`, and a workflow misbehaves, find your symptom in the table of contents below and follow the diagnosis flow. The cures cite the canonical ADRs and the doc references where the design intent lives.
+Operator-facing. If `ssh-mcp` (HTTP), `ssh-mcp-stdio`, or `ssh-mcp-tail` misbehaves, find your symptom in the TOC and follow the diagnosis flow. Cures cite the canonical ADR and doc reference where the design intent lives.
 
-This document is **forthcoming** for v5.0 sections that depend on Phase 2 / 3 / 4 of the v5 roadmap (the channel mux, the new tools, the daemon binary). The diagnosis steps for v4-equivalent symptoms work today on `master`; the v5-specific steps activate as the relevant phases land.
+**Forthcoming** for v5.0 sections depending on Phase 2 / 3 / 4 (channel mux, new tools, daemon binary). v4-equivalent diagnosis steps work today on `master`; v5-specific steps activate as the relevant phases land.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -497,34 +497,16 @@ Runs the use-case tests against deterministic in-memory adapters (`FakeClock`, `
 
 ## When to file a bug
 
-File a bug when:
+File a bug for any of:
 
-1. You see an `INTERNAL` category error code (`LIFECYCLE_STATE_CONFLICT`, `SESSION_REFCOUNT_UNDERFLOW`, `STORAGE_ERROR`, `INTERNAL_ERROR`). These signal an invariant violation; the code is defensive on purpose.
-2. A documented invariant from [`docs/LOCKS.md`](./LOCKS.md) appears to be violated (deadlock, livelock, observable Mutex on a hot path).
-3. A wire format change is observed without a corresponding ADR (e.g. an unknown `ev` in NDJSON whose shape is undocumented).
-4. A loom invariant test under `tests/lockfree_invariants.rs` regresses (Phase 5 commits ≥4 new loom tests for the v5 lifecycle and channel mux).
-5. The daemon hangs past `SSH_GRACE_HARD_TIMEOUT_S` on shutdown.
+1. `INTERNAL`-category codes (`LIFECYCLE_STATE_CONFLICT`, `SESSION_REFCOUNT_UNDERFLOW`, `STORAGE_ERROR`, `INTERNAL_ERROR`) — invariant violation; the code is defensive on purpose.
+2. Documented invariants from [LOCKS.md](./LOCKS.md) violated (deadlock, livelock, observable Mutex on a hot path).
+3. Wire format change without a matching ADR (e.g. undocumented `ev` in NDJSON).
+4. Regression in a loom invariant test under `tests/lockfree_invariants.rs`.
+5. Daemon hangs past `SSH_GRACE_HARD_TIMEOUT_S` on shutdown.
 
-Capture, in the bug report:
-
-- ssh-mcp version (e.g. `v5.0.0-rc1` or branch + commit SHA).
-- The exact tool / op call sequence that reproduces the issue.
-- `RUST_LOG=ssh_mcp=debug` output for the relevant time window.
-- `ssh_daemon_stats` snapshot at the moment of the issue.
-- The wire response or NDJSON event that surprised you.
-- Reproducer (shell script or Rust test) ideally.
-
-The bug template under `.github/ISSUE_TEMPLATE/bug_report.md` (forthcoming) drives this checklist.
+Capture in the report: ssh-mcp version (e.g. `v5.0.0-rc1` or branch + commit SHA), exact reproducer call sequence, `RUST_LOG=ssh_mcp=debug` output for the time window, `ssh_daemon_stats` snapshot at the moment of failure, the surprising wire response or NDJSON event, and a reproducer script (shell or Rust test) where possible. Bug template at `.github/ISSUE_TEMPLATE/bug_report.md` (forthcoming).
 
 ## See also
 
-- [`docs/MIGRATION_v4_to_v5.md`](./MIGRATION_v4_to_v5.md) — host migration guide.
-- [`docs/INSTRUCTIONS_DAEMON.md`](./INSTRUCTIONS_DAEMON.md) — `ssh-mcp-tail` reference.
-- [`docs/llm-ux/ERROR_HANDBOOK.md`](./llm-ux/ERROR_HANDBOOK.md) (forthcoming) — every wire code, every cure.
-- [`docs/llm-ux/ANTIPATTERNS.md`](./llm-ux/ANTIPATTERNS.md) (forthcoming) — common LLM-driven failure modes.
-- [`docs/LOCKS.md`](./LOCKS.md) — lock-free invariants enforced by Clippy.
-- [ADR 0003 — Lifecycle Binding](./adr/0003-lifecycle-binding.md).
-- [ADR 0004 — Channel Mux + SubId](./adr/0004-channel-mux-fairness.md).
-- [ADR 0006 — Backpressure Policies](./adr/0006-backpressure-policies.md).
-- [ADR 0007 — Error Taxonomy](./adr/0007-error-taxonomy.md).
-- [ADR 0008 — NDJSON Daemon Protocol](./adr/0008-ndjson-daemon-protocol.md).
+[MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md) · [INSTRUCTIONS_DAEMON.md](./INSTRUCTIONS_DAEMON.md) · [llm-ux/ERROR_HANDBOOK.md](./llm-ux/ERROR_HANDBOOK.md) · [llm-ux/ANTIPATTERNS.md](./llm-ux/ANTIPATTERNS.md) · [LOCKS.md](./LOCKS.md) · ADRs [0003](./adr/0003-lifecycle-binding.md), [0004](./adr/0004-channel-mux-fairness.md), [0006](./adr/0006-backpressure-policies.md), [0007](./adr/0007-error-taxonomy.md), [0008](./adr/0008-ndjson-daemon-protocol.md).
