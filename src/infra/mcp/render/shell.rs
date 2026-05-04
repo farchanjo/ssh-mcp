@@ -164,13 +164,18 @@ pub fn shell_send_key_render(outcome: SendKeyOutcome) -> String {
 }
 
 /// Successor tools after a shell drive call (`ssh_shell_write` /
-/// `ssh_shell_send_key`) — read the buffered response either via
-/// subscription or pull-mode read.
+/// `ssh_shell_send_key`) — read the buffered response.
+///
+/// v5 Phase 3 narrative closure: `ssh_subscribe` listed FIRST so the
+/// drive ops honour the subscribe-first contract established by
+/// `ssh_shell_open`. Polling alternatives (`resources/read` cursor,
+/// `ssh_shell_read`) appear last as fallbacks.
 fn next_hint_for_shell_drive(shell_id: &str) -> String {
     format!(
-        "resources/read shell://{shell_id}/output?cursor=auto | \
+        "ssh_subscribe uri=shell://{shell_id}/output | \
          ssh_shell_wait_for | \
-         ssh_shell_read"
+         resources/read shell://{shell_id}/output?cursor=auto (poll fallback) | \
+         ssh_shell_read (poll fallback)"
     )
 }
 
@@ -258,8 +263,9 @@ fn next_hint_for_wait_for(status: WaitForPatternStatus, shell_id: &str) -> Optio
              ssh_shell_close(shell_id={shell_id})"
         )),
         WaitForPatternStatus::Timeout => Some(format!(
-            "ssh_shell_wait_for(shell_id={shell_id}, ...) | \
-             ssh_shell_read(shell_id={shell_id}) | \
+            "ssh_subscribe uri=shell://{shell_id}/output | \
+             ssh_shell_wait_for(shell_id={shell_id}, ...) | \
+             ssh_shell_read(shell_id={shell_id}) (poll fallback) | \
              ssh_shell_close(shell_id={shell_id})"
         )),
         WaitForPatternStatus::Closed => None,
@@ -470,7 +476,11 @@ mod tests {
             "body: {m}"
         );
         assert!(
-            m.contains("\nNEXT: resources/read shell://shell-1/output?cursor=auto"),
+            m.contains("\nNEXT: ssh_subscribe uri=shell://shell-1/output"),
+            "body: {m}"
+        );
+        assert!(
+            m.contains("resources/read shell://shell-1/output?cursor=auto (poll fallback)"),
             "body: {m}"
         );
     }
