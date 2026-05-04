@@ -1,6 +1,8 @@
-# Error Code Reference (v4.7.0)
+# Error Code Reference (v4.8.0)
 
 This is the exhaustive catalog of error codes returned by ssh-mcp tools and `resources/*` methods. Error wire shapes are byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)). v4.5 promoted 14 tag-prefixed reasons into granular wire codes; v4.6 wired the last three reserved tags (`FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR`) to live raise sites; v4.7 adds one new code — `IDEMPOTENCY_KEY_TOO_LONG` — and extends every NOT_FOUND row with a closest-match suggestion in `DETAIL`. See [Granular tag dispatcher](#granular-tag-dispatcher) below. Every code listed here is grounded in the source — `src/application/*.rs` for use case validation, `src/infra/mcp/{tool_router,resource_handlers,helpers/error,idempotency,suggestions}.rs` for the rmcp-facing error mapping, and `src/domain/error.rs` for the central `DomainError` enum.
+
+> **v4.8 — no new error codes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement; the structured error envelope (`{ tool, status: "error", code, reason, detail }`) is byte-identical to v4.7.1. Every code, every emission site, every recovery hint listed below carries forward unchanged.
 
 ## v4.7 NOT_FOUND closest-match suggestions
 

@@ -1,576 +1,215 @@
-# SSH-MCP Server
+# ssh-mcp
 
+[![Version](https://img.shields.io/badge/version-4.8.0-blue.svg)]()
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-1156%20passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-4.7.0-blue.svg)]()
-[![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
+[![MCP](https://img.shields.io/badge/MCP-2025--06--18-purple.svg)]()
 [![Transport](https://img.shields.io/badge/transport-rmcp%201.6-purple.svg)]()
+[![Architecture](https://img.shields.io/badge/architecture-hexagonal-purple.svg)]()
+[![Tests](https://img.shields.io/badge/lib%20tests-1168%20passing-brightgreen.svg)]()
 
-> [!caution]
-> **NOT** original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp).
-> Rewritten from scratch — different SSH lib, different
-> MCP transport (rmcp 1.6), different threading model, lock-free state,
-> full hexagonal (Ports + Adapters) layout.
+> [!CAUTION]
+> This is **not** the original [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp). Rewritten from scratch — different SSH library (`russh` 0.55), different MCP transport (`rmcp` 1.6), different threading model, lock-free hot-path state, full Hexagonal (Ports + Adapters) layout.
 
-Rust SSH server with full Model Context Protocol (MCP) integration. LLMs
-connect to SSH servers, execute commands, drive interactive shells with
-**realtime resource subscriptions**, stream files via SFTP — over
-**rmcp 1.6** Streamable HTTP transport (axum-hosted) or stdio.
+A Rust MCP server that exposes SSH as Model Context Protocol tools. LLMs connect to remote hosts, run commands, drive interactive PTY shells with realtime resource subscriptions, transfer files via SFTP, and forward TCP ports — over `rmcp` 1.6 Streamable HTTP (axum-hosted) or stdio. Built for small LLMs (27B-30B class): every tool advertises a typed `output_schema` (v4.8), a `structured_content` JSON twin sits next to the Markdown body, and inter-tool conversation hints (`NEXT:`, `HINT:`, prompts catalog) chain workflows without external docs.
 
-> **Codebase contributors upgrading from v3.x or v4.0?** See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) (includes v4.1 deep-decouple addendum). Public MCP API unchanged — v4.x = internal restructure to full hexagonal, no wire-format break.
-> LLM-side token-efficient patterns: see [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
-
-[[_TOC_]]
-
-## What's New in v4.7.0
-
-- **MCP inter-tool conversation surface** — every tool emits parallel `structured_content` JSON next to existing block-style Markdown body. 6 tools advertise `output_schema` JSON Schema (`ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress`); other 15 emit free-form structured payload. Errors land in structured channel as `{ tool, status: "error", code, reason, detail }`. Text channel byte-identical with v4.6 — every existing host keeps working unchanged. See [docs/LLM_GUIDE.md section K](docs/LLM_GUIDE.md#k-structured_content-channel-v47).
-- **Three new tools** — `ssh_run` (one-shot connect + execute + optional disconnect), `ssh_execute_batch` (sequential 1..=16 commands per session, stop-on-failure), `ssh_disconnect_many` (best-effort batch disconnect 1..=64 ids). Tool count: 18 → 21 (or 17 → 20 without `port_forward`). See [docs/API.md](docs/API.md).
-- **Resource templates** — `resources/templates/list` advertises 4 RFC 6570 URI shapes (5 with `port_forward`) so smaller LLMs scan URI catalogue without enumerating live instances. See [docs/RESOURCES.md - Resource Templates (v4.7)](docs/RESOURCES.md#resource-templates-v47).
-- **Progress notifications** — when request includes `_meta.progressToken`, server fires periodic `notifications/progress` updates during long async waits: `ssh_get_command_output(wait=true)` (5 s cadence), `ssh_get_transfer_progress(wait=true)` (5 s), `ssh_shell_wait_for` (1 s). Best-effort — transport errors swallowed. See [docs/LLM_GUIDE.md section L](docs/LLM_GUIDE.md#l-progress-notifications-v47).
-- **MCP prompts catalog** — server advertises `prompts/list` + `prompts/get` with 5 canonical workflows: `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent`. See [docs/LLM_GUIDE.md section M](docs/LLM_GUIDE.md#m-prompts-catalog-v47).
-- **Idempotency cache** — mutating tools (15 total) accept request `_meta.idempotency_key` (1..=256 bytes). Cached response replays within TTL window (default 300 s, env `SSH_IDEMPOTENCY_TTL_SECS`; cap 1024 entries, env `SSH_IDEMPOTENCY_MAX_ENTRIES`). New error code `IDEMPOTENCY_KEY_TOO_LONG`. Read-only tools ignore key. See [docs/LLM_GUIDE.md section J](docs/LLM_GUIDE.md#j-idempotency-v47).
-- **NOT_FOUND closest-match suggestions** — when `SESSION_NOT_FOUND` / `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `FORWARD_NOT_FOUND` fires + relevant repo non-empty, `DETAIL:` line carries `closest matches: <id1>, <id2>, <id3>` (top-3 Levenshtein neighbors). Smaller LLMs recover from typos without round-tripping `ssh_list_*`. See [docs/ERRORS.md](docs/ERRORS.md#v47-not_found-closest-match-suggestions).
-- **`INITIAL_BUFFER:` line on `ssh_shell_open`** — when PTY emits stdout within ~100 ms after open, response embeds head-truncated bytes (cap 4 KiB) so LLM can sometimes skip first `resources/read` round-trip. Tunables: `SSH_SHELL_OPEN_INITIAL_PEEK_MS`, `SSH_SHELL_OPEN_INITIAL_PEEK_TICK_MS`, `SSH_SHELL_OPEN_INITIAL_BUFFER_MAX_BYTES`. See [docs/LLM_GUIDE.md section O](docs/LLM_GUIDE.md#o-initial_buffer-on-ssh_shell_open-v47).
-- **Public MCP API additive** — every v4.6 wire shape preserved. Text channel byte-identical; new `structured_content`, `prompts/*`, `resources/templates/*`, `notifications/progress`, `_meta.idempotency_key` surfaces additive. v3 / v4.0 / v4.1 / v4.5 / v4.6 hosts walking markdown body line-by-line into key-value map keep working unchanged.
-
-### Carried forward from v4.6.0
-
-- **`NEXT:` advisory line** — every response with clear successor ends with `NEXT: <pipe-separated tool calls>` listing concrete next-step calls. Coverage matrix in [docs/LLM_GUIDE.md section E](docs/LLM_GUIDE.md#e-next-advisory-line-v46).
-- **Subscribe-first `HINT:` lines** — `SSH_SHELL_OPEN: OK`, `SSH_EXECUTE: STARTED`, `SSH_UPLOAD/DOWNLOAD: STARTED`, `SSH_FORWARD: OK` — each carries `HINT: subscribe to <uri> for realtime ...`.
-- **`AGENT:` -> `AGENT_ID:` (narrow wire change)** — renamed for consistency with every other ID field. Affects 7 render sites; hosts grepping `^AGENT:` literally must update.
-- **JSON Schema `default` keywords + one-line `Cost:` hints** — every optional arg surfaces default on schema; every tool description ends with `Cost:` line.
-- **`Implementation.icons` wired** — single hosted SVG entry on `Implementation` advertised on `initialize`.
-- **All 14 wire error tags live** — `FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR` reached wire in v4.6.
-
-### Carried forward from v4.5.0
-
-- **LLM UX overhaul** — wire contract documented for years now actually emitted on every read.
-- **Stable `PeerId`** — derived from `Mcp-Session-Id` (HTTP) or `Stdio` singleton key. Subscribe + unsubscribe addressed to same connection share single id, so per-peer cursors no longer reset between requests.
-- **`_meta` envelope on `resources/read`** — every response embeds `kind`, `cursor`, `buffer_size`, `last_seq`, `status` (cursor + `buffer_size` only on byte-stream resources). MIME types explicit: `text/plain` for `shell://`, block-style `text/plain` for `command://`, `application/json` for `transfer:// session:// forward://`.
-- **Granular wire error codes** — 14 error tags reach wire as of v4.6 (v4.5 set of 11 emitted plus `FORWARD_FAILED`, `LOCAL_NOT_FILE`, `REMOTE_METADATA_ERROR` newly wired). Untagged messages still fall through to flat codes (`INVALID_ARGUMENT`, `TRANSPORT_ERROR`, `SFTP_ERROR`).
-- **Server identity** — `Implementation` advertised on `initialize` carries `title = "SSH Remote Shell"`, multi-line `description`, `website_url = "https://github.com/farchanjo/ssh-mcp"`, (v4.6) icon URL above.
-- **18 tool annotations + few-shot `instructions`** — every tool emits `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}` so MCP hosts rank, filter, warn before destructive use. `instructions` field carries three canonical workflows (run command, interactive shell, upload) for smaller LLMs.
-- **`ssh_forward` emits `FORWARD_ID` + `SESSION_ID`** — callers construct matching `forward://<FORWARD_ID>/events` subscribe URI without round-trip through `resources/list`.
-
-### Carried forward from v4.4.0
-
-- **Connection lifecycle steering** — `EXPIRES_AT` (RFC3339), `PERSISTENT: true|false`, anti-leak `HINT:` line when `agent_id` owns more than 5 sessions. `agent_id` now first-class on `ssh_connect`, ranks reuse matches when set.
-
-### Carried forward from v4.1.0
-
-- **Deep decouple complete** — H17.6 removed entire `src/mcp/` foundational tree (~6 500 LOC). Every former `crate::mcp::*` reference now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` (or `adapters::subscription::legacy` for transitional global registry). Each adapter self-contained.
-- **`async-trait` direct dep dropped** — surviving v3 strategy chain rewritten to native AFIT inside `src/adapters/ssh/internal/auth/` with enum dispatcher replacing dyn. Any `async-trait` copies left in dependency tree transitive (rmcp, etc.) and outside our control.
-
-### Carried forward from v4.0.0
-
-- **Hexagonal (Ports + Adapters) architecture** — `src/{domain, ports, application, adapters, infra, composition}/`. Use cases live under `src/application/` (one struct per business operation), take ports as generic parameters (static dispatch via `trait-variant` AFIT — **no `Box<dyn Trait>` in hot paths**), unit-tested against in-memory fakes with **zero rmcp / russh / SFTP machinery in test path**.
-- **Compile-time wiring root** — `src/composition/{prod, fixtures}.rs` pins concrete adapters at compile time so wiring errors surface at `cargo build` not runtime.
-- **PeerHandle abstraction** — use cases interact with rmcp peers through sync handle (`subscribe`, `unsubscribe`, `notify`) instead of holding `Peer<RoleServer>` inside hot DashMap values.
-- **Shared SSH handle registry** — `SshHandleRegistry` lets SFTP adapter reuse russh handle from `RusshClient` instead of opening second connection per session.
-- **HTTP root-mount fix** under `axum` 0.8 — `composition::prod` switches to `Router::fallback_service` when `MCP_HTTP_PATH = "/"`.
-
-## Features
-
-- **rmcp 1.6 transport** — Streamable HTTP MCP (with SSE notifications) hosted by `axum`, plus stdio.
-- **21 MCP tools** (20 without `port_forward`) — full SSH lifecycle, async commands, interactive shells, semantic keystrokes, SFTP, port forwarding (feature-gated). v4.7 adds `ssh_run` (one-shot connect+execute+disconnect), `ssh_execute_batch` (sequential 1..=16 commands), `ssh_disconnect_many` (batch disconnect 1..=64 ids).
-- **5 resource subscribe schemes** — push notifications for shell output, command output, transfer progress, session health, port-forward events.
-- **Native async SSH** — `russh` 0.55, no `spawn_blocking`, no C dependencies.
-- **Multiple auth methods** — Password, key file (explicit or auto-discovered in `~/.ssh/`), SSH agent.
-- **Smart session reuse** — `ssh_connect.reuse = "suggest" | "auto" | "force_new"` (typed enum).
-- **Smart retry** — exponential backoff via `backon`, retry only on transient failures.
-- **Lock-free hot-path state** — `DashMap`, `ArcSwap`, `OnceCell`, atomic counters, `tokio::sync::broadcast`, `tokio::sync::Notify`. Zero `Mutex` fields on hot-path types — enforced by clippy invariants.
-- **Bounded buffers** — head-drained caps for both command and shell output protect long-running processes from OOM.
-- **Anti-injection nonces** — every output block carries 8-hex-char nonce, UTF-8 safe truncation, `(truncated …)` annotations.
-- **Port forwarding** — efficient bidirectional tunneling (feature: `port_forward`, default on).
-- **Strict clippy baseline** — Layer A forbid, Layer B deny (`pedantic`, `nursery`, `cargo`), plus 6 lock-free invariants (`await_holding_lock`, `mutex_atomic`, …). All `#[allow]` attributes carry `reason = "..."`.
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/ARCHITECTURE.md) | v4 hexagonal layout, layer-by-layer module map, dependency graph, sequence diagrams |
-| [API Reference](docs/API.md) | All 21 MCP tools (inputs, outputs, structured_content, errors) |
-| [Resources](docs/RESOURCES.md) | 5 resource subscribe schemes + cursor / sequence semantics |
-| [LLM Guide](docs/LLM_GUIDE.md) | Token-efficient subscribe-first patterns for LLM clients |
-| [Flows](docs/FLOWS.md) | Sequence diagrams for connect / execute / shell / SFTP / subscribe |
-| [Configuration](docs/CONFIGURATION.md) | Full env-var table (25+ vars, floors and caps) |
-| [Errors](docs/ERRORS.md) | Error code catalogue (REASON codes + recovery hints) |
-| [Locks](docs/LOCKS.md) | Lock-free invariants per layer + clippy enforcement |
-| [Migration v3 → v4](docs/MIGRATION_v3_to_v4.md) | Codebase contributor migration guide (public MCP API unchanged) |
-| [Migration v2 → v3](docs/MIGRATION_v2_to_v3.md) | Historical client upgrade guide |
-| [ADR-0001](docs/adr/0001-migrate-to-rmcp.md) | Decision: migrate poem-mcpserver → rmcp 1.6 (v3) |
-| [ADR-0002](docs/adr/0002-adopt-hexagonal-architecture.md) | Decision: adopt Hexagonal (Ports + Adapters) for v4 |
-
-## Quick Start
-
-### Build
+## Quick start
 
 ```bash
-git clone https://github.com/farchanjo/ssh-mcp.git
-cd ssh-mcp
+git clone https://github.com/farchanjo/ssh-mcp.git && cd ssh-mcp
 cargo build --release
-cargo test --lib --quiet      # 1156 tests
-cargo test --tests --quiet    # 2 integration tests (incl. v4 composition smoke)
+sudo cp target/release/ssh-mcp{,-stdio} /usr/local/bin/
 ```
 
-### Install
+Then run one of the two transports:
 
 ```bash
-sudo cp ./target/release/ssh-mcp-stdio /usr/local/bin/
-sudo cp ./target/release/ssh-mcp /usr/local/bin/
-sudo codesign -f -s - /usr/local/bin/ssh-mcp{,-stdio}  # macOS only
+ssh-mcp-stdio                              # stdio transport (recommended for local MCP hosts)
+ssh-mcp                                    # HTTP transport on 0.0.0.0:8000/
 ```
 
-### Option 1: Stdio Transport (recommended)
-
-`ssh-mcp-stdio` reads JSON-RPC frames from stdin, writes responses + notifications on stdout. Logs go to stderr (set `RUST_LOG=debug` for verbose tracing). MCP transport = `rmcp::transport::io::stdio()` — no custom JSON-RPC shim.
-
-```bash
-# Run directly (for development)
-cargo run --release --bin ssh-mcp-stdio
-```
-
-<details>
-<summary>MCP client configuration</summary>
-
-#### Claude Code / Claude Desktop / Cursor / OpenCode
-
-```json
-{
-  "mcpServers": {
-    "ssh": {
-      "command": "ssh-mcp-stdio",
-      "args": []
-    }
-  }
-}
-```
-
-</details>
-
-### Option 2: HTTP Transport (`ssh-mcp`)
-
-`ssh-mcp` hosts rmcp `StreamableHttpService` behind `axum` 0.8 router on `MCP_HOST:MCP_PORT` (default `0.0.0.0:8000`) at `MCP_HTTP_PATH` (default `/`). MCP sessions tracked through `Mcp-Session-Id` header per Streamable HTTP spec; notifications pushed over SSE channel established by same endpoint.
-
-> **v4 fix**: `MCP_HTTP_PATH = "/"` now wired via `Router::fallback_service` (axum 0.8 panics on nested `/` mount). Tunable to any path (`/mcp`, `/api/v1/mcp`, …) without touching binary.
-
-```bash
-# Default
-ssh-mcp
-
-# Custom bind
-MCP_HOST=127.0.0.1 MCP_PORT=9000 ssh-mcp
-
-# Verbose tracing
-RUST_LOG=debug ssh-mcp
-```
-
-<details>
-<summary>HTTP client configuration</summary>
-
-#### Claude Code
-
-```json
-{
-  "mcpServers": {
-    "ssh": {
-      "url": "http://localhost:8000/"
-    }
-  }
-}
-```
-
-#### Direct HTTP — initialize then call
-
-Streamable HTTP transport requires session handshake. Capture `Mcp-Session-Id` from `initialize` response, replay on every subsequent request:
-
-```bash
-# 1. initialize → server returns Mcp-Session-Id header
-curl -i -X POST http://localhost:8000/ \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{
-        "jsonrpc":"2.0","id":1,"method":"initialize",
-        "params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}
-      }'
-
-# 2. list sessions, replaying Mcp-Session-Id from step 1
-curl -X POST http://localhost:8000/ \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Mcp-Session-Id: <id-from-step-1>" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call",
-       "params":{"name":"ssh_list_sessions","arguments":{}}}'
-```
-
-</details>
-
-<details>
-<summary>macOS launchd service</summary>
-
-Install as system service starting on boot:
-
-```bash
-sudo mkdir -p /usr/local/var/log /usr/local/var/ssh-mcp
-sudo cp com.farchanjo.ssh-mcp.plist /Library/LaunchDaemons/
-sudo launchctl load /Library/LaunchDaemons/com.farchanjo.ssh-mcp.plist
-sudo launchctl list | grep ssh-mcp
-tail -f /usr/local/var/log/ssh-mcp.log
-```
-
-User-level service (no sudo, runs only when logged in):
-
-```bash
-cp com.farchanjo.ssh-mcp.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.farchanjo.ssh-mcp.plist
-```
-
-</details>
-
-## MCP Tools (21 with `port_forward`, 20 without)
-
-| Group | Tools |
-|-------|-------|
-| **Connection** | `ssh_connect` (typed `ReusePolicy`), `ssh_disconnect`, `ssh_disconnect_many` *(v4.7)*, `ssh_list_sessions`, `ssh_disconnect_agent` |
-| **Commands** | `ssh_execute` (optional `pty=true`), `ssh_execute_batch` *(v4.7)*, `ssh_run` *(v4.7)*, `ssh_get_command_output`, `ssh_list_commands` (typed `CommandStatus`), `ssh_cancel_command` |
-| **Shell** *(subscribe-first)* | `ssh_shell_open` *(v4.7 `INITIAL_BUFFER:`)*, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_read` (long-poll: `wait` / `wait_timeout_secs` / `min_bytes`), `ssh_shell_wait_for`, `ssh_shell_close` |
-| **SFTP** | `ssh_upload`, `ssh_download`, `ssh_get_transfer_progress` |
-| **Network** *(feature-gated)* | `ssh_forward` |
-
-Each session serializes one russh channel at a time through per-session semaphore, so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. Shared `SshHandleRegistry` lets SFTP adapter reuse same russh handle for file transfers.
-
-Full input schema + response shape per tool: see [docs/API.md](docs/API.md).
-
-## Resources (subscribe-first)
-
-5 resource schemes = canonical way to consume realtime updates without polling. Subscribe via `resources/subscribe`; server pushes `notifications/resources/updated` over your transport (SSE for HTTP, stdout for stdio); read with `resources/read`.
-
-| URI Scheme | Description | Cursor |
-|------------|-------------|--------|
-| `shell://<shell-id>/output` | PTY output stream | yes (`?cursor=auto` or absolute byte offset) |
-| `command://<command-id>/output` | Async command stdout/stderr | yes |
-| `transfer://<transfer-id>/progress` | SFTP point-in-time progress | no (snapshot) |
-| `session://<session-id>/health` | Session health snapshot | no |
-| `forward://<forward-id>/events` | Port-forward event log (feature-gated) | yes |
-
-Subscription registry **debounces** events (default 50 ms coalesce, 1 s force-flush, 30 s keepalive — all tunable via env vars). Each event carries sequence number for gap detection; lagged subscribers auto-recover from snapshot. v4 adapter `MemoryRegistry<N>` generic over notifier port — no `Box<dyn>` in push hot path.
-
-See [docs/RESOURCES.md](docs/RESOURCES.md) for full contract, [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) for token-efficient consumption patterns.
-
-## Response Format
-
-All 21 (or 20) MCP tools return BOTH **single markdown `String`** in block style AND (v4.7) typed JSON object on `structured_content`:
-
-- **First line**: `TOOL_NAME: STATUS` (`OK`, `REUSED`, `SUGGESTED`, `STARTED`, `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `NOOP`, `OPEN`, `CLOSED`, `ACTIVE`, `ERROR`, …).
-- **Body**: one `KEY: value` per line. All identifiers carry `_ID` suffix (`SESSION_ID`, `COMMAND_ID`, `SHELL_ID`, `TRANSFER_ID`).
-- **Output blocks** carry 8-hex-char nonce per response to prevent injection from content imitating markers:
-
-  ```
-  --- stdout [a3f2b1d7] ---
-  <content>
-  --- stderr [a3f2b1d7] (empty) ---
-  ```
-
-  Truncation annotated as `(truncated: showing 16.0KB of 2.3MB)`; partial output of still-running command annotated as `(partial)`.
-- **Errors**:
-
-  ```
-  SSH_EXECUTE: ERROR
-  REASON: [CODE] human-readable reason
-  DETAIL: optional context (truncated to 2 KiB)
-  ```
-
-  Full error code catalogue: [docs/ERRORS.md](docs/ERRORS.md).
-
-> **Wire compatibility**: v4 / v4.7 markdown shape byte-identical to v3 on text channel (verified by snapshot tests in `tests/v4_smoke.rs`). v3 / v4.x clients keep working unchanged. v4.7 `structured_content` payload sits next to text body — clients ignoring it stay byte-compatible.
-
-Python helper (`parse_mcp_response`) ships in `scripts/test_http.py` and `scripts/test_stdio.py` for clients needing markdown → legacy field name mapping.
-
-## Usage Examples
-
-<details>
-<summary>Connect with SSH agent</summary>
-
-```json
-{
-  "tool": "ssh_connect",
-  "arguments": {
-    "address": "example.com:22",
-    "username": "user"
-  }
-}
-```
-
-```
-SSH_CONNECT: OK
-SESSION_ID: 550e8400-e29b-41d4-a716-446655440000
-HOST: user@example.com:22
-RETRY: 0
-PERSISTENT: false
-EXPIRES_AT: 2026-05-03T18:30:00+00:00
-NEXT: ssh_execute(session_id=550e8400-..., command=...) | ssh_shell_open(session_id=550e8400-...) | ssh_disconnect(session_id=550e8400-...)
-```
-
-`AGENT_ID:` line appended when `agent_id` passed (renamed from `AGENT:` in v4.6). Trailing `NEXT:` line (v4.6) names three most-likely successor calls.
-
-</details>
-
-<details>
-<summary>Smart reuse</summary>
-
-```json
-{ "tool": "ssh_connect",
-  "arguments": { "address": "example.com:22", "username": "user", "reuse": "auto" } }
-```
-
-- `"suggest"` (default): returns `SSH_CONNECT: SUGGESTED` listing matching sessions without connecting.
-- `"auto"`: reuses most recent healthy match → `SSH_CONNECT: REUSED`.
-- `"force_new"`: skips lookup, always creates new connection.
-
-In every mode, unhealthy matches disconnected + reported as `REPLACED: N`.
-
-</details>
-
-<details>
-<summary>Async command execution</summary>
-
-```json
-{ "tool": "ssh_execute",
-  "arguments": { "session_id": "<sid>", "command": "npm run build", "timeout_secs": 300 } }
-```
-
-```
-SSH_EXECUTE: STARTED
-COMMAND_ID: abc123
-SESSION_ID: <sid>
-```
-
-Poll or block:
-
-```json
-{ "tool": "ssh_get_command_output",
-  "arguments": { "command_id": "abc123", "wait": true,
-                 "wait_timeout_secs": 60, "max_output_bytes": 32768 } }
-```
-
-For long-running output, **subscribe to `command://abc123/output`** instead of polling.
-
-</details>
-
-<details>
-<summary>Interactive shell + semantic keystrokes</summary>
-
-Open PTY:
-
-```json
-{ "tool": "ssh_shell_open",
-  "arguments": { "session_id": "<sid>", "term": "xterm", "cols": 80, "rows": 24 } }
-```
-
-Send semantic keystrokes (no manual `\x03` / `\x1b[A` mapping):
-
-```json
-{ "tool": "ssh_shell_send_key",
-  "arguments": { "shell_id": "<shid>", "key": "ctrl_c" } }
-
-{ "tool": "ssh_shell_send_key",
-  "arguments": { "shell_id": "<shid>", "key": "tab", "modifiers": ["shift"] } }   // back-tab
-
-{ "tool": "ssh_shell_send_key",
-  "arguments": { "shell_id": "<shid>", "key": "down", "repeat": 5 } }
-```
-
-Wait for prompt instead of sleeping:
-
-```json
-{ "tool": "ssh_shell_wait_for",
-  "arguments": { "shell_id": "<shid>", "patterns": ["$ ", "# "], "timeout_secs": 30 } }
-```
-
-Or **subscribe to `shell://<shid>/output`** for push notifications with cursor-based replay.
-
-</details>
-
-<details>
-<summary>SFTP upload with progress subscription</summary>
-
-```json
-{ "tool": "ssh_upload",
-  "arguments": { "session_id": "<sid>",
-                 "local_path": "~/Downloads/backup.tar.gz",
-                 "remote_path": "/var/backups/backup.tar.gz" } }
-```
-
-```
-SSH_UPLOAD: STARTED
-TRANSFER_ID: xfer-1
-SIZE: 245.7MB (257632256 bytes)
-```
-
-Either poll `ssh_get_transfer_progress` or subscribe to `transfer://xfer-1/progress` for push.
-
-</details>
-
-<details>
-<summary>Port forward (feature-gated)</summary>
-
-```json
-{ "tool": "ssh_forward",
-  "arguments": { "session_id": "<sid>", "local_port": 8080,
-                 "remote_address": "localhost", "remote_port": 3000 } }
-```
-
-```
-SSH_FORWARD: OK
-LOCAL: 127.0.0.1:8080
-REMOTE: localhost:3000
-ACTIVE: true
-```
-
-Subscribe to `forward://<fid>/events` for accept / close / error events.
-
-</details>
-
-## Configuration
-
-Priority: **Parameter > Environment Variable > Default**. Full table (25+ vars including broadcast caps, debouncer, peer GC vars): [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Most-used vars:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | HTTP transport bind |
-| `MCP_HTTP_PATH` | `/` | HTTP transport path (root mount uses fallback service in v4) |
-| `RUST_LOG` | `info` | Log filter |
-| `SSH_CONNECT_TIMEOUT` | 30s | Connection timeout |
-| `SSH_COMMAND_TIMEOUT` | 180s | Command execution timeout |
-| `SSH_INACTIVITY_TIMEOUT` | 300s | Session inactivity timeout (disabled when `persistent=true`) |
-| `SSH_SHELL_INACTIVITY_TTL` | 600s | Shell auto-close on idle |
-| `SSH_SHELL_MAX_BUFFER_SIZE` | 10m | Shell output buffer cap (`b`/`k`/`m`/`g`/`t`) |
-| `SSH_COMMAND_MAX_BUFFER_SIZE` | 10m | Per-command output cap |
-| `SSH_NOTIFY_DEBOUNCE_MS` | 50 | Subscribe debounce window |
-| `SSH_NOTIFY_FORCE_FLUSH_MS` | 1000 | Subscribe force-flush |
-| `SSH_NOTIFY_KEEPALIVE_S` | 30 | Subscribe keepalive |
-| `SSH_MCP_PEER_GC_INTERVAL_S` | 30 | Peer-GC scan interval |
-| `SSH_*_BROADCAST_CAP` | 1024 / 256 | Broadcast channel capacity |
-
-## Limits
-
-> [!note]
-> - Max 100 concurrent async commands per session.
-> - Max 10 concurrent interactive shells per session.
-> - Max 10 concurrent SFTP transfers per session.
-> - One russh channel at a time per session (semaphore-serialized → OpenSSH `MaxSessions` friendly).
-> - Output blocks default 16 KiB per response (cap 1 MiB) — tune with `max_output_bytes`.
-> - List tools default 500 items (cap 10 000) — tune with `max_items`.
+## Highlights (v4.8.0)
+
+| Surface | Count | Notes |
+|:---|:---:|:---|
+| MCP tools | **21** (20 without `port_forward`) | Connection / Commands / Shell / SFTP / Network |
+| Tools advertising `output_schema` | **21 / 21** | v4.8 lifted coverage from 9 to full (additive on `tools/list`) |
+| Resource subscribe streams | **5** | `shell://`, `command://`, `transfer://`, `session://`, `forward://` |
+| `prompts/list` workflows | **5** | `run_one_shot_command`, `investigate_session`, `upload_and_verify`, `interactive_shell_drive`, `cleanup_agent` |
+| RFC 6570 resource templates | **4** (5 with `port_forward`) | Advertised on `resources/templates/list` |
+| Mutating tools wrapped by idempotency cache | **15** | Dedup via `_meta.idempotency_key` |
+| Wire error tags | **14 + 1** | All live as of v4.6, plus v4.7 `IDEMPOTENCY_KEY_TOO_LONG` |
+| Lib tests | **1168** | Plus 2 integration, 11 v4.7 pytest suites, 4 stress scripts |
+
+The text channel is byte-identical to v3.0.0 / v4.0.x / v4.5 / v4.6 / v4.7. The v4.7 `structured_content` JSON channel sits next to it. v4.8 adds typed schema *advertisement* on every tool's `tools/list` metadata — runtime payloads unchanged. Hosts walking the Markdown body keep working without modification.
 
 ## Architecture
 
-v4.1.0 ships deep-decoupled hexagonal layout (no surviving `src/mcp/` tree):
+```mermaid
+flowchart LR
+    LLM["LLM / MCP host"]
+    subgraph SshMcp["ssh-mcp (Rust 2024, hexagonal)"]
+        direction TB
+        Infra["infra/mcp<br/>21 tools + 5 resources<br/>+ prompts + templates<br/>+ idempotency"]
+        App["application<br/>22 use cases"]
+        Ports["ports<br/>trait skeletons"]
+        Adapters["adapters<br/>russh / russh-sftp<br/>+ DashMap repos<br/>+ MemoryRegistry"]
+        Comp["composition<br/>root wiring"]
+        Infra --> App
+        App --> Ports
+        Adapters --> Ports
+        Comp --> Adapters
+        Comp --> App
+    end
+    Russh["russh 0.55<br/>(SSH + SFTP)"]
+    Remote["sshd / SFTP / agent"]
 
-```
-src/
-├── main.rs                — HTTP transport thin shell (axum 0.8 + StreamableHttpService); calls composition::prod
-├── bin/ssh_mcp_stdio.rs   — Stdio transport thin shell (rmcp::transport::io::stdio()); calls composition::prod
-├── domain/                — pure entities + value objects + errors + live event variants (no I/O, no async)
-├── ports/                 — trait skeletons (sync via plain trait, async via trait-variant AFIT)
-├── application/           — 22 use cases (one struct per business operation; generic over ports)
-├── adapters/              — concrete adapters; each one self-contained (own internal/ subtree where needed)
-│   ├── ssh/               — RusshClient + SshHandleRegistry; internal/{client,session,async_command,shell,types,error}.rs + internal/auth/ (AFIT chain)
-│   ├── sftp/              — RusshSftpClient + InMemorySftp; internal/{sftp,transfer,types}.rs
-│   ├── repo/dashmap/      — lock-free in-memory repos for every domain entity
-│   ├── auth/              — port-side AuthChainAdapter (delegates to ssh/internal/auth)
-│   ├── clock/             — system + fake
-│   ├── config/            — EnvConfig + internal/ env-var resolvers
-│   ├── id_generator/      — uuid + deterministic
-│   ├── notifier/          — RmcpAdapter + RmcpPeer (PeerHandle abstraction)
-│   ├── output_stream/     — RusshOutput + InMemory PTY broadcast
-│   └── subscription/      — MemoryRegistry<N> + legacy.rs (transitional SUBSCRIPTION_REGISTRY + spawn_peer_gc)
-├── infra/mcp/             — inbound rmcp surface
-│   ├── server.rs          — McpSshServer<UC> (generic over the use-case set)
-│   ├── tool_router.rs     — the 18 #[tool] entry points
-│   ├── resource_handlers.rs — resources/list, read, subscribe, unsubscribe
-│   ├── peer_handle.rs     — PeerTable re-export for binaries
-│   ├── args/              — per-tool Deserialize + JsonSchema structs
-│   ├── render/            — per-domain markdown builders
-│   └── helpers/           — error / nonce / output rendering primitives
-└── composition/           — wiring root
-    ├── prod.rs            — production adapter set (russh + russh-sftp + DashMap + env-config + UUID v4)
-    └── fixtures.rs        — deterministic test adapter set (gated by `test-fixtures` feature)
+    LLM <-->|"rmcp 1.6<br/>(HTTP / stdio)"| Infra
+    Adapters <--> Russh
+    Russh <--> Remote
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full layer-by-layer module map, dependency graph, sequence diagrams.
+The full layer-by-layer module map, the subscribe pipeline, and the lock-free invariants live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Testing
+## MCP tools
+
+Every tool advertises a typed `output_schema` on `tools/list` (v4.8). The Markdown body and the parallel `structured_content` JSON twin are byte-stable from v4.7.
+
+| Group | Tool | Purpose | `output_schema` |
+|:---|:---|:---|:---:|
+| Connection | `ssh_connect` | Open SSH session (typed `ReusePolicy`) | yes |
+| Connection | `ssh_disconnect` | Close one session | yes |
+| Connection | `ssh_disconnect_many` *(v4.7)* | Best-effort batch (1..=64 ids) | yes |
+| Connection | `ssh_list_sessions` | List live sessions (filter by `agent_id`) | yes |
+| Connection | `ssh_disconnect_agent` | Bulk-cleanup all sessions owned by an agent | yes |
+| Commands | `ssh_execute` | Async command (optional `pty=true`) | yes |
+| Commands | `ssh_execute_batch` *(v4.7)* | Sequential 1..=16 commands, stop-on-failure | yes |
+| Commands | `ssh_run` *(v4.7)* | One-shot connect + execute + optional disconnect | yes |
+| Commands | `ssh_get_command_output` | Poll or long-poll (`wait`, `wait_timeout_secs`) | yes |
+| Commands | `ssh_list_commands` | List commands (typed `CommandStatus`) | yes |
+| Commands | `ssh_cancel_command` | Cancel an in-flight command | yes |
+| Shell | `ssh_shell_open` | Open PTY (carries optional `INITIAL_BUFFER:` line) | yes |
+| Shell | `ssh_shell_write` | Send raw bytes to PTY | yes |
+| Shell | `ssh_shell_send_key` | Semantic keystrokes + modifiers + repeat | yes |
+| Shell | `ssh_shell_read` | Snapshot or long-poll (`wait`, `min_bytes`) | yes |
+| Shell | `ssh_shell_wait_for` | Multi-pattern gate | yes |
+| Shell | `ssh_shell_close` | Close PTY | yes |
+| SFTP | `ssh_upload` | Streaming upload (`transfer://` push) | yes |
+| SFTP | `ssh_download` | Streaming download | yes |
+| SFTP | `ssh_get_transfer_progress` | Poll or long-poll progress | yes |
+| Network | `ssh_forward` *(feature `port_forward`)* | Local TCP port forward | yes |
+
+Per-tool input schema, response shape, and structured payload: [docs/API.md](docs/API.md).
+
+## Resource streams
+
+5 subscribe-friendly URI schemes. Subscribe via `resources/subscribe`; the server pushes `notifications/resources/updated` (SSE on HTTP, stdout on stdio); pull deltas via `resources/read?cursor=auto`.
+
+| URI scheme | Pushes | Cursor | MIME |
+|:---|:---|:---:|:---|
+| `shell://<shell-id>/output` | PTY output stream | yes | `text/plain` |
+| `command://<command-id>/output` | Async command stdout/stderr | yes | `text/plain` |
+| `transfer://<transfer-id>/progress` | SFTP point-in-time progress | no | `application/json` |
+| `session://<session-id>/health` | Session health snapshot | no | `application/json` |
+| `forward://<forward-id>/events` *(feature `port_forward`)* | Port-forward event log | yes | `application/json` |
+
+Producer events coalesce on `SSH_NOTIFY_DEBOUNCE_MS` (default 50 ms), force-flush after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 1000 ms), and keepalive every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). Each event carries a sequence number for gap detection; lagged subscribers auto-recover by reading from the snapshot buffer. Full contract: [docs/RESOURCES.md](docs/RESOURCES.md). Token-efficient subscribe-first patterns: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
+
+## Configuration
+
+Three-tier resolution: **Parameter > Environment Variable > Built-in default**. The full env-var table (25+ vars including broadcast caps, debouncer timing, peer GC, idempotency cache) lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Most-used vars:
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | HTTP transport bind |
+| `MCP_HTTP_PATH` | `/` | HTTP mount path |
+| `RUST_LOG` | `info` | Tracing filter |
+| `SSH_CONNECT_TIMEOUT` | `30` (s) | SSH handshake timeout |
+| `SSH_COMMAND_TIMEOUT` | `180` (s) | Default per-command timeout |
+| `SSH_INACTIVITY_TIMEOUT` | `300` (s) | Session idle timeout (disabled when `persistent=true`) |
+| `SSH_SHELL_INACTIVITY_TTL` | `600` (s) | Shell auto-close on idle |
+| `SSH_SHELL_MAX_BUFFER_SIZE` | `10m` | Shell output buffer cap (`b`/`k`/`m`/`g`/`t`) |
+| `SSH_NOTIFY_DEBOUNCE_MS` | `50` | Subscribe debounce window |
+| `SSH_IDEMPOTENCY_TTL_SECS` | `300` | Idempotency cache TTL (v4.7) |
+
+## Versioning and compatibility
+
+| Surface | v3.0 | v4.0 | v4.5 | v4.6 | v4.7 | **v4.8** |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Markdown response body | byte-stable | byte-stable | byte-stable | byte-stable* | byte-stable | byte-stable |
+| Tool count | 18 | 18 | 18 | 18 | 21 | **21** |
+| Tools with `output_schema` | 0 | 0 | 0 | 0 | 9 | **21** |
+| `structured_content` channel | — | — | — | — | added | unchanged |
+| `prompts/list` | — | — | — | — | added | unchanged |
+| `resources/templates/list` | — | — | — | — | added | unchanged |
+| `notifications/progress` | — | — | — | — | added | unchanged |
+| Idempotency cache | — | — | — | — | added | unchanged |
+| Hexagonal layout | — | added | — | — | — | unchanged |
+
+*v4.6 narrow rename: wire key `AGENT:` -> `AGENT_ID:`. Generic key/value parsers unaffected.
+
+v4.8 is **strictly additive** on the `tools/list` metadata: it advertises the typed schema for the 12 tools that previously emitted free-form structured payloads (and consolidates the v4.7 ad-hoc `output_schema` advertisements on the other 9 into the same path). Wire shape, env vars, error codes, runtime behaviour — all unchanged from v4.7.1.
+
+Contributor migration guide: [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md). Historical client guide v2 -> v3: [docs/MIGRATION_v2_to_v3.md](docs/MIGRATION_v2_to_v3.md).
+
+## Development
 
 ```bash
-# Rust unit tests (1156)
-cargo test --lib --quiet
-
-# Rust integration tests (2 — incl. v4 composition smoke)
-cargo test --tests --quiet
-
-# Combined with all features
-cargo test --all-features
-
-# With deterministic test fixtures (use cases composed against in-memory adapters)
-cargo test --features test-fixtures
-
-# Python integration suites (require a reachable SSH server)
-python3 scripts/test_http.py        # HTTP transport — all 21 tools + resources
-python3 scripts/test_stdio.py       # Stdio transport — all 21 tools + resources
-python3 scripts/test_send_key.py    # ssh_shell_send_key coverage
-python3 scripts/test_wait_for.py    # ssh_shell_wait_for coverage
-python3 scripts/test_resources.py   # 5 resource schemes + subscribe + cursor
-
-# Stress scripts (Python)
-python3 scripts/stress_subscribe.py          # subscribe burst
-python3 scripts/stress_concurrent_writes.py  # writer-task ownership
-python3 scripts/stress_lagged_sub.py         # lagged-subscriber recovery
-python3 scripts/stress_locks.py              # lock-free hot-path
-
-# Loom invariants (gated; currently blocked upstream)
-RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants
+cargo build --release                                                    # both binaries
+cargo build --release --bin ssh-mcp                                      # HTTP only
+cargo build --release --bin ssh-mcp-stdio                                # stdio only
+cargo build --release --no-default-features                              # without port_forward
+cargo test --lib --quiet                                                 # 1168 unit tests
+cargo test --tests --quiet                                               # 2 integration tests
+cargo test --features test-fixtures                                      # use cases against in-memory adapters
+cargo fmt --all -- --check
+cargo clippy --all-features --all-targets --workspace -- -D warnings
 ```
 
-| Suite | Count |
-|-------|-------|
-| Lib unit tests | **1156** |
-| Integration tests | **2** (incl. `tests/v4_smoke.rs`) |
-| Python integration scripts | 5 |
-| Python stress scripts | 4 |
-| Loom invariant tests | 8 (gated) |
+Python integration suites (require a reachable sshd):
 
-## Binary Targets
+```bash
+python3 scripts/test_http.py                # HTTP transport — all 21 tools + resources
+python3 scripts/test_stdio.py               # stdio transport — all 21 tools + resources
+python3 scripts/test_send_key.py            # ssh_shell_send_key
+python3 scripts/test_wait_for.py            # ssh_shell_wait_for
+python3 scripts/test_resources.py           # 5 schemes + subscribe + cursor
+python3 scripts/stress_subscribe.py         # subscribe burst
+python3 scripts/stress_concurrent_writes.py # writer-task ownership
+python3 scripts/stress_lagged_sub.py        # lagged-subscriber recovery
+python3 scripts/stress_locks.py             # lock-free hot-path
+```
 
-| Binary | Description |
-|--------|-------------|
-| `ssh-mcp` | HTTP transport: axum 0.8 + rmcp `StreamableHttpService` (default `0.0.0.0:8000/`); composition::prod |
-| `ssh-mcp-stdio` | Stdio transport: `rmcp::transport::io::stdio()` (logs to stderr); composition::prod |
+For changes touching shell / command / transfer hot-path state, read [docs/LOCKS.md](docs/LOCKS.md) before introducing any `Mutex`. For changes spanning multiple layers, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) shows where each layer's responsibility lies.
 
-Both binaries thin shells over `composition::prod` — same wiring root, only transport differs.
+### Documentation map
 
-## Credits
-
-- Original concept: [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)
-- SSH implementation: [russh](https://github.com/warp-tech/russh)
-- SFTP implementation: [russh-sftp](https://github.com/AspectUnk/russh-sftp)
-- Retry logic: [backon](https://github.com/Xuanwo/backon)
-- MCP framework: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) (official Anthropic Rust SDK)
-- HTTP host: [axum](https://github.com/tokio-rs/axum) + [tower](https://github.com/tower-rs/tower)
-- AFIT trait pattern: [trait-variant](https://github.com/rust-lang/impl-trait-utils)
-- Lock-free primitives: [arc-swap](https://github.com/vorner/arc-swap), [dashmap](https://github.com/xacrimon/dashmap)
+| Document | Description |
+|:---|:---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hexagonal layout, layer-by-layer module map, dependency graph, sequence diagrams |
+| [docs/API.md](docs/API.md) | All 21 MCP tools (inputs, outputs, structured_content, errors) |
+| [docs/RESOURCES.md](docs/RESOURCES.md) | 5 resource schemes, cursor / sequence semantics, `_meta` envelope |
+| [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) | Token-efficient subscribe-first patterns for LLM hosts |
+| [docs/FLOWS.md](docs/FLOWS.md) | Sequence diagrams for connect / execute / shell / SFTP / subscribe |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full env-var table (25+ vars, floors and caps, tuning profiles) |
+| [docs/ERRORS.md](docs/ERRORS.md) | Error code catalogue (REASON codes + recovery hints) |
+| [docs/LOCKS.md](docs/LOCKS.md) | Lock-free invariants per layer + Clippy enforcement |
+| [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) | Contributor migration guide (v4.1 deep-decouple addendum) |
+| [docs/MIGRATION_v2_to_v3.md](docs/MIGRATION_v2_to_v3.md) | Historical client upgrade guide |
+| [docs/adr/0001-migrate-to-rmcp.md](docs/adr/0001-migrate-to-rmcp.md) | Decision: poem-mcpserver -> rmcp 1.6 (v3) |
+| [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md) | Decision: adopt Hexagonal layout (v4) |
 
 ## License
 
 MIT — declared via `license = "MIT"` in `Cargo.toml`.
 
-## Contributing
+## Author and links
 
-Contributions welcome. Ensure:
-
-- All tests pass: `cargo test --all-features`.
-- No clippy warnings: `cargo clippy --all-features --all-targets --workspace -- -D warnings`.
-- Code formatted: `cargo fmt --all -- --check`.
-- For changes touching shell / command / transfer hot-path state, see [docs/LOCKS.md](docs/LOCKS.md) before introducing any `Mutex`.
-- For changes spanning multiple layers, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first to find right layer for change (domain / port / use case / adapter / infra) and [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) for per-layer responsibility table.
+- Author: Fabricio Archanjo (<fabricio@archanjo.com>)
+- Issues: <https://github.com/farchanjo/ssh-mcp/issues>
+- Releases: <https://github.com/farchanjo/ssh-mcp/releases>
+- Original concept: [mingyang91/ssh-mcp](https://github.com/mingyang91/ssh-mcp)
+- SSH library: [russh](https://github.com/warp-tech/russh) — SFTP via [russh-sftp](https://github.com/AspectUnk/russh-sftp)
+- MCP framework: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) (official Anthropic Rust SDK)
+- HTTP host: [axum](https://github.com/tokio-rs/axum) + [tower](https://github.com/tower-rs/tower)
+- Lock-free primitives: [arc-swap](https://github.com/vorner/arc-swap), [dashmap](https://github.com/xacrimon/dashmap)

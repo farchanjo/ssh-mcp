@@ -1,21 +1,31 @@
-# SSH MCP Architecture (v4.1.0 — hexagonal, deep-decoupled)
+# SSH MCP Architecture (v4.8.0 — hexagonal, deep-decoupled)
 
-This document describes the architecture of the SSH Model Context Protocol (MCP) server. It reflects the **v4.1.0** codebase, which closes the H17.6 deferred decouple from v4.0.0: the foundational `src/mcp/` tree is gone, the `async-trait` direct dependency is dropped, and every adapter is self-contained. The hexagonal (Ports and Adapters) layout — same 18 MCP tools, same 5 resource subscribe schemes, same wire format — splits into `domain/` (pure), `ports/` (trait skeletons), `application/` (use cases), `adapters/` (concrete implementations, each with its own `internal/` subtree where needed), `infra/` (inbound MCP transport), and `composition/` (root wiring).
+This document describes the architecture of the SSH Model Context Protocol (MCP) server. It reflects the **v4.8.0** codebase. The hexagonal (Ports and Adapters) layout — same 21 MCP tools as v4.7 (or 20 without `port_forward`), same 5 resource subscribe schemes, same Markdown wire shape, same `structured_content` JSON twin — splits into `domain/` (pure), `ports/` (trait skeletons), `application/` (use cases), `adapters/` (concrete implementations, each with its own `internal/` subtree where needed), `infra/` (inbound MCP transport), and `composition/` (root wiring).
+
+### Version trail
+
+- **v4.0** — original hexagonal restructuring; v3 monolith deleted.
+- **v4.1** — H17.6 deep decouple closed: `src/mcp/` deleted, `async-trait` direct dep dropped.
+- **v4.5** — LLM UX foundation: stable `PeerId`, `_meta` envelope on `resources/read`, 14 wire error codes, `Implementation` identity, `ToolAnnotations`.
+- **v4.6** — `NEXT:` advisory line, subscribe-first `HINT:` sites, JSON Schema `default` keywords, one-line `Cost:` hints, `AGENT:` -> `AGENT_ID:` rename, wired `Implementation.icons` URL.
+- **v4.7** — MCP inter-tool conversation surface: `structured_content` JSON channel parallel to Markdown, `resources/templates/list`, `notifications/progress`, `prompts/list` + `prompts/get` catalog (5 workflows), idempotency cache (`_meta.idempotency_key`, 15 mutating tools), NOT_FOUND closest-match suggestions, optional `INITIAL_BUFFER:` line on `ssh_shell_open`. Tool count moves from 18 to 21 (`ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`).
+- **v4.7.1** — stability patch: `max_buffer_size` now honoured on `ssh_shell_open`, `ssh_get_command_output` tolerates evicted snapshots in terminal states, idempotency replay does not re-trigger subscriber notifications. 1156 -> 1168 lib tests.
+- **v4.8** — full `output_schema` coverage: every one of the 21 tools (or 20 without `port_forward`) now publishes a typed JSON Schema on `tools/list[].outputSchema` mirroring its `structured_content` payload byte-for-byte. Strictly additive on the `tools/list` metadata; wire shape, env vars, error codes, runtime behaviour all unchanged from v4.7.1.
 
 [[_TOC_]]
 
 ## Overview
 
-ssh-mcp is a Rust crate (edition `2024`, MSRV `1.85`) that turns SSH operations into MCP tools. v4.1.0 ships:
+ssh-mcp is a Rust crate (edition `2024`, MSRV `1.85`) that turns SSH operations into MCP tools. v4.8.0 ships:
 
 - **Hexagonal architecture** — every concrete dependency (rmcp, russh, russh-sftp, dashmap, tokio) is wrapped behind a port trait. Use cases compose ports through static-dispatch generics, never `dyn`. Adapters live in `src/adapters/` and are swapped wholesale at composition time. Each adapter owns its private internals under `internal/` (or, transitionally, `legacy.rs`).
-- **Inbound MCP layer** under `src/infra/mcp/` — an `rmcp::ServerHandler` (`McpSshServer<UC>`) generic over the `UseCases<…>` container, with the `#[tool_router]` block aggregating the 18 `#[tool]` entry points and the `resources/*` overrides.
+- **Inbound MCP layer** under `src/infra/mcp/` — an `rmcp::ServerHandler` (`McpSshServer<UC>`) generic over the `UseCases<…>` container, with the `#[tool_router]` block aggregating the 21 `#[tool]` entry points (20 without `port_forward`), the `resources/*` overrides, the `resources/templates/list` advertisement (4 / 5 templates), the `prompts/list` + `prompts/get` catalog (5 workflows), and the v4.7 idempotency cache wrapper. Every tool publishes a typed `output_schema` (v4.8).
 - **Two binaries** — `ssh-mcp` (HTTP via `axum 0.8` + `rmcp::transport::streamable_http_server::StreamableHttpService`) and `ssh-mcp-stdio` (stdio via `rmcp::transport::io::stdio()`). Both delegate to `composition::prod::run_{http,stdio}` so the wiring lives in one place.
 - **Lock-free runtime** preserved verbatim from v3/v4.0 — `Arc<ArcSwap<T>>`, `tokio::sync::broadcast`, `tokio::sync::mpsc`, `OnceCell`, `AtomicU64`, `Notify`, `DashMap`. The carriers (`RunningCommand`, `RunningShell`, `RunningTransfer`) and the per-resource debouncer / subscription registry now live inside the owning adapters (see [LOCKS.md](./LOCKS.md)).
 - **No `async-trait` direct dep** — every async port uses `trait-variant` AFIT, and the SSH adapter's internal auth chain dispatches concretely through an enum (`adapters/ssh/internal/auth/chain.rs`). Any `async-trait` copies still in the dep tree are transitive (e.g. via rmcp).
 - **Strict lint baseline** — Clippy `forbid` / `deny` plus `await_holding_lock`, `mutex_atomic`, `mutex_integer`, `clone_on_ref_ptr`, `as_conversions`, `pub_use`, `absolute_paths`, `allow_attributes_without_reason`. Every `#[allow(...)]` carries `reason = "..."`.
 
-Public MCP API is **stable**: same 18 tools, same 5 resource schemes, same response markdown shape, same env-var names. Only the internal module layout moved. See [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) for the contributor-facing change log (now including the v4.1 deep-decouple addendum).
+Public MCP API after v4.7 expansion: 21 tools (20 without `port_forward`), 5 resource schemes, the v4.7 `structured_content` JSON channel parallel to the Markdown body, `resources/templates/list`, `prompts/list` + `prompts/get`, idempotency cache, progress notifications. v4.8 adds typed `output_schema` advertisement on every tool (was 9 / 21 in v4.7, now **21 / 21**). The Markdown body shape, env-var names, error codes, and runtime behaviour are byte-stable since v3. See [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) for the contributor-facing change log (including the v4.1 deep-decouple addendum).
 
 ## Hexagonal layers
 
@@ -30,7 +40,7 @@ flowchart TB
 
     subgraph Infra["src/infra/mcp/  -- inbound MCP transport"]
         Server["McpSshServer&lt;UC&gt;<br/>(rmcp ServerHandler)"]
-        ToolRouter["tool_router.rs<br/>(18 #[tool] fns)"]
+        ToolRouter["tool_router.rs<br/>(21 #[tool] fns)"]
         ResHandlers["resource_handlers.rs<br/>(list/read/subscribe/unsubscribe)"]
         Render["render/* + helpers/*<br/>(markdown builders)"]
     end
@@ -249,7 +259,13 @@ Every adapter implements one or more ports.
 | File | Role |
 |------|------|
 | `server.rs` | `McpSshServer<UC>` — generic over the `UseCases<…>` container. Owns `Arc<UC>` plus `Arc<PeerTable>`. |
-| `tool_router.rs` | `#[tool_router]` impl populating the 18 `#[tool]` entry points (one per MCP tool) and the `#[tool_handler] impl ServerHandler` block. Compiled twice via `#[cfg]` (with / without `port_forward`) so the generic signature stays clean. |
+| `tool_router.rs` | `#[tool_router]` impl populating the 21 `#[tool]` entry points (20 without `port_forward`) — every tool now carries `output_schema = schema_for_type::<…Result>()` (v4.8) referencing a typed struct from `results.rs`. Also wires the `#[tool_handler] impl ServerHandler` block, the idempotency cache wrapper (`with_idempotency`), and the closest-match suggestion populator. Compiled twice via `#[cfg]` (with / without `port_forward`) so the generic signature stays clean. |
+| `results.rs` | Typed Rust output structs for every tool's success-path `structured_content` payload (v4.8 — full coverage of all 21 tools). Each struct is `#[derive(Debug, Clone, Serialize, JsonSchema)] #[non_exhaustive]` and uses `#[serde(skip_serializing_if = "Option::is_none")]` on optional fields so absent values do not surface as JSON `null` on the wire. |
+| `prompts.rs` | `prompts/list` + `prompts/get` catalog (v4.7) — 5 canonical workflows. |
+| `idempotency.rs` | DashMap-backed LRU cache (v4.7) — dedup mutating tool calls by `_meta.idempotency_key`. |
+| `progress.rs` | `notifications/progress` emitter (v4.7) — best-effort, mid-flight on long async waits. |
+| `suggestions.rs` | NOT_FOUND closest-match picker (v4.7) — top-3 Levenshtein neighbours, lock-free. |
+| `resource_templates.rs` | `resources/templates/list` static catalogue (v4.7) — 4 / 5 RFC 6570 URI shapes. |
 | `resource_handlers.rs` | Adapters between rmcp `resources/{list,read,subscribe,unsubscribe}` payloads and the matching `*_resource` use cases. Maps `DomainError` onto `McpError` (validation -> `invalid_params`, not-found -> `resource_not_found`, everything else -> `internal_error`). |
 | `peer_handle.rs` | Type aliases (`PeerTable`, `RmcpPeerHandle`) re-surfacing the adapter that lives under `src/adapters/notifier/rmcp_peer.rs`. The wrapper mints a fresh `PeerId`, registers in the per-process `PeerTable` on construction, and removes itself on `Drop`. |
 | `args/` | One module per tool domain (`connection`, `execute`, `shell`, `sftp`, `forward`) with `#[derive(Deserialize, JsonSchema)]` argument structs. |
@@ -393,7 +409,7 @@ sequenceDiagram
 
 | Capability | Status |
 |------------|--------|
-| `tools/list` | 18 tools registered via `#[tool_router]` (see [API.md](./API.md)) |
+| `tools/list` | 21 tools registered via `#[tool_router]` (20 without `port_forward`); every tool advertises a typed `outputSchema` since v4.8 (see [API.md](./API.md)) |
 | `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
 | `resources/list` | 5 schemes (`shell`, `command`, `transfer`, `session`, `forward`) — see [RESOURCES.md](./RESOURCES.md) |
 | `resources/read` | All 5 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` |

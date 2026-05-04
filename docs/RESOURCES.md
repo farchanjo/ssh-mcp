@@ -1,6 +1,8 @@
-# Resources Reference (v4.7.0)
+# Resources Reference (v4.8.0)
 
 ssh-mcp implements the MCP `resources/*` family on top of five subscribe-friendly URI schemes. This document is the source of truth for URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure features, and (v4.7) the `resources/templates/list` advertisement. The wire contract is byte-compatible with v3.0.0 (see [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md)); v4.5 put the v3-promised `_meta` envelope on every read, formalised the per-resource MIME types, and derived a stable `PeerId` from the transport (HTTP `Mcp-Session-Id` header or stdio singleton) so the per-peer cursor survives across requests. v4.6 layered the LLM steering surface onto the tool responses (`HINT:` and `NEXT:` lines). v4.7 adds the parameterised template advertisement so smaller LLMs can scan the URI shape catalogue without enumerating every live instance — see [Resource Templates (v4.7)](#resource-templates-v47) below.
+
+> **v4.8 — no resource changes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement; resource schemes, URI grammar, cursor semantics, `_meta` envelope, subscribe lifecycle, and `resources/templates/list` payload are byte-identical to v4.7.1. Every section below carries forward unchanged.
 
 Cross references:
 

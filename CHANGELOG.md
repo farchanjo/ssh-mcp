@@ -5,6 +5,43 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.8.0] — 2026-05-03
+
+### Highlights
+
+- **Full `output_schema` coverage on every MCP tool — 21 / 21.** v4.7 advertised typed `output_schema` on 9 tools (the 6 originals — `ssh_connect`, `ssh_execute`, `ssh_get_command_output`, `ssh_shell_open`, `ssh_shell_read`, `ssh_get_transfer_progress` — plus the v4.7 step-3 additions `ssh_run`, `ssh_execute_batch`, `ssh_disconnect_many`). v4.8 lifts the remaining 12 tools (`ssh_disconnect`, `ssh_list_sessions`, `ssh_disconnect_agent`, `ssh_list_commands`, `ssh_cancel_command`, `ssh_shell_write`, `ssh_shell_send_key`, `ssh_shell_wait_for`, `ssh_shell_close`, `ssh_upload`, `ssh_download`, `ssh_forward`) to typed schemas mirroring their `structured_content` payload byte-for-byte. Smaller LLMs (Haiku / Llama / Qwen 7B-30B) can now validate every tool response against a published schema without hard-coding any field names.
+- **Strictly additive on the wire.** The text channel is byte-identical to v4.7.1; the `structured_content` payload shape is byte-identical to v4.7.1. Only `tools/list[].outputSchema` grows. v3 / v4.0 / v4.5 / v4.6 / v4.7 hosts work against v4.8 servers without any change.
+
+### Added
+
+- **12 new typed result structs** in `src/infra/mcp/results.rs`, each `#[derive(Debug, Clone, Serialize, JsonSchema)] #[non_exhaustive]` mirroring the runtime `structured_content` payload of its tool's success path:
+  - `SshDisconnectResult`, `SshListSessionsResult` (with `SessionEntry`), `SshDisconnectAgentResult`
+  - `SshListCommandsResult` (with `CommandEntry`), `SshCancelCommandResult`
+  - `SshShellWriteResult`, `SshShellSendKeyResult`, `SshShellWaitForResult`, `SshShellCloseResult`
+  - `SshUploadResult`, `SshDownloadResult`
+  - `SshForwardResult`
+- **Typed schema advertisement on 24 new `#[tool]` sites** (12 with `port_forward`, 12 without) — one `output_schema = schema_for_type::<…Result>()` call per `#[tool]` macro invocation in `src/infra/mcp/tool_router.rs`.
+- **Full 21 / 21 (or 20 / 20 without `port_forward`) coverage on `tools/list[].outputSchema`** — every tool published by the server now carries an `outputSchema` field. Reference: `src/infra/mcp/results.rs` head doc-comment, "Coverage" section.
+
+### Changed
+
+- **`SshConnectResult` schema fields** — additive growth to cover the existing runtime payload variants on `status = "ok"` / `"reused"` / `"suggested"`:
+  - `name: Option<String>` (mirrors the `NAME:` line on suggested matches)
+  - `replaced: Option<usize>` (mirrors `REPLACED:` on `status = "ok"` when stale duplicate sessions are evicted on the connect path)
+  - `matches: Option<Vec<SessionEntry>>` (mirrors the `MATCHES:` body on `status = "suggested"`)
+  - `count: Option<usize>` (mirrors the `COUNT:` line on multi-match suggested responses)
+- **`SshShellOpenResult.initial_buffer: Option<String>`** — mirrors the v4.7 `INITIAL_BUFFER:` Markdown line. Was an ad-hoc field in v4.7's free-form structured payload; v4.8 promotes it into the typed schema.
+- **`src/infra/mcp/results.rs` doc-comment** — "Coverage" section rewritten to claim 21 / 21 (or 20 / 20 without `port_forward`); "Stability" section preserved.
+
+### Compatibility
+
+- Wire shape: byte-identical to v4.7.1 on the Markdown body and on the `structured_content` JSON payload. No env vars added, no error codes added, no runtime behaviour change. Only `tools/list[].outputSchema` grows.
+- v4.7 / v4.6 / v4.5 / v4.0 / v3.0 hosts walking the Markdown body keep working unchanged. Hosts validating against the v4.7 partial `output_schema` continue to validate the same responses (the schemas remained source-compatible — additions only).
+
+### Tests
+
+- No new public-surface tests required (schema advertisement is checked by rmcp at macro-expansion time). The v4.7.1 baseline of 1168 lib tests + 2 integration tests passes unchanged.
+
 ## [4.7.1] — 2026-05-03
 
 ### Highlights
@@ -446,6 +483,14 @@ See `docs/MIGRATION_v2_to_v3.md` for client upgrade instructions.
 
 See `git log` for the v2.x changes; this CHANGELOG was introduced in v3.0.0.
 
+[4.8.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.8.0
+[4.7.1]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.7.1
+[4.7.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.7.0
+[4.6.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.6.0
+[4.5.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.5.0
+[4.4.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.4.0
+[4.3.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.3.0
+[4.2.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.2.0
 [4.1.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.1.0
 [4.0.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v4.0.0
 [3.0.0]: https://github.com/farchanjo/ssh-mcp/releases/tag/v3.0.0

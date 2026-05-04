@@ -1,6 +1,8 @@
-# Locks Reference (v4.1.0)
+# Locks Reference (v4.8.0)
 
 ssh-mcp v4 preserves the v3 **lock-free** baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. The v4.1 hexagonal layout (see [ARCHITECTURE.md](./ARCHITECTURE.md)) keeps the carriers inside the owning adapters' `internal/` subtrees (and a transitional `adapters/subscription/legacy.rs`) while preserving every lint, every channel size, and every acquisition rule.
+
+> **v4.8 — no locking-surface changes.** v4.8 is strictly additive on `tools/list[].outputSchema` advertisement (typed schemas published from `src/infra/mcp/results.rs`). No new shared state, no new channels, no new shard locks. Every invariant below is byte-identical to v4.7.1.
 
 This document is the source of truth for the patterns, the lints that enforce them, and the acquisition order for the residual `DashMap` shard locks that are still in play (briefly, never across `.await`).
 
