@@ -32,7 +32,9 @@ use crate::application::list_resources::{
 use crate::application::read_resource::{
     ReadResourceOutcome, ReadResourceRequest, ReadResourceUseCase,
 };
-use crate::application::subscribe_resource::{SubscribeResourceRequest, SubscribeResourceUseCase};
+use crate::application::subscribe_resource::{
+    SubscribeResourceOutcome, SubscribeResourceRequest, SubscribeResourceUseCase,
+};
 use crate::application::unsubscribe_resource::{
     UnsubscribeResourceRequest, UnsubscribeResourceUseCase,
 };
@@ -513,14 +515,15 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    use_case
+    let outcome = use_case
         .execute(SubscribeResourceRequest {
             uri: request.uri,
             peer: handle,
         })
         .await
-        .map(|_outcome| ())
-        .map_err(|e| map_resource_error(&e))
+        .map_err(|e| map_resource_error(&e))?;
+    log_subscribe_outcome(&outcome);
+    Ok(())
 }
 
 /// Handle `resources/subscribe` for the v4 server (with `port_forward`).
@@ -544,14 +547,29 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    use_case
+    let outcome = use_case
         .execute(SubscribeResourceRequest {
             uri: request.uri,
             peer: handle,
         })
         .await
-        .map(|_outcome| ())
-        .map_err(|e| map_resource_error(&e))
+        .map_err(|e| map_resource_error(&e))?;
+    log_subscribe_outcome(&outcome);
+    Ok(())
+}
+
+/// v5 Phase 2: log the synthesised `SubId` so operators can
+/// correlate subscriptions across logs. Phase 3 introduces a
+/// dedicated `ssh_subscribe` tool that returns the `SubId` in the
+/// response body.
+fn log_subscribe_outcome(outcome: &SubscribeResourceOutcome) {
+    if let Some(sub_id) = outcome.sub_id.as_ref() {
+        tracing::info!(
+            uri = %outcome.uri,
+            sub_id = %sub_id,
+            "resources/subscribe: SubId synthesised"
+        );
+    }
 }
 
 /// Handle `resources/unsubscribe` for the v4 server.
@@ -580,6 +598,12 @@ where
         .execute(UnsubscribeResourceRequest {
             uri: request.uri,
             peer_id,
+            // v5 Phase 2: the rmcp `resources/unsubscribe` schema
+            // does not carry a `sub_id` yet — Phase 3 introduces
+            // dedicated `ssh_sub_*` tools that pass it explicitly.
+            // For now the use case skips the lane close-by-id path
+            // when the protocol cannot supply the sub_id.
+            sub_id: None,
         })
         .await
         .map(|_outcome| ())
