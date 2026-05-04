@@ -322,7 +322,7 @@ mod tests {
             let mut buffer = OutputBuffer::default();
             let cap = 4096_usize;
             for _ in 0..50_000_usize {
-                buffer.append_stdout_bounded(&[b'x'], cap);
+                buffer.append_stdout_bounded(b"x", cap);
             }
             assert_eq!(buffer.stdout.len(), cap);
         }
