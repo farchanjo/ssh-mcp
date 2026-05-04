@@ -1,20 +1,12 @@
 # Locks Reference (v5.0)
 
-ssh-mcp v5 preserves the v3 / v4 **lock-free** baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. v5 stacks three new categories of lock-free state on top — lifecycle adapter atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)), subscription mux atomics ([ADR 0004](./adr/0004-channel-mux-fairness.md)), and cascade refcount atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)) — all of which preserve the strict baseline lints (`await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_in_scrutinee`).
+ssh-mcp v5 preserves the v3 / v4 **lock-free** baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. v5 stacks three new categories on top — lifecycle adapter atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)), subscription mux atomics ([ADR 0004](./adr/0004-channel-mux-fairness.md)), and cascade refcount atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)) — all preserving the strict baseline lints (`await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_in_scrutinee`).
 
 > **v5.0 — three new categories of lock-free state.** Phase 1 lands `ResourceLifecycle` + `SessionLifecycle` atomics ([§Lifecycle adapter](#lifecycle-adapter-invariants-phase-1)); Phase 2 lands per-`SubId` `MultiplexLane` mpsc + `ChannelMux` round-robin cursor ([§Subscription mux](#subscription-mux-invariants-phase-2)); cascade refcount sits on `SessionLifecycle.active_refs` ([§Cascade refcount](#cascade-refcount-phase-1)). All Mutex-free; all loom-verifiable.
 
-This document is the source of truth for the patterns, the lints that enforce them, and the acquisition order for the residual `DashMap` shard locks that are still in play (briefly, never across `.await`).
+Source of truth for patterns, the lints that enforce them, and the acquisition order for the residual `DashMap` shard locks (briefly, never across `.await`).
 
-Cross references:
-
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — module map and threading overview.
-- [RESOURCES.md](./RESOURCES.md) — backpressure features that depend on these primitives.
-- [adr/0003-lifecycle-binding.md](./adr/0003-lifecycle-binding.md) — lifecycle adapter design.
-- [adr/0004-channel-mux-fairness.md](./adr/0004-channel-mux-fairness.md) — channel mux + sub_id design.
-- [adr/0006-backpressure-policies.md](./adr/0006-backpressure-policies.md) — LagPolicy semantics on the lane mpsc.
-- [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md) — file-path map between v3 and v4 modules (v4.1 deep-decouple addendum).
-- [MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md) — v4.x to v5.0 host migration guide.
+Cross-refs: [ARCHITECTURE.md](./ARCHITECTURE.md) (module map + threading) · [RESOURCES.md](./RESOURCES.md) (backpressure features) · ADRs [0003](./adr/0003-lifecycle-binding.md), [0004](./adr/0004-channel-mux-fairness.md), [0006](./adr/0006-backpressure-policies.md) · [MIGRATION_v3_to_v4.md](./MIGRATION_v3_to_v4.md), [MIGRATION_v4_to_v5.md](./MIGRATION_v4_to_v5.md).
 
 ## Adapter-internal carriers (post-v4.1 deep decouple, v5 additions)
 
