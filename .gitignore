@@ -57,3 +57,6 @@ scripts/.ruff_cache/
 scripts/.tox/
 scripts/.coverage
 scripts/htmlcov/
+
+# v5 Phase 5 — soak / stress harness output
+scripts/soak_metrics.csv
