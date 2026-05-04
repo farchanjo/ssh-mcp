@@ -71,7 +71,10 @@ impl ProgressEmitter {
 
     /// Build a disabled emitter without an rmcp context. Mostly useful in
     /// tests so callers can exercise helpers that take a `&ProgressEmitter`.
-    #[cfg(test)]
+    /// Also gated behind the `test-fixtures` feature so integration
+    /// tests that wire the leak-warn bridge can build a no-op emitter
+    /// without standing up an rmcp transport.
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[must_use]
     pub const fn disabled() -> Self {
         Self {

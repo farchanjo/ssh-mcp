@@ -16,17 +16,22 @@
 //!
 //! See ADR 0005 §"Hygiene tail" for the operator-facing semantics.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::clock::system::SystemClock;
-use crate::adapters::config::internal::{resolve_sub_leak_risk_kill_s, resolve_sub_leak_risk_warn_s};
+use crate::adapters::config::internal::{
+    resolve_sub_leak_risk_kill_s, resolve_sub_leak_risk_warn_s,
+};
 use crate::adapters::lifecycle::refcount::{LifecycleScanEntry, RefcountedLifecycleAdapter};
+use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::lifecycle::LifecycleState;
 use crate::ports::clock::ClockPort;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
@@ -93,10 +98,45 @@ impl Default for LeakWatcherConfig {
     }
 }
 
+/// Active alert key — composite of `(kind, resource_id)`. Mirrors the
+/// shape used by the lifecycle adapter so a single alert per resource
+/// is tracked even if the watcher fires repeatedly.
+type AlertKey = (ResourceKind, String);
+
+/// Read-only snapshot of currently-flagged resources.
+///
+/// Implemented by [`LeakWatcher`] in production and by fakes in tests
+/// so list-style render paths can attach `WARN: SUB_LEAK_RISK ...`
+/// lines without depending on the concrete adapter.
+pub trait LeakWatcherProbe: Send + Sync + 'static {
+    /// Return every alert currently in effect. Order is unspecified —
+    /// callers that need stable ordering should sort by `(kind, resource_id)`.
+    fn current_alerts(&self) -> Vec<LeakRiskAlert>;
+
+    /// Return the alert in effect for `(kind, resource_id)` if any.
+    fn alert_for(&self, kind: ResourceKind, resource_id: &str) -> Option<LeakRiskAlert>;
+
+    /// Return the alert in effect for the resource addressed by
+    /// `canonical_uri` (e.g. `shell://abc/output`). `None` when the URI
+    /// is unparseable or no alert is in effect.
+    fn alert_for_uri(&self, uri: &str) -> Option<LeakRiskAlert>;
+}
+
 /// Live watcher.
+///
+/// In addition to broadcasting [`LeakRiskAlert`]s, the watcher keeps a
+/// lock-free [`DashMap`] of currently-flagged resources so list-style
+/// renderers can attach `WARN: SUB_LEAK_RISK <uri>` lines without
+/// re-subscribing to the broadcast channel. Entries are inserted on
+/// emit, refreshed on each subsequent emit (severity may upgrade
+/// `Warn` -> `Kill`), and cleared on `clear_alert` or once the
+/// resource transitions out of `Owned` (e.g. a peer subscribes).
 #[derive(Debug, Clone)]
 pub struct LeakWatcher {
     tx: broadcast::Sender<LeakRiskAlert>,
+    /// Lock-free snapshot of in-effect alerts. Shared with the scan
+    /// task so emit + reset operations stay atomic per key.
+    active: Arc<DashMap<AlertKey, LeakRiskAlert>>,
 }
 
 impl LeakWatcher {
@@ -114,13 +154,23 @@ impl LeakWatcher {
         C: ClockPort + Send + Sync + 'static,
     {
         let (tx, _rx) = broadcast::channel::<LeakRiskAlert>(LEAK_BROADCAST_CAPACITY);
+        let active: Arc<DashMap<AlertKey, LeakRiskAlert>> = Arc::new(DashMap::new());
         let cancel = CancellationToken::new();
-        let watcher = Self { tx: tx.clone() };
+        let watcher = Self {
+            tx: tx.clone(),
+            active: Arc::clone(&active),
+        };
         let task = if config.warn_after_s == 0 {
             tokio::spawn(async {})
         } else {
             let cancel_clone = cancel.clone();
-            tokio::spawn(scan_loop(Arc::clone(adapter), tx, config, cancel_clone))
+            tokio::spawn(scan_loop(
+                Arc::clone(adapter),
+                tx,
+                Arc::clone(&active),
+                config,
+                cancel_clone,
+            ))
         };
         LeakWatcherHandle {
             watcher,
@@ -137,6 +187,34 @@ impl LeakWatcher {
     pub fn subscribe(&self) -> broadcast::Receiver<LeakRiskAlert> {
         self.tx.subscribe()
     }
+}
+
+impl LeakWatcherProbe for LeakWatcher {
+    fn current_alerts(&self) -> Vec<LeakRiskAlert> {
+        self.active
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn alert_for(&self, kind: ResourceKind, resource_id: &str) -> Option<LeakRiskAlert> {
+        self.active
+            .get(&(kind, resource_id.to_string()))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn alert_for_uri(&self, uri: &str) -> Option<LeakRiskAlert> {
+        let parsed = parse_uri(uri).ok()?;
+        self.alert_for(parsed.kind, &parsed.id)
+    }
+}
+
+/// Build the canonical URI for the resource flagged by `alert`. Helper
+/// shared by the leak-warn bridge + list render injection so both
+/// surfaces emit the same `shell://<id>/output` form.
+#[must_use]
+pub fn alert_canonical_uri(alert: &LeakRiskAlert) -> String {
+    canonical_uri(alert.kind, &alert.resource_id)
 }
 
 /// Bundled handle — cancelling the token + awaiting the task is the
@@ -171,6 +249,7 @@ pub fn spawn_default(adapter: &Arc<RefcountedLifecycleAdapter<SystemClock>>) -> 
 async fn scan_loop<C>(
     adapter: Arc<RefcountedLifecycleAdapter<C>>,
     tx: broadcast::Sender<LeakRiskAlert>,
+    active: Arc<DashMap<AlertKey, LeakRiskAlert>>,
     config: LeakWatcherConfig,
     cancel: CancellationToken,
 ) where
@@ -182,7 +261,7 @@ async fn scan_loop<C>(
             biased;
             () = cancel.cancelled() => break,
             _ = tick.tick() => {
-                run_scan_pass(&adapter, &tx, &config);
+                run_scan_pass(&adapter, &tx, &active, &config);
             }
         }
     }
@@ -191,31 +270,34 @@ async fn scan_loop<C>(
 fn run_scan_pass<C>(
     adapter: &RefcountedLifecycleAdapter<C>,
     tx: &broadcast::Sender<LeakRiskAlert>,
+    active: &DashMap<AlertKey, LeakRiskAlert>,
     config: &LeakWatcherConfig,
 ) where
     C: ClockPort + Send + Sync + 'static,
 {
     let warn_ms = u64::from(config.warn_after_s).saturating_mul(1_000);
     let kill_ms = u64::from(config.kill_after_s).saturating_mul(1_000);
+    let mut still_active: HashSet<AlertKey> = HashSet::new();
     for entry in adapter.scan() {
         if let Some(alert) = classify(&entry, warn_ms, kill_ms) {
             // best-effort send — slow consumers handle Lagged on recv.
             let _ = tx.send(alert.clone());
+            still_active.insert((alert.kind, alert.resource_id.clone()));
+            active.insert((alert.kind, alert.resource_id.clone()), alert.clone());
             if alert.severity == LeakRiskSeverity::Kill {
                 let _ = adapter.force_close(alert.kind, &alert.resource_id);
             }
         }
     }
+    // Drop alerts that are no longer firing — e.g. a peer subscribed
+    // (resource transitioned to `Observed`), or the resource closed.
+    active.retain(|key, _| still_active.contains(key));
 }
 
 /// Pure classification helper. Decoupled from the loop so unit tests
 /// can drive every branch without spawning a task.
 #[must_use]
-pub fn classify(
-    entry: &LifecycleScanEntry,
-    warn_ms: u64,
-    kill_ms: u64,
-) -> Option<LeakRiskAlert> {
+pub fn classify(entry: &LifecycleScanEntry, warn_ms: u64, kill_ms: u64) -> Option<LeakRiskAlert> {
     // Resources that opted in to refcount-driven release self-clean —
     // the leak watcher never warns on them.
     if entry.policy.release_when_no_subs {
@@ -265,7 +347,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn entry(state: LifecycleState, sub_count: usize, age_ms: u64, release: bool) -> LifecycleScanEntry {
+    fn entry(
+        state: LifecycleState,
+        sub_count: usize,
+        age_ms: u64,
+        release: bool,
+    ) -> LifecycleScanEntry {
         LifecycleScanEntry {
             kind: ResourceKind::Shell,
             resource_id: "x".to_string(),
@@ -472,6 +559,161 @@ mod tests {
         // sub_count > 0 means the resource is observed; no leak risk.
         let e = entry(LifecycleState::Observed, 1, 30_000, false);
         assert!(classify(&e, 2_000, 0).is_none());
+    }
+
+    // -- v5 Phase 3 — LeakWatcherProbe surface ---------------------------
+
+    use super::{LeakWatcherProbe, alert_canonical_uri};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_current_alerts_reflects_active_warning() {
+        let adapter = build_adapter();
+        adapter.track_resource(
+            ResourceKind::Shell,
+            "leaky",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+        let handle = LeakWatcher::spawn(
+            &adapter,
+            LeakWatcherConfig {
+                warn_after_s: 1,
+                kill_after_s: 0,
+                scan_interval: Duration::from_millis(50),
+            },
+        );
+        // Wait until the broadcaster fires the first alert so the probe
+        // map is populated.
+        let mut rx = handle.watcher.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("alert in time")
+            .expect("alert ok");
+        // Active alerts must surface the same resource.
+        let alerts = handle.watcher.current_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].resource_id, "leaky");
+        assert_eq!(alerts[0].kind, ResourceKind::Shell);
+        // alert_for + alert_for_uri agree.
+        let by_kind = handle
+            .watcher
+            .alert_for(ResourceKind::Shell, "leaky")
+            .expect("alert by kind");
+        assert_eq!(by_kind.resource_id, "leaky");
+        let by_uri = handle
+            .watcher
+            .alert_for_uri("shell://leaky/output")
+            .expect("alert by uri");
+        assert_eq!(by_uri.resource_id, "leaky");
+        handle.cancel.cancel();
+        let _ = handle.task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_alert_for_unknown_uri_returns_none() {
+        let adapter = build_adapter();
+        let handle = LeakWatcher::spawn(
+            &adapter,
+            LeakWatcherConfig {
+                warn_after_s: 1,
+                kill_after_s: 0,
+                scan_interval: Duration::from_millis(50),
+            },
+        );
+        // Empty adapter -> empty probe state.
+        assert!(handle.watcher.current_alerts().is_empty());
+        assert!(
+            handle
+                .watcher
+                .alert_for(ResourceKind::Shell, "nonexistent")
+                .is_none()
+        );
+        // Bad URI -> None (parse error).
+        assert!(handle.watcher.alert_for_uri("gibberish").is_none());
+        // Unknown URI -> None (parses but no alert).
+        assert!(
+            handle
+                .watcher
+                .alert_for_uri("shell://no-such-shell/output")
+                .is_none()
+        );
+        handle.cancel.cancel();
+        let _ = handle.task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_alert_drops_when_resource_subscribed() {
+        // Once a peer subscribes, the resource transitions to
+        // `Observed` and the watcher must clear the active-alert entry
+        // on the next sweep so the list render stops emitting WARN lines.
+        let adapter = build_adapter();
+        adapter.track_resource(
+            ResourceKind::Shell,
+            "transient",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+        let handle = LeakWatcher::spawn(
+            &adapter,
+            LeakWatcherConfig {
+                warn_after_s: 1,
+                kill_after_s: 0,
+                scan_interval: Duration::from_millis(50),
+            },
+        );
+        // Wait for first alert.
+        let mut rx = handle.watcher.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("alert in time")
+            .expect("alert ok");
+        assert_eq!(handle.watcher.current_alerts().len(), 1);
+        // Subscribing transitions to Observed -> watcher should clear
+        // the active alert on the next sweep.
+        adapter
+            .on_subscribe(ResourceKind::Shell, "transient")
+            .expect("subscribe");
+        // Wait long enough for several sweeps so the cleanup pass runs.
+        let watcher = handle.watcher.clone();
+        let cleared_in_time = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if watcher.current_alerts().is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            cleared_in_time,
+            "subscribed resource must be cleared from the active-alerts map"
+        );
+        handle.cancel.cancel();
+        let _ = handle.task.await;
+    }
+
+    #[test]
+    fn alert_canonical_uri_emits_canonical_form() {
+        let alert = super::LeakRiskAlert {
+            kind: ResourceKind::Command,
+            resource_id: "abc".to_string(),
+            age_ms: 1_000,
+            severity: super::LeakRiskSeverity::Warn,
+        };
+        assert_eq!(alert_canonical_uri(&alert), "command://abc/output");
+    }
+
+    #[test]
+    fn watcher_clone_and_probe_dyn_safety_compile_checks() {
+        // The watcher's `active` map is held in an Arc so cheap clones
+        // see the same state. Important: the bridge clones the watcher
+        // rather than re-subscribing the underlying broadcast channel.
+        // Verified at the type level: LeakWatcher: Clone + Sync.
+        fn _assert_clone<T: Clone + Send + Sync>() {}
+        _assert_clone::<LeakWatcher>();
+        // Compile-time check that the probe trait is dyn-safe.
+        fn _assert_probe(_: Arc<dyn LeakWatcherProbe>) {}
     }
 
     #[tokio::test(flavor = "multi_thread")]

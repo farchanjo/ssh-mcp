@@ -32,6 +32,8 @@
 use core::fmt;
 use std::sync::Arc;
 
+use crate::adapters::lifecycle::leak_watcher::{LeakWatcher, LeakWatcherProbe};
+
 use super::idempotency::IdempotencyCache;
 use super::peer_handle::PeerTable;
 use super::tool_router::{IdLister, noop_id_lister};
@@ -62,6 +64,18 @@ where
     /// Defaults to a no-op lister so tests can construct the server
     /// without repository wiring.
     pub(super) id_lister: Arc<dyn IdLister>,
+    /// v5 Phase 3 — production [`LeakWatcher`] handle the rmcp tool
+    /// layer pumps onto the originating `progressToken` channel via
+    /// [`crate::infra::mcp::leak_warn_bridge`]. `None` when the
+    /// transport is not wired with a watcher (e.g. unit tests or the
+    /// HTTP entry point that builds one server per session).
+    pub(super) leak_watcher: Option<Arc<LeakWatcher>>,
+    /// v5 Phase 3 — read-only probe consumed by the list renderers
+    /// (`ssh_list_sessions`, `ssh_list_commands`, `resources/list`).
+    /// Defaults to `None` so tests construct the server without
+    /// touching the watcher; production wiring shares the
+    /// [`LeakWatcher`] handle behind both this and `leak_watcher`.
+    pub(super) leak_probe: Option<Arc<dyn LeakWatcherProbe>>,
 }
 
 impl<UC> McpSshServer<UC>
@@ -83,6 +97,8 @@ where
             peer_table,
             idempotency,
             id_lister: noop_id_lister(),
+            leak_watcher: None,
+            leak_probe: None,
         }
     }
 
@@ -92,6 +108,39 @@ where
     #[must_use]
     pub fn with_id_lister(mut self, lister: Arc<dyn IdLister>) -> Self {
         self.id_lister = lister;
+        self
+    }
+
+    /// Plug a [`LeakWatcher`] into the server.
+    ///
+    /// Sharing the watcher here installs **both** consumer-side
+    /// wirings at once:
+    ///
+    /// 1. The rmcp tool layer pumps `notifications/progress` carrying
+    ///    `WARN: SUB_LEAK_RISK <uri>` lines through
+    ///    [`crate::infra::mcp::leak_warn_bridge`] for tool calls that
+    ///    supply `_meta.progressToken`.
+    /// 2. The list renderers (`ssh_list_sessions`, `ssh_list_commands`,
+    ///    `resources/list`) append `WARN: SUB_LEAK_RISK <uri>` lines
+    ///    for resources currently flagged by the watcher.
+    #[must_use]
+    pub fn with_leak_watcher(mut self, watcher: Arc<LeakWatcher>) -> Self {
+        // Implicit `Arc<T>` -> `Arc<dyn Trait>` coercion via a typed
+        // local binding keeps the `as_conversions` lint silent. The
+        // same pattern is used elsewhere in the wiring (see
+        // `composition::prod::lane_admin_from`).
+        let probe: Arc<dyn LeakWatcherProbe> = Arc::<LeakWatcher>::clone(&watcher);
+        self.leak_probe = Some(probe);
+        self.leak_watcher = Some(watcher);
+        self
+    }
+
+    /// Plug a custom [`LeakWatcherProbe`]. Useful for tests that want to
+    /// drive the list-render injection path without spawning a real
+    /// watcher.
+    #[must_use]
+    pub fn with_leak_probe(mut self, probe: Arc<dyn LeakWatcherProbe>) -> Self {
+        self.leak_probe = Some(probe);
         self
     }
 
@@ -118,6 +167,23 @@ where
     pub const fn id_lister(&self) -> &Arc<dyn IdLister> {
         &self.id_lister
     }
+
+    /// Borrow the production leak watcher when wired. Used by the rmcp
+    /// tool layer to spawn the `notifications/progress` bridge per tool
+    /// call.
+    #[must_use]
+    pub const fn leak_watcher(&self) -> Option<&Arc<LeakWatcher>> {
+        self.leak_watcher.as_ref()
+    }
+
+    /// Borrow the read-only leak probe when wired. Used by the list
+    /// renderers to inject `WARN: SUB_LEAK_RISK <uri>` lines into
+    /// `ssh_list_sessions`, `ssh_list_commands`, and the resource list
+    /// path.
+    #[must_use]
+    pub const fn leak_probe(&self) -> Option<&Arc<dyn LeakWatcherProbe>> {
+        self.leak_probe.as_ref()
+    }
 }
 
 impl<UC> fmt::Debug for McpSshServer<UC>
@@ -130,6 +196,14 @@ where
             .field("peer_table", &"<elided>")
             .field("idempotency", &self.idempotency)
             .field("id_lister", &"<dyn IdLister>")
+            .field(
+                "leak_watcher",
+                &self.leak_watcher.as_ref().map_or("<unset>", |_| "<wired>"),
+            )
+            .field(
+                "leak_probe",
+                &self.leak_probe.as_ref().map_or("<unset>", |_| "<wired>"),
+            )
             .finish()
     }
 }

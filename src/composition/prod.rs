@@ -40,7 +40,9 @@ use crate::adapters::config::internal::{
 };
 use crate::adapters::id_generator::uuid::UuidIds;
 use crate::adapters::lifecycle::cascade::CascadeCoordinator;
-use crate::adapters::lifecycle::leak_watcher::spawn_default;
+use crate::adapters::lifecycle::leak_watcher::{
+    LeakWatcher, LeakWatcherHandle, LeakWatcherProbe, spawn_default,
+};
 use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
@@ -289,9 +291,8 @@ pub fn build_use_cases() -> ProdWiring {
     // via the standard unsizing coercion. Wrapping via `Arc::clone`
     // would require erasing the type first, so the explicit binding
     // is the cleanest path.
-    let lifecycle: Arc<dyn LifecyclePolicyPort> = Arc::<RefcountedLifecycleAdapter<SystemClock>>::clone(
-        &lifecycle_concrete,
-    );
+    let lifecycle: Arc<dyn LifecyclePolicyPort> =
+        Arc::<RefcountedLifecycleAdapter<SystemClock>>::clone(&lifecycle_concrete);
 
     // v5 Phase 2: SubscriberLane + ChannelMux. The lane adapter
     // mints per-`SubId` UUIDv7 ids through the same id generator
@@ -619,10 +620,36 @@ pub fn build_server_with_lifecycle() -> (
     Arc<RefcountedLifecycleAdapter<SystemClock>>,
 ) {
     let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
-    let server =
-        McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency).with_id_lister(id_lister);
+    let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
+        .with_id_lister(id_lister);
     (server, lifecycle_concrete)
 }
+
+/// Build a fresh [`McpSshServer`] with the v5 Phase 3 leak watcher
+/// already plumbed in.
+///
+/// Returns the server (with the watcher wired into both consumer-side
+/// surfaces — progress notifications + list render), the concrete
+/// lifecycle adapter, and the spawned [`LeakWatcherHandle`] the binary
+/// owns until graceful shutdown.
+#[must_use]
+pub fn build_server_with_leak_watcher() -> (
+    McpSshServer<ProdUseCases>,
+    Arc<RefcountedLifecycleAdapter<SystemClock>>,
+    LeakWatcherHandle,
+) {
+    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
+    let leak_handle = spawn_default(&lifecycle_concrete);
+    let watcher_arc: Arc<LeakWatcher> = Arc::new(leak_handle.watcher.clone());
+    let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
+        .with_id_lister(id_lister)
+        .with_leak_watcher(watcher_arc);
+    (server, lifecycle_concrete, leak_handle)
+}
+
+/// Re-export of the [`LeakWatcherProbe`] dyn alias so tests can build a
+/// fake probe without reaching into the adapter layer.
+pub type DynLeakProbe = Arc<dyn LeakWatcherProbe>;
 
 // ---------------------------------------------------------------------------
 // Transport entry points
@@ -730,14 +757,15 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
     // Stdio runs a single `McpSshServer` for the whole process — share
     // its `PeerTable` with the GC pump so closed peers in the v4 side
     // table are pruned alongside the legacy registry.
-    let (server, lifecycle_concrete) = build_server_with_lifecycle();
+    //
+    // v5 Phase 3 — `build_server_with_leak_watcher` plumbs the
+    // `SUB_LEAK_RISK` watcher into both consumer-side surfaces:
+    //   1. notifications/progress (`leak_warn_bridge`) when the tool
+    //      call supplies `_meta.progressToken`.
+    //   2. WARN: SUB_LEAK_RISK lines on `ssh_list_*` responses.
+    let (server, _lifecycle_concrete, leak_handle) = build_server_with_leak_watcher();
     let peer_table = Arc::clone(server.peer_table());
-
-    // v5 Phase 3 — SUB_LEAK_RISK watcher. Surfaces typed alerts on a
-    // broadcast channel; subscribers pump them into the rmcp tool
-    // responses + ssh_list_* renders. The handle is dropped on shutdown.
-    let leak_handle = spawn_default(&lifecycle_concrete);
-    tracing::info!("SUB_LEAK_RISK watcher spawned");
+    tracing::info!("SUB_LEAK_RISK watcher spawned + wired into rmcp surface");
     let gc_interval = resolve_peer_gc_interval_s();
     let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), Some(peer_table));
     tracing::info!("peer GC task spawned (interval = {gc_interval}s)");
