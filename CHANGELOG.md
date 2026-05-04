@@ -5,9 +5,20 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [5.0.0-rc1] — 2026-05-04
+## [5.0.0] — 2026-05-04
 
-In flight on `feat/v5-foundation`. Phase 1 (lifecycle binding) and Phase 2 (channel mux + sub_id) merged; Phase 3 (LLM UX overhaul) and Phase 4 (NDJSON daemon) running in parallel by other agents, will land before the rc1 tag. Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). Design narrative: ADRs at [docs/adr/0001..0008.md](docs/adr/).
+Stable release. All 7 phases merged on `master` plus 3 follow-up hook closures (idempotency args fingerprint, `MAX_SUBS_PER_URI` / `MAX_SUBS_TOTAL` enforcement, UUIDv7 across every id type). Wire-compatible with every v3 / v4 host on the legacy 21-tool catalogue. Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). Design narrative: ADRs at [docs/adr/0001..0008.md](docs/adr/).
+
+### Verified gates at release
+
+- `cargo build --release` exit 0 (3 binaries: `ssh-mcp`, `ssh-mcp-stdio`, `ssh-mcp-tail`).
+- `cargo fmt --all -- --check` exit 0.
+- `cargo clippy --release --all-features -- -D warnings` exit 0.
+- `cargo test --lib --quiet` — **1633 passed**.
+- `cargo test --tests --features test-fixtures --quiet` — **88 passed** (41 chaos + 32 property + 8 v5_smoke + 5 v5_daemon_smoke + 2 v4_smoke).
+- Python adversarial + chaos suites — **86 passed**.
+
+## [5.0.0-rc1] — 2026-05-04 (superseded by 5.0.0)
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
