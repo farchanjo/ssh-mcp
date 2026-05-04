@@ -8,16 +8,19 @@ flowchart LR
     V2["v2.0<br/>poem-mcpserver"]
     V3["v3.0<br/>rmcp 1.6 + resources"]
     V4["v4.x<br/>hexagonal layout"]
-    V5["v5.0<br/>subscribe-first"]
+    V5["v5.x<br/>subscribe-first"]
+    V6["v6.0<br/>tool name eixos"]
 
     V2 -->|client migration<br/>5 breaking changes| V3
     V3 -->|contributor migration<br/>file-path table| V4
     V4 -->|host migration<br/>0 breaking| V5
+    V5 -->|host migration<br/>tool name strings only| V6
 
     style V2 fill:#21262d,color:#8b949e,stroke:#30363d
     style V3 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style V4 fill:#238636,color:#f0f6fc,stroke:#2ea043
     style V5 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style V6 fill:#cf222e,color:#f0f6fc,stroke:#f85149
 ```
 
 | Section | Audience | Scope |
@@ -25,8 +28,9 @@ flowchart LR
 | [v2 → v3](#v2--v3) | MCP client / host implementors | rmcp 1.6 transport, 18 tools, 5 `resources/*` schemes |
 | [v3 → v4](#v3--v4) | Codebase contributors | Hexagonal restructuring, `src/mcp/` deletion, AFIT ports, v4.1 deep decouple, v4.7→v4.8 addendum |
 | [v4 → v5](#v4--v5) | MCP host operators / contributors / downstream automations | Subscribe-first, lifecycle binding, channel mux, daemon binary |
+| [v5 → v6](#v5--v6) | MCP host operators / contributors / downstream automations | Tool name eixos (`ssh_*` / `sub_*` / `serial_*`); wire-breaking on tool name strings only |
 
-The 8 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md).
+The 9 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md), [0009 serial](./adr/0009-serial-transport.md).
 
 ---
 
@@ -557,7 +561,7 @@ For **MCP host operators, contributors, and downstream automations** moving from
 
 If you only consume the v4 MCP surface and never opt into the new tools, env vars, or `release_when_no_subs` flag, no host-side change is required. v5 is wire-compatible with v4 on every legacy path. The expansions are additive.
 
-> **Status.** v5.0 is in flight on the `feat/v5-foundation` branch (Phase 0 through Phase 7). This guide is forthcoming until v5.0-rc1 ships; sections marked _v5.0 forthcoming_ describe surface that exists in design (the 6 ADRs at [adr/0003-..0008.md](./adr/)) but is not yet exercised by every binary in the repo. Phase 1 (lifecycle layer with v4-compatible defaults) is the only fully-wired phase as of this branch snapshot.
+> **Status.** v5.x is shipped on `master`. Phases 1 / 2 / 3 / 4 are merged; the v5.2 release added the 6 serial / UART / TTY / COM tools (ADR 0009). v6.0.0 builds on v5.3.2 and only renames tool strings (`ssh_*` / `sub_*` / `serial_*` eixos) — see [v5 → v6](#v5--v6). All v4 → v5 surfaces below are wire-compatible.
 
 ### Wire compatibility summary
 
@@ -599,7 +603,7 @@ v5.0 adds nine net-new MCP tools and one second binary (`ssh-mcp-tail`). All are
 
 #### Nine new tools (Phase 3)
 
-The tool catalogue grows from 21 to 30 (or from 20 to 29 without `port_forward`). All nine are subscription-management primitives that key on the new `SubId` (UUIDv7 per `resources/subscribe` or `sub_open` call) introduced by [ADR 0004](./adr/0004-channel-mux-fairness.md).
+The tool catalogue grows from 21 to 30 (or from 20 to 29 without `port_forward`) at the end of Phase 3; v5.2 then layers 6 serial tools on top, taking the v5.2+ surface to 36 / 35. All nine Phase 3 tools are subscription-management primitives that key on the new `SubId` (UUIDv7 per `resources/subscribe` or `sub_open` call) introduced by [ADR 0004](./adr/0004-channel-mux-fairness.md).
 
 | Tool | Purpose | Returns | Idempotency |
 |---|---|---|---|
@@ -627,15 +631,18 @@ The full reference is at [DAEMON.md](./DAEMON.md).
 
 Defaults preserve v4 behaviour. The new env vars are listed exhaustively in [CONFIGURATION.md](./CONFIGURATION.md). Highlights:
 
-- `SSH_LIFECYCLE_GRACE_MS` (default 2000) — grace window between last `sub_close` and `Closed` when `release_when_no_subs = true`.
-- `SSH_LIFECYCLE_OWN_GRACE_MS` (default unlimited unless `release_when_no_subs = true`) — grace for `Owned` resources that opted into auto-cleanup but never received a subscriber.
-- `SSH_SESSION_IDLE_GRACE_MS` (default 5000) — grace at the session level after `active_refs` drops to zero.
 - `SSH_LAG_POLICY_DEFAULT` (default `snapshot`) — lane LagPolicy for subscribers that do not specify.
 - `SSH_LANE_BUFFER` (default 1024) — per-lane mpsc capacity.
 - `SSH_MUX_BUFFER` (default 8192) — global mux mpsc capacity.
+- `SSH_MAX_SUBS_PER_URI` (default 16), `SSH_MAX_SUBS_TOTAL` (default 1024) — subscriber caps.
 - `SSH_BP_BLOCK_TIMEOUT_MS` (default 5000) — `BlockSlow` escape hatch.
-- `SSH_SUB_LEAK_RISK_WARN_S` (default 2) — warning threshold for `Owned` resources without subscribers.
+- `SSH_FILTER_REGEX_MAX` (default 1024 chars) — filter regex length cap.
+- `SSH_REPLAY_WINDOW_BYTES` (default 1 MiB) — default `sub_replay` window.
+- `SSH_SUB_LEAK_RISK_WARN_S` (default 2) — `SUB_LEAK_RISK` watcher scan period.
 - `SSH_SUB_LEAK_RISK_KILL_S` (default 0 = off) — operator-opt-in hard kill threshold.
+- Daemon-only: `SSH_NDJSON_LINE_MAX`, `SSH_HEARTBEAT_INTERVAL_S`, `SSH_DAEMON_STATS_INTERVAL_S`, `SSH_GRACE_HARD_TIMEOUT_S`, `SSH_NDJSON_PRETTY` — see [DAEMON.md](./DAEMON.md).
+
+> **Lifecycle grace windows** are programmatic per `release_when_no_subs` call (per-resource grace held on `LifecyclePolicy.grace_ms`); v5/v6 do **not** ship `SSH_LIFECYCLE_*` / `SSH_SESSION_IDLE_GRACE_MS` env vars. Future ADRs may add env-var overrides.
 - `SSH_NDJSON_LINE_MAX` (default 1 MB) — daemon stdin line size limit.
 - `SSH_HEARTBEAT_INTERVAL_S` (default 30) — daemon heartbeat cadence.
 - `SSH_DAEMON_STATS_INTERVAL_S` (default 60) — daemon stats auto-emit cadence.
@@ -652,7 +659,7 @@ flowchart LR
         T1["(SubId, Uri) cursor key<br/>(legacy hosts get<br/>synthesised sub_id)"]
         T2["per-lane mpsc<br/>(Snapshot default)"]
         T3["refcount-aware<br/>session reaper"]
-        T4["WARN: SUB_LEAK_RISK<br/>once Phase 3 lands"]
+        T4["WARN: SUB_LEAK_RISK<br/>(emitted on resource list)"]
     end
 
     subgraph Opt["Opt-in (per-call)"]
@@ -677,7 +684,7 @@ flowchart LR
 | Session-level reaper | inactivity TTL only | refcount-aware (active_refs supersedes TTL) | always on |
 | Inactivity TTL on shell | unchanged (`SSH_SHELL_INACTIVITY_TTL_SECS`) | unchanged | n/a |
 | Shutdown sequence | abrupt for stdio; HTTP graceful via axum | NDJSON daemon adds explicit drain (`SSH_GRACE_HARD_TIMEOUT_S`) | `daemon` subcommand only |
-| Auto-warning for leak risk | none | `WARN: SUB_LEAK_RISK` line on next `ssh_list_*` call referencing the resource | always on once Phase 3 lands |
+| Auto-warning for leak risk | none | `WARN: SUB_LEAK_RISK` line on next `ssh_sessions` / `ssh_commands` call referencing the resource | always on (Phase 3 merged) |
 
 The `release_when_no_subs = false` default means v5 hosts that do **not** add the flag inherit v4 leak semantics: a long-running shell persists until manually closed (or until the inactivity TTL fires). This is intentional. v6.0 will flip the default to `true`; v5 ships the flag wired but defaulted off so that hosts upgrade their prompts and idempotency strategy first.
 
@@ -713,7 +720,7 @@ sub_open(uri="shell://<SHELL_ID>/output", lifetime="auto-close", lag_policy="sna
 ssh_shell_write(shell_id, bytes="ls -la\n")
 # ... events drain via notifications/resources/updated ...
 sub_close(sub_id)            # release_when_no_subs triggers grace timer
-# shell auto-closes after SSH_LIFECYCLE_GRACE_MS
+# shell auto-closes after the per-call lifecycle grace window expires
 ssh_disconnect_agent(agent_id="my-claude-agent")
 ```
 

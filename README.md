@@ -13,7 +13,7 @@ Drive remote shells, async commands, SFTP transfers, TCP forwards, and local UAR
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-a371f7?style=flat-square)](docs/ARCHITECTURE.md)
 [![Hot path](https://img.shields.io/badge/hot--path-lock--free-238636?style=flat-square)](docs/DEVELOPMENT.md#lock-free-invariants)
 [![Tools](https://img.shields.io/badge/MCP%20tools-36-1f6feb?style=flat-square)](docs/API.md)
-[![Tests](https://img.shields.io/badge/lib%20tests-1.2k%2B-238636?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/lib%20tests-1.6k%2B-238636?style=flat-square)]()
 
 </div>
 
@@ -57,7 +57,7 @@ Same throughput. **~30× cheaper.** Model reacts the moment the remote process s
 
 - **6 push-resource schemes** — `shell://` · `command://` · `transfer://` · `session://` · `forward://` · `serial://` (local UART/TTY/COM, no SSH)
 - **36 MCP tools across 3 namespaces** — `ssh_*` (21) · `sub_*` (9) · `serial_*` (6)
-- **Per-subscription lanes** — independent filter, replay buffer, lag policy (`DropOldest` / `Snapshot` / `Disconnect`) per `SubId`. One slow consumer never penalizes a fast one.
+- **Per-subscription lanes** — independent filter, replay buffer, lag policy (`BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot`) per `SubId`. One slow consumer never penalizes a fast one.
 - **Lock-free hot path** — zero `Mutex` on shell/command/transfer state. Enforced by `clippy::mutex_atomic = deny`.
 - **Lifecycle binding with cascade** — CAS state machine (`Owned → Observed → Releasing → Closed`) + refcount cascade. No leaked shells when the host crashes.
 - **Three transports, one core** — HTTP (axum), stdio (rmcp), NDJSON daemon (Unix-pipeline composable).
@@ -121,35 +121,36 @@ ssh_disconnect_agent                      # cascade-close everything
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','background':'#0d1117','mainBkg':'#161b22','clusterBkg':'#161b22','clusterBorder':'#30363d'}}}%%
 flowchart LR
-    REM(["Remote process<br/>(build · tail -f · REPL)"])
+    REM(["Source<br/>(remote build · tail -f · REPL · local UART)"])
     KER["Kernel readiness<br/>epoll · kqueue · IOCP"]
-    RUSSH["russh 0.55<br/>SSH 2.0 frames<br/>per-channel mpsc"]
+    MIO["mio + tokio reactor<br/>work-stealing scheduler"]
+    SRC["Transport<br/>russh 0.55 (SSH) ·<br/>tokio-serial (UART)"]
     LIFE["Lifecycle adapter<br/>ArcSwap RingBuffer<br/>AtomicU8 state · refcount"]
     DEB["Debouncer<br/>200 ms coalesce<br/>OR 64 KiB flush"]
     LANE["Per-sub lane<br/>mpsc(1024)<br/>filter · replay · policy"]
     MUX["ChannelMux<br/>AtomicUsize cursor<br/>round-robin"]
-    OUT(["LLM host<br/>notifications/resources/updated"])
+    OUT(["LLM host<br/>notifications/resources/updated<br/>or NDJSON line"])
 
-    REM --> KER --> RUSSH --> LIFE --> DEB --> LANE --> MUX --> OUT
+    REM --> KER --> MIO --> SRC --> LIFE --> DEB --> LANE --> MUX --> OUT
 
     classDef rt fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     classDef mux fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
     classDef host fill:#238636,color:#f0f6fc,stroke:#2ea043
-    class KER,RUSSH,LIFE,DEB rt
+    class KER,MIO,SRC,LIFE,DEB rt
     class LANE,MUX mux
     class OUT host
 ```
 
 **Layer roles in one line each:**
 
-1. **Kernel readiness** — `epoll` / `kqueue` / `IOCP` wakes the process when the socket has data. Zero CPU while idle.
+1. **Kernel readiness** — `epoll` / `kqueue` / `IOCP` wakes the process when the socket / TTY has data. Zero CPU while idle.
 2. **`mio` + `tokio` reactor** — cross-platform abstraction; work-stealing scheduler resumes the awaiting task.
-3. **`russh`** — parses SSH 2.0 frames, dispatches per-channel data over one TCP connection (RFC 4254 multi-channel).
+3. **Transport layer** — `russh` parses SSH 2.0 frames over one TCP connection (RFC 4254 multi-channel) for `shell://` / `command://` / `transfer://` / `forward://` / `session://`; `tokio-serial` reads raw UART bytes for `serial://` (ADR 0009).
 4. **Lifecycle adapter** — `AtomicU8` state, `AtomicUsize` refcount, `ArcSwap<RingBuffer>` snapshots. CAS state machine, grace timer cancels on re-subscribe.
 5. **Debouncer** — coalesces bursts. Flushes on whichever fires first: 200 ms window OR 64 KiB byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). Force-flush every 1 s for liveness.
 6. **Per-subscription lane** — own bounded `mpsc::channel(1024)`, own filter regex, own replay buffer, own lag policy. Three subscribers = three independent lanes.
 7. **`ChannelMux`** — single `AtomicUsize` cursor walks lanes round-robin. Drift between adjacent lanes < 1% under burst.
-8. **Outbound writer** — emits `notifications/resources/updated` (HTTP/stdio) or one NDJSON line (daemon).
+8. **Outbound writer** — emits `notifications/resources/updated` (HTTP / stdio) or one NDJSON line per event (`ssh-mcp-tail` daemon).
 
 End-to-end latency: **single-digit milliseconds** on a local network. No polling loop anywhere on the path.
 
@@ -172,7 +173,7 @@ flowchart TB
         RES["resource_handlers"]
     end
     subgraph APP["application"]
-        UC["~22 UseCases<br/>generic over ports"]
+        UC["~24 UseCases<br/>generic over ports"]
     end
     subgraph PORTS["ports"]
         P["session_repo · ssh_client · sftp_client<br/>notifier · subscriber_registry<br/>lifecycle_policy · channel_mux"]
@@ -200,7 +201,7 @@ flowchart TB
 |---|---|---|
 | `bin/` | `src/main.rs`, `src/bin/` | Three thin entry points over `composition::prod` / `embed` |
 | `infra/mcp/` | tool_router · resource_handlers · prompts · render · idempotency | Inbound MCP surface (rmcp 1.6) |
-| `application/` | `src/application/` | ~22 `*UseCase` types, generic over ports |
+| `application/` | `src/application/` | ~24 `*UseCase` types, generic over ports |
 | `ports/` | `src/ports/` | Trait skeletons (AFIT) — no implementation |
 | `adapters/` | `src/adapters/` | russh, SFTP, dashmap repos, lifecycle CAS machine, channel mux, serial |
 | `domain/` | `src/domain/` | Pure entities, UUIDv7 ids, lifecycle + subscription state |
@@ -271,17 +272,20 @@ Cursor + sequence semantics + `_meta` envelope: [docs/RESOURCES.md](docs/RESOURC
 
 ## Performance & guarantees
 
-Apple M2 Pro, macOS 25.4, native arm64 `--release`, localhost SSH server. Reproduce via `scripts/`.
+Design targets and verified invariants. No public benchmark harness ships in the repo today; the chaos suite (`tests/chaos/*.rs`) verifies the structural invariants, and `tests/lockfree_invariants.rs` covers the concurrency interleavings under loom.
 
-| Scenario | Number |
-|---|---|
-| First push after `sub_open` (warm session) | < 5 ms p50 |
-| Lane full + `Snapshot` recovery | sub-millisecond (1 MB ring) |
-| Round-robin mux fairness drift | < 1% between adjacent lanes |
-| Session reaper vs active resources | refcount supersedes inactivity TTL |
-| Library tests | 1 200+ (`#[test]` + `#[tokio::test]`) |
-| Loom invariants | 20 tests in `tests/lockfree_invariants.rs` |
-| ADRs | 9 (rmcp · hexagonal · lifecycle · mux · LLM UX · backpressure · errors · daemon · serial) |
+| Scenario | Property | Verified by |
+|---|---|---|
+| Round-robin mux fairness | No lane starves under uneven load (heaviest lane does not block all others) | `tests/chaos/chaos23_channel_mux_fairness_n_lanes.rs`, loom `loom_mux_round_robin_no_starvation` |
+| Lane full + `Snapshot` recovery | Drop backlog, rebuild from per-resource ring buffer; cursor stays monotonic | `tests/chaos/chaos04_slow_consumer_overflow.rs`, loom `slow_subscriber_recovers_after_lag` |
+| Session reaper vs active resources | Refcount supersedes inactivity TTL; session never reaped while `active_refs > 0` | `tests/chaos/chaos12_session_inactivity_during_active_sub.rs`, loom `loom_phase3_release_when_no_subs_grace` |
+| Cascade close on disconnect | `ssh_disconnect` / `ssh_disconnect_agent` force-close every child resource lifecycle entry + lane | `tests/chaos/chaos06_concurrent_disconnect_subscribe.rs`, `tests/chaos/chaos25_cascade_refcount_many_simultaneous_close.rs` |
+| Library tests | ~1657 (`#[test]` + `#[tokio::test]`) | `cargo test --lib` |
+| Integration tests | 88 across 5 binaries (`v4_smoke` 2, `v5_smoke` 8, `v5_daemon_smoke` 5, `chaos` 41, `property` 32) | `cargo test --tests --features test-fixtures` |
+| Loom invariants | 20 interleavings in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`) | `RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants --release` |
+| ADRs | 9 (rmcp · hexagonal · lifecycle · mux · LLM UX · backpressure · errors · daemon · serial) | `docs/adr/000{1..9}-*.md` |
+
+Latency / throughput numbers are operator-measured; reproduce against a workload that matches your traffic. The hot path is lock-free (no `Mutex` on `Running*` state — `clippy::mutex_atomic = deny` enforces) and debouncer / lane / mux drains run on the work-stealing tokio scheduler.
 
 ### Strict baseline
 
@@ -296,7 +300,7 @@ Lock-free invariants explained: [docs/DEVELOPMENT.md → Lock-free invariants](d
 
 ## Configuration
 
-Three-tier resolution: **parameter → env var → built-in default.** Defaults preserve v4 behaviour. Full table (33+ vars): [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+Three-tier resolution: **parameter → env var → built-in default.** Defaults preserve v4 behaviour. Full table (40 vars): [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### High-impact env vars
 
@@ -306,9 +310,9 @@ Three-tier resolution: **parameter → env var → built-in default.** Defaults 
 | `SSH_NOTIFY_FLUSH_BYTES` | `65536` | Byte threshold; flush on whichever fires first |
 | `SSH_NOTIFY_FORCE_FLUSH_MS` | `1000` | Liveness flush |
 | `SSH_LANE_BUFFER` | `1024` | Bounded mpsc capacity per lane |
-| `SSH_GRACE_DEFAULT_MS` | `5000` | Grace between last unsubscribe and release |
-| `SSH_PEER_GC_INTERVAL_S` | `30` | Dead-transport scan cadence |
-| `SSH_MAX_SUBS_PER_URI` | `64` | Hard cap on lanes per resource |
+| `SSH_MUX_BUFFER` | `1024` | `ChannelMux` outbound mpsc capacity |
+| `SSH_MCP_PEER_GC_INTERVAL_S` | `30` | Dead-transport scan cadence |
+| `SSH_MAX_SUBS_PER_URI` | `16` | Hard cap on lanes per resource |
 | `SSH_MAX_SUBS_TOTAL` | `1024` | Hard cap server-wide |
 
 ---
@@ -370,7 +374,7 @@ Yes. Run `ssh-mcp-tail daemon` as a subprocess and read NDJSON push events from 
 Pass `release_when_no_subs=true` on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download`. Peer-GC detects dropped transport, lifecycle grace timer fires, resource released automatically.
 
 **Why per-subscription lanes instead of one broadcast channel?**
-Broadcast forces one shared lag policy — when one consumer falls behind, everyone falls behind. Per-sub lanes give each consumer independent backpressure, filter regex, replay buffer, and lag policy (`DropOldest` · `Snapshot` · `Disconnect`).
+Broadcast forces one shared lag policy — when one consumer falls behind, everyone falls behind. Per-sub lanes give each consumer independent backpressure, filter regex, replay buffer, and lag policy (`BlockSlow` · `DropOldest` · `DropNewest` · `Snapshot`).
 
 **Is the lock-free claim real?**
 Yes. Enforced by `clippy::await_holding_lock` + `clippy::mutex_atomic` + `clippy::significant_drop_tightening` denials. 20 loom invariant tests in `tests/lockfree_invariants.rs`. Production `-D warnings` exit 0 every commit.

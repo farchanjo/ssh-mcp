@@ -1,6 +1,6 @@
-# SSH MCP Architecture (v5.0 — subscribe-first hexagonal)
+# SSH MCP Architecture (v6.0 — subscribe-first hexagonal)
 
-Architecture of the SSH Model Context Protocol (MCP) server on the `feat/v5-foundation` branch. The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with three v5 layers stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — in flight), and the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — in flight). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new MCP tools and a third binary `ssh-mcp-tail`.
+Architecture of the SSH Model Context Protocol (MCP) server on `master` (v6.0.0). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with five v5 layers stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), and the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, and v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos (36 tools / 35 without `port_forward`).
 
 Version trail (one line each):
 
@@ -18,11 +18,11 @@ flowchart TB
     subgraph BIN["bin — entry points"]
         HTTP["src/main.rs"]
         STDIO["src/bin/ssh_mcp_stdio.rs"]
-        TAIL["src/bin/ssh_mcp_tail.rs<br/>(Phase 4)"]
+        TAIL["src/bin/ssh_mcp_tail.rs"]
     end
     subgraph COMP["composition — wiring root"]
         PROD["prod.rs"]
-        EMB["embed.rs<br/>(Phase 4)"]
+        EMB["embed.rs"]
         FIX["fixtures.rs"]
     end
     subgraph EMBEDLAYER["embed — daemon transport"]
@@ -103,7 +103,7 @@ flowchart TB
 | `application` | Use cases (`*UseCase<Ports...>`) — one struct + DTO per business operation. | `domain`, `ports`, `tokio` (for `select!` / `spawn`) | `russh`, `rmcp`, `axum`, `dashmap` |
 | `adapters` | Concrete implementations of every port. v5: `lifecycle/`, `subscription/{subscriber_lane,channel_mux,filter,replay}`. | All runtime crates (`tokio`, `russh`, `russh_sftp`, `dashmap`, `arc_swap`) | `rmcp` (only `notifier/rmcp_*`), `axum` |
 | `infra` | Inbound MCP transport (`#[tool_router]`, `ServerHandler`, render, args, helpers). v5: `error_detail.rs`. | `rmcp`, `application`, `domain`, `adapters::notifier::rmcp_peer` | `russh`, `russh_sftp`, `dashmap` |
-| `composition` | Root wiring — pins concrete adapters via `type ConcreteX = …`, builds the `UseCases` container. v5: `embed.rs` (Phase 4 — in flight). | All adapters + `infra::mcp` + `application` | — (it is the leaf) |
+| `composition` | Root wiring — pins concrete adapters via `type ConcreteX = …`, builds the `UseCases` container. v5: `embed.rs` (Phase 4 — merged). | All adapters + `infra::mcp` + `application` | — (it is the leaf) |
 
 ### Static dispatch + AFIT (no async-trait, no dyn on hot path)
 
@@ -119,7 +119,7 @@ The crate root is `src/`. Library code lives under `src/{domain,ports,applicatio
 |------|------|
 | `src/main.rs` | HTTP transport (`ssh-mcp`). Calls `composition::prod::run_http()`. Default bind `0.0.0.0:8000`, path `/`. |
 | `src/bin/ssh_mcp_stdio.rs` | Stdio transport (`ssh-mcp-stdio`). Calls `composition::prod::run_stdio()`. Logs to stderr via `RUST_LOG`. |
-| `src/bin/ssh_mcp_tail.rs` (Phase 4 — in flight) | NDJSON daemon (`ssh-mcp-tail`). Embeds rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. |
+| `src/bin/ssh_mcp_tail.rs` | NDJSON daemon (`ssh-mcp-tail`). Embeds rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. |
 
 All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s). rmcp 1.6 does not expose a peer-disconnect callback, so the periodic scan is the only way to reclaim subscription state for closed transports.
 
@@ -168,7 +168,7 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 
 ### `src/application/` — use cases
 
-22 files, one per business operation. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 (in flight) will add 9 new use case files for the new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`).
+24 files (excl. `mod.rs`), one per business operation or admin slice. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 added the consolidated `subscription_admin` slice that powers all 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`). The serial transport (ADR 0009) is wired through `infra::mcp` directly against the in-process `SerialPortRegistry` adapter.
 
 | Domain | Use cases |
 |--------|-----------|
@@ -205,9 +205,9 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 | File | Role |
 |------|------|
 | `server.rs` | `McpSshServer<UC>` — generic over the `UseCases<…>` container. |
-| `tool_router.rs` | `#[tool_router]` impl populating the 21 v4 + 9 v5 = 30 `#[tool]` entry points (29 without `port_forward`). Phase 3 (in flight) wires the 9 new tools and updates `HINT:` severity. |
+| `tool_router.rs` | `#[tool_router]` impl populating the 21 `ssh_*` + 9 `sub_*` + 6 `serial_*` = 36 `#[tool]` entry points (35 without `port_forward`). |
 | `results.rs` | Typed Rust output structs for every tool's `structured_content` payload. |
-| `prompts.rs` | `prompts/list` + `prompts/get` catalog — 10 workflows in v5 (5 carry-overs + 5 push-first; Phase 3 in flight). See [LLM_GUIDE.md → Prompts catalogue](./LLM_GUIDE.md#prompts-catalogue). |
+| `prompts.rs` | `prompts/list` + `prompts/get` catalog — 10 workflows in v5 (5 carry-overs + 5 push-first). See [LLM_GUIDE.md → Prompts catalogue](./LLM_GUIDE.md#prompts-catalogue). |
 | `idempotency.rs` | DashMap-backed LRU cache — dedup mutating tool calls by `_meta.idempotency_key`. |
 | `progress.rs` | `notifications/progress` emitter — best-effort, mid-flight on long async waits. |
 | `suggestions.rs` | NOT_FOUND closest-match picker (Levenshtein top-3, lock-free). |
@@ -225,7 +225,7 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 |------|------|
 | `mod.rs` | The generic `UseCases<…>` container (compiled twice via `#[cfg]` — `port_forward` toggle). |
 | `prod.rs` | Production wiring — pins concrete adapters via `type ConcreteX = …`; exposes `build_use_cases()`, `build_server()`, `run_http()`, `run_stdio()`. v5 commit `4730066` injected `SubscriberLane` + `ChannelMux` adapters. |
-| `embed.rs` (Phase 4 — in flight) | In-process duplex transport for `ssh-mcp-tail`. Spawns the rmcp server task; the daemon's main loop owns the rmcp client side. |
+| `embed.rs` | In-process duplex transport for `ssh-mcp-tail`. Spawns the rmcp server task; the daemon's main loop owns the rmcp client side. |
 | `fixtures.rs` | Deterministic adapters for tests (gated by `test-fixtures`). |
 | `id_lister.rs` | Helper consumed by the closest-match suggestion path. |
 | `status_sinks.rs` | Adapter wiring for the v4.8.1 transfer progress watcher. |
@@ -239,7 +239,7 @@ Each runtime adapter owns its private internals under `internal/` (the v4.1 deep
 | `src/adapters/ssh/internal/{client,session,async_command,shell,types,error}.rs` | SSH | russh wiring — `connect_to_ssh_with_retry`, `execute_ssh_command`, `open_pty_shell`, `RunningCommand`, `RunningShell` + `RingBuffer`, retry classification. |
 | `src/adapters/ssh/internal/auth/{traits,password,key,agent,chain}.rs` | SSH | Internal auth chain (PasswordAuth -> KeyAuth -> AgentAuth) statically dispatched through an enum (no `async-trait`). |
 | `src/adapters/sftp/internal/{sftp,transfer,types}.rs` | SFTP | Streaming SFTP session helpers; `RunningTransfer` lock-free state. |
-| `src/adapters/config/internal/mod.rs` | Config | Env-var resolvers (33+ tunables in v5). |
+| `src/adapters/config/internal/mod.rs` | Config | Env-var resolvers (40 tunables in v5/v6). |
 | `src/adapters/subscription/legacy.rs` | Subscription (transitional) | `SubscriptionRegistry` global + `spawn_peer_gc`. Coexists with `MemoryRegistry<N>` until the SSH/SFTP runtime adapters are wired through the port surface end-to-end. |
 
 ## Phase 1 — Lifecycle binding (merged)
@@ -414,7 +414,7 @@ Subscribers cannot extend or shorten a resource's lifetime — only its creator 
 
 ## Resource scheme topology
 
-5 push-capable URI schemes map to the 4 long-running tools. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
+6 push-capable URI schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial`) map to the 5 long-running tool families. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -463,13 +463,13 @@ flowchart LR
 
 Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(SubId, Uri)` lane atomics: [DEVELOPMENT.md → Subscription mux invariants](./DEVELOPMENT.md#subscription-mux-invariants-phase-2).
 
-## Phase 3 — LLM UX surface (in flight)
+## Phase 3 — LLM UX surface (merged)
 
 ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
 
 This document tracks names; the canonical LLM reference is [LLM_GUIDE.md](./LLM_GUIDE.md) (golden rules, prompts catalogue, anti-patterns, error handbook).
 
-## Phase 4 — NDJSON daemon (in flight)
+## Phase 4 — NDJSON daemon (merged)
 
 ADR: [adr/0008-ndjson-daemon-protocol.md](./adr/0008-ndjson-daemon-protocol.md). Binary `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds an rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. Stdin reads NDJSON ops; stdout emits NDJSON events (`ack`, `push`, `completed`, `lagged`, `snapshot`, `warn`, `heartbeat`, `daemon_stats`).
 
@@ -553,7 +553,7 @@ The full table — every atomic, every channel, every guard — lives in [DEVELO
 
 ## Configuration
 
-The full env-var table (33+ tunables) lives in [CONFIGURATION.md](./CONFIGURATION.md). v5 adds five categories of new vars: lifecycle (`SSH_LIFECYCLE_*`, `SSH_SESSION_IDLE_GRACE_MS`), lane / mux (`SSH_LAG_POLICY_DEFAULT`, `SSH_LANE_BUFFER`, `SSH_MUX_BUFFER`, `SSH_BP_BLOCK_TIMEOUT_MS`, `SSH_REPLAY_WINDOW_BYTES`, `SSH_FILTER_REGEX_MAX`, `SSH_MAX_SUBS_PER_URI`, `SSH_MAX_SUBS_TOTAL`), LLM hygiene (`SSH_SUB_LEAK_RISK_WARN_S`, `SSH_SUB_LEAK_RISK_KILL_S`), daemon (`SSH_NDJSON_LINE_MAX`, `SSH_HEARTBEAT_INTERVAL_S`, `SSH_DAEMON_STATS_INTERVAL_S`, `SSH_GRACE_HARD_TIMEOUT_S`).
+The full env-var table (40 tunables) lives in [CONFIGURATION.md](./CONFIGURATION.md). v5 adds three categories of new vars: lane / mux / backpressure (`SSH_LAG_POLICY_DEFAULT`, `SSH_LANE_BUFFER`, `SSH_MUX_BUFFER`, `SSH_BP_BLOCK_TIMEOUT_MS`, `SSH_REPLAY_WINDOW_BYTES`, `SSH_FILTER_REGEX_MAX`, `SSH_MAX_SUBS_PER_URI`, `SSH_MAX_SUBS_TOTAL`), LLM hygiene (`SSH_SUB_LEAK_RISK_WARN_S`, `SSH_SUB_LEAK_RISK_KILL_S`), daemon (`SSH_NDJSON_LINE_MAX`, `SSH_HEARTBEAT_INTERVAL_S`, `SSH_DAEMON_STATS_INTERVAL_S`, `SSH_GRACE_HARD_TIMEOUT_S`, `SSH_NDJSON_PRETTY`). The lifecycle layer ([ADR 0003](./adr/0003-lifecycle-binding.md)) sets grace windows programmatically per `release_when_no_subs` call; no env var overrides today.
 
 Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioural change unless they opt into the new flags / tools / env vars.
 
@@ -563,10 +563,10 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 
 | Capability | Status |
 |------------|--------|
-| `tools/list` | 30 tools registered (29 without `port_forward`); every tool advertises a typed `outputSchema` |
+| `tools/list` | 36 tools registered (35 without `port_forward`); every tool advertises a typed `outputSchema` |
 | `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
-| `resources/list` | 5 schemes (`shell`, `command`, `transfer`, `session`, `forward`) — see [RESOURCES.md](./RESOURCES.md) |
-| `resources/read` | All 5 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` |
+| `resources/list` | 6 schemes (`shell`, `command`, `transfer`, `session`, `forward`, `serial`) — see [RESOURCES.md](./RESOURCES.md) |
+| `resources/read` | All 6 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` / `serial` |
 | `resources/subscribe` + `resources/unsubscribe` | Per `(SubId, Uri)` cursor in v5; `(PeerId, Uri)` synthesised for legacy hosts |
 | `notifications/resources/updated` | Emitted by the per-resource debouncer task |
 | `notifications/resources/list_changed` | Capability advertised; emission still deferred (tracked under [Future work](#future-work)) |

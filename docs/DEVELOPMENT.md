@@ -16,7 +16,7 @@ Four gates must stay green on every commit:
 cargo build --release                              # All binaries (default + port_forward)
 cargo build --release --bin ssh-mcp                # HTTP server (axum 0.8 + rmcp 1.6)
 cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
-cargo build --release --bin ssh-mcp-tail           # NDJSON daemon (Phase 4 — in flight)
+cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
 cargo build --release --no-default-features        # No port forwarding
 
 cargo test --lib --quiet                           # ~1378 lib tests on Phase 1+2 stable
@@ -62,14 +62,14 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 | Layer | Path | What it covers | Cost |
 |---|---|---|---|
-| Lib unit tests | `src/**/{mod,*}.rs::tests` | ~1378 tests across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
+| Lib unit tests | `src/**/{mod,*}.rs::tests` | ~1657 tests across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
 | `test-fixtures` | gated by `cargo test --features test-fixtures` | Use cases against deterministic adapters (`FakeClock`, `DeterministicIdGen`) for reproducible bug bisection. | seconds |
-| Integration tests | `tests/*.rs` | 2 tests: `v4_smoke.rs` (snapshot of v3/v4 wire compatibility), `v5_daemon_smoke.rs` (5 cases against `ssh-mcp-tail daemon`). | tens of seconds |
-| Loom invariants | `tests/lockfree_invariants.rs` (`#[cfg(loom)]`) | 16 interleavings (8 v4 baseline + 4 Phase 1 + 4 Phase 2). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
+| Integration tests | `tests/*.rs` (+ `tests/chaos/`, `tests/property/`) | 88 active tests across 5 binaries: `v4_smoke` (2, wire-compat snapshot), `v5_smoke` (8), `v5_daemon_smoke` (5, against `ssh-mcp-tail daemon`), `chaos` (41, ADR-driven failure-mode coverage), `property` (32, lifecycle / mux / lane invariants). Most need `--features test-fixtures`. | tens of seconds |
+| Loom invariants | `tests/lockfree_invariants.rs` (`#[cfg(loom)]`) | 20 interleavings (v4 baseline + Phase 1 lifecycle + Phase 2 mux). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
 | Python integration | `scripts/test_*.py` | `requires_sshd` end-to-end suites against a real OpenSSH server. | minutes |
-| Stress | `scripts/stress_*.py` | 4 stress scripts (channel exhaustion, connection storms, transfer concurrency, shell turn-around). | varies |
+| Stress | `scripts/stress_*.py` | 5 stress scripts (concurrent writes, lagged sub, locks, multi-host, subscribe). | varies |
 
-### Loom invariants (16 total)
+### Loom invariants (20 total)
 
 `tests/lockfree_invariants.rs` is gated behind `#[cfg(loom)]`. To run:
 
@@ -79,9 +79,12 @@ RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants --release
 
 The tests permute concurrent interleavings on:
 
-- **v4 baseline (8 invariants)**: shell `ArcSwap<RingBuffer>` rcu loop, command `ArcSwap<OutputBuffer>` snapshot path, registry's `peer_progress` cursor advance, slow-subscriber recovery via snapshot, `OnceCell` write-once, `fetch_max` cursor under contention, `RingBuffer` head-truncation composition, broadcast lag recovery.
-- **Phase 1 (4 new)**: subscribe / unsubscribe race on `ResourceLifecycle`, grace fire vs re-subscribe, cascade double-disconnect on `SessionLifecycle.active_refs`, cursor monotonicity under lifecycle CAS chain.
-- **Phase 2 (4 new)**: `ChannelMux` round-robin fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, `byte_cursor.fetch_max` under contention.
+- **v4 baseline (8 invariants)**: `ringhistory_reader_observes_consistent_snapshot`, `ringhistory_two_writers_reader_atomicity`, `oncemodel_only_first_set_wins`, `oncemodel_reader_sees_stable_value_after_first_observation`, `cursor_fetch_max_with_compensate_truncation`, `cursor_double_compensation_saturates_at_zero`, `slow_subscriber_recovers_after_lag`, `sequence_allocation_no_duplicates`.
+- **Phase 1 lifecycle (4 new)**: `loom_lifecycle_concurrent_subscribe_unsubscribe`, `loom_grace_fire_vs_resubscribe`, `loom_cascade_double_disconnect`, `loom_cursor_atomic_advance`.
+- **Phase 2 mux (4 new)**: `loom_mux_round_robin_no_starvation`, `loom_lane_mpsc_drop_oldest_monotonic`, `loom_lane_pause_resume_no_loss`, `loom_subid_cursor_atomic_advance`.
+- **Phase 2/3/4 extensions (4 new)**: `loom_phase2_replay_during_concurrent_subscribe`, `loom_phase3_leak_watcher_no_double_alert`, `loom_phase3_release_when_no_subs_grace`, `loom_phase4_embed_transport_shutdown_race`.
+
+Total currently shipped: **20 `#[test]` annotations** in `tests/lockfree_invariants.rs` (8 + 4 + 4 + 4).
 
 Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum (documented in the test file and `Cargo.toml`).
 
@@ -89,7 +92,7 @@ Full loom mode is currently blocked by upstream tokio/loom incompatibility in ru
 
 | Feature | Default | Effect |
 |---|---|---|
-| `port_forward` | on | Includes the `forward://` resource scheme and the `ssh_forward` tool surface (catalog grows from 29 to 30 tools). |
+| `port_forward` | on | Includes the `forward://` resource scheme and the `ssh_forward` tool surface (catalog grows from 35 to 36 tools). |
 | `test-fixtures` | off | Wires deterministic adapters (`FakeClock`, `DeterministicIdGen`). For tests; never enable in production builds. |
 
 ---
@@ -98,7 +101,7 @@ Full loom mode is currently blocked by upstream tokio/loom incompatibility in ru
 
 ssh-mcp v5 preserves the v3 / v4 lock-free baseline: every shared producer / consumer path uses `Arc<ArcSwap<T>>`, atomics, broadcast / mpsc channels, and `OnceCell` instead of `Mutex` / `RwLock`. v5 stacks three new categories of lock-free state on top: lifecycle adapter atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)), subscription mux atomics ([ADR 0004](./adr/0004-channel-mux-fairness.md)), and cascade refcount atomics ([ADR 0003](./adr/0003-lifecycle-binding.md)) — all preserve the strict baseline lints (`await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_in_scrutinee`).
 
-> **v5.0 — three new categories of lock-free state.** Phase 1 lands `ResourceLifecycle` + `SessionLifecycle` atomics; Phase 2 lands per-`SubId` `MultiplexLane` mpsc + `ChannelMux` round-robin cursor; cascade refcount sits on `SessionLifecycle.active_refs`. All Mutex-free; all loom-verifiable.
+> **v5.0 — three new categories of lock-free state, all merged.** Phase 1 landed `ResourceLifecycle` + `SessionLifecycle` atomics; Phase 2 landed per-`SubId` `MultiplexLane` mpsc + `ChannelMux` round-robin cursor; cascade refcount sits on `SessionLifecycle.active_refs`. All Mutex-free; all loom-verifiable.
 
 ### Adapter-internal carriers
 
