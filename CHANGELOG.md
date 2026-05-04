@@ -5,6 +5,34 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.2] — 2026-05-04
+
+LLM UX patch — penalize `ssh_run`, steer shell drive ops to await push, and propose ADR 0006 Amendment 1 (byte-threshold debouncer flush). No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
+
+### Penalize `ssh_run` (promote session reuse)
+
+- `ssh_run` description rewritten as `PENALIZED FALLBACK`. Spells out the per-call handshake cost (200–2000 ms + full session teardown) and the `DO NOT USE WHEN` matrix (any reuse possible, follow-up commands, output > a few KiB). Gives the preferred `ssh_connect(reuse=auto) → ssh_execute → ssh_subscribe` path step-by-step.
+- `ssh_execute` and `ssh_execute_batch` overlap guidance no longer steers atomic short commands toward `ssh_run`; both redirect to `ssh_connect(reuse=auto)` + `ssh_execute`.
+- Root `Implementation.instructions` (both `port_forward` feature gates) demote `ssh_run` from happy-path #1 to penalized fallback #4. Push-first connect+execute+subscribe path becomes the default.
+- `docs/API.md` instructions snapshot synced.
+- `docs/LLM_GUIDE.md` updates: terse + 70B prompts, decision flowchart (red-classed P5 `ssh_run` node), decision table split into may-revisit vs single-touch rows, FALLBACK PATHS prose all reordered.
+
+### Steer shell drive ops to await push (no `wait_for` chaining)
+
+- After `ssh_shell_write` / `ssh_shell_send_key`, the response arrives via push on the existing `shell://<id>/output` subscription. New `HINT: RECOMMENDED:` line on every drive response tells the LLM to wait on `notifications/resources/updated` and drain via `resources/read?cursor=auto`, with an explicit `Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex`.
+- `next_hint_for_shell_drive` reorders to lead with `ssh_subscribe (await push if not subscribed)` and `resources/read?cursor=auto (drain delta on push)`. `ssh_shell_wait_for` appears later qualified `(only for regex prompt sync)`. Polling reads stay last.
+- `next_hint_for_wait_for` leads with `ssh_subscribe` in BOTH `Matched` and `Timeout` states so the LLM stops chaining `wait_for` recursively. `Closed` remains terminal.
+- Tool descriptions: `ssh_shell_write`, `ssh_shell_send_key` get the `DO NOT chain ssh_shell_wait_for` block. `ssh_shell_wait_for` rewritten to lead with `PREFER ssh_subscribe`, lists `DO NOT USE WHEN` cases (post-write chaining, generic 'any output', repeated matches), and gives the preferred subscribe + push + drain path step-by-step.
+
+### Proposed (no code yet)
+
+- ADR 0006 Amendment 1 — byte-threshold debouncer flush. Adds a fourth wakeup source on the per-resource debouncer: flush whichever fires first between debounce window, force-flush tick, keepalive tick, or accumulated bytes since last broadcast. Bumps debouncer defaults to **`200ms` coalesce** + **`64k` byte-threshold**. Switches env-var interface from raw `*_MS` / `*_BYTES` integers to human-readable `Duration` (`200ms`, `1s`) and `ByteSize` (`64k`, `1m`) strings; legacy aliases stay accepted for one minor with a `DEPRECATED:` log nudge. Adds optional per-call `flush_bytes` / `debounce` overrides on `ssh_subscribe` (oneOf `integer | string`), with precedence `tool > env > default` and first-subscriber-wins on the shared debouncer. See [ADR 0006 → Amendment 1](docs/adr/0006-backpressure-policies.md#status).
+
+### Verified gates
+
+- `cargo build --release` exit 0 (3 binaries).
+- `cargo test --lib --quiet` — **1636 passed** (was 1633 in 5.0.1; +3 new render assertions covering the new HINT line, the subscribe-first NEXT line on send_key, and subscribe-first NEXT in both Matched/Timeout outcomes of `wait_for`).
+
 ## [5.0.1] — 2026-05-04
 
 LLM UX patch — closes the v5 narrative arc so every push-capable resource is `ssh_subscribe`-first across tool descriptions, NEXT chains, HINT lines, and discovery surfaces. No wire-format breakage; tool catalogue, structured_content schema, env vars, and error taxonomy unchanged.
