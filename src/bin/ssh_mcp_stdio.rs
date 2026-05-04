@@ -8,7 +8,13 @@
 #![deny(warnings)]
 #![deny(clippy::unwrap_used)]
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ssh_mcp::composition::prod::run_stdio().await
+use std::error::Error;
+
+use tokio::runtime::Builder;
+
+use ssh_mcp::composition::prod::run_stdio;
+
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(run_stdio())
 }
