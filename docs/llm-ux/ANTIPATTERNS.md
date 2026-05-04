@@ -1,8 +1,6 @@
 # Anti-patterns
 
-Ten failure modes that v5.0 explicitly engineers against. Each entry maps a behaviour to its symptom on the wire, the consequence (token waste / leak / cascade failure / data loss), the correct workflow, and the operator-side detection signal.
-
-The list is informed by [ADR 0005](../adr/0005-llm-ux-priorities.md), the lifecycle layer in [ADR 0003](../adr/0003-lifecycle-binding.md), and the channel-mux invariants in [ADR 0004](../adr/0004-channel-mux-fairness.md). The error codes referenced below are catalogued in [`ERROR_HANDBOOK.md`](./ERROR_HANDBOOK.md).
+Ten failure modes v5.0 explicitly engineers against. Each entry: symptom on the wire, consequence (token waste / leak / cascade failure / data loss), correct workflow, and operator-side detection signal. Sources: [ADR 0005](../adr/0005-llm-ux-priorities.md), [ADR 0003](../adr/0003-lifecycle-binding.md), [ADR 0004](../adr/0004-channel-mux-fairness.md). Error codes referenced below are catalogued in [ERROR_HANDBOOK.md](./ERROR_HANDBOOK.md).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
