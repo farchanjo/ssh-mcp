@@ -11,6 +11,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use crate::adapters::lifecycle::leak_watcher::{
+    LeakRiskAlert, LeakRiskSeverity, alert_canonical_uri,
+};
 use crate::application::connect_session::ConnectOutcome;
 use crate::application::disconnect_agent::DisconnectAgentOutcome;
 use crate::application::disconnect_session::DisconnectOutcome;
@@ -18,6 +21,7 @@ use crate::application::list_sessions::ListSessionsOutcome;
 use crate::domain::ids::AgentId;
 use crate::domain::session::SessionEntity;
 use crate::infra::mcp::helpers::output::sanitize_value;
+use crate::ports::subscriber_registry::ResourceKind;
 
 /// Threshold (per-agent session count) above which the list-sessions
 /// renderer appends an anti-leak HINT line nudging the LLM toward
@@ -292,17 +296,32 @@ pub fn disconnect_render(outcome: &DisconnectOutcome) -> String {
 }
 
 /// Render a [`ListSessionsOutcome`] as the v3 `SSH_LIST_SESSIONS` block.
+///
+/// Equivalent to [`list_sessions_render_with_warnings`] with an empty
+/// alert slice. Kept as a thin shim so tests + downstream callers that
+/// have not migrated to the leak-watcher probe stay source-compatible.
 #[must_use]
 pub fn list_sessions_render(outcome: ListSessionsOutcome) -> String {
+    list_sessions_render_with_warnings(outcome, &[])
+}
+
+/// Render a [`ListSessionsOutcome`] and append a `WARN: SUB_LEAK_RISK
+/// <uri>` line for each [`LeakRiskAlert`] supplied. Empty `alerts`
+/// produces the same output as [`list_sessions_render`].
+#[must_use]
+pub fn list_sessions_render_with_warnings(
+    outcome: ListSessionsOutcome,
+    alerts: &[LeakRiskAlert],
+) -> String {
     let ListSessionsOutcome {
         healthy,
         removed_dead: _,
         total,
     } = outcome;
-    if healthy.is_empty() && total == 0 {
+    if healthy.is_empty() && total == 0 && alerts.is_empty() {
         return String::from("SSH_LIST_SESSIONS: OK\nCOUNT: 0");
     }
-    let mut out = String::with_capacity(64 + healthy.len() * 128);
+    let mut out = String::with_capacity(64 + healthy.len() * 128 + alerts.len() * 96);
     out.push_str("SSH_LIST_SESSIONS: OK\nCOUNT: ");
     out.push_str(&healthy.len().to_string());
     if total > healthy.len() {
@@ -317,8 +336,64 @@ pub fn list_sessions_render(outcome: ListSessionsOutcome) -> String {
         append_session_item(&mut out, s);
     }
     append_anti_leak_hint(&mut out, &healthy);
+    append_sub_leak_risk_warnings(&mut out, alerts);
     append_next_line(&mut out, &next_hint_for_list_sessions(&healthy));
     out
+}
+
+/// Append one `WARN: SUB_LEAK_RISK <uri> [severity=...]` line per
+/// alert. Used by every list-style render — kept here so the format is
+/// single-sourced.
+pub(crate) fn append_sub_leak_risk_warnings(out: &mut String, alerts: &[LeakRiskAlert]) {
+    for alert in alerts {
+        out.push_str("\nWARN: SUB_LEAK_RISK ");
+        out.push_str(&alert_canonical_uri(alert));
+        out.push_str(" age_ms=");
+        out.push_str(&alert.age_ms.to_string());
+        out.push_str(" severity=");
+        out.push_str(severity_label(alert.severity));
+    }
+}
+
+/// Build the `warnings` array for the structured-content payload.
+/// Mirrors the markdown emitted by [`append_sub_leak_risk_warnings`] so
+/// MCP clients can parse either surface to the same set of resources.
+pub(crate) fn warnings_value(alerts: &[LeakRiskAlert]) -> Value {
+    let entries: Vec<Value> = alerts
+        .iter()
+        .map(|alert| {
+            json!({
+                "code":     "SUB_LEAK_RISK",
+                "resource": alert_canonical_uri(alert),
+                "kind":     resource_kind_label(alert.kind),
+                "age_ms":   alert.age_ms,
+                "severity": severity_label(alert.severity),
+                "msg":      format!(
+                    "{kind} {id} stayed Owned past the SUB_LEAK_RISK_WARN threshold; consider closing or subscribing.",
+                    kind = resource_kind_label(alert.kind),
+                    id   = alert.resource_id,
+                ),
+            })
+        })
+        .collect();
+    Value::Array(entries)
+}
+
+const fn severity_label(s: LeakRiskSeverity) -> &'static str {
+    match s {
+        LeakRiskSeverity::Warn => "warn",
+        LeakRiskSeverity::Kill => "kill",
+    }
+}
+
+const fn resource_kind_label(k: ResourceKind) -> &'static str {
+    match k {
+        ResourceKind::Shell => "shell",
+        ResourceKind::Command => "command",
+        ResourceKind::Transfer => "transfer",
+        ResourceKind::Session => "session",
+        ResourceKind::Forward => "forward",
+    }
 }
 
 /// Successor tools after a non-empty `ssh_list_sessions` — bulk-cleanup
@@ -576,11 +651,25 @@ pub fn disconnect_structured(outcome: &DisconnectOutcome) -> Value {
 }
 
 /// Build the list-sessions structured payload mirroring
-/// [`list_sessions_render`].
+/// [`list_sessions_render`]. Empty warnings list — kept for legacy
+/// callers; new code should use
+/// [`list_sessions_structured_with_warnings`].
 #[must_use]
 pub fn list_sessions_structured(
     outcome: &ListSessionsOutcome,
     filter_agent: Option<&str>,
+) -> Value {
+    list_sessions_structured_with_warnings(outcome, filter_agent, &[])
+}
+
+/// Build the list-sessions structured payload mirroring
+/// [`list_sessions_render_with_warnings`]. Adds a `warnings` array
+/// echoing the in-effect leak-risk alerts.
+#[must_use]
+pub fn list_sessions_structured_with_warnings(
+    outcome: &ListSessionsOutcome,
+    filter_agent: Option<&str>,
+    alerts: &[LeakRiskAlert],
 ) -> Value {
     let healthy: Vec<Value> = outcome.healthy.iter().map(session_json).collect();
     let hint = anti_leak_hint_text(&outcome.healthy);
@@ -594,6 +683,7 @@ pub fn list_sessions_structured(
         "total":   outcome.total,
         "hint":    hint,
         "next":    next,
+        "warnings": warnings_value(alerts),
     })
 }
 
@@ -978,5 +1068,140 @@ mod tests {
         assert_eq!(arr[1]["status"], "error");
         assert_eq!(arr[1]["code"], "TRANSPORT_ERROR");
         assert_eq!(arr[1]["reason"], "kaput");
+    }
+
+    // -- v5 Phase 3 — SUB_LEAK_RISK warnings -----------------------------
+
+    use super::{
+        list_sessions_render_with_warnings, list_sessions_structured,
+        list_sessions_structured_with_warnings,
+    };
+    use crate::adapters::lifecycle::leak_watcher::{LeakRiskAlert, LeakRiskSeverity};
+    use crate::ports::subscriber_registry::ResourceKind;
+
+    fn warn_alert(kind: ResourceKind, id: &str, age_ms: u64) -> LeakRiskAlert {
+        LeakRiskAlert {
+            kind,
+            resource_id: id.to_string(),
+            age_ms,
+            severity: LeakRiskSeverity::Warn,
+        }
+    }
+
+    #[test]
+    fn list_sessions_render_appends_warn_line_for_each_alert() {
+        let healthy = vec![sample_session("s-1", Some("agent-A"))];
+        let outcome = ListSessionsOutcome {
+            healthy: healthy.clone(),
+            removed_dead: vec![],
+            total: 1,
+        };
+        let alerts = vec![
+            warn_alert(ResourceKind::Shell, "leaky-shell", 2_500),
+            warn_alert(ResourceKind::Command, "leaky-cmd", 5_000),
+        ];
+        let body = list_sessions_render_with_warnings(outcome, &alerts);
+        assert!(
+            body.contains(
+                "WARN: SUB_LEAK_RISK shell://leaky-shell/output age_ms=2500 severity=warn"
+            ),
+            "missing shell warning, body: {body}"
+        );
+        assert!(
+            body.contains(
+                "WARN: SUB_LEAK_RISK command://leaky-cmd/output age_ms=5000 severity=warn"
+            ),
+            "missing command warning, body: {body}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_render_emits_no_warn_lines_when_alerts_empty() {
+        let outcome = ListSessionsOutcome {
+            healthy: vec![sample_session("s-1", None)],
+            removed_dead: vec![],
+            total: 1,
+        };
+        let body = list_sessions_render_with_warnings(outcome, &[]);
+        assert!(
+            !body.contains("WARN: SUB_LEAK_RISK"),
+            "must not emit WARN lines when alerts list is empty, body: {body}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_structured_includes_empty_warnings_array() {
+        let outcome = ListSessionsOutcome {
+            healthy: vec![sample_session("s-1", None)],
+            removed_dead: vec![],
+            total: 1,
+        };
+        let json = list_sessions_structured(&outcome, None);
+        let arr = json["warnings"].as_array().expect("warnings array");
+        assert!(
+            arr.is_empty(),
+            "default render must emit empty warnings array"
+        );
+    }
+
+    #[test]
+    fn list_sessions_structured_with_warnings_mirrors_render() {
+        let outcome = ListSessionsOutcome {
+            healthy: vec![sample_session("s-1", None)],
+            removed_dead: vec![],
+            total: 1,
+        };
+        let alerts = vec![warn_alert(ResourceKind::Shell, "leaky", 3_500)];
+        let json = list_sessions_structured_with_warnings(&outcome, None, &alerts);
+        let warnings = json["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 1);
+        let entry = &warnings[0];
+        assert_eq!(entry["code"], "SUB_LEAK_RISK");
+        assert_eq!(entry["resource"], "shell://leaky/output");
+        assert_eq!(entry["age_ms"], 3_500);
+        assert_eq!(entry["severity"], "warn");
+        assert!(entry["msg"].as_str().expect("msg").contains("shell leaky"));
+    }
+
+    #[test]
+    fn list_sessions_render_with_warnings_handles_kill_severity() {
+        let outcome = ListSessionsOutcome {
+            healthy: vec![],
+            removed_dead: vec![],
+            total: 0,
+        };
+        let alerts = vec![LeakRiskAlert {
+            kind: ResourceKind::Shell,
+            resource_id: "deadbeef".to_string(),
+            age_ms: 30_000,
+            severity: LeakRiskSeverity::Kill,
+        }];
+        let body = list_sessions_render_with_warnings(outcome, &alerts);
+        assert!(
+            body.contains("severity=kill"),
+            "kill severity must be reflected in WARN line, body: {body}"
+        );
+        assert!(
+            body.contains("shell://deadbeef/output"),
+            "uri must be canonical, body: {body}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_render_with_warnings_only_alerts_no_sessions() {
+        // Edge case: empty session list but watcher flagged a resource
+        // (e.g. a leaky command on a session that was just disconnected).
+        // The render should still emit the WARN line.
+        let outcome = ListSessionsOutcome {
+            healthy: vec![],
+            removed_dead: vec![],
+            total: 0,
+        };
+        let alerts = vec![warn_alert(ResourceKind::Transfer, "stuck", 4_000)];
+        let body = list_sessions_render_with_warnings(outcome, &alerts);
+        assert!(
+            body.contains("transfer://stuck/progress"),
+            "WARN line must surface even when sessions list is empty, body: {body}"
+        );
     }
 }
