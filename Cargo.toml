@@ -1,6 +1,17 @@
+[workspace]
+# v7.0.0-alpha.2 — ADR 0011 architectural retrenchment. The agent
+# binary path was retracted in favour of two integrated transports
+# (Wire + Sftp) that live inside the host crate, so the workspace
+# collapses back to a single package. The `[workspace.lints.*]` table
+# stays authoritative for the strict 3-layer lint baseline so the
+# `[lints] workspace = true` shorthand keeps working from the sole
+# member.
+members = ["."]
+resolver = "3"
+
 [package]
 name = "ssh-mcp"
-version = "6.0.0"
+version = "7.0.0"
 edition = "2024"
 rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
@@ -114,6 +125,11 @@ tracing = "0.1"                                                         # Tracin
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
 regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
+sha2 = "0.10"               # ADR 0010 — sha256 of resume prefix when verify=true
+md4 = "0.11"                # ADR 0011 v7.0 wire transport (slice 3) — MD4 strong checksum + per-file digest (RFC 1320)
+md-5 = "0.10"               # ADR 0011 v7.0 wire transport (slice 5) — MD5 per-file digest at protocol >= 30 (rsync 3.x default xfer_sum_nni)
+globset = "0.4"             # ADR 0011 SFTP transport — gitignore-style include/exclude glob matcher
+
 # clap intentionally not added — its derive macros emit
 # `#[allow(clippy::restriction)]` which conflicts with our forbid-level
 # Layer A Clippy baseline. The `ssh-mcp-tail` CLI surface is small (3
@@ -122,13 +138,20 @@ regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
 proptest = "1"              # v5 Phase 5 — property-based tests for state machine, cursor, lag policy invariants
+tempfile = "3"              # Synthetic local source trees for the ADR 0011 e2e-vm test (gated behind feature = "e2e-vm")
 
 [features]
 default = ["port_forward"]
 port_forward = []           # Port forwarding support
 test-fixtures = []          # Expose deterministic in-memory adapters (FakeClock, ...) for downstream tests
+e2e-vm = ["test-fixtures"]  # ADR 0011 SFTP rsync transport e2e test against a real Linux VM (requires SSH access to root@vm.services or SSH_MCP_E2E_HOST)
 
-[lints.clippy]
+[lints]
+# Inherit the strict 3-layer Clippy + rustc baseline declared at the
+# workspace root so every workspace member shares the same gate.
+workspace = true
+
+[workspace.lints.clippy]
 # Layer A — forbid (cannot be downgraded)
 unwrap_used      = { level = "forbid", priority = 1 }
 expect_used      = { level = "forbid", priority = 1 }
@@ -186,7 +209,7 @@ mutex_integer                   = "deny"
 # Allowed
 multiple_crate_versions = "allow"
 
-[lints.rust]
+[workspace.lints.rust]
 # `deny` (not `forbid`) so tests can opt-in via per-module `#[allow(unsafe_code, reason = "...")]`
 # for env-var manipulation; production code remains forbidden by default.
 unsafe_code                = "deny"
