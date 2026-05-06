@@ -27,6 +27,7 @@ The `list_changed` advertisement is reserved for tool-driven lifecycle events. T
 | `session://<id>/health`             | Session health snapshot           | `application/json` | no                       |
 | `forward://<id>/events`             | Port-forward event log            | `application/json` | yes                      |
 | `serial://<id>/output`              | UART / TTY / COM byte stream (v5.2 — ADR 0009) | `text/plain`       | yes                      |
+| `rsync://<id>/progress`             | Rsync per-file + aggregate progress events (v7.0 — ADR 0011; agent path in progress) | `application/json` | no                       |
 
 Reference implementation: `src/application/{list_resources,read_resource,subscribe_resource,unsubscribe_resource}.rs` (use cases), `src/infra/mcp/resource_handlers.rs` (rmcp wiring + URI parser), and `src/adapters/subscription/memory_registry.rs` (registry + per-resource debouncer + per-peer cursor).
 
@@ -35,10 +36,10 @@ Reference implementation: `src/application/{list_resources,read_resource,subscri
 ```
 <scheme>://<resource_id>/<sub_path>[?cursor=<value>]
 
-<scheme>     ::= shell | command | transfer | session | forward
+<scheme>     ::= shell | command | transfer | session | forward | serial | rsync
 <resource_id> ::= non-empty UUIDv4 (or any non-empty string for forward)
-<sub_path>   ::= output  (shell, command)
-              |  progress (transfer)
+<sub_path>   ::= output  (shell, command, serial)
+              |  progress (transfer, rsync)
               |  health   (session)
               |  events   (forward)
 <value>      ::= auto | 0 | <u64>
@@ -52,6 +53,26 @@ Errors during parsing surface as `INVALID_PARAMS` from `resources/read` and `res
 - `MissingId` — empty resource id.
 - `BadSubPath` — sub-path does not match the scheme (e.g. `shell://abc/progress`).
 - `BadCursor` — `?cursor=` value is neither `auto`, `0`, nor a valid `u64`.
+
+### v7.0 / ADR 0011 — `rsync://<id>/progress` event types
+
+The new `rsync://` push lane carries per-file + aggregate sync progress as `application/json` payloads serialised through `serde_json` (the `kind` discriminator tags every variant in `snake_case`):
+
+| `kind`            | Fields                                                                                                                | When emitted                                                |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `session_started` | `transport: wire \| agent`, `files_planned: u64`, `bytes_planned: u64`                                                | Once, after the planner walks the source tree.              |
+| `file_started`    | `rel_path: String`, `bytes_total: u64`                                                                                | Per file, before the delta phase begins.                    |
+| `file_progress`   | `rel_path`, `bytes_done: u64`, `bytes_total: u64`                                                                     | Mid-file, debounced by the standard 200 ms / 1 s windows.   |
+| `file_completed`  | `rel_path`, `bytes_transferred: u64`, `bytes_skipped: u64`                                                            | Per file, after the file finishes successfully.             |
+| `file_skipped`    | `rel_path`, `reason: size_match \| mtime_match \| dry_run`                                                            | Per file when the heuristic short-circuits the transfer.    |
+| `file_failed`     | `rel_path`, `code: ErrorCode`, `detail: String`                                                                       | Per file on a non-fatal failure (sync continues).           |
+| `sync_progress`   | `files_done: u64`, `files_total: u64`, `bytes_done: u64`, `bytes_total: u64`                                          | Aggregate beacon, debounced.                                |
+| `sync_completed`  | `stats: { files_total, files_done, bytes_total, bytes_transferred, bytes_skipped, files_deleted, files_failed }`      | Once, terminal — lane closes after this event.              |
+| `session_failed`  | `code: ErrorCode`, `detail: String`                                                                                   | Once, terminal — lane closes after this event.              |
+
+Backpressure default: `Snapshot` (matches v5 default for any push resource); switch to `DropOldest` per ADR 0006 when sync covers millions of small files. The byte-threshold flush (ADR 0006 Amendment 1, default 64 KiB) is reused — `sync_progress` ticks fire fast on multi-million-file trees and would otherwise wait on the 50 ms debounce window.
+
+> **Status (v7.0.0-alpha.4):** `transport=Sftp` lanes carry live `RsyncProgressEvent` frames end-to-end — `SessionStarted` → `FileStarted` / `FileProgress` / `FileCompleted` / `FileSkipped` / `FileFailed` → `SyncCompleted`. The `SessionStarted` discriminator carries `transport: "sftp"` (or `"wire"` once the Wire transport lands). Value-object types (`RsyncProgressEvent`, `RsyncTransportKind`, `SkipReason`, `ErrorCode`) live under `src/adapters/rsync/types.rs`. The Wire transport remains stubbed; lanes opened with `transport=Wire` close before any event reaches the subscriber until that slice lands.
 
 ## Resource Templates (v4.7)
 
@@ -204,9 +225,17 @@ The envelope is constructed in `src/infra/mcp/resource_handlers.rs::build_stream
 |--------|------|------------|
 | `shell://` | `text/plain` | UTF-8 lossy slice of the PTY ring buffer for the requested cursor window. |
 | `command://` | `text/plain` | Block-style v3 stdout/stderr (one nonce per response, two `--- name [nonce] ---` blocks separated by a newline). |
-| `transfer://` | `application/json` | Snapshot JSON (transfer id, direction, paths, bytes_transferred, total_bytes, status, last_seq). |
+| `transfer://` | `application/json` | Snapshot JSON (transfer id, direction, paths, bytes_transferred, total_bytes, status, last_seq). v6.1 / ADR 0010 adds `resumed_from: u64` (default `0`). |
 | `session://` | `application/json` | Snapshot JSON (session id, healthy, last_health_check, last_seq). |
 | `forward://` | `application/json` | Snapshot JSON (forward id, listener, target, accepted/closed counters, last_seq). |
+
+### v6.1 / ADR 0010 — resumed transfers ramp from `resumed_from`
+
+When a caller passes `resume=true` to `ssh_upload` / `ssh_download` and the preflight returns a non-zero offset, the server seeds `bytes_transferred` to `resumed_from` before the streaming task spawns. Subscribers on `transfer://<id>/progress` see push events ramp from `bytes_transferred = resumed_from` to `bytes_transferred = total_bytes` rather than from `0` — the percentage in the snapshot JSON reflects only the resumed segment progress.
+
+Skip-plan transfers (`resume=true` with destination already at `total_bytes`) reach `Completed` synchronously inside the tool call; subscribers connecting after the call get a single replay event with `status=Completed`, `bytes_transferred = total_bytes`, `resumed_from = total_bytes`. No mid-flight events emit.
+
+The `resumed_from` field is `#[serde(default)] = 0` — v5/v6.0 snapshot JSON deserialises unchanged.
 
 ## Stable peer identity (v4.5)
 

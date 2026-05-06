@@ -5,6 +5,450 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.0.0-alpha.8] — 2026-05-06
+
+ADR 0011 Wire transport — slice 2 of the openrsync port lands. The
+file-list (flist) encode/decode plus a minimal local-source walker
+ship in a new `src/adapters/rsync/wire/flist.rs`, wired into the
+session driver. Verified end-to-end against `rsync 3.2.7 --server` on
+a real Linux VM: the server's generator subsystem accepts our flist
+bytes, then waits for the slice-3 block-checksum protocol that
+remains on the backlog.
+
+### Added
+
+- `src/adapters/rsync/wire/flist.rs` — port of OpenBSD openrsync's
+  `flist.c` (BSD/ISC). Carries `Flist` value-object mirroring
+  `struct flist + struct flstat`, the eight `FLIST_*` flag constants
+  (verbatim from `flist.c` lines 55..62), `recv_flist` / `send_flist`
+  drivers over `MplexReader` / `MplexWriter`, and `gen_flist_local`
+  for walking a local directory tree into a sorted `Vec<Flist>`.
+  Security checks for absolute / backtracking / zero-length paths
+  ported verbatim from openrsync's `flist_recv_name`. 16 unit tests
+  cover every FLIST_* flag combination on round-trip.
+- Slice-2 driver `drive_slice2_session` in `src/adapters/rsync/wire/mod.rs`
+  — handshake → emit `RsyncProgressEvent::SessionStarted { transport: Wire }`
+  → walk local source → send empty filter-list terminator (single
+  `MSG_DATA` frame with `0u32` LE payload) → send flist → drain a few
+  post-flist mplex frames → return the slice-3 boundary error pointing
+  at signature + tokens + sender state machines.
+- `docs/MIGRATION.md` — `v7.0.0-alpha.8` section documenting the
+  slice-2 surface, the openrsync port deviations (FLIST_* vs XMIT_*,
+  always-LONG name encoding, no identifier sub-lists, no
+  `flist_topdirs` re-pass), and the preserved lock-free invariants.
+
+### Changed
+
+- `src/adapters/rsync/wire/mod.rs::WIRE_NEXT_SLICE_DETAIL` — now reads
+  `"openrsync port: handshake + mplex + flist landed (slice 2);
+  signature + token + sender state machines are slice 3"`.
+- `src/adapters/rsync/wire/mod.rs::run_wire_session` — receives `src`
+  by value and threads it through `gen_flist_local`. The slice-2
+  pre-flist `SessionStarted` event is emitted before flist send so
+  consumers see the canonical envelope.
+
+### Lock-free invariants (preserved)
+
+Zero new `Mutex` fields on hot paths. The single documented exception
+(`LaneState::{rx, join}` in `wire/mod.rs` wrapping a per-session
+`mpsc::Receiver` and `JoinHandle`) is unchanged from slice 1.
+
+### Wire-compat compatibility notes (against rsync 3.2.7)
+
+1. **`FLIST_*` vs `XMIT_*`**: the openrsync port uses the
+   protocol-27 8-bit flag set (`FLIST_TOP_LEVEL`, `FLIST_NAME_LONG`,
+   etc.). The upstream rsync `XMIT_EXTENDED_FLAGS` two-byte header
+   (used at protocols >= 28) is not part of the port; the rsync
+   server parses the 8-bit shape identically when the client never
+   advertises `XMIT_EXTENDED_FLAGS`.
+2. **Always-LONG name encoding**: every entry sets `FLIST_NAME_LONG`,
+   so the name remainder length is always a 4-byte LE i32. Mirrors
+   openrsync's "for ease, make all of our filenames be 'long'"
+   comment in `flist_send`.
+3. **No identifier sub-lists**: numeric uid/gid only this slice;
+   `idents_send` / `idents_recv` ship later.
+
+## [7.0.0-alpha.5] — 2026-05-06
+
+ADR 0011 Wire transport — first three layers of the rsync v31
+wire-compat client land real: handshake, multiplex framing, file-list
+encode/decode. The end-to-end pump exec's `rsync --server --sender`
+on the remote, runs the version + checksum-seed exchange, and reaches
+the mplex pump. Verified against rsync 3.2.7 on a real Linux VM.
+
+The wire transport now surfaces a 5-second
+[`DomainError::Timeout`] when the post-handshake mplex pump is
+blocked waiting on bytes the next slice's sender state machine
+needs to emit (filter-list send + file-list send for the push path,
+or the receiver's request stream for pull). The handshake reaching
+the seed exchange against real bytes proves the codec layers work;
+the deferred state machines are honestly surfaced as `TIMEOUT` rather
+than pinned in a permanent deadlock.
+
+### Added
+
+- `src/adapters/rsync/wire/handshake.rs` — rsync v31 handshake
+  (version + server-supplied seed) with full unit-test coverage
+  including a `tokio::io::duplex` smoke that mirrors the real wire
+  bytes captured from rsync 3.2.7.
+- `src/adapters/rsync/wire/mplex.rs` — rsync multiplex I/O codec
+  (`MplexReader` / `MplexWriter` over arbitrary `AsyncRead+Write`,
+  `MplexTag` enum mapping the 18 `MSG_*` tags through the
+  `MPLEX_BASE` bias). Frame-aggregation helpers + frame-size cap +
+  fatal-frame propagation.
+- `src/adapters/rsync/wire/flist.rs` — file-list encode/decode
+  with rsync's varint codec (1- to 9-byte little-endian-tail
+  format), the XMIT_* flag matrix (SAME_NAME, SAME_TIME, SAME_MODE,
+  SAME_UID, SAME_GID, LONG_NAME, EXTENDED_FLAGS, HLINKED), symlink
+  target capture, hardlink-index capture, and the trailing-zero
+  list terminator. 16 unit tests (varint roundtrip, XMIT collapse
+  paths, EXTENDED_FLAGS high-byte decode, truncated-payload
+  diagnostic).
+- `WireRsyncTransport::with_registry` — production wiring against
+  the shared `SshHandleRegistry`. The legacy `WireRsyncTransport::new`
+  stub stays as the unwired fallback so the composition root can
+  thread the registry in incrementally.
+- `tests/v7_rsync_wire_e2e_vm.rs` — opt-in end-to-end test
+  (`cargo test --features e2e-vm --test v7_rsync_wire_e2e_vm --
+  --include-ignored --nocapture`) that drives the live wire
+  transport against `rsync 3.2.7` on a real Linux host.
+
+### Changed
+
+- `WireSession::checksum_seed` now reflects the wire reality:
+  rsync sends the seed unilaterally (server -> client) over SSH;
+  the client-sent seed described in the original brief is a
+  daemon-mode artefact that does not exist in the SSH-tunnelled
+  flow. The handshake API drops the `local_seed` parameter.
+
+### Wire-compat compatibility notes (vs the original ADR 0011 brief)
+
+- The brief's textual `@RSYNCD: 31\n` greeting is the **daemon-mode**
+  handshake (`rsync://` URL scheme over a dedicated TCP server). The
+  SSH-tunnelled path emits **binary** 4-byte LE u32 fields. We follow
+  the SSH-tunnelled wire reality.
+- Mode / mtime / uid / gid in v31 file-list entries are **varint**,
+  not raw little-endian. The flist codec follows
+  `flist.c::send_file` in rsync 3.2.7.
+- `MPLEX_BASE = 7` — every mplex tag byte on the wire is biased by
+  this offset (`socket.c::write_mplex` in rsync 3.2.x). The
+  `MplexTag::from_wire` / `MplexTag::to_wire` helpers hide the bias
+  from callers.
+- The rsync server-sender path waits for the client to emit an empty
+  filter-list terminator before unblocking and emitting the
+  `MSG_FLIST` chunks. The current slice sends the terminator but the
+  full filter-list semantics + the file-list expectation byte that
+  follows it on the push side land in the next slice — the e2e test
+  documents this with a 5-second wire-session deadline that surfaces
+  the deadlock as a clean `TIMEOUT` instead of pinning the lane.
+
+## [7.0.0-alpha.4] — 2026-05-06
+
+ADR 0011 SFTP transport — capability probe wiring + e2e VM coverage. The
+`RsyncSyncUseCase` now consults a per-session-cached `SftpFeatures`
+snapshot before driving the SFTP path, surfaces `SFTP_FEATURE_MISSING`
+with a one-sentence DETAIL line for `preserve.symlinks` /
+`preserve.perms` requests against locked-down servers, and ships an
+opt-in end-to-end test (`tests/v7_rsync_e2e_vm.rs`, gated `e2e-vm`)
+that drives the live transport against a real Linux host. First
+real-world contact surfaced two bugs in the SFTP transport — both
+fixed in this slice.
+
+### Added
+
+- `RsyncSyncDeps` constructor bundle on `RsyncSyncUseCase` — port
+  cluster the composition root passes in to keep the constructor
+  under the `too_many_arguments` Clippy threshold while still
+  accepting the new `Arc<RusshRsyncSftpFs>` collaborator that drives
+  the SFTP capability probe.
+- `RsyncSyncRequest::preserve_symlinks` / `preserve_perms` —
+  request-level mirrors of `opts.preserve.links` / `opts.preserve.perms`
+  the use case consumes to fire the new probe-driven capability
+  gates.
+- Per-session probe cache (`DashMap<SessionId, SftpFeatures>`) inside
+  `RsyncSyncUseCase` so repeated `ssh_rsync` calls against the same
+  SSH session pay the probe round-trips only once.
+- `tests/v7_rsync_e2e_vm.rs` — opt-in end-to-end test (`cargo test
+  --features e2e-vm v7_rsync_e2e_vm -- --ignored --nocapture`) that
+  drives the live SFTP rsync transport against a real Linux host.
+  Defaults to `root@vm.services` with `~/.ssh/id_rsa`; honours
+  `SSH_MCP_E2E_HOST` / `_USER` / `_KEY_PATH` env-var overrides.
+- `e2e-vm` Cargo feature (default-off) and `tempfile` dev-dep.
+- 4 new use-case tests pinning the symlink / perms / cache-reuse
+  branches; 3 new v7 smoke tests pinning the same branches against
+  the integration fake stack.
+
+### Fixed
+
+- **Destination root must exist before the recursive walk** —
+  `walk_both_trees` (`src/adapters/rsync/sftp/mod.rs`) now best-effort
+  `mkdir`s the destination root before walking it. "Path exists"
+  failures are swallowed (the happy path on a re-run). Without this
+  fix the comparator emitted `Mkdir` actions for every nested child
+  but never for the root itself, so every subsequent `write_chunk`
+  failed with `No such file`.
+- **OpenSSH `SSH_FXP_SYMLINK` argument-order quirk** —
+  `RusshRsyncSftpFs::symlink` (`src/adapters/sftp/rsync_fs_impl.rs`)
+  now passes `(target_first, link_second)` to russh-sftp's
+  `symlink(linkpath, targetpath)` so the wire-level swap matches
+  OpenSSH's long-standing inversion (documented in `OpenSSH
+  PROTOCOL.1`). Without the swap symlinks were being created in the
+  wrong direction and surfaced as `SFTP_FEATURE_MISSING` despite the
+  server fully supporting symlinks.
+
+### Changed
+
+- `RsyncSyncUseCase` gains an extra generic `Sfs: RsyncSftpFsPort`
+  for the capability-probe collaborator. The composition root shares
+  the same `Arc<RusshRsyncSftpFs>` between the SFTP transport and
+  the use-case probe (both ride the same `SshHandleRegistry`).
+- `RsyncSyncUseCase::execute` now runs the SFTP capability probe
+  inline before invoking the SFTP transport's `start_session` — the
+  probe is cached per-session, so repeated calls amortise the three
+  round-trips (mkdir + setstat + symlink) across the lifetime of the
+  use case.
+
+### Documentation
+
+- `docs/API.md` — flips `transport=Sftp` from "being implemented" to
+  live for the supported subset; documents the four capability gates
+  (`preserve.symlinks` / `preserve.perms` / `preserve.hardlinks` /
+  `verify_checksum`) with the exact detail strings they emit.
+- `docs/LLM_GUIDE.md` — adds a "When SFTP transport is enough"
+  section, expands the `SFTP_FEATURE_MISSING` error handbook entry
+  to cover all four gate cases, and updates the v7 status block
+  from "alpha.2 stubs" to "alpha.4 live SFTP".
+- `docs/MIGRATION.md` — adds a v7.0.0-alpha.4 sub-section with the
+  e2e VM test invocation + env-var matrix and a "SFTP server
+  compatibility notes" subsection documenting the OpenSSH symlink
+  quirk and the destination-root mkdir requirement.
+
+## [7.0.0-alpha.3] — 2026-05-06
+
+ADR 0011 SFTP transport — first real implementation slice. The
+`SftpRsyncTransport` adapter goes from honest "being implemented" stub
+to a live recursive-mirror pipeline driven entirely through SFTP
+`readdir` + `stat` + `read` + `write` + `setstat` (no remote helper,
+no rsync binary required on the host). The Wire transport remains
+stubbed and ships in the next slice.
+
+### Added
+
+- `RsyncSftpFsPort` (`src/ports/rsync_sftp_fs.rs`) — narrow remote
+  filesystem port distinct from the legacy `SftpClientPort` so the
+  rsync mirror does not perturb the production `ssh_upload` /
+  `ssh_download` surface. Surfaces `readdir` / `lstat` / `read_link`
+  / `mkdir` / `rmdir` / `remove_file` / `symlink` / `set_metadata`
+  / `read_chunk` / `write_chunk`.
+- `FakeRsyncSftpFs` (`src/adapters/rsync/sftp/fake.rs`) — in-memory
+  fake driving the unit and integration tests; exposes
+  `fail_symlink` / `fail_setstat` knobs to exercise SFTP server
+  rejection paths.
+- `SftpWalker` (`src/adapters/rsync/sftp/walker.rs`) — recursive BFS
+  walker over `RsyncSftpFsPort::readdir` honouring gitignore-style
+  excludes / includes via `globset` and refusing the walk past the
+  `SSH_RSYNC_FILE_LIST_LIMIT` cap with `RSYNC_FILE_LIST_TOO_LARGE`.
+- `compare_trees` (`src/adapters/rsync/sftp/comparator.rs`) — derives
+  ordered `SyncAction` lists (`Mkdir` / `Transfer` / `Setstat` /
+  `Symlink` / `Skip` / `Delete`) from a source / destination pair.
+  Honours `--delete`, `--checksum` (`force_transfer`), and
+  preserve-mask differential setstat.
+- `SftpExecutor` (`src/adapters/rsync/sftp/executor.rs`) — applies
+  the action list, emits `RsyncProgressEvent`s into an `mpsc` lane
+  (32 KiB chunks per ADR 0010, 64 KiB `FileProgress` cadence),
+  enforces `dry_run`, cancellation tokens, and an optional
+  token-bucket bandwidth limit.
+- `TokenBucket` (`src/adapters/rsync/sftp/bwlimit.rs`) — lock-free
+  refill-on-demand rate limiter sized in bytes-per-second; drives
+  `--bwlimit` for the SFTP path. Cancel-safe.
+- `globset` 0.4 dependency for the include / exclude matcher.
+
+### Changed
+
+- `SftpRsyncTransport` is now generic over `F: RsyncSftpFsPort` with
+  `NoopFs` as the default. `SftpRsyncTransport::new()` and
+  `SftpRsyncTransport::without_fs()` keep returning the honest
+  "being implemented" stub for the production composition root that
+  has not wired the real adapter yet; downstream callers wire a real
+  filesystem via `SftpRsyncTransport::with_fs(fs, opts, capacity)`
+  and start receiving live `SessionStarted`, per-file progress, and
+  `SyncCompleted` events through `recv_event`.
+- `RsyncTransportPort::start_session` for the SFTP transport mints a
+  UUIDv7-suffixed `RsyncId`, spawns the pipeline as a background
+  task, and registers a per-session lane for `recv_event` /
+  `close`.
+
+### Tests
+
+- 1807 lib tests (+32 vs alpha.2): walker (BFS, kind classification,
+  exclude / include, file-list cap), comparator (skip / transfer /
+  delete / symlink replace / setstat differential / parent-before-child
+  ordering), executor (skip / dry-run / transfer / cancel / delete /
+  symlink unsupported), bwlimit (zero-rate disabled / refill / take
+  semantics), fake fs (readdir / write / read / rmdir / knobs).
+- Live transport pipeline test (`live_pipeline_emits_session_started_then_completed`)
+  drives an end-to-end recursive sync against `FakeRsyncSftpFs` with
+  one source file and asserts both the wire frame ordering and the
+  byte-identical destination.
+
+## [7.0.0-alpha.2] — 2026-05-06
+
+ADR 0011 architectural retrenchment — the deployed-agent path was retracted
+in favour of two integrated transports (`WireRsyncTransport` for the rsync
+v31 wire-compat client and `SftpRsyncTransport` for the universal SFTP
+fallback). Both transports live in-process inside the host crate; the
+workspace collapsed back to a single package. Both transports return
+descriptive `RSYNC_PROTOCOL_ERROR` "being implemented" stubs in this slice;
+the surface (tools, error taxonomy, push-lane URI shape, lifecycle
+binding) is the permanent shape — the next slice fills the transport
+bodies without churning anything else.
+
+### Removed
+
+- `crates/ssh-mcp-rsync-agent/` — the deployed binary sub-crate is gone.
+- `crates/ssh-mcp-rsync-proto/` — the shared wire-format crate is gone;
+  surviving value-object types (`FileKind`, `PreserveFlags`, `RsyncStats`,
+  `RsyncProgressEvent`, `RsyncTransportKind`, `SkipReason`, `ErrorCode`)
+  moved to `src/adapters/rsync/types.rs`. `RsyncStats` lives in
+  `src/domain/rsync.rs` so domain rules stay clean. Wire-format types
+  (`RsyncOp`, `RsyncOpPayload`, frame codec, op-code constants) had a
+  single producer / single consumer and were dropped along with the
+  agent.
+- `target/agents/{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,aarch64-apple-darwin}`
+  — the cross-compiled blobs are gone.
+- `RsyncAgentDeployPort`, `EmbeddedAgentDeployAdapter`,
+  `AgentRsyncTransport`, `SshShellExecAdapter`, the `RemoteShellExec`
+  collaborator port, and the agent embed mechanism — every artefact
+  under the deleted `src/adapters/rsync/agent/` sub-tree.
+- `transport=Agent` on the inbound `RsyncTransportArg` enum (replaced
+  by `transport=Sftp`).
+- `agent_path` request override on `SshRsyncArgs` (no agent to
+  override).
+- Cargo features `embed-linux-x86_64`, `embed-linux-aarch64`,
+  `embed-macos-aarch64`, `embed-all`.
+- 4 error codes: `AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`,
+  `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`. Net error-taxonomy
+  delta: 9 → 6 codes.
+
+### Added
+
+- `WireRsyncTransport` (`src/adapters/rsync/wire/mod.rs`) — stub Tier
+  1 transport, drives a remote `rsync --server` over the existing
+  russh exec channel. Returns `RSYNC_PROTOCOL_ERROR` with detail
+  "Wire transport (rsync v31 wire-compat) is being implemented; pass
+  transport=Sftp for the SFTP fallback or wait for the next slice".
+- `SftpRsyncTransport` (`src/adapters/rsync/sftp/mod.rs`) — stub Tier
+  2 transport, drives a recursive sync entirely through SFTP (no
+  remote helper). Returns `RSYNC_PROTOCOL_ERROR` with detail "SFTP
+  transport is being implemented; install rsync >= 3.2.0 on the
+  remote and pass transport=Wire, or wait for the next slice".
+- `transport=Sftp` on the inbound `RsyncTransportArg` enum.
+- `SFTP_FEATURE_MISSING` error code (POLICY) — surfaced when the
+  request asks the SFTP path for hardlinks (`opts.preserve.hardlinks=true`)
+  or delta-sync semantics (`opts.verify_checksum=true`); both are
+  Wire-only features today.
+- New v7 smoke tests covering each transport-selection branch (forced
+  Sftp, forced Wire with rsync missing → `RSYNC_VERSION_TOO_OLD`,
+  Auto-routes-to-Wire-when-rsync-v31, Auto-routes-to-Sftp-when-rsync-missing,
+  cancel-drives-close-on-both-transports, SFTP-with-hardlinks →
+  `SFTP_FEATURE_MISSING`).
+- `FakeSshClient::queue_exec_string` — scripted one-shot `execute`
+  outcome useful for the rsync probe path and other one-shot
+  exec assertions.
+
+### Changed
+
+- `RsyncSyncUseCase` generic surface simplified from
+  `<T, D, R, SR, Idg, Cfg, Sh>` to `<W, Sf, R, SR, Ssh, Idg, Cfg>`
+  where `W: RsyncTransportPort` is the wire-compat transport,
+  `Sf: RsyncTransportPort` is the SFTP fallback, and `Ssh: SshClientPort`
+  drives the rsync version probe via `execute`.
+- `RsyncTransportPort::send_op` was removed — the future Wire and
+  SFTP transports drive their on-the-wire operations through
+  transport-specific codecs that do not benefit from a generic op
+  enum. The port now exposes `start_session` + `recv_event` + `close`
+  only.
+- Workspace `Cargo.toml [workspace]` block: members list collapses
+  to `["."]`; `[workspace.lints.*]` table stays authoritative for
+  the strict 3-layer Clippy baseline.
+
+## [7.0.0] — 2026-05-05
+
+ADR 0011 phases 5+6+10 — agent fallback wire-format on `linux-x86_64`, full
+feature parity (recursive walk, exclude/include, `--delete`, dry-run, bwlimit,
+partial), and the `rsync://<id>/progress` push lane. **Wire-additive** on the
+MCP surface: the existing 36 tool catalogue is unchanged; the new
+`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats` tools currently still
+return `RSYNC_NOT_IMPLEMENTED` (the agent crate is fully implemented; the
+host-side transport adapter — phase 5b — is deferred to a follow-up).
+
+### Added
+
+- **`crates/ssh-mcp-rsync-agent`** is now a real binary, not a skeleton.
+  Implements the full custom protocol from ADR 0011 § "Wire format":
+  `Hello` handshake, `ListRequest` walking with `walkdir` + `globset`-based
+  gitignore-style exclude/include matcher, `SignatureReq` / `DeltaChunk`
+  via `fast_rsync`, `Mkdir` / `Symlink` / `Hardlink` / `Chmod` / `Chown`
+  / `Chmtime` / `Unlink` via `std::fs` + `nix`, `Progress` / `FileDone`
+  beacons, terminal `Cancel` handling. `--bwlimit=KBPS` token-bucket on
+  the writer side (60 ms tick granularity).
+- **`ResourceKind::Rsync`** variant on both the legacy
+  (`adapters::subscription::legacy`) and hexagonal port
+  (`ports::subscriber_registry`) enums. `rsync://<id>/progress` URIs
+  parse + format end-to-end through the registry helpers.
+- **Workspace versions** synced to `7.0.0` (root `ssh-mcp`,
+  `crates/ssh-mcp-rsync-proto`, `crates/ssh-mcp-rsync-agent`).
+
+### Fixed
+
+- **`cargo build --no-default-features` regression** in v6.1.0: the
+  `ResourceKind::Serial` variant was missing from the
+  `read_resource.rs` non-`port_forward` branch's exhaustive match,
+  blocking every no-default-features build. Phase 10 also adds the
+  matching `Rsync` arms project-wide so the new variant compiles
+  under every feature combination.
+
+### Deferred (out of phase scope; tracked for a follow-up)
+
+- **Phase 5 server-side adapter wiring** (`AgentTransportDeploy` +
+  `AgentRsyncTransport`). The agent binary is real but the host-side
+  russh+SFTP deploy + drive adapter is not yet plumbed into the
+  `RsyncTransportPort` "Agent" impl. The tool router stub therefore
+  still answers `RSYNC_NOT_IMPLEMENTED` on every `ssh_rsync*` call.
+- **Phase 7** cross-arch matrix (`linux-aarch64`, `macos-aarch64`).
+- **Phase 8 / 9** wire-compat client v31 + feature parity.
+- **Phase 13** loopback OpenSSH integration tests + cross-transport
+  property tests.
+- The 5 new env vars from ADR 0011 § "Configuration surface" stay
+  documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) but
+  are not yet read by the host transport adapter (which has not been
+  wired in this slice).
+
+## [6.1.0] — 2026-05-05
+
+SFTP transfer resume + verify (ADR 0010). **Wire-additive** — every v6.0 host keeps working byte-for-byte; resume is purely opt-in via two new request flags defaulting to `false`. No tool name strings, resource URI schemes, default behaviours, env vars, or MSRV changes.
+
+### Added
+
+- **`ssh_upload(resume: bool?, verify: bool?)`** and **`ssh_download(resume: bool?, verify: bool?)`** — opt-in resume from the first non-overlapping byte. When `resume=true`, the server pre-flights the destination size and seeks both endpoints to the resume offset; the streaming chunk loop then ramps `bytes_transferred` from `resumed_from` to `total_bytes`. When `verify=true` the resume prefix is sha256-hashed on both sides before continuing — costs one extra `ssh_exec` round-trip plus O(offset) bytes hashed remotely.
+- **`RESUMED_FROM:` response line** on the `ssh_upload` / `ssh_download` block-markdown body. Emitted **only** when the resume offset is > 0; suppressed for fresh transfers so v6.0 callers see byte-identical wires.
+- **`resumed_from: u64`** field on the upload / download `structured_content` payload and on `TransferEntity` (snapshot JSON). `#[serde(default)] = 0` keeps v5/v6.0 payloads backward-compatible.
+- **Two new wire codes** in the `STATE` category (extends [ADR 0007](docs/adr/0007-error-taxonomy.md)):
+  - `RESUME_OVERSHOOT` — destination is larger than source; refusing to resume.
+  - `RESUME_MISMATCH` — verify-mode hash mismatch (local vs remote diverged).
+- **NDJSON daemon** (`ssh-mcp-tail`) now accepts `resume` / `verify` on `upload` / `download` ops via `#[serde(default)]`. v6.0 daemon clients work unchanged.
+- **Test surface**: `tests/v6_resume_smoke.rs` (12 scenarios, 6 upload + 6 download covering Truncate / Skip / Resume / Overshoot / Mismatch / fresh transfer); `tests/property_resume.rs` (6 proptest invariants over the pure decision matrix); 4 net-new NDJSON parser tests; 2 net-new dispatcher tests; 5 net-new domain tests on `TransferEntity::with_resumed_from`; 11 unit tests on `decide_*_plan` decision matrix; 10 unit tests on the verify-mode helpers.
+
+### Changed
+
+- Total error-taxonomy size grows from 38 to 40 codes.
+- `TransferEntity` deserialisation accepts JSON without a `resumed_from` field (legacy snapshots) — the new field is `#[serde(default)]`.
+- Daemon NDJSON `upload` / `download` ops gain `resume?: bool` and `verify?: bool` (omitted by v6.0 callers).
+
+### Migration
+
+See [docs/MIGRATION.md → v6.0 → v6.1](docs/MIGRATION.md#v60--v61) for the full migration guide. Hosts that never opt into the new flags do not need to update code. New flags are documented in [docs/API.md → ssh_upload v6.1](docs/API.md#v61--adr-0010--resume--verify), [docs/LLM_GUIDE.md → Resuming a failed transfer](docs/LLM_GUIDE.md#v61--adr-0010--resuming-a-failed-transfer), and [docs/RESOURCES.md → v6.1](docs/RESOURCES.md#v61--adr-0010--resumed-transfers-ramp-from-resumed_from). No new env vars — see [docs/CONFIGURATION.md → v6.1 / ADR 0010](docs/CONFIGURATION.md#v61--adr-0010--resume--verify-no-new-env-vars).
+
 ## [6.0.0] — 2026-05-04
 
 Tool-name namespace cleanup. **First wire-breaking release since v5.0** — only `tools/list` name strings change. Every other surface (resource URI schemes, push narrative, error taxonomy, structured-content payloads, env vars, MSRV, dependency graph) is byte-identical to v5.3.2.

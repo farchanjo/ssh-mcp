@@ -518,6 +518,74 @@ flowchart TB
     style UC fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
 ```
 
+## Phase 5 — Rsync hybrid transport (v7.0.0-alpha.2 — surface stubs)
+
+ADR: [adr/0011-rsync-hybrid-transport.md](./adr/0011-rsync-hybrid-transport.md). Two-tier transport behind a single `ssh_rsync` MCP tool. **v7.0.0-alpha.2 architectural retrenchment**: the deployed-agent path was retracted in favour of two integrated transports — `WireRsyncTransport` (rsync v31 wire-compat client over a remote `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat`). Both transports live in-process inside the host crate; the workspace collapsed back to a single package. Both transports return descriptive `RSYNC_PROTOCOL_ERROR` "being implemented" stubs in this slice; the next slice fills the bodies.
+
+The transports ride the existing russh session via the shared `SshHandleRegistry` — one handshake per host, one channel per sync, zero new `Mutex` on the hot path. The progress lane registers under `rsync://<id>/progress` exactly like every other v5 push resource.
+
+### Hexagonal layer additions (v7.0)
+
+| Layer | Type | Module | Notes |
+|-------|------|--------|-------|
+| Domain | `RsyncSession` aggregate | `domain/rsync.rs` | `AtomicU8` status + 7 `AtomicU64` counters; CAS-driven status transitions; zero `Mutex`. |
+| Domain | `RsyncStats` value object | `domain/rsync.rs` | Aggregate counters; pure data. Re-exported via `adapters/rsync/types.rs` for transport-side projections. |
+| Domain | `RsyncId` newtype | `domain/rsync_ids.rs` | UUIDv7 wrapper. |
+| Domain | `DomainError::Rsync*` + `SftpFeatureMissing` | `domain/error.rs` | 6 new variants (RSYNC_NOT_FOUND, RSYNC_VERSION_TOO_OLD, RSYNC_PROTOCOL_ERROR, RSYNC_FILE_LIST_TOO_LARGE, RSYNC_PARTIAL_TRANSFER, SFTP_FEATURE_MISSING). |
+| Ports | `RsyncTransportPort` | `ports/rsync_transport.rs` | AFIT — `start_session`, `recv_event`, `close`. |
+| Ports | `RsyncRepository` | `ports/rsync_repo.rs` | AFIT — `insert`, `insert_if_under_cap`, `get`, `remove`, `count_by_session`, `list_filtered`. |
+| Application | `RsyncSyncUseCase` | `application/rsync_sync.rs` | Generic over `W: RsyncTransportPort` (wire) + `Sf: RsyncTransportPort` (sftp) + `R: RsyncRepository` + `SR: SessionRepository` + `Ssh: SshClientPort` + `Idg` + `Cfg`; drives probe / select / start / register. The probe runs the rsync version `ssh_exec` directly through `SshClientPort::execute` — no separate `RemoteShellExec` collaborator port. |
+| Adapters | `WireRsyncTransport` | `adapters/rsync/wire/mod.rs` | Stub Tier 1 transport. Real implementation drives a remote `rsync --server` over the existing russh exec channel speaking protocol v31. |
+| Adapters | `SftpRsyncTransport` | `adapters/rsync/sftp/mod.rs` | Stub Tier 2 transport. Real implementation drives a recursive sync entirely through SFTP — `readdir` + `stat` + `read` + `write` + `setstat`, no remote helper. |
+| Adapters | `adapters/rsync/types.rs` | value objects | `FileKind`, `PreserveFlags`, `RsyncProgressEvent`, `RsyncTransportKind`, `SkipReason`, `ErrorCode`. Replaces the deleted `ssh-mcp-rsync-proto` crate. |
+| Adapters | `DashMapRsyncRepo` | `adapters/repo/dashmap/rsync.rs` | Lock-free repo; primary `by_id` + secondary `by_session` index; `Arc<RsyncSession>` shared between producer and consumer. |
+| Infra MCP | `args/rsync.rs` + `render/rsync.rs` + `tool_router::ssh_rsync*` | `infra/mcp/` | Wire-additive — three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) + the `rsync://<id>/progress` resource read short-circuit + `resources/list` injection of live rsync URIs. |
+
+### Transport selection flow
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    participant Caller as MCP caller
+    participant H as Host (RsyncSyncUseCase)
+    participant Ssh as SshClientPort
+    participant W as WireRsyncTransport
+    participant Sf as SftpRsyncTransport
+    participant Reg as DashMapRsyncRepo
+
+    Caller->>H: ssh_rsync(transport=Auto|Wire|Sftp, opts)
+    alt transport=Sftp (skip probe)
+        H->>Sf: start_session(req)
+    else transport=Wire (forced)
+        H->>Ssh: execute("which rsync && rsync --version | head -1")
+        Ssh-->>H: stdout
+        alt protocol >= 31
+            H->>W: start_session(req)
+        else missing or older
+            H-->>Caller: Err(RSYNC_VERSION_TOO_OLD)
+        end
+    else transport=Auto
+        H->>Ssh: execute("which rsync && rsync --version | head -1")
+        Ssh-->>H: stdout
+        alt protocol >= 31
+            H->>W: start_session(req)
+        else missing / older
+            H->>Sf: start_session(req)
+        end
+    end
+    Note over H: capability gate: SFTP path<br/>refuses preserve.hardlinks<br/>+ verify_checksum<br/>(SFTP_FEATURE_MISSING)
+    H->>Reg: insert RsyncSession (Pending)
+    H-->>Caller: STARTED + RSYNC_ID + transport label
+```
+
+In v7.0.0-alpha.2 every `start_session` call returns `RSYNC_PROTOCOL_ERROR` with a transport-specific "being implemented" detail line — the surface is honest and the next slice swaps the stub bodies for the real Wire / SFTP drivers without touching the use case, the tool router, or the push lane wiring.
+
+### Lock-free invariants
+
+`RsyncSession` carries the entire mutable state as atomics — `AtomicU8` for the status byte (CAS-driven transitions), `AtomicU64` for each of the 7 progress counters. The producer (transport reader task) calls `record_file_done` / `record_file_failed` / `record_file_deleted` with `Acquire` / `AcqRel` orderings; the consumer (`ssh_rsync_stats`) reads the same atomics with `Acquire` ordering, so a counter snapshot always sees a consistent set of writes. Zero `Mutex` on the hot path.
+
+The transport adapters are stateless today (zero-sized stubs); the future Wire / Sftp implementations will own per-session lanes via `tokio::sync::mpsc::channel(N)` exactly like the channel-mux pattern from ADR 0004, never holding a lock across an `.await`.
+
 ## Subscribe pipeline (v5 layered view)
 
 ```mermaid

@@ -866,6 +866,199 @@ Reconnect after an unexpected transport drop and replay the lost segment of a kn
 
 ---
 
+### v6.1 / ADR 0010 — Resuming a failed transfer
+
+Two opt-in flags on `ssh_upload` / `ssh_download` recover a partially-completed multi-GiB transfer instead of re-streaming the full byte range. Defaults preserve v6.0 byte-identical behaviour — every existing host keeps working without code change.
+
+#### Happy path A — bare resume (`resume=true`, `verify=false`)
+
+Lowest-cost recovery. The server pre-flights the destination size and resumes from the first non-overlapping byte. The resume prefix is **trusted verbatim** — use this only when the caller knows the partial bytes have not been corrupted (no concurrent writers, no mid-flight mtime drift).
+
+```text
+1. ssh_upload(session_id, local_path, remote_path, resume=true)
+   -> SSH_UPLOAD: STARTED
+      TRANSFER_ID: ...
+      TOTAL_BYTES: 5368709120
+      RESUMED_FROM: 4294967296          # offset; line absent on fresh transfers
+
+2. sub_open uri=transfer://<TRANSFER_ID>/progress
+   -> push events ramp from `bytes_transferred = RESUMED_FROM` to `total_bytes`
+
+3. sub_close on terminal event
+```
+
+Skip-plan short-circuit: when remote size already equals local size, the call returns synchronously with `bytes_transferred = total_bytes`, `resumed_from = total_bytes`, terminal status `Completed`. No progress events emit.
+
+#### Happy path B — verified resume (`resume=true`, `verify=true`)
+
+Pair `verify=true` with `resume=true` to sha256-hash the resume prefix on both sides before continuing. Aborts with `[RESUME_MISMATCH]` if the hashes diverge — the supported guard against silent prefix corruption (mtime drift, concurrent edits, partial writes).
+
+```text
+1. ssh_upload(session_id, local_path, remote_path, resume=true, verify=true)
+   -> on hash agreement: identical to happy path A.
+   -> on hash divergence:
+      SSH_UPLOAD: ERROR
+      REASON: [SFTP_ERROR] [RESUME_MISMATCH] resume prefix sha256 differs (offset=...);
+              local=aa00... remote=bb11... Re-run with resume=false to overwrite,
+              or fix the partial file.
+```
+
+Cost: one extra `ssh_exec` round-trip plus O(offset) bytes hashed remotely (`sha256sum -b -- '<remote>' 2>/dev/null`). For a 10 GiB transfer interrupted at 4 GiB, the prefix hash takes 30–60 s on a 1 Gbps disk.
+
+#### Failure modes
+
+- `[RESUME_OVERSHOOT]` (STATE, no retry) — destination is **larger** than source. Indicates corruption or a wrong target file. Re-run with `resume=false` to overwrite, or pick the correct destination path.
+- `[RESUME_MISMATCH]` (STATE, no retry) — verify-mode hash mismatch. Re-run with `resume=false` to overwrite, or fix the partial file before retrying.
+
+#### When NOT to resume
+
+- Atomic-rename workflows (`path.tmp` -> `rename(path.tmp, path)`) — the partial file lives at a different path; point `remote_path` / `local_path` at the `.tmp` file or skip resume entirely.
+- Concurrent writers on the same path — same risk surface as v6.0 streaming; resume amplifies the corruption window.
+- The local file changed between the failure and the retry — `verify=false` produces a silently-corrupt destination; either use `verify=true` or restart from scratch.
+
+---
+
+### v7.0 / ADR 0011 — Recursive sync with rsync
+
+Three new tools: `ssh_rsync` (start), `ssh_rsync_cancel` (terminate), `ssh_rsync_stats` (snapshot). Two-tier transport: `transport=Auto` probes the remote and prefers wire-compat (rsync v31+); falls back to the universal SFTP transport when rsync is missing or older than v31. `transport=Wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older). `transport=Sftp` skips the probe and uses the universal SFTP fallback — slower than the Wire path because every block crosses the wire, but works against any host with a working SFTP subsystem.
+
+> **v7.0.0-alpha.4 status.** `transport=Sftp` is **live** for the supported subset (recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` continues to surface `RSYNC_PROTOCOL_ERROR` "wire transport is being implemented" — that slice lands next. The MCP surface, error taxonomy, push-lane URI shape, and lifecycle binding are all the permanent shape.
+
+#### When SFTP transport is enough
+
+The SFTP path covers the typical "deploy a directory tree" use case end-to-end without needing rsync on the remote. Pick `transport=Sftp` (or `transport=Auto` on a host that has no rsync) when:
+
+- The remote has a working SFTP subsystem (every host that already passes `ssh_upload` qualifies).
+- You do NOT need delta-sync (`opts.verify_checksum=true`) — SFTP copies whole blocks; the `bytes_skipped` counter only fires on whole-file size+mtime matches.
+- You do NOT need hard-link preservation (`opts.preserve.hardlinks=true`) — Wire-only.
+- You can accept the SFTP capability gates: when the server refuses `SSH_FXP_SETSTAT` (`opts.preserve.perms=true`) or `SSH_FXP_SYMLINK` (`opts.preserve.symlinks=true`), the use case returns `SFTP_FEATURE_MISSING` before burning RTT on the recursive walk.
+
+Pick `transport=Wire` when:
+
+- You need delta-sync (huge log / RDB / tarball with append-only mutations).
+- You need hard-link preservation across the sync root.
+- The remote has rsync >= 3.2.0 installed.
+
+Pick `transport=Auto` (default) when you don't care which path the server picks — the probe runs `which rsync && rsync --version`, prefers Wire on a v31+ remote, and routes to SFTP otherwise.
+
+Both transports ride the existing russh session — one handshake per host, one channel per sync. Progress events stream through `rsync://<id>/progress` (same push-resource conventions as `transfer://`).
+
+#### Happy path A — push a directory tree (`transport=Auto`, SFTP fallback)
+
+```text
+1. ssh_connect(address, username) -> SESSION_ID
+
+2. ssh_rsync(session_id=<sid>,
+             src="/home/me/build/",
+             dst="<host>:/var/www/site/",
+             opts={ recursive: true, delete: false, exclude: [".git/", "*.tmp"] })
+   -> SSH_RSYNC: STARTED
+      RSYNC_ID: 01902e76-...
+      TRANSPORT: sftp            # remote had no rsync; auto routed to SFTP
+      SUBSCRIBE: rsync://01902e76-.../progress
+
+3. sub_open uri=rsync://01902e76-.../progress
+   -> push events:
+      SessionStarted { transport: "sftp", files_planned: 1248, bytes_planned: 314_572_800 }
+      FileStarted    { rel_path: "index.html", bytes_total: 4096 }
+      FileProgress   { rel_path: "index.html", bytes_done: 4096, bytes_total: 4096 }
+      FileCompleted  { rel_path: "index.html", bytes_transferred: 4096, bytes_skipped: 0 }
+      ...
+      SyncCompleted  { stats: { files_done: 1248, bytes_transferred: 102_993_920, ... } }
+
+4. sub_close sub_id=<sid_from_step_3>
+```
+
+When the remote runs rsync >= 3.2.0, `transport=Auto` picks the Wire path; that path uses `fast_rsync`'s rolling-checksum delta sync to collapse unchanged blocks (`bytes_skipped` accumulates the wire-saved bytes; `bytes_transferred` counts only bytes that moved). The SFTP path copies whole blocks — `bytes_skipped` only fires on whole-file size+mtime matches.
+
+#### Happy path B — pull a directory tree
+
+```text
+ssh_rsync(session_id=<sid>,
+          src="<host>:/var/log/myapp/",
+          dst="/tmp/log-snapshot/",
+          opts={ recursive: true })
+```
+
+Direction is inferred from the `host:` prefix on `src` / `dst`. Exactly one side must be remote.
+
+#### Happy path C — `--delete` mode (mirror)
+
+```text
+ssh_rsync(session_id=<sid>,
+          src="/home/me/site/",
+          dst="<host>:/var/www/site/",
+          opts={ recursive: true, delete: true })
+```
+
+When `delete=true`, files present at the destination but missing from the source are removed. Push events emit `FileSkipped { reason: ... }` on dry-run mode and standard `FileCompleted` on real execution.
+
+#### Happy path D — resume an interrupted sync (`partial=true`)
+
+```text
+1. (first attempt — interrupted by network drop)
+   ssh_rsync(session_id=<sid>, src=..., dst=..., opts={ recursive: true })
+   -> sub_open ... -> SessionFailed { code: "RSYNC_PARTIAL_TRANSFER", detail: ... }
+
+2. (retry — re-uses the partial files)
+   ssh_rsync(session_id=<sid>, src=..., dst=..., opts={ recursive: true, partial: true })
+   -> agent skips files that already match by size + mtime;
+      delta-syncs files where the partial dst sha differs.
+```
+
+`partial=true` inherits ADR 0010's resume primitive — partial files at the destination are kept and the agent resumes from the first non-overlapping block. `partial=false` (default) truncates the destination and starts from byte zero on every retry.
+
+#### Happy path E — exclude / include patterns
+
+```text
+ssh_rsync(session_id=<sid>,
+          src="/home/me/repo/",
+          dst="<host>:/srv/repo/",
+          opts={ recursive: true,
+                 exclude: [".git/", "node_modules/", "target/", "*.tmp"],
+                 include: [".gitignore"] })  # overrides exclude on match
+```
+
+Patterns match gitignore-style. `include` wins over `exclude` when both rules match the same path. The agent enforces the rule list locally before frame emission, so the wire never carries excluded bytes.
+
+#### Happy path F — bandwidth limit (`bwlimit_kbps`)
+
+```text
+ssh_rsync(session_id=<sid>,
+          src=..., dst=...,
+          opts={ recursive: true, bwlimit_kbps: 5_000 })  # 5 MB/s cap
+```
+
+Token-bucket implementation on the agent's writer side; 60 ms tick granularity. Suitable for shaping background syncs against a production host.
+
+#### Happy path G — dry-run
+
+```text
+ssh_rsync(session_id=<sid>,
+          src=..., dst=...,
+          opts={ recursive: true, delete: true, dry_run: true })
+```
+
+Every would-be op emits `FileSkipped { reason: "dry_run" }` instead of a destructive write or delete. No bytes cross the wire. Useful for reviewing the impact of a `--delete` mirror before committing.
+
+#### Cleanup and cancellation
+
+```text
+ssh_rsync_cancel(rsync_id=<id>)            # terminate mid-sync; idempotent
+
+ssh_rsync_stats(rsync_id=<id>)             # pure read; same shape as ssh_transfer_progress
+```
+
+Cancel is a CAS to the `Cancelled` terminal status plus a `RsyncTransportPort::close` call. Idempotent on already-terminal sessions.
+
+#### When to fall back
+
+- **Operator does not control the remote** (managed services, vendor systems, locked-down hosts): `transport=Sftp` works against any host with a functional SFTP subsystem — i.e. any host where `ssh_upload` already works. Slower than the Wire path because every block crosses the wire, but universal.
+- **Hardlinks / delta-sync needed**: `transport=Sftp` returns `SFTP_FEATURE_MISSING` for `opts.preserve.hardlinks=true` and `opts.verify_checksum=true`. Switch to `transport=Wire` (requires rsync >= 3.2.0 on the remote) or drop the offending option.
+- **Wire transport surfaces `RSYNC_VERSION_TOO_OLD`**: install rsync >= 3.2.0 on the remote (the wire-compat client speaks protocol v31 only), or fall back to `transport=Sftp`.
+
+---
+
 ## Anti-patterns
 
 Ten failure modes v5.0 explicitly engineers against. Each entry: symptom on the wire, consequence, correct workflow, operator-side detection signal.
@@ -1494,6 +1687,26 @@ Argument validation and idempotency cache failures. Retry only after changing th
 - **Prevention:** Refer to the `ssh_shell_press` table in [API.md](./API.md) for the supported `(key, modifier)` matrix.
 - **Related:** [INVALID_REPEAT].
 
+#### [RESUME_OVERSHOOT] SFTP resume preflight: destination larger than source
+
+- **Category:** STATE
+- **Retryable:** no
+- **When:** `ssh_upload(resume=true)` saw a remote file larger than the local source, or `ssh_download(resume=true)` saw a local file larger than the remote source. The destination cannot be a strict prefix of the source.
+- **Why:** Either the wrong target path was supplied, the partial file was double-written, or another writer extended it.
+- **Cure:** Re-run with `resume=false` to overwrite the destination, or repoint `remote_path` / `local_path` at the correct partial file.
+- **Prevention:** Track which `remote_path` corresponds to a given `local_path`; never share a target path with a different writer.
+- **Related:** [RESUME_MISMATCH], [SFTP_ERROR].
+
+#### [RESUME_MISMATCH] SFTP resume verify: prefix sha256 differs (local vs remote)
+
+- **Category:** STATE
+- **Retryable:** no
+- **When:** `ssh_upload(resume=true, verify=true)` or `ssh_download(resume=true, verify=true)` hashed the resume prefix on both sides and the digests diverged. Indicates the local file changed between the original failure and the retry, the remote file was concurrently edited, or the partial bytes were corrupted in transit.
+- **Why:** The supported guard against silent prefix corruption.
+- **Cure:** Re-run with `resume=false` to overwrite the destination, or fix the partial file (truncate / repair) before retrying with `verify=true`.
+- **Prevention:** Avoid mtime drift on the source between transfer attempts; pair `resume=true` with `verify=true` on every flaky link to surface divergence early.
+- **Related:** [RESUME_OVERSHOOT], [SFTP_ERROR].
+
 ---
 
 ### INTERNAL
@@ -1539,6 +1752,77 @@ Bugs. Never retry. Collect logs and report.
 - **Cure:** Collect logs and file an issue.
 - **Prevention:** None at the caller level.
 - **Related:** [LIFECYCLE_STATE_CONFLICT].
+
+---
+
+### v7.0 / ADR 0011 — rsync hybrid transport
+
+Nine new codes covering the wire-compat probe, the agent deploy lifecycle, and the per-file / per-session error surface. Total error-taxonomy size: 40 -> 49.
+
+#### [RSYNC_NOT_FOUND] rsync binary missing on remote
+
+- **Category:** RESOURCE
+- **Retryable:** no
+- **When:** `transport=Wire` was forced and `which rsync` returned nothing.
+- **Why:** The remote does not have rsync installed.
+- **Cure:** Install rsync >= 3.2.0 on the remote, OR re-issue with `transport=Sftp` to take the universal SFTP fallback path.
+- **Prevention:** Use `transport=Auto` (default) to let the host pick the right path.
+- **Related:** [RSYNC_VERSION_TOO_OLD], [SFTP_FEATURE_MISSING].
+
+#### [RSYNC_VERSION_TOO_OLD] Remote rsync protocol older than v31
+
+- **Category:** POLICY
+- **Retryable:** conditional (only after upgrading the remote)
+- **When:** `transport=Wire` was forced and the rsync probe returned a binary older than 3.2.0 (or no binary at all).
+- **Why:** The wire-compat client speaks rsync protocol v31 only — older protocols are not supported.
+- **Cure:** Upgrade rsync on the remote to >= 3.2.0, OR re-issue with `transport=Sftp` to take the universal SFTP fallback path.
+- **Prevention:** Default to `transport=Auto`; the host falls back to the SFTP transport automatically when rsync is missing or older than v31.
+- **Related:** [RSYNC_NOT_FOUND], [SFTP_FEATURE_MISSING].
+
+#### [RSYNC_PROTOCOL_ERROR] Wire-compat or SFTP transport surfaced a transport-level fault
+
+- **Category:** TRANSPORT
+- **Retryable:** yes (one retry on the same channel; the russh session is reused)
+- **When:** Handshake or frame parsing failed mid-protocol on the Wire transport, OR an SFTP-side stat/read/write failed in a way the SFTP transport could not classify under `SFTP_FEATURE_MISSING`. v7.0.0-alpha.2: the transport bodies are stubs returning a descriptive "being implemented" detail per transport choice.
+- **Why:** Network corruption, server-side rsync stderr, or (in v7.0.0-alpha.2) the surface stub.
+- **Cure:** Switch transports (Wire ↔ Sftp) and retry. Inspect the detail line for guidance on the alternative path.
+- **Prevention:** Default to `transport=Auto`; the host picks the path that maximises liveness.
+- **Related:** [RSYNC_PARTIAL_TRANSFER], [SFTP_FEATURE_MISSING].
+
+#### [RSYNC_FILE_LIST_TOO_LARGE] File list exceeds `SSH_RSYNC_FILE_LIST_LIMIT`
+
+- **Category:** POLICY
+- **Retryable:** conditional (after tightening the include/exclude rules)
+- **When:** The recursive walk produced more than `SSH_RSYNC_FILE_LIST_LIMIT` (default 1,000,000) entries before the transport flushed its list-end frame.
+- **Why:** Pathological tree (millions of files) or missing exclude rules.
+- **Cure:** Tighten `opts.exclude` (e.g. add `node_modules/`, `target/`, `.git/`, large generated trees), OR raise `SSH_RSYNC_FILE_LIST_LIMIT` if the workload genuinely needs it.
+- **Prevention:** Audit the source tree before the first sync; size includes/excludes for the host's memory budget.
+- **Related:** [RSYNC_PROTOCOL_ERROR].
+
+#### [RSYNC_PARTIAL_TRANSFER] Sync interrupted mid-flight
+
+- **Category:** TRANSPORT
+- **Retryable:** yes (re-run with `partial=true`)
+- **When:** The russh channel dropped, the transport crashed, or an explicit cancel landed mid-sync.
+- **Why:** Network drop, host kill signal, or operator cancel.
+- **Cure:** Re-run with `opts.partial=true` so the transport resumes from the first non-overlapping block per file. Defaults (`partial=false`) truncate the destination on retry.
+- **Prevention:** Set `partial=true` upfront on long-running syncs over flaky links.
+- **Related:** [TIMEOUT], [LAGGED_DROPS_DETECTED].
+
+#### [SFTP_FEATURE_MISSING] SFTP transport cannot satisfy a requested feature
+
+- **Category:** POLICY
+- **Retryable:** conditional (after dropping the offending flag or switching to `transport=Wire`)
+- **When:** `transport=Sftp` was selected (forced or chosen by Auto) AND one of:
+  1. Hardlink preservation requested (`opts.preserve.hardlinks=true`) — Wire-only.
+  2. Delta-sync semantics requested (`opts.verify_checksum=true`) — Wire-only.
+  3. Symlink preservation requested (`opts.preserve.symlinks=true`) AND the SFTP capability probe reported `symlink_supported=false` (server refused `SSH_FXP_SYMLINK`).
+  4. Permission preservation requested (`opts.preserve.perms=true`) AND the probe reported `setstat_supported=false` (server refused `SSH_FXP_SETSTAT`).
+- **Why:** Hardlinks and rolling-checksum delta sync are Wire-only features today (the SFTP transport copies whole blocks and cannot reconstruct an inode-deduped tree). Symlink / setstat ops are routinely refused by locked-down SFTP servers (`internal-sftp` chroot configurations, Windows OpenSSH 7.7).
+- **Cure (case 1/2)**: drop the Wire-only flag OR re-issue with `transport=Wire` (needs rsync >= 3.2.0 on the remote).
+- **Cure (case 3/4)**: drop the offending preserve flag OR re-issue with `transport=Wire` to bypass the SFTP server's restriction.
+- **Prevention:** Default to `transport=Auto`; only force `transport=Sftp` when you know the workload tolerates whole-block copies and the server's capability profile matches.
+- **Related:** [RSYNC_PROTOCOL_ERROR], [RSYNC_VERSION_TOO_OLD].
 
 ---
 
