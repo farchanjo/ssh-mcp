@@ -598,7 +598,9 @@ pub fn build_use_cases() -> ProdWiring {
     //   first slice wires it on top of [`RusshRsyncSftpFs`] using the
     //   shared [`SshHandleRegistry`] so the live pipeline rides the
     //   same russh session as `ssh_exec` / `ssh_upload`.
-    let rsync_wire: Arc<ConcreteRsyncWire> = Arc::new(WireRsyncTransport::new());
+    let rsync_wire: Arc<ConcreteRsyncWire> = Arc::new(WireRsyncTransport::with_registry(
+        sftp.handle_registry().clone(),
+    ));
     let rsync_sftp_fs: Arc<ConcreteRsyncSftpFs> =
         Arc::new(RusshRsyncSftpFs::new(sftp.handle_registry().clone()));
     let rsync_sftp: Arc<ConcreteRsyncSftp> = Arc::new(SftpRsyncTransport::with_fs(
