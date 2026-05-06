@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-ssh-mcp **v6.0.0** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus five v5 layers: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), serial transport ([ADR 0009](docs/adr/0009-serial-transport.md), v5.2 — merged). v6.0 splits the 36-tool catalogue across three semantic eixos: **`ssh_*`** (21 tools, ops over SSH), **`sub_*`** (9 tools, lane management — cross-resource), **`serial_*`** (6 tools, local UART/TTY/COM — no SSH). Wire-breaking on tool name strings only; resource URIs / push narrative / error taxonomy / structured-content payloads are byte-identical to v5.x.
+ssh-mcp **v7.0.0-alpha.8** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus six layered deltas: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), serial transport ([ADR 0009](docs/adr/0009-serial-transport.md), v5.2 — merged), SFTP resume + verify ([ADR 0010](docs/adr/0010-sftp-resume.md), v6.1 — merged), and the rsync hybrid transport ([ADR 0011](docs/adr/0011-rsync-hybrid-transport.md), v7.0 — **SFTP transport live; openrsync port: handshake + mplex + flist landed (slice 2); slice 3 (signature + tokens + sender) next**). v6.0 split the 36-tool catalogue across three semantic eixos: **`ssh_*`** (21 tools, ops over SSH), **`sub_*`** (9 tools, lane management — cross-resource), **`serial_*`** (6 tools, local UART/TTY/COM — no SSH). v7.0 ships **`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`** with the permanent surface and two integrated transports — `WireRsyncTransport` (rsync v31 wire-compat over a remote `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback). v7.0.0-alpha.4 flipped the SFTP transport to live for the supported subset: recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a per-session `SftpFeatures` capability probe, opt-in end-to-end test (`tests/v7_rsync_e2e_vm.rs`, gated `e2e-vm`) against a real Linux VM. v7.0.0-alpha.7 then retired the alpha.5 / alpha.6 handcrafted Wire client and started a canonical port of OpenBSD's openrsync (BSD/ISC); v7.0.0-alpha.8 lands slice 2 (file-list encode/decode plus a minimal local-source walker, verified end-to-end against rsync 3.2.7 — the server's generator subsystem accepts our flist bytes). The Wire transport continues to surface `RSYNC_PROTOCOL_ERROR` with the slice-3 boundary message until signature + tokens + sender state machines land. Resource URIs / push narrative / error taxonomy / structured-content payloads remain byte-identical to v5.x.
 
-Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5).
+**v7.0.0-alpha.2 architectural retrenchment** — the original v7.0 plan shipped a deployed-agent transport (linux-x86_64 cross-compiled binary, embedded via `include_bytes!`, SFTP-uploaded with sha256 verification). That path was retracted in favour of "tudo integrado": both transports live inside the host crate. The `crates/ssh-mcp-rsync-agent/` and `crates/ssh-mcp-rsync-proto/` sub-crates were deleted; the workspace collapsed back to a **single package**. 4 agent-specific error codes (`AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`, `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`) were dropped; 1 new code (`SFTP_FEATURE_MISSING`) was added. The `transport` enum is now `Auto | Wire | Sftp`. Resolver 3, edition 2024, MSRV 1.95.
+
+Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION.md → v6.1 → v7.0](docs/MIGRATION.md#v61--v70).
 
 ## Build commands
 
@@ -12,8 +14,8 @@ cargo build --release --bin ssh-mcp                # HTTP server (axum 0.8 + rmc
 cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
 cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
 cargo build --release --no-default-features        # No port forwarding
-cargo test --lib --quiet                           # ~1657 lib tests
-cargo test --tests --features test-fixtures --quiet  # 88 integration tests across 5 binaries (v4_smoke 2, v5_smoke 8, v5_daemon_smoke 5, chaos 41, property 32) + lockfree_invariants (gated #[cfg(loom)])
+cargo test --lib --quiet                           # ~1775 lib tests
+cargo test --tests --features test-fixtures --quiet  # 106 integration tests across 8 binaries (v4_smoke 2, v5_smoke 8, v5_daemon_smoke 5, v6_resume_smoke 12, v7_rsync_smoke 6, chaos 41, property 32) + lockfree_invariants (gated #[cfg(loom)])
 cargo test --features test-fixtures                # Use cases vs deterministic adapters
 cargo fmt --all -- --check
 cargo clippy --release --all-features -- -D warnings   # Strict lint gate (production-only)
@@ -205,7 +207,7 @@ All settings follow: **Parameter → Environment Variable → Default**. Full ta
 
 ### Error handling
 
-- **Categorised** ([ADR 0007](docs/adr/0007-error-taxonomy.md)): 38 codes across 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics. LLM hosts can branch on category alone.
+- **Categorised** ([ADR 0007](docs/adr/0007-error-taxonomy.md), extended by [ADR 0010](docs/adr/0010-sftp-resume.md)): 40 codes across 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics. v6.1 adds `RESUME_OVERSHOOT` and `RESUME_MISMATCH` to the `STATE` bucket. LLM hosts can branch on category alone.
 - **Retryable**: `TRANSPORT` class — exponential backoff via `backon`, max 10 s.
 - **Non-retryable**: `AUTH`, `RESOURCE`, `STATE` (without `_meta.idempotency_key`), `INTERNAL`.
 - All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers use `Result<T, DomainError>` (`thiserror`).
@@ -237,7 +239,7 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 - Use cases stay generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT; the dyn-safe slices (`LaneAdmin`) live alongside the async slice for cold-path operations.
 - Match exhaustively (no `_ =>` for closed enums; `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- ~1657 lib tests + 88 integration tests across 5 binaries (`v4_smoke` 2, `v5_smoke` 8, `v5_daemon_smoke` 5, `chaos` 41, `property` 32) + 20 loom invariants (`tests/lockfree_invariants.rs`, gated `#[cfg(loom)]`) + Python integration suites (`scripts/test_*.py`) + 5 stress scripts (`scripts/stress_*.py`).
+- ~1775 ssh-mcp lib tests + 106 integration tests across 7 binaries (`v4_smoke` 2, `v5_smoke` 8, `v5_daemon_smoke` 5, `v6_resume_smoke` 12, `v7_rsync_smoke` 6, `chaos` 41, `property` 32) + 20 loom invariants (`tests/lockfree_invariants.rs`, gated `#[cfg(loom)]`) + Python integration suites (`scripts/test_*.py`) + 5 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - Loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`); 20 `#[test]` annotations covering lifecycle CAS race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity, mux fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, cursor advance under contention. Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum.
 
@@ -252,3 +254,12 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 - New env vars (lifecycle / lane / mux / daemon) — defaults preserve v4 behaviour. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Full host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). v3 → v4 contributor narrative (the v4.1 deep-decouple addendum): [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4).
+
+## v6.1 migration notes (ADR 0010)
+
+- **Wire-additive** — every v6.0 host keeps working byte-for-byte. No tool name strings, env vars, or default-behaviour deltas. See [docs/MIGRATION.md → v6.0 → v6.1](docs/MIGRATION.md#v60--v61).
+- Two opt-in `bool?` flags on `ssh_upload` / `ssh_download`: `resume` (default `false`) and `verify` (default `false`). Per [ADR 0010](docs/adr/0010-sftp-resume.md).
+- One new response line: `RESUMED_FROM: <u64>` — emitted only when offset > 0. v6.0 callers see byte-identical wires.
+- One new structured-content / domain field: `resumed_from: u64` with `#[serde(default)] = 0`.
+- Two new wire codes: `RESUME_OVERSHOOT`, `RESUME_MISMATCH` (both `STATE`, neither retryable). Total error-taxonomy size grows from 38 to 40.
+- No new env vars — see [docs/CONFIGURATION.md → v6.1 / ADR 0010](docs/CONFIGURATION.md#v61--adr-0010--resume--verify-no-new-env-vars).

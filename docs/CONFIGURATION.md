@@ -73,6 +73,26 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 |----------|------|---------|-------|-------------|
 | `SSH_TRANSFER_CLEANUP_TTL` | `u64` (s) | `300` | `>= 0` | TTL before terminated (completed/failed/cancelled) transfers are removed from the transfer repository. Gives clients a window to poll the final state. |
 
+### v6.1 / ADR 0010 — resume + verify (no new env vars)
+
+The ADR 0010 resume primitive is purely runtime opt-in via two `bool?` request flags (`resume`, `verify`) on `ssh_upload` / `ssh_download`. There are **no new environment variables**:
+
+- Chunk size, debouncer windows, lag policies, per-transfer broadcast cap, and lifecycle bindings are inherited byte-for-byte from v6.0.
+- The `verify=true` hash command runs through the existing `ssh_exec` path; its O(offset) cost is documented in [API.md → ssh_upload](./API.md#ssh_upload) but is not configurable.
+- Resume preflight pays at most one `metadata` round-trip on the SFTP channel; no caller-tunable cap exists.
+
+If a future ADR introduces resume tuning knobs (chunk-size override, parallel hash threads, prefix-truncation policy), they will land here.
+
+### v7.0 / ADR 0011 — rsync hybrid transport (3 reserved env vars)
+
+Documented for forward-compat; **none of these are read yet** in v7.0.0-alpha.2 because both transports are surface stubs. The next slice wires the env-var path together with the Wire / SFTP transport bodies. The agent-cache env vars (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped along with the agent path during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SSH_RSYNC_PROBE_TIMEOUT_MS` | `u64` (ms) | `2000` | Max wait for the `rsync --version` probe before falling back to the SFTP transport. |
+| `SSH_RSYNC_BLOCK_SIZE` | `u32` (bytes) | `0` (auto: `sqrt(file_size)` rounded to 1 KiB) | Override `fast_rsync` rolling-checksum block size on the Wire transport. Smaller blocks yield finer deltas at the cost of larger signature footprints. SFTP transport ignores this knob. |
+| `SSH_RSYNC_FILE_LIST_LIMIT` | `u64` (entries) | `1_000_000` | Max file-list size; both transports refuse with `RSYNC_FILE_LIST_TOO_LARGE` above this cap. |
+
 ## Subscribe layer
 
 The subscription layer (introduced in v3, preserved in v4) adds eight env vars covering broadcast channel sizing, debouncer timing, and peer GC. See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline) for the producer → debouncer → notification pipeline.

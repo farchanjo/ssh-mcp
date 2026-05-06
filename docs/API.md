@@ -58,7 +58,9 @@ Complete API reference for the **36 MCP tools** (or 35 without `port_forward`) s
 
 ---
 
-## Tools (36 with `port_forward`, 35 without)
+## Tools (39 with `port_forward`, 38 without)
+
+**v7.0 / ADR 0011** adds three live tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) on top of the v6.x carry-over surface. Three semantic eixos: `ssh_*` (24 tools — was 21), `sub_*` (9 tools), `serial_*` (6 tools).
 
 v5.2 adds **6 serial / UART / TTY / COM tools** (ADR 0009): `serial_open`, `serial_close`, `serial_write`, `serial_press`, `serial_scan`, `serial_active`. The legacy 21-tool surface is unchanged; existing v3 / v4 / v5.0 / v5.1 hosts continue to work without changes.
 
@@ -736,6 +738,45 @@ NEXT: ssh_transfer_progress(transfer_id=8f7e6d5c-..., wait=true)
 
 **Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `LOCAL_FILE_ERROR` (tagged SFTP — `fs::metadata` failed), `LOCAL_NOT_FILE` (live in v4.6 — emitted from `application/upload_file.rs::guard_local_path_is_file` when the local path resolves but is not a regular file), `SFTP_ERROR` (untagged catch-all).
 
+#### v6.1 / ADR 0010 — resume + verify
+
+Two opt-in flags layer onto `ssh_upload`. Defaults preserve v6.0 byte-for-byte behaviour; both fields are wire-additive (`#[serde(default)]`).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `resume` | `bool?` | `false` | Pre-flight remote size; resume from the first non-overlapping byte. When `false`, every upload truncates the destination (v6.0 semantics). |
+| `verify` | `bool?` | `false` | When `resume = true`, hash the resume prefix on both sides (sha256) and abort with `RESUME_MISMATCH` on divergence. When `false`, the prefix is trusted verbatim. |
+
+Resumed responses gain one extra line:
+
+```
+SSH_UPLOAD: STARTED
+TRANSFER_ID: 8f7e6d5c-...
+SESSION_ID: a3f2b1d7-...
+FROM: /home/alice/data.tar.gz
+TO: /var/incoming/data.tar.gz
+SIZE: 5.0 GB (5368709120 bytes)
+BYTES: 5368709120
+RESUMED_FROM: 4294967296          # NEW — emitted only when resume offset > 0
+HINT: subscribe to transfer://8f7e6d5c-.../progress for realtime progress
+NEXT: sub_open uri=transfer://8f7e6d5c-.../progress
+```
+
+`RESUMED_FROM:` is suppressed for fresh transfers (offset `0`) so v6.0 callers see byte-identical wires. The structured payload always carries `"resumed_from": <u64>`.
+
+**Skip plan** — when `resume = true` and remote size already equals local size, the transfer reaches `Completed` synchronously: `bytes_transferred = total_bytes`, `resumed_from = total_bytes`, no progress events emitted. Subscribers connecting after the call get a single replay event.
+
+**New error codes (extends [ADR 0007](./adr/0007-error-taxonomy.md))**:
+
+| Code | Category | Retry | Detail |
+|---|---|---|---|
+| `RESUME_OVERSHOOT` | `STATE` | no | Destination is larger than source; refusing to resume. Re-run with `resume=false` to overwrite. |
+| `RESUME_MISMATCH` | `STATE` | no | Resume prefix hash mismatch (local vs remote diverged); re-run with `resume=false` to overwrite, or fix the partial file. |
+
+`verify = true` adds one extra `ssh_exec` round-trip plus O(offset) bytes hashed remotely (`sha256sum -b -- '<remote>' 2>/dev/null`). For a 10 GiB transfer interrupted at 4 GiB, the prefix hash takes 30–60 s on a 1 Gbps disk. Default-off keeps the fast path fast.
+
+**mtime-drift caveat** — when the local file is modified between the original failure and the resume call, the resume prefix bytes diverge. With `verify = false` the destination is silently corrupt; `verify = true` is the supported guard.
+
 ---
 
 ### ssh_download
@@ -768,6 +809,17 @@ Same shape as upload — `FROM` is the remote source, `TO` is the local destinat
 **Errors**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `SFTP_OPEN_FAILED`, `REMOTE_METADATA_ERROR`, `SFTP_ERROR`.
 
 **Wire codes**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `SFTP_OPEN_FAILED` (tagged SFTP), `REMOTE_METADATA_ERROR` (live in v4.6 — emitted from `adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` when the remote stat call fails), `SFTP_ERROR` (untagged catch-all).
+
+#### v6.1 / ADR 0010 — resume + verify
+
+Mirror of the upload contract with directions swapped. Two opt-in flags; defaults preserve v6.0 behaviour.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `resume` | `bool?` | `false` | Pre-flight local size; resume the download from the first non-overlapping byte. When `false`, every download truncates the local destination (v6.0 semantics). |
+| `verify` | `bool?` | `false` | When `resume = true`, hash the resume prefix on both sides (sha256 over `dd if='<remote>' bs=1 count=<offset>` on the remote) and abort with `RESUME_MISMATCH` on divergence. |
+
+Resumed responses gain a `RESUMED_FROM:` line identical in shape to `ssh_upload` (suppressed when offset is `0`). Skip plan, structured payload, and the `RESUME_OVERSHOOT` / `RESUME_MISMATCH` error codes mirror the upload direction. See the upload section above for the full contract.
 
 ---
 
@@ -898,6 +950,118 @@ Snapshot every serial port currently held by this process. Returns `SERIAL_ID`, 
 
 **Status values:** OK.
 **Cost:** O(N) over the per-process registry.
+
+## Rsync (3, v7.0 — ADR 0011)
+
+Two-tier transport behind a single `ssh_rsync` tool, both running in-process inside the host binary. **v7.0.0-alpha.2 retrenchment**: the deployed-agent path was retracted in favour of two integrated transports — `transport=Wire` (rsync v31 wire-compat client over a remote `rsync --server`) and `transport=Sftp` (universal SFTP fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat`). `transport=Auto` probes the remote and prefers Wire when rsync >= 3.2.0 is present, otherwise routes to Sftp.
+
+**Status (v7.0.0-alpha.5)**: `transport=Sftp` is **live** for the supported subset (recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` is **partial** — handshake + multiplex framing + file-list encode/decode have landed (verified against rsync 3.2.7 on a real Linux VM via `tests/v7_rsync_wire_e2e_vm.rs`). The post-handshake mplex pump deadlocks with a clean `TIMEOUT` after 5 seconds while waiting on bytes the next slice's sender state machine still owes the server. See [ADR 0011 § Wire transport implementation status](./adr/0011-rsync-hybrid-transport.md#wire-transport-implementation-status-v700-alpha5) for the per-layer status table.
+
+### SFTP capability gates
+
+Before driving the sync, the use case probes the remote SFTP server and caches the result for the lifetime of the session. The probe runs three round-trips (mkdir + setstat + symlink) under `/tmp/.ssh-mcp-probe-<session>`, then maps the outcome to a [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot. The use case fires three capability gates:
+
+| Caller request | Probe result | Outcome |
+|---|---|---|
+| `opts.preserve.symlinks=true` | `symlink_supported=false` | `SFTP_FEATURE_MISSING` — "Remote SFTP server does not support symlink op; pass preserve.symlinks=false or use transport=Wire" |
+| `opts.preserve.perms=true` | `setstat_supported=false` | `SFTP_FEATURE_MISSING` — "Remote SFTP server does not support setstat; pass preserve.perms=false or use transport=Wire" |
+| `opts.preserve.hardlinks=true` | (always — Wire-only) | `SFTP_FEATURE_MISSING` — "hardlink preservation needs transport=Wire; rerun with transport=Wire or drop preserve.hardlinks" |
+| `opts.verify_checksum=true` | (always — Wire-only) | `SFTP_FEATURE_MISSING` — "delta-sync needs transport=Wire; rerun with transport=Wire or drop verify_checksum / delta_sync" |
+
+The probe is cached per-session in a `DashMap<SessionId, SftpFeatures>` inside the use case, so repeated `ssh_rsync` calls against the same SSH session pay the round-trips only once.
+
+### ssh_rsync
+
+Start a recursive sync between a local path and a remote path. Returns immediately with `STARTED`; progress streams via the `rsync://<id>/progress` push lane.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_id` | string | — | `SESSION_ID` from `ssh_connect`. |
+| `src` | string | — | Source path. Either a plain local path or a `host:` prefixed remote path. Exactly one of `src` / `dst` must be remote. |
+| `dst` | string | — | Destination path. Same shape as `src`. |
+| `opts.recursive` | bool | `false` | `-r` — recurse into directories. |
+| `opts.archive` | bool | `false` | `-a` — alias for `-rlptgoD` (pre-empts `recursive` and `preserve` when set). |
+| `opts.delete` | bool | `false` | `--delete` — remove dst paths missing from src. |
+| `opts.exclude` | `[string]` | `[]` | gitignore-style exclude patterns. |
+| `opts.include` | `[string]` | `[]` | gitignore-style include patterns (override `exclude` on match). |
+| `opts.dry_run` | bool | `false` | `-n` — emit `FileSkipped { reason: DryRun }` per would-be op; no destructive side-effects. |
+| `opts.bwlimit_kbps` | `u64?` | `null` | Token-bucket bandwidth cap on the writer side (60 ms tick granularity on the Wire path; SFTP path uses the same envelope around its `write` calls). |
+| `opts.compress` | bool | `false` | `-z` — request rsync-side compression (Wire path only; SFTP path ignores). |
+| `opts.partial` | bool | `false` | `--partial` — inherits ADR 0010 resume semantics. Default `false` truncates the dst on retry. |
+| `opts.verify_checksum` | bool | `false` | `-c` — force a content checksum even when size + mtime match. **Wire-only**; the SFTP path returns `SFTP_FEATURE_MISSING` when this flag is set. |
+| `opts.preserve.perms` | bool | `true` | `-p` — preserve POSIX mode bits. |
+| `opts.preserve.mtime` | bool | `true` | `-t` — preserve modification time. |
+| `opts.preserve.owner` | bool | `true` | `-o` — preserve numeric owner (root only on remote). |
+| `opts.preserve.group` | bool | `true` | `-g` — preserve numeric group. |
+| `opts.preserve.links` | bool | `true` | `-l` — preserve symlinks as-is. |
+| `opts.preserve.hardlinks` | bool | `false` | `-H` — preserve the hard-link graph. **Wire-only**; the SFTP path returns `SFTP_FEATURE_MISSING` when this flag is set. |
+| `opts.preserve.sparse` | bool | `false` | `-S` — preserve sparse holes. |
+| `opts.preserve.devices` | bool | `false` | `-D` — preserve devices, fifos, sockets (root only). |
+| `transport` | enum (`auto` / `wire` / `sftp`) | `auto` | Auto probes; prefer wire-compat (rsync v31+); fall back to SFTP. `wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if rsync is missing or older than v3.2.0). `sftp` skips the probe and uses the universal SFTP fallback. |
+| `release_when_no_subs` | `bool?` | `false` | ADR 0003 lifecycle binding — auto-release the rsync session when the last subscriber detaches. |
+
+**Response — STARTED**:
+```
+SSH_RSYNC: STARTED
+SESSION_ID: 8f2b3c4a-...
+RSYNC_ID: 01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab
+TRANSPORT: sftp
+SUBSCRIBE: rsync://01902e76-.../progress
+
+NEXT: sub_open uri=rsync://01902e76-.../progress | ssh_rsync_stats rsync_id=01902e76-... | ssh_rsync_cancel rsync_id=01902e76-...
+```
+
+`TRANSPORT` is `wire` or `sftp`. The structured-content payload mirrors the wire shape: `{ tool: "ssh_rsync", status: "started", session_id, rsync_id, transport, files_planned, bytes_planned }`. `files_planned` / `bytes_planned` are `0` until the transport's list-end frame lands; subscribe to `rsync://<id>/progress` to observe them.
+
+**Errors**: `SESSION_NOT_FOUND`, `MAX_TRANSFERS_EXCEEDED`, `RSYNC_NOT_FOUND`, `RSYNC_VERSION_TOO_OLD`, `RSYNC_PROTOCOL_ERROR`, `RSYNC_FILE_LIST_TOO_LARGE`, `RSYNC_PARTIAL_TRANSFER`, `SFTP_FEATURE_MISSING`. Each error response carries a one-sentence `DETAIL:` line tuned for direct LLM consumption — see [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
+
+---
+
+### ssh_rsync_cancel
+
+Cancel a live rsync session. Idempotent: cancelling an already-terminated session is a no-op. Drives `RsyncSession::cancel()` (CAS to `Cancelled`) and tears down the russh channel through the `RsyncTransportPort::close` path.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `rsync_id` | string | — | `RSYNC_ID` from `ssh_rsync`. |
+
+**Response — OK**:
+```
+SSH_RSYNC_CANCEL: OK
+RSYNC_ID: 01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab
+```
+
+**Errors**: `RSYNC_NOT_FOUND`. Surfaces as `Internal` with `RSYNC_NOT_FOUND` tag in the detail line.
+
+---
+
+### ssh_rsync_stats
+
+Read the live aggregate counters from a running rsync session. Pure read; mirrors `ssh_transfer_progress` semantics.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `rsync_id` | string | — | `RSYNC_ID` from `ssh_rsync`. |
+
+**Response — OK**:
+```
+SSH_RSYNC_STATS: OK
+RSYNC_ID: 01902e76-9f1a-7c3d-bd9b-f5a30c7df0ab
+STATUS: running
+FILES_TOTAL: 1248
+FILES_DONE: 412
+BYTES_TOTAL: 314572800
+BYTES_TRANSFERRED: 102993920
+BYTES_SKIPPED: 0
+FILES_DELETED: 0
+FILES_FAILED: 0
+```
+
+**Status values**: `pending`, `probing`, `running`, `completed`, `failed`, `cancelled`. Terminal statuses (`completed` / `failed` / `cancelled`) omit the `NEXT:` advisory.
+
+**Errors**: `RSYNC_NOT_FOUND`.
+
+---
 
 ## Subscription administration (9, v5 — ADR 0004 / 0005)
 
