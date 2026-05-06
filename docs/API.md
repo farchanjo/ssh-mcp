@@ -953,9 +953,15 @@ Snapshot every serial port currently held by this process. Returns `SERIAL_ID`, 
 
 ## Rsync (3, v7.0 — ADR 0011)
 
-Two-tier transport behind a single `ssh_rsync` tool, both running in-process inside the host binary. **v7.0.0-alpha.2 retrenchment**: the deployed-agent path was retracted in favour of two integrated transports — `transport=Wire` (rsync v31 wire-compat client over a remote `rsync --server`) and `transport=Sftp` (universal SFTP fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat`). `transport=Auto` probes the remote and prefers Wire when rsync >= 3.2.0 is present, otherwise routes to Sftp.
+Two-tier transport behind a single `ssh_rsync` tool, both running in-process inside the host binary. `transport=Wire` is a canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v31 against a remote `rsync --server`. `transport=Sftp` is the universal SFTP fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat`. `transport=Auto` probes the remote and prefers Wire when rsync >= 3.2.0 is present, otherwise routes to Sftp.
 
-**Status (v7.0.0-alpha.5)**: `transport=Sftp` is **live** for the supported subset (recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` is **partial** — handshake + multiplex framing + file-list encode/decode have landed (verified against rsync 3.2.7 on a real Linux VM via `tests/v7_rsync_wire_e2e_vm.rs`). The post-handshake mplex pump deadlocks with a clean `TIMEOUT` after 5 seconds while waiting on bytes the next slice's sender state machine still owes the server. See [ADR 0011 § Wire transport implementation status](./adr/0011-rsync-hybrid-transport.md#wire-transport-implementation-status-v700-alpha5) for the per-layer status table.
+**Status (v7.0.0)**: both transports are live for the supported feature set. Push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM (six wire e2e tests in `tests/v7_rsync_wire_e2e_vm.rs`, gated `e2e-vm`). Slices 11–12 (`-c` checksum delta over the wire-format extension and `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today; successor ADR will scope. See [ADR 0011 → Final slice status](./adr/0011-rsync-hybrid-transport.md#final-slice-status) for the per-layer table.
+
+**When to use which transport**:
+
+- **`transport=Sftp`** — pick when the remote has no rsync, when `ssh_upload` already works against the host, or when you only need a recursive deploy with `--delete` + dry-run + exclude/include + attribute preservation. SFTP path copies whole blocks; `bytes_skipped` only fires on whole-file size+mtime matches.
+- **`transport=Wire`** — pick when you need delta-sync of large append-only files (logs, tarballs, RDB dumps), when you want the rolling-checksum block-match path to collapse unchanged blocks, or when the SFTP server refuses `SSH_FXP_SETSTAT` / `SSH_FXP_SYMLINK`. Requires rsync >= 3.2.0 on the remote.
+- **`transport=Auto`** (default) — probe + prefer Wire when v31+ is available. Most callers should leave the default in place.
 
 ### SFTP capability gates
 

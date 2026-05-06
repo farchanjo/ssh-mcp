@@ -83,15 +83,15 @@ The ADR 0010 resume primitive is purely runtime opt-in via two `bool?` request f
 
 If a future ADR introduces resume tuning knobs (chunk-size override, parallel hash threads, prefix-truncation policy), they will land here.
 
-### v7.0 / ADR 0011 — rsync hybrid transport (3 reserved env vars)
+### v7.0 / ADR 0011 — rsync hybrid transport (3 env vars)
 
-Documented for forward-compat; **none of these are read yet** in v7.0.0-alpha.2 because both transports are surface stubs. The next slice wires the env-var path together with the Wire / SFTP transport bodies. The agent-cache env vars (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped along with the agent path during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
+Three knobs governing the v7.0 rsync hybrid transport. The agent-cache env vars from the original v7.0 plan (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped along with the agent path during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `SSH_RSYNC_PROBE_TIMEOUT_MS` | `u64` (ms) | `2000` | Max wait for the `rsync --version` probe before falling back to the SFTP transport. |
-| `SSH_RSYNC_BLOCK_SIZE` | `u32` (bytes) | `0` (auto: `sqrt(file_size)` rounded to 1 KiB) | Override `fast_rsync` rolling-checksum block size on the Wire transport. Smaller blocks yield finer deltas at the cost of larger signature footprints. SFTP transport ignores this knob. |
-| `SSH_RSYNC_FILE_LIST_LIMIT` | `u64` (entries) | `1_000_000` | Max file-list size; both transports refuse with `RSYNC_FILE_LIST_TOO_LARGE` above this cap. |
+| `SSH_RSYNC_PROBE_TIMEOUT_MS` | `u64` (ms) | `2000` | Max wait for the `which rsync && rsync --version` probe before treating the host as having no rsync (Auto transport falls through to SFTP). |
+| `SSH_RSYNC_BLOCK_SIZE` | `u32` (bytes) | `0` (auto: `sqrt(file_size)` rounded to 1 KiB) | Override the rolling-checksum block size on the Wire transport's block-match path. Smaller blocks yield finer deltas at the cost of larger signature footprints. SFTP transport ignores this knob. |
+| `SSH_RSYNC_FILE_LIST_LIMIT` | `u64` (entries) | `1_000_000` | Max file-list size; both transports refuse with `RSYNC_FILE_LIST_TOO_LARGE` above this cap. Cure: tighten `opts.exclude` (`.git/`, `node_modules/`, `target/`, large generated trees) or raise this limit if the workload genuinely needs it. |
 
 ## Subscribe layer
 

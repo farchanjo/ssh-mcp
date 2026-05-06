@@ -4,16 +4,16 @@
 
 **Subscribe-first SSH bridge for the Model Context Protocol.**
 
-Drive remote shells, async commands, SFTP transfers, TCP forwards, and local UART/TTY/COM ports from any MCP-capable LLM host. Output streams to the model the moment bytes arrive — no polling, no empty payloads, no token waste.
+Drive remote shells, async commands, SFTP transfers, recursive rsync (wire-compat or SFTP fallback), TCP forwards, and local UART/TTY/COM ports from any MCP-capable LLM host. Output streams to the model the moment bytes arrive — no polling, no empty payloads, no token waste.
 
-[![Version](https://img.shields.io/badge/version-6.0.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v6.0.0)
+[![Version](https://img.shields.io/badge/version-7.0.0-1f6feb?style=flat-square)](https://github.com/farchanjo/ssh-mcp/releases/tag/v7.0.0)
 [![Rust](https://img.shields.io/badge/rust-2024%20%C2%B7%20MSRV%201.95-orange?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-238636?style=flat-square)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-a371f7?style=flat-square)](https://modelcontextprotocol.io/)
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-a371f7?style=flat-square)](docs/ARCHITECTURE.md)
 [![Hot path](https://img.shields.io/badge/hot--path-lock--free-238636?style=flat-square)](docs/DEVELOPMENT.md#lock-free-invariants)
-[![Tools](https://img.shields.io/badge/MCP%20tools-36-1f6feb?style=flat-square)](docs/API.md)
-[![Tests](https://img.shields.io/badge/lib%20tests-1.6k%2B-238636?style=flat-square)]()
+[![Tools](https://img.shields.io/badge/MCP%20tools-39-1f6feb?style=flat-square)](docs/API.md)
+[![Tests](https://img.shields.io/badge/lib%20tests-1.9k%2B-238636?style=flat-square)]()
 
 </div>
 
@@ -55,13 +55,14 @@ Same throughput. **~30× cheaper.** Model reacts the moment the remote process s
 
 ### Headline capabilities
 
-- **6 push-resource schemes** — `shell://` · `command://` · `transfer://` · `session://` · `forward://` · `serial://` (local UART/TTY/COM, no SSH)
-- **36 MCP tools across 3 namespaces** — `ssh_*` (21) · `sub_*` (9) · `serial_*` (6)
+- **7 push-resource schemes** — `shell://` · `command://` · `transfer://` · `session://` · `forward://` · `serial://` (local UART/TTY/COM, no SSH) · `rsync://` (per-file + aggregate sync progress, v7.0)
+- **39 MCP tools across 4 namespaces** — `ssh_*` (24, includes `ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`) · `sub_*` (9) · `serial_*` (6)
 - **Per-subscription lanes** — independent filter, replay buffer, lag policy (`BlockSlow` / `DropOldest` / `DropNewest` / `Snapshot`) per `SubId`. One slow consumer never penalizes a fast one.
-- **Lock-free hot path** — zero `Mutex` on shell/command/transfer state. Enforced by `clippy::mutex_atomic = deny`.
+- **Lock-free hot path** — zero `Mutex` on shell/command/transfer/rsync state. Enforced by `clippy::mutex_atomic = deny`.
 - **Lifecycle binding with cascade** — CAS state machine (`Owned → Observed → Releasing → Closed`) + refcount cascade. No leaked shells when the host crashes.
 - **Three transports, one core** — HTTP (axum), stdio (rmcp), NDJSON daemon (Unix-pipeline composable).
-- **Strong LLM steering** — `HINT:` lines, `NEXT:` chains, push-first prompts, 38-code error taxonomy with single-sentence cures. Smaller open-source models drive it correctly first try.
+- **Two rsync transports, one tool** — `WireRsyncTransport` (canonical port of OpenBSD `openrsync`, v31 wire-compat against `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback). Push and pull both byte-identical against `rsync 3.2.7` on a real Linux VM.
+- **Strong LLM steering** — `HINT:` lines, `NEXT:` chains, push-first prompts, 46-code error taxonomy with single-sentence cures. Smaller open-source models drive it correctly first try.
 
 ---
 
