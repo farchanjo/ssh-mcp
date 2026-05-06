@@ -184,6 +184,15 @@ pub enum Op {
         /// Auto-cleanup once the last subscriber leaves.
         #[serde(default)]
         release_when_no_subs: Option<bool>,
+        /// ADR 0010 — opt-in resume from the remote tail. Default `false`
+        /// preserves v6.0 semantics (every upload truncates the
+        /// destination).
+        #[serde(default)]
+        resume: Option<bool>,
+        /// ADR 0010 — when `resume == true`, sha256-verify the resume
+        /// prefix on both sides before continuing. Default `false`.
+        #[serde(default)]
+        verify: Option<bool>,
         /// Optional correlation identifier.
         #[serde(default)]
         id: Option<String>,
@@ -199,6 +208,15 @@ pub enum Op {
         /// Auto-cleanup once the last subscriber leaves.
         #[serde(default)]
         release_when_no_subs: Option<bool>,
+        /// ADR 0010 — opt-in resume from the local tail. Default `false`
+        /// preserves v6.0 semantics (every download truncates the
+        /// destination).
+        #[serde(default)]
+        resume: Option<bool>,
+        /// ADR 0010 — when `resume == true`, sha256-verify the resume
+        /// prefix on both sides before continuing. Default `false`.
+        #[serde(default)]
+        verify: Option<bool>,
         /// Optional correlation identifier.
         #[serde(default)]
         id: Option<String>,
@@ -411,6 +429,56 @@ mod tests {
             }
         }
         assert_eq!(count, lines.len());
+    }
+
+    /// ADR 0010 — `upload` / `download` ops accept the new `resume` and
+    /// `verify` boolean flags additively. v6.0 NDJSON callers that omit
+    /// them deserialise unchanged (`#[serde(default)]` -> `None`).
+    #[tokio::test]
+    async fn parses_upload_with_resume_and_verify_flags() {
+        let mut r = reader(
+            "{\"op\":\"upload\",\"sid\":\"s\",\"local\":\"/tmp/a\",\
+             \"remote\":\"/srv/a\",\"resume\":true,\"verify\":true}\n",
+        );
+        match r.next().await {
+            ParseOutcome::Op(Op::Upload { resume, verify, .. }) => {
+                assert_eq!(resume, Some(true));
+                assert_eq!(verify, Some(true));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    /// Mirror of the upload test for the download direction.
+    #[tokio::test]
+    async fn parses_download_with_resume_and_verify_flags() {
+        let mut r = reader(
+            "{\"op\":\"download\",\"sid\":\"s\",\"remote\":\"/srv/a\",\
+             \"local\":\"/tmp/a\",\"resume\":true,\"verify\":false}\n",
+        );
+        match r.next().await {
+            ParseOutcome::Op(Op::Download { resume, verify, .. }) => {
+                assert_eq!(resume, Some(true));
+                assert_eq!(verify, Some(false));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    /// v6.0 NDJSON payloads omit the new flags; the parser must accept
+    /// them with `None` defaults so the wire stays additive.
+    #[tokio::test]
+    async fn upload_without_resume_field_defaults_to_none() {
+        let mut r = reader(
+            "{\"op\":\"upload\",\"sid\":\"s\",\"local\":\"/tmp/a\",\"remote\":\"/srv/a\"}\n",
+        );
+        match r.next().await {
+            ParseOutcome::Op(Op::Upload { resume, verify, .. }) => {
+                assert_eq!(resume, None);
+                assert_eq!(verify, None);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     #[tokio::test]

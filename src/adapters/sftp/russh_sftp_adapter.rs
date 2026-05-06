@@ -58,7 +58,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::adapters::sftp::internal::sftp::{
-    TransferShared, classify_transfer_error, open_sftp_session, resolve_local_path,
+    ResumePlan, TransferShared, classify_transfer_error, open_sftp_session,
+    preflight_resume_download, preflight_resume_upload, resolve_local_path,
     sftp_download_streaming, sftp_upload_streaming,
 };
 use crate::adapters::sftp::internal::transfer::TransferStatus as McpStatus;
@@ -333,7 +334,12 @@ impl RusshSftpAdapter {
     /// alongside the bundle so the spawn helpers can wire a watcher
     /// task without re-cloning out of the bundle (the streaming task
     /// owns the bundle by value once spawned).
-    fn build_shared(&self, transfer_id: &TransferId, total_bytes: u64) -> SharedBundle {
+    fn build_shared(
+        &self,
+        transfer_id: &TransferId,
+        total_bytes: u64,
+        resume_plan: ResumePlan,
+    ) -> SharedBundle {
         let cancel = CancellationToken::new();
         let (status_tx, status_rx) = watch::channel(McpStatus::Running);
         let (progress_tx, _rx) = broadcast::channel::<ProgressEvent>(self.broadcast_cap);
@@ -344,7 +350,10 @@ impl RusshSftpAdapter {
         // it here, while `build_shared` still owns the sender, guarantees
         // no Tick is published before the receiver exists.
         let progress_rx = progress_tx.subscribe();
-        let bytes = Arc::new(AtomicU64::new(0));
+        // ADR 0010 — bytes_transferred starts at the resume offset so
+        // progress reporting shows the ramp from `resumed_from` to
+        // `total_bytes` rather than from zero.
+        let bytes = Arc::new(AtomicU64::new(resume_plan.start_offset()));
         let total = Arc::new(AtomicU64::new(total_bytes));
         let error = Arc::new(OnceCell::new());
         let shared = TransferShared {
@@ -356,6 +365,7 @@ impl RusshSftpAdapter {
             cancel_token: cancel.clone(),
             status_tx,
             error: Arc::clone(&error),
+            resume_plan,
         };
         SharedBundle {
             shared,
@@ -385,6 +395,10 @@ impl RusshSftpAdapter {
 
     /// Spawn the upload streaming task. Returns the resolved local path
     /// so the caller can build the snapshot entity without re-resolving.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ADR 0010 wires resume_plan alongside the existing five plumbing args"
+    )]
     fn spawn_upload_task(
         &self,
         handle: Arc<client::Handle<SshClientHandler>>,
@@ -393,8 +407,10 @@ impl RusshSftpAdapter {
         local_path: PathBuf,
         remote_path: String,
         total_bytes: u64,
+        resume_plan: ResumePlan,
     ) {
-        let (shared, task_id) = self.prepare_streaming(transfer_id, session_id, total_bytes);
+        let (shared, task_id) =
+            self.prepare_streaming(transfer_id, session_id, total_bytes, resume_plan);
         let inflight = self.inflight.clone();
         tokio::spawn(async move {
             sftp_upload_streaming(handle, local_path, remote_path, shared).await;
@@ -415,6 +431,10 @@ impl RusshSftpAdapter {
     }
 
     /// Spawn the download streaming task. Mirror of `spawn_upload_task`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ADR 0010 wires resume_plan alongside the existing five plumbing args"
+    )]
     fn spawn_download_task(
         &self,
         handle: Arc<client::Handle<SshClientHandler>>,
@@ -423,8 +443,10 @@ impl RusshSftpAdapter {
         local_path: PathBuf,
         remote_path: String,
         total_bytes: u64,
+        resume_plan: ResumePlan,
     ) {
-        let (shared, task_id) = self.prepare_streaming(transfer_id, session_id, total_bytes);
+        let (shared, task_id) =
+            self.prepare_streaming(transfer_id, session_id, total_bytes, resume_plan);
         let inflight = self.inflight.clone();
         tokio::spawn(async move {
             sftp_download_streaming(handle, remote_path, local_path, shared).await;
@@ -449,6 +471,7 @@ impl RusshSftpAdapter {
         transfer_id: TransferId,
         session_id: SessionId,
         total_bytes: u64,
+        resume_plan: ResumePlan,
     ) -> (TransferShared, TransferId) {
         let SharedBundle {
             shared,
@@ -457,7 +480,7 @@ impl RusshSftpAdapter {
             progress_rx,
             bytes_transferred,
             error,
-        } = self.build_shared(&transfer_id, total_bytes);
+        } = self.build_shared(&transfer_id, total_bytes, resume_plan);
         self.inflight
             .register(transfer_id.clone(), session_id, cancel);
         Self::spawn_status_watcher(
@@ -778,6 +801,39 @@ fn fresh_entity(
     entity
 }
 
+/// ADR 0010 — wrap [`fresh_entity`] with the resume-plan offset so the
+/// returned entity carries the correct `resumed_from` value before the
+/// streaming task starts pumping ticks. For [`ResumePlan::Truncate`] the
+/// offset is `0`, preserving v6.0 wire shape on every legacy callsite.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "thin wrapper over fresh_entity that adds the ResumePlan plumbing"
+)]
+fn fresh_entity_with_plan(
+    transfer_id: TransferId,
+    session_id: SessionId,
+    direction: TransferDirection,
+    local_path: String,
+    remote_path: String,
+    total_bytes: u64,
+    resume_plan: ResumePlan,
+) -> TransferEntity {
+    let entity = fresh_entity(
+        transfer_id,
+        session_id,
+        direction,
+        local_path,
+        remote_path,
+        total_bytes,
+    );
+    let offset = resume_plan.start_offset();
+    if offset == 0 {
+        entity
+    } else {
+        entity.with_resumed_from(offset)
+    }
+}
+
 impl RusshSftpAdapter {
     /// v4.3 fix: defensive registration spawned so the adapter return
     /// path is not blocked by a redundant repo write. The use case
@@ -788,6 +844,83 @@ impl RusshSftpAdapter {
         tokio::spawn(async move {
             sink.register(entity).await;
         });
+    }
+
+    /// ADR 0010 — extract the spawn-task + entity-build + defensive-
+    /// register tail of [`SftpClientPort::upload`] so the public method
+    /// stays under the project's 30-line clippy threshold once the
+    /// resume preflight is wired.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ADR 0010 plumbs resume_plan alongside the existing six args"
+    )]
+    fn dispatch_upload(
+        &self,
+        handle: Arc<client::Handle<SshClientHandler>>,
+        transfer_id: TransferId,
+        session_id: SessionId,
+        resolved_local: &Path,
+        remote_path: &str,
+        total_bytes: u64,
+        resume_plan: ResumePlan,
+    ) -> TransferEntity {
+        self.spawn_upload_task(
+            handle,
+            transfer_id.clone(),
+            session_id.clone(),
+            resolved_local.to_path_buf(),
+            remote_path.to_string(),
+            total_bytes,
+            resume_plan,
+        );
+        let entity = fresh_entity_with_plan(
+            transfer_id,
+            session_id,
+            TransferDirection::Upload,
+            resolved_local.to_string_lossy().into_owned(),
+            remote_path.to_string(),
+            total_bytes,
+            resume_plan,
+        );
+        self.defensive_register(entity.clone());
+        entity
+    }
+
+    /// Mirror of [`Self::dispatch_upload`] for the download direction.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ADR 0010 plumbs resume_plan alongside the existing six args"
+    )]
+    fn dispatch_download(
+        &self,
+        handle: Arc<client::Handle<SshClientHandler>>,
+        transfer_id: TransferId,
+        session_id: SessionId,
+        resolved_local: &Path,
+        remote_path: &str,
+        total_bytes: u64,
+        resume_plan: ResumePlan,
+    ) -> TransferEntity {
+        self.spawn_download_task(
+            handle,
+            transfer_id.clone(),
+            session_id.clone(),
+            resolved_local.to_path_buf(),
+            remote_path.to_string(),
+            total_bytes,
+            resume_plan,
+        );
+        let entity = fresh_entity_with_plan(
+            transfer_id,
+            session_id,
+            TransferDirection::Download,
+            resolved_local.to_string_lossy().into_owned(),
+            remote_path.to_string(),
+            total_bytes,
+            resume_plan,
+        );
+        self.defensive_register(entity.clone());
+        entity
     }
 }
 
@@ -801,28 +934,25 @@ impl SftpClientPort for RusshSftpAdapter {
             session_id,
             local_path,
             remote_path,
+            resume,
+            verify,
         } = request;
         let handle = self.preflight(&session_id)?;
         let resolved_local = resolve_local_path(&local_path);
         let total_bytes = stat_local_size(&resolved_local).await?;
-        self.spawn_upload_task(
+        let resume_plan =
+            preflight_resume_upload(&handle, &resolved_local, &remote_path, resume, verify)
+                .await
+                .map_err(DomainError::Sftp)?;
+        Ok(self.dispatch_upload(
             handle,
-            transfer_id.clone(),
-            session_id.clone(),
-            resolved_local.clone(),
-            remote_path.clone(),
-            total_bytes,
-        );
-        let entity = fresh_entity(
             transfer_id,
             session_id,
-            TransferDirection::Upload,
-            resolved_local.to_string_lossy().into_owned(),
-            remote_path,
+            &resolved_local,
+            &remote_path,
             total_bytes,
-        );
-        self.defensive_register(entity.clone());
-        Ok(entity)
+            resume_plan,
+        ))
     }
 
     async fn download(
@@ -834,6 +964,8 @@ impl SftpClientPort for RusshSftpAdapter {
             session_id,
             remote_path,
             local_path,
+            resume,
+            verify,
         } = request;
 
         let handle = self.preflight(&session_id)?;
@@ -846,26 +978,19 @@ impl SftpClientPort for RusshSftpAdapter {
         // is a one-RTT pre-flight only.
         let total_bytes = stat_remote_size(&handle, &remote_path).await?;
         let resolved_local = resolve_local_path(&local_path);
-
-        self.spawn_download_task(
+        let resume_plan =
+            preflight_resume_download(&handle, &remote_path, &resolved_local, resume, verify)
+                .await
+                .map_err(DomainError::Sftp)?;
+        Ok(self.dispatch_download(
             handle,
-            transfer_id.clone(),
-            session_id.clone(),
-            resolved_local.clone(),
-            remote_path.clone(),
-            total_bytes,
-        );
-
-        let entity = fresh_entity(
             transfer_id,
             session_id,
-            TransferDirection::Download,
-            resolved_local.to_string_lossy().into_owned(),
-            remote_path,
+            &resolved_local,
+            &remote_path,
             total_bytes,
-        );
-        self.defensive_register(entity.clone());
-        Ok(entity)
+            resume_plan,
+        ))
     }
 
     async fn cancel(&self, transfer_id: &TransferId) -> Result<(), DomainError> {
@@ -996,6 +1121,8 @@ mod tests {
             session_id: SessionId::new("missing".to_string()),
             local_path: "/tmp/source.bin".to_string(),
             remote_path: "/srv/dest.bin".to_string(),
+            resume: false,
+            verify: false,
         };
         let result = adapter
             .upload(TransferId::new("t-up".to_string()), request)
@@ -1014,6 +1141,8 @@ mod tests {
             session_id: SessionId::new("missing".to_string()),
             remote_path: "/srv/source.bin".to_string(),
             local_path: "/tmp/dest.bin".to_string(),
+            resume: false,
+            verify: false,
         };
         let result = adapter
             .download(TransferId::new("t-down".to_string()), request)

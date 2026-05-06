@@ -130,7 +130,7 @@ impl StdError for ParseError {}
 const fn sub_path_of(kind: ResourceKind) -> &'static str {
     match kind {
         ResourceKind::Shell | ResourceKind::Command | ResourceKind::Serial => "output",
-        ResourceKind::Transfer => "progress",
+        ResourceKind::Transfer | ResourceKind::Rsync => "progress",
         ResourceKind::Session => "health",
         ResourceKind::Forward => "events",
     }
@@ -144,6 +144,7 @@ const fn scheme_of(kind: ResourceKind) -> &'static str {
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
         ResourceKind::Serial => "serial",
+        ResourceKind::Rsync => "rsync",
     }
 }
 
@@ -208,6 +209,7 @@ fn parse_scheme(scheme: &str) -> Result<ResourceKind, ParseError> {
         "session" => Ok(ResourceKind::Session),
         "forward" => Ok(ResourceKind::Forward),
         "serial" => Ok(ResourceKind::Serial),
+        "rsync" => Ok(ResourceKind::Rsync),
         other => Err(ParseError::BadScheme(other.to_string())),
     }
 }
@@ -442,6 +444,14 @@ where
                 "FEATURE_DISABLED: forward:// resources require the port_forward Cargo feature"
                     .to_string(),
             )),
+            ResourceKind::Serial => Err(DomainError::InvalidArgument(
+                "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
+                    .to_string(),
+            )),
+            ResourceKind::Rsync => Err(DomainError::InvalidArgument(
+                "rsync:// reads are dispatched at the MCP infra layer (see resource_handlers); the application use case is bypassed — see ADR 0011"
+                    .to_string(),
+            )),
         }
     }
 }
@@ -531,6 +541,10 @@ where
             }
             ResourceKind::Serial => Err(DomainError::InvalidArgument(
                 "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
+                    .to_string(),
+            )),
+            ResourceKind::Rsync => Err(DomainError::InvalidArgument(
+                "rsync:// reads are dispatched at the MCP infra layer (see resource_handlers); the application use case is bypassed — see ADR 0011"
                     .to_string(),
             )),
         }
@@ -1033,6 +1047,7 @@ mod tests {
             ResourceKind::Session,
             ResourceKind::Forward,
             ResourceKind::Serial,
+            ResourceKind::Rsync,
         ] {
             let uri = canonical_uri(kind, "abc");
             let parsed = parse_uri(&uri).expect("parse");

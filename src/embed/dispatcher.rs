@@ -158,12 +158,21 @@ fn upload_args_for(op: &Op) -> Map<String, Value> {
         local,
         remote,
         release_when_no_subs,
+        resume,
+        verify,
         ..
     } = op
     else {
         return Map::new();
     };
-    upload_arguments(sid.as_str(), local, remote, *release_when_no_subs)
+    upload_arguments(
+        sid.as_str(),
+        local,
+        remote,
+        *release_when_no_subs,
+        *resume,
+        *verify,
+    )
 }
 
 fn download_args_for(op: &Op) -> Map<String, Value> {
@@ -172,12 +181,21 @@ fn download_args_for(op: &Op) -> Map<String, Value> {
         remote,
         local,
         release_when_no_subs,
+        resume,
+        verify,
         ..
     } = op
     else {
         return Map::new();
     };
-    download_arguments(sid.as_str(), remote, local, *release_when_no_subs)
+    download_arguments(
+        sid.as_str(),
+        remote,
+        local,
+        *release_when_no_subs,
+        *resume,
+        *verify,
+    )
 }
 
 fn cancel_args_for(op: &Op) -> Map<String, Value> {
@@ -288,6 +306,8 @@ fn upload_arguments(
     local: &str,
     remote: &str,
     release_when_no_subs: Option<bool>,
+    resume: Option<bool>,
+    verify: Option<bool>,
 ) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("session_id".to_string(), Value::String(sid.to_string()));
@@ -295,6 +315,12 @@ fn upload_arguments(
     map.insert("remote_path".to_string(), Value::String(remote.to_string()));
     if let Some(r) = release_when_no_subs {
         map.insert("release_when_no_subs".to_string(), Value::Bool(r));
+    }
+    if let Some(r) = resume {
+        map.insert("resume".to_string(), Value::Bool(r));
+    }
+    if let Some(v) = verify {
+        map.insert("verify".to_string(), Value::Bool(v));
     }
     map
 }
@@ -304,6 +330,8 @@ fn download_arguments(
     remote: &str,
     local: &str,
     release_when_no_subs: Option<bool>,
+    resume: Option<bool>,
+    verify: Option<bool>,
 ) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("session_id".to_string(), Value::String(sid.to_string()));
@@ -311,6 +339,12 @@ fn download_arguments(
     map.insert("local_path".to_string(), Value::String(local.to_string()));
     if let Some(r) = release_when_no_subs {
         map.insert("release_when_no_subs".to_string(), Value::Bool(r));
+    }
+    if let Some(r) = resume {
+        map.insert("resume".to_string(), Value::Bool(r));
+    }
+    if let Some(v) = verify {
+        map.insert("verify".to_string(), Value::Bool(v));
     }
     map
 }
@@ -690,6 +724,8 @@ mod tests {
             local: "/tmp/a".to_string(),
             remote: "/srv/a".to_string(),
             release_when_no_subs: None,
+            resume: None,
+            verify: None,
             id: None,
         };
         let args = op_call_arguments(&op).unwrap();
@@ -701,6 +737,10 @@ mod tests {
             args.get("remote_path"),
             Some(&Value::String("/srv/a".to_string()))
         );
+        // ADR 0010 — opt-in fields are omitted when caller does not set
+        // them; v6.0 NDJSON callers see byte-identical CallTool args.
+        assert!(!args.contains_key("resume"));
+        assert!(!args.contains_key("verify"));
     }
 
     #[test]
@@ -710,11 +750,50 @@ mod tests {
             remote: "/srv/a".to_string(),
             local: "/tmp/a".to_string(),
             release_when_no_subs: None,
+            resume: None,
+            verify: None,
             id: None,
         };
         let args = op_call_arguments(&op).unwrap();
         assert!(args.contains_key("local_path"));
         assert!(args.contains_key("remote_path"));
+    }
+
+    /// ADR 0010 — when the NDJSON caller passes `resume` / `verify`, the
+    /// dispatcher must surface them as `bool` fields on the
+    /// `ssh_upload` CallTool argument map so the tool router picks them
+    /// up via `args.resume.unwrap_or(false)` / `args.verify.unwrap_or`.
+    #[test]
+    fn upload_arguments_carry_resume_and_verify_when_set() {
+        let op = Op::Upload {
+            sid: SessionId::new("s".to_string()),
+            local: "/tmp/a".to_string(),
+            remote: "/srv/a".to_string(),
+            release_when_no_subs: None,
+            resume: Some(true),
+            verify: Some(true),
+            id: None,
+        };
+        let args = op_call_arguments(&op).unwrap();
+        assert_eq!(args.get("resume"), Some(&Value::Bool(true)));
+        assert_eq!(args.get("verify"), Some(&Value::Bool(true)));
+    }
+
+    /// Mirror invariant for the download direction.
+    #[test]
+    fn download_arguments_carry_resume_and_verify_when_set() {
+        let op = Op::Download {
+            sid: SessionId::new("s".to_string()),
+            remote: "/srv/a".to_string(),
+            local: "/tmp/a".to_string(),
+            release_when_no_subs: None,
+            resume: Some(true),
+            verify: Some(false),
+            id: None,
+        };
+        let args = op_call_arguments(&op).unwrap();
+        assert_eq!(args.get("resume"), Some(&Value::Bool(true)));
+        assert_eq!(args.get("verify"), Some(&Value::Bool(false)));
     }
 
     #[test]

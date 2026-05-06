@@ -267,6 +267,12 @@ mod tests {
             | DomainError::LaneBufferFull { .. }
             | DomainError::LagDetected { .. }
             | DomainError::MuxBackpressure
+            | DomainError::RsyncNotFound(_)
+            | DomainError::RsyncVersionTooOld(_)
+            | DomainError::RsyncProtocolError(_)
+            | DomainError::RsyncFileListTooLarge { .. }
+            | DomainError::RsyncPartialTransfer(_)
+            | DomainError::SftpFeatureMissing(_)
             | DomainError::InvalidLagPolicy(_)
             | DomainError::InvalidLifetime(_) => {
                 panic!("unexpected error variant: {err:?}")

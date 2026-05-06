@@ -12,6 +12,7 @@
 pub mod command;
 #[cfg(feature = "port_forward")]
 pub mod forward;
+pub mod rsync;
 pub mod session;
 pub mod shell;
 pub mod transfer;

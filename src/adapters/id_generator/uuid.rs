@@ -28,6 +28,7 @@
 use uuid::Uuid;
 
 use crate::domain::ids::{CommandId, ForwardId, SessionId, ShellId, TransferId};
+use crate::domain::rsync_ids::RsyncId;
 use crate::ports::id_generator::IdGeneratorPort;
 
 /// Production id generator that wraps [`uuid::Uuid::now_v7`].
@@ -56,6 +57,10 @@ impl IdGeneratorPort for UuidIds {
 
     fn new_forward_id(&self) -> ForwardId {
         ForwardId::new(Uuid::now_v7().to_string())
+    }
+
+    fn new_rsync_id(&self) -> RsyncId {
+        RsyncId::new(Uuid::now_v7().to_string())
     }
 }
 

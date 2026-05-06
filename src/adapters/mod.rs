@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod notifier;
 pub mod output_stream;
 pub mod repo;
+pub mod rsync;
 pub mod serial;
 pub mod sftp;
 pub mod ssh;

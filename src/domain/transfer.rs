@@ -68,10 +68,19 @@ pub struct TransferEntity {
     pub started_at: DateTime<Utc>,
     /// Lifecycle state.
     pub status: TransferStatus,
-    /// Bytes transferred so far.
+    /// Bytes present at the destination (resume offset + bytes moved by this
+    /// transfer). For fresh transfers ramps from `0` to `total_bytes`; for
+    /// resumed transfers ramps from `resumed_from` to `total_bytes`.
     pub bytes_transferred: u64,
     /// Total bytes to transfer (snapshot at start time).
     pub total_bytes: u64,
+    /// Byte offset the transfer resumed from (ADR 0010). `0` when the
+    /// caller did not request resume, when the destination did not exist,
+    /// or when the destination was empty. Equal to `total_bytes` when the
+    /// destination already matched and the transfer short-circuited via the
+    /// Skip plan.
+    #[serde(default)]
+    pub resumed_from: u64,
     /// Optional terminal failure description (set when status is `Failed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -99,6 +108,7 @@ impl TransferEntity {
             status: TransferStatus::Running,
             bytes_transferred: 0,
             total_bytes,
+            resumed_from: 0,
             error: None,
         }
     }
@@ -107,6 +117,19 @@ impl TransferEntity {
     #[must_use]
     pub const fn with_progress(mut self, bytes_transferred: u64) -> Self {
         self.bytes_transferred = bytes_transferred;
+        self
+    }
+
+    /// Mark the transfer as resumed from `offset` bytes (ADR 0010).
+    ///
+    /// Sets both `resumed_from = offset` and `bytes_transferred = offset`.
+    /// Progress reporting therefore shows the ramp from the resume point
+    /// to `total_bytes` rather than from zero, matching the actual
+    /// destination state.
+    #[must_use]
+    pub const fn with_resumed_from(mut self, offset: u64) -> Self {
+        self.resumed_from = offset;
+        self.bytes_transferred = offset;
         self
     }
 
@@ -155,8 +178,10 @@ mod tests {
     fn lifecycle_transitions() {
         let t = sample();
         assert_eq!(t.status, TransferStatus::Running);
+        assert_eq!(t.resumed_from, 0);
         let progressed = t.clone().with_progress(512);
         assert_eq!(progressed.bytes_transferred, 512);
+        assert_eq!(progressed.resumed_from, 0);
         let done = t.clone().complete(1024);
         assert_eq!(done.status, TransferStatus::Completed);
         let cancelled = t.clone().cancel();
@@ -164,6 +189,49 @@ mod tests {
         let failed = t.fail("disk full".to_string());
         assert_eq!(failed.status, TransferStatus::Failed);
         assert_eq!(failed.error.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn resumed_from_sets_progress_and_offset() {
+        let t = sample().with_resumed_from(512);
+        assert_eq!(t.resumed_from, 512);
+        assert_eq!(t.bytes_transferred, 512);
+        assert_eq!(t.total_bytes, 1024);
+        assert_eq!(t.status, TransferStatus::Running);
+    }
+
+    #[test]
+    fn resumed_from_preserved_through_lifecycle() {
+        let resumed = sample().with_resumed_from(256);
+        let progressed = resumed.clone().with_progress(800);
+        assert_eq!(progressed.resumed_from, 256);
+        assert_eq!(progressed.bytes_transferred, 800);
+        let done = resumed.clone().complete(1024);
+        assert_eq!(done.resumed_from, 256);
+        assert_eq!(done.bytes_transferred, 1024);
+        let cancelled = resumed.clone().cancel();
+        assert_eq!(cancelled.resumed_from, 256);
+        let failed = resumed.fail("link drop".to_string());
+        assert_eq!(failed.resumed_from, 256);
+    }
+
+    #[test]
+    fn resumed_from_default_when_deserialised_from_v6_payload() {
+        let v6_json = r#"{
+            "id": "t",
+            "session_id": "s",
+            "direction": "upload",
+            "local_path": "/tmp/x",
+            "remote_path": "/r/x",
+            "started_at": "2026-01-01T00:00:00Z",
+            "status": "running",
+            "bytes_transferred": 0,
+            "total_bytes": 1024
+        }"#;
+        let entity: TransferEntity =
+            serde_json::from_str(v6_json).expect("v6 payload deserialises");
+        assert_eq!(entity.resumed_from, 0);
+        assert_eq!(entity.total_bytes, 1024);
     }
 
     #[test]

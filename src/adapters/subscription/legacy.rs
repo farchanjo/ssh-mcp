@@ -72,6 +72,8 @@ pub enum ResourceKind {
     Forward,
     /// `serial://<id>/output` — UART / TTY / COM (v5.2; ADR 0009).
     Serial,
+    /// `rsync://<id>/progress` — ADR 0011 hybrid transport (v7.0).
+    Rsync,
 }
 
 /// Map the legacy module's [`ResourceKind`] onto the hexagonal port
@@ -85,6 +87,7 @@ const fn legacy_kind_to_port(kind: ResourceKind) -> PortResourceKind {
         ResourceKind::Session => PortResourceKind::Session,
         ResourceKind::Forward => PortResourceKind::Forward,
         ResourceKind::Serial => PortResourceKind::Serial,
+        ResourceKind::Rsync => PortResourceKind::Rsync,
     }
 }
 
@@ -496,10 +499,11 @@ pub fn format_uri(kind: ResourceKind, id: &str) -> String {
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
         ResourceKind::Serial => "serial",
+        ResourceKind::Rsync => "rsync",
     };
     let suffix = match kind {
         ResourceKind::Shell | ResourceKind::Command | ResourceKind::Serial => "output",
-        ResourceKind::Transfer => "progress",
+        ResourceKind::Transfer | ResourceKind::Rsync => "progress",
         ResourceKind::Session => "health",
         ResourceKind::Forward => "events",
     };
@@ -518,6 +522,7 @@ pub fn parse_uri(uri: &str) -> Option<(ResourceKind, String)> {
         "session" => ResourceKind::Session,
         "forward" => ResourceKind::Forward,
         "serial" => ResourceKind::Serial,
+        "rsync" => ResourceKind::Rsync,
         _ => return None,
     };
     let id = rest.split_once('/').map_or(rest, |(id, _)| id);

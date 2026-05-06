@@ -47,6 +47,7 @@ use crate::application::open_shell::OpenShellUseCase;
 use crate::application::peer_gc::PeerGcUseCase;
 use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
+use crate::application::rsync_sync::RsyncSyncUseCase;
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
 use crate::application::subscription_admin::{
@@ -67,6 +68,9 @@ use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::notifier::NotifierPort;
 use crate::ports::output_stream::OutputStreamPort;
+use crate::ports::rsync_repo::RsyncRepository;
+use crate::ports::rsync_sftp_fs::RsyncSftpFsPort;
+use crate::ports::rsync_transport::RsyncTransportPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::sftp_client::SftpClientPort;
 use crate::ports::shell_repo::ShellRepository;
@@ -83,7 +87,7 @@ use crate::ports::transfer_repo::TransferRepository;
 /// holds `Arc` handles to use cases parameterised by the port traits.
 #[cfg(feature = "port_forward")]
 #[derive(Debug)]
-pub struct UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg>
+pub struct UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -99,6 +103,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     /// Connect / reuse an SSH session.
     pub connect: Arc<ConnectSessionUseCase<S, SR, C, Idg, Cfg>>,
@@ -188,13 +196,26 @@ where
     pub sub_stats: Arc<SubStatsUseCase>,
     /// `sub_stats_all` use case.
     pub daemon_stats: Arc<DaemonStatsUseCase>,
+
+    /// ADR 0011 — rsync hybrid transport use case.
+    ///
+    /// Generic over the two transport ports (`W` for the wire-compat
+    /// client and `Sf` for the SFTP fallback), the [`RsyncSftpFsPort`]
+    /// driving the capability probe, the rsync session repo, the
+    /// existing SSH client (used for the rsync version probe),
+    /// `SessionRepository` / `IdGeneratorPort` / `ConfigPort`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the eight-generic surface mirrors the hexagonal port wiring; collapsing into a type alias would hide the bound chain that makes the use case Sync."
+    )]
+    pub rsync_sync: Arc<RsyncSyncUseCase<W, Sf, Sfs, Rs, SR, S, Idg, Cfg>>,
 }
 
 /// Generic container for every use case the v4 server exposes (with
 /// `port_forward` disabled — the `FR` parameter is omitted).
 #[cfg(not(feature = "port_forward"))]
 #[derive(Debug)]
-pub struct UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg>
+pub struct UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -209,6 +230,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     /// Connect / reuse an SSH session.
     pub connect: Arc<ConnectSessionUseCase<S, SR, C, Idg, Cfg>>,
@@ -289,4 +314,17 @@ where
     pub sub_stats: Arc<SubStatsUseCase>,
     /// `sub_stats_all` use case.
     pub daemon_stats: Arc<DaemonStatsUseCase>,
+
+    /// ADR 0011 — rsync hybrid transport use case.
+    ///
+    /// Generic over the two transport ports (`W` for the wire-compat
+    /// client and `Sf` for the SFTP fallback), the [`RsyncSftpFsPort`]
+    /// driving the capability probe, the rsync session repo, the
+    /// existing SSH client (used for the rsync version probe),
+    /// `SessionRepository` / `IdGeneratorPort` / `ConfigPort`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the eight-generic surface mirrors the hexagonal port wiring; collapsing into a type alias would hide the bound chain that makes the use case Sync."
+    )]
+    pub rsync_sync: Arc<RsyncSyncUseCase<W, Sf, Sfs, Rs, SR, S, Idg, Cfg>>,
 }

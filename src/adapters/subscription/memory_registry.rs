@@ -755,10 +755,11 @@ pub fn format_uri(kind: ResourceKind, id: &str) -> String {
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
         ResourceKind::Serial => "serial",
+        ResourceKind::Rsync => "rsync",
     };
     let suffix = match kind {
         ResourceKind::Shell | ResourceKind::Command | ResourceKind::Serial => "output",
-        ResourceKind::Transfer => "progress",
+        ResourceKind::Transfer | ResourceKind::Rsync => "progress",
         ResourceKind::Session => "health",
         ResourceKind::Forward => "events",
     };
@@ -777,6 +778,7 @@ pub fn parse_uri(uri: &str) -> Option<(ResourceKind, String)> {
         "session" => ResourceKind::Session,
         "forward" => ResourceKind::Forward,
         "serial" => ResourceKind::Serial,
+        "rsync" => ResourceKind::Rsync,
         unknown => {
             debug!("parse_uri: unknown scheme {unknown}");
             return None;

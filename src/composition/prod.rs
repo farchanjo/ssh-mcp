@@ -49,9 +49,14 @@ use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
 #[cfg(feature = "port_forward")]
 use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
+use crate::adapters::repo::dashmap::rsync::DashMapRsyncRepo;
 use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
 use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
 use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
+use crate::adapters::rsync::sftp::SftpRsyncOpts;
+use crate::adapters::rsync::sftp::SftpRsyncTransport;
+use crate::adapters::rsync::wire::WireRsyncTransport;
+use crate::adapters::sftp::rsync_fs_impl::RusshRsyncSftpFs;
 use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegistry};
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
 use crate::adapters::subscription::channel_mux::ChannelMuxAdapter;
@@ -77,6 +82,7 @@ use crate::application::open_shell::OpenShellUseCase;
 use crate::application::peer_gc::PeerGcUseCase;
 use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
+use crate::application::rsync_sync::{RsyncSyncDeps, RsyncSyncUseCase};
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
 use crate::application::subscription_admin::{
@@ -142,6 +148,19 @@ type ConcreteClock = SystemClock;
 type ConcreteConfig = EnvConfig;
 /// Production UUID-based id generator.
 type ConcreteIds = UuidIds;
+/// Production rsync wire-compat transport (Tier 1 — stub today; real
+/// driver lands in the next slice).
+type ConcreteRsyncWire = WireRsyncTransport;
+/// Production rsync SFTP fallback transport (Tier 2 — fully wired
+/// against [`RusshRsyncSftpFs`] in v7.0.0-alpha.4 first slice).
+type ConcreteRsyncSftp = SftpRsyncTransport<RusshRsyncSftpFs>;
+/// Production [`RsyncSftpFsPort`] driving the SFTP capability probe
+/// inside `RsyncSyncUseCase`. Same `Arc<RusshRsyncSftpFs>` instance the
+/// SFTP transport uses, shared so the probe and the runtime sync share
+/// one russh handle registry.
+type ConcreteRsyncSftpFs = RusshRsyncSftpFs;
+/// Production rsync session repository (`DashMap`).
+type ConcreteRsyncRepo = DashMapRsyncRepo;
 
 /// Concrete `UseCases` shape pinned to the production adapters above.
 #[cfg(feature = "port_forward")]
@@ -160,6 +179,10 @@ pub type ProdUseCases = UseCases<
     ConcreteClock,
     ConcreteConfig,
     ConcreteIds,
+    ConcreteRsyncWire,
+    ConcreteRsyncSftp,
+    ConcreteRsyncSftpFs,
+    ConcreteRsyncRepo,
 >;
 
 #[cfg(not(feature = "port_forward"))]
@@ -177,6 +200,10 @@ pub type ProdUseCases = UseCases<
     ConcreteClock,
     ConcreteConfig,
     ConcreteIds,
+    ConcreteRsyncWire,
+    ConcreteRsyncSftp,
+    ConcreteRsyncSftpFs,
+    ConcreteRsyncRepo,
 >;
 
 // ---------------------------------------------------------------------------
@@ -221,9 +248,13 @@ pub fn build_use_cases() -> ProdWiring {
     let transfers = Arc::new(DashMapTransferRepo::new());
 
     // Single shared SFTP handle registry: the SSH adapter publishes
-    // every session it opens into the registry; the SFTP adapter reads
-    // from the same registry. Without sharing the SFTP layer would see
-    // an empty session table.
+    // every session it opens into the registry; the SFTP adapter
+    // reads from the same registry. The future Wire / SFTP rsync
+    // transports will share this same handle so a sync rides the
+    // same russh session as `ssh_exec` / `ssh_upload`; v7.0.0-alpha.2
+    // ships the stubs, so the registry is plumbed only into the SFTP
+    // adapter today and the rsync transports pick it up in the next
+    // slice.
     //
     // Both adapters also receive a status sink so the v4.2 status
     // pump can transition CommandEntity / ShellEntity / TransferEntity
@@ -559,6 +590,34 @@ pub fn build_use_cases() -> ProdWiring {
     let sub_stats = Arc::new(SubStatsUseCase::new(Arc::clone(&lane_admin)));
     let daemon_stats = Arc::new(DaemonStatsUseCase::new(Arc::clone(&lane_admin)));
 
+    // ADR 0011 — rsync hybrid transport.
+    // - `WireRsyncTransport` drives a remote `rsync --server` over the
+    //   existing russh exec channel; still a stub returning the honest
+    //   "being implemented" wire error until its slice lands.
+    // - `SftpRsyncTransport` falls back to plain SFTP; v7.0.0-alpha.4
+    //   first slice wires it on top of [`RusshRsyncSftpFs`] using the
+    //   shared [`SshHandleRegistry`] so the live pipeline rides the
+    //   same russh session as `ssh_exec` / `ssh_upload`.
+    let rsync_wire: Arc<ConcreteRsyncWire> = Arc::new(WireRsyncTransport::new());
+    let rsync_sftp_fs: Arc<ConcreteRsyncSftpFs> =
+        Arc::new(RusshRsyncSftpFs::new(sftp.handle_registry().clone()));
+    let rsync_sftp: Arc<ConcreteRsyncSftp> = Arc::new(SftpRsyncTransport::with_fs(
+        Arc::clone(&rsync_sftp_fs),
+        SftpRsyncOpts::default(),
+        256,
+    ));
+    let rsync_repo: Arc<ConcreteRsyncRepo> = Arc::new(DashMapRsyncRepo::new());
+    let rsync_sync = Arc::new(RsyncSyncUseCase::new(RsyncSyncDeps {
+        wire: Arc::clone(&rsync_wire),
+        sftp: Arc::clone(&rsync_sftp),
+        sftp_fs: Arc::clone(&rsync_sftp_fs),
+        rsync_repo: Arc::clone(&rsync_repo),
+        sessions: Arc::clone(&sessions),
+        ssh: Arc::clone(&ssh),
+        ids: Arc::clone(&ids),
+        config: Arc::clone(&config),
+    }));
+
     let idempotency = Arc::new(IdempotencyCache::from_env());
 
     #[cfg(feature = "port_forward")]
@@ -614,6 +673,7 @@ pub fn build_use_cases() -> ProdWiring {
         sub_list,
         sub_stats,
         daemon_stats,
+        rsync_sync,
     });
 
     (

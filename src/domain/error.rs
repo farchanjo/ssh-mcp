@@ -191,6 +191,47 @@ pub enum DomainError {
     /// `INVALID_LIFETIME`.
     #[error("invalid lifetime: {0}")]
     InvalidLifetime(String),
+
+    // ----- ADR 0011 (rsync hybrid transport) -----------------------
+    /// Wire-compat path requested but the remote does not have rsync
+    /// installed. Wire code: `RSYNC_NOT_FOUND` (RESOURCE — never
+    /// retry without changing transport).
+    #[error("rsync not found on remote: {0}")]
+    RsyncNotFound(String),
+
+    /// Remote rsync protocol version is below v31 (ADR 0011 § "Tier 1").
+    /// Wire code: `RSYNC_VERSION_TOO_OLD` (POLICY — retry only after
+    /// the operator upgrades rsync or the caller switches to
+    /// `transport=agent`).
+    #[error("rsync protocol below v31: {0}")]
+    RsyncVersionTooOld(String),
+
+    /// Wire-compat negotiation or framing failed mid-protocol.
+    /// Wire code: `RSYNC_PROTOCOL_ERROR` (TRANSPORT — retry).
+    #[error("rsync protocol error: {0}")]
+    RsyncProtocolError(String),
+
+    /// File-list size exceeded the `SSH_RSYNC_FILE_LIST_LIMIT` cap.
+    /// Wire code: `RSYNC_FILE_LIST_TOO_LARGE` (POLICY — retry only
+    /// after tightening `--exclude` or raising the limit).
+    #[error("rsync file list exceeds cap (limit {limit})")]
+    RsyncFileListTooLarge {
+        /// Configured cap that the planner exceeded.
+        limit: u64,
+    },
+
+    /// Sync interrupted before completion (`--partial` resumes inherit
+    /// from ADR 0010). Wire code: `RSYNC_PARTIAL_TRANSFER` (TRANSPORT
+    /// — retry with `--partial`).
+    #[error("rsync partial transfer: {0}")]
+    RsyncPartialTransfer(String),
+
+    /// Remote SFTP server lacks an operation the `transport=Sftp`
+    /// fallback path needs (e.g. `setstat` for hardlinks or symlinks).
+    /// Wire code: `SFTP_FEATURE_MISSING` (POLICY — retry only after
+    /// dropping the request feature or switching to `transport=Wire`).
+    #[error("sftp feature missing: {0}")]
+    SftpFeatureMissing(String),
 }
 
 #[cfg(test)]
@@ -312,6 +353,61 @@ mod tests {
     fn invalid_lifetime_carries_offending_value() {
         let err = DomainError::InvalidLifetime("forever".to_string());
         assert!(err.to_string().contains("forever"));
+    }
+
+    // ----- ADR 0011 (rsync hybrid transport) -----------------------
+
+    #[test]
+    fn rsync_not_found_carries_diagnostic_string() {
+        let err = DomainError::RsyncNotFound("MISSING".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("rsync not found on remote"));
+        assert!(rendered.contains("MISSING"));
+    }
+
+    #[test]
+    fn rsync_version_too_old_carries_observed_protocol() {
+        let err = DomainError::RsyncVersionTooOld("protocol=29".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("below v31"));
+        assert!(rendered.contains("protocol=29"));
+    }
+
+    #[test]
+    fn rsync_protocol_error_carries_reason() {
+        let err = DomainError::RsyncProtocolError("malformed file list".to_string());
+        assert!(err.to_string().contains("malformed file list"));
+    }
+
+    #[test]
+    fn rsync_file_list_too_large_carries_limit() {
+        let err = DomainError::RsyncFileListTooLarge { limit: 1_000_000 };
+        let rendered = err.to_string();
+        assert!(rendered.contains("file list"));
+        assert!(rendered.contains("1000000"));
+    }
+
+    #[test]
+    fn rsync_partial_transfer_carries_reason() {
+        let err = DomainError::RsyncPartialTransfer("connection reset".to_string());
+        assert!(err.to_string().contains("connection reset"));
+    }
+
+    #[test]
+    fn sftp_feature_missing_carries_diagnostic() {
+        let err = DomainError::SftpFeatureMissing("hardlinks unsupported".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("sftp feature missing"));
+        assert!(rendered.contains("hardlinks"));
+    }
+
+    #[test]
+    fn rsync_variants_clone_and_eq() {
+        let err = DomainError::RsyncNotFound("MISSING".to_string());
+        assert_eq!(err.clone(), err);
+        let err2 = DomainError::SftpFeatureMissing("hardlinks".to_string());
+        assert_eq!(err2.clone(), err2);
+        assert_ne!(err, err2);
     }
 
     #[test]

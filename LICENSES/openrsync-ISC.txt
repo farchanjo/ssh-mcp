@@ -1,0 +1,27 @@
+Copyright (c) 2019, Kristaps Dzonsons <kristaps@bsd.lv>
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+
+================================================================================
+
+This file vendors the ISC license terms covering OpenBSD's openrsync
+(https://github.com/kristapsdz/openrsync) — used here as the canonical
+reference for porting protocol-state-machine code into ssh-mcp's
+`src/adapters/rsync/wire/` module tree (ADR 0011).
+
+Files in `src/adapters/rsync/wire/` ported from openrsync carry an
+`SPDX-License-Identifier: ISC` line and a header block referencing this
+notice. The Rust port maintains openrsync's struct names + field order
+to ease cross-references against the C source; the I/O layer is
+rewritten to async + lock-free Rust per the project's hot-path
+invariants.

@@ -13,3 +13,5 @@
 pub(crate) mod sftp;
 pub(crate) mod transfer;
 pub mod types;
+
+pub mod resume;

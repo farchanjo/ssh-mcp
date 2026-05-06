@@ -51,6 +51,10 @@ use crate::application::list_commands::ListCommandsRequest;
 use crate::application::list_sessions::ListSessionsRequest;
 use crate::application::open_shell::OpenShellRequest;
 use crate::application::read_shell::ReadShellRequest;
+use crate::application::rsync_sync::{
+    RsyncStartedOutcome, RsyncSyncRequest, RsyncSyncUseCase, RsyncTransportPicked,
+    RsyncTransportSelection,
+};
 use crate::application::send_key::SendKeyRequest;
 use crate::application::subscription_admin::{
     DaemonStatsUseCase, ListSubsRequest, ListSubsUseCase, PauseSubUseCase, ReplayRequest,
@@ -71,6 +75,7 @@ use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
+use crate::domain::rsync_ids::RsyncId;
 use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
 use crate::infra::mcp::args::serial::{
     SerialCloseArgs, SerialListOpenArgs, SerialListPortsArgs, SerialOpenArgs, SerialPressArgs,
@@ -111,6 +116,9 @@ use crate::ports::forward_repo::ForwardRepository;
 use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::{NotifierPort, PeerHandle};
 use crate::ports::output_stream::OutputStreamPort;
+use crate::ports::rsync_repo::RsyncRepository;
+use crate::ports::rsync_sftp_fs::RsyncSftpFsPort;
+use crate::ports::rsync_transport::RsyncTransportPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::sftp_client::SftpClientPort;
 use crate::ports::shell_repo::ShellRepository;
@@ -128,6 +136,7 @@ use super::args::execute::{
 };
 #[cfg(feature = "port_forward")]
 use super::args::forward::SshForwardArgs;
+use super::args::rsync::{SshRsyncArgs, SshRsyncCancelArgs, SshRsyncStatsArgs};
 use super::args::sftp::{SshDownloadArgs, SshTransferProgressArgs, SshUploadArgs};
 use super::args::shell::{
     SshShellCloseArgs, SshShellOpenArgs, SshShellPressArgs, SshShellReadArgs, SshShellWaitForArgs,
@@ -274,7 +283,19 @@ fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
         | DomainError::LagDetected { .. }
         | DomainError::MuxBackpressure
         | DomainError::InvalidLagPolicy(_)
-        | DomainError::InvalidLifetime(_) => None,
+        | DomainError::InvalidLifetime(_)
+        // ADR 0011 — none of the rsync errors carry an id we can
+        // closest-match against today (file paths get propagated as
+        // detail strings; the `RsyncId` is per-session and lives in
+        // the wire-shape RSYNC_ID field, which has no closest-match
+        // surface yet — phase 11 wires `ssh_rsync_cancel` /
+        // `ssh_rsync_stats` against the live id list).
+        | DomainError::RsyncNotFound(_)
+        | DomainError::RsyncVersionTooOld(_)
+        | DomainError::RsyncProtocolError(_)
+        | DomainError::RsyncFileListTooLarge { .. }
+        | DomainError::RsyncPartialTransfer(_)
+        | DomainError::SftpFeatureMissing(_) => None,
     }
 }
 
@@ -538,6 +559,147 @@ fn extract_tag<'a>(msg: &'a str, allowed: &[&'static str]) -> Option<(&'static s
     None
 }
 
+/// Drive the rsync use case for the live `ssh_rsync` tool.
+///
+/// Builds the [`RsyncSyncRequest`] from the inbound DTO, runs the
+/// use case, and renders the started block-markdown + structured-content
+/// twin via [`render::rsync::started_render`] /
+/// [`render::rsync::started_structured`].
+///
+/// Errors fall through to [`render_tool_error_smart`] so a stale
+/// `session_id` surfaces the v4.7-step6 closest-match suggestions.
+async fn run_ssh_rsync<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>(
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>,
+    lister: &dyn IdLister,
+    args: SshRsyncArgs,
+) -> CallToolResult
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    let session_id = SessionId::new(args.session_id.clone());
+    let req = RsyncSyncRequest {
+        session_id,
+        src: args.src.clone(),
+        dst: args.dst.clone(),
+        transport: rsync_transport_arg_to_selection(args.transport),
+        preserve_hardlinks: args.opts.preserve.hardlinks,
+        delta_sync: args.opts.verify_checksum,
+        preserve_symlinks: args.opts.preserve.links,
+        preserve_perms: args.opts.preserve.perms,
+        preserve_mtime: args.opts.preserve.mtime,
+        delete: args.opts.delete,
+        release_when_no_subs: args.release_when_no_subs.unwrap_or(false),
+    };
+    match use_case.execute(req).await {
+        Ok(outcome) => render_rsync_started(&args, &outcome),
+        Err(err) => render_tool_error_smart("SSH_RSYNC", &err, lister).await,
+    }
+}
+
+/// Render the success body for the live `ssh_rsync` tool. Split out
+/// of [`run_ssh_rsync`] so the parent stays under the workspace
+/// 30-line ceiling.
+fn render_rsync_started(args: &SshRsyncArgs, outcome: &RsyncStartedOutcome) -> CallToolResult {
+    let transport_label = match outcome.transport {
+        RsyncTransportPicked::Wire => render::rsync::RsyncTransportLabel::Wire,
+        RsyncTransportPicked::Sftp => render::rsync::RsyncTransportLabel::Sftp,
+    };
+    let render_input = render::rsync::StartedRender {
+        rsync_id: outcome.rsync_id.as_str(),
+        session_id: outcome.session_id.as_str(),
+        src: &args.src,
+        dst: &args.dst,
+        transport: transport_label,
+        files_planned: outcome.files_planned,
+        bytes_planned: outcome.bytes_planned,
+        dry_run: args.opts.dry_run,
+        delete: args.opts.delete,
+    };
+    let body = render::rsync::started_render(&render_input);
+    let structured = render::rsync::started_structured(&render_input);
+    ok_text_and_structured(body, structured)
+}
+
+/// Map the inbound `RsyncTransportArg` enum onto the use-case-side
+/// [`RsyncTransportSelection`] enum.
+const fn rsync_transport_arg_to_selection(
+    arg: super::args::rsync::RsyncTransportArg,
+) -> RsyncTransportSelection {
+    use super::args::rsync::RsyncTransportArg;
+    match arg {
+        RsyncTransportArg::Auto => RsyncTransportSelection::Auto,
+        RsyncTransportArg::Wire => RsyncTransportSelection::Wire,
+        RsyncTransportArg::Sftp => RsyncTransportSelection::Sftp,
+    }
+}
+
+/// Drive the rsync use case for the live `ssh_rsync_cancel` tool.
+async fn run_ssh_rsync_cancel<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>(
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>,
+    lister: &dyn IdLister,
+    args: SshRsyncCancelArgs,
+) -> CallToolResult
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    let rsync_id = RsyncId::new(args.rsync_id.clone());
+    match use_case.cancel(&rsync_id).await {
+        Ok(()) => {
+            let body = render::rsync::cancel_render(rsync_id.as_str());
+            let structured = render::rsync::cancel_structured(rsync_id.as_str());
+            ok_text_and_structured(body, structured)
+        }
+        Err(err) => render_tool_error_smart("SSH_RSYNC_CANCEL", &err, lister).await,
+    }
+}
+
+/// Drive the rsync use case for the live `ssh_rsync_stats` tool.
+async fn run_ssh_rsync_stats<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>(
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, Rs, SR, Ssh, Idg, Cfg>,
+    lister: &dyn IdLister,
+    args: SshRsyncStatsArgs,
+) -> CallToolResult
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    let rsync_id = RsyncId::new(args.rsync_id.clone());
+    match use_case.stats(&rsync_id).await {
+        Ok(snapshot) => {
+            let status = format!("{:?}", snapshot.status).to_lowercase();
+            let body =
+                render::rsync::stats_render(snapshot.rsync_id.as_str(), &status, &snapshot.stats);
+            let structured = render::rsync::stats_structured(
+                snapshot.rsync_id.as_str(),
+                &status,
+                &snapshot.stats,
+            );
+            ok_text_and_structured(body, structured)
+        }
+        Err(err) => render_tool_error_smart("SSH_RSYNC_STATS", &err, lister).await,
+    }
+}
+
 /// Pick a v3-compatible error code, reason and optional detail per
 /// [`DomainError`] variant. v4.5 promotes per-site tag prefixes
 /// (see [`ARG_TAGS`], [`TRANSPORT_TAGS`], [`SFTP_TAGS`]) to specific wire
@@ -682,6 +844,37 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "INVALID_LIFETIME",
             "lifetime must be one of {manual, auto_close, lease}".to_string(),
             Some(value.clone()),
+        ),
+        // ADR 0011 — rsync hybrid transport.
+        DomainError::RsyncNotFound(reason) => (
+            "RSYNC_NOT_FOUND",
+            "rsync binary missing on remote".to_string(),
+            Some(reason.clone()),
+        ),
+        DomainError::RsyncVersionTooOld(reason) => (
+            "RSYNC_VERSION_TOO_OLD",
+            "remote rsync protocol below v31".to_string(),
+            Some(reason.clone()),
+        ),
+        DomainError::RsyncProtocolError(reason) => (
+            "RSYNC_PROTOCOL_ERROR",
+            "wire-compat negotiation failed".to_string(),
+            Some(reason.clone()),
+        ),
+        DomainError::RsyncFileListTooLarge { limit } => (
+            "RSYNC_FILE_LIST_TOO_LARGE",
+            "file list exceeds SSH_RSYNC_FILE_LIST_LIMIT".to_string(),
+            Some(format!("limit={limit}")),
+        ),
+        DomainError::RsyncPartialTransfer(reason) => (
+            "RSYNC_PARTIAL_TRANSFER",
+            "transfer interrupted; re-run with --partial to resume".to_string(),
+            Some(reason.clone()),
+        ),
+        DomainError::SftpFeatureMissing(reason) => (
+            "SFTP_FEATURE_MISSING",
+            "remote SFTP server does not support required operation; this transport=Sftp request cannot proceed".to_string(),
+            Some(reason.clone()),
         ),
     }
 }
@@ -1235,8 +1428,8 @@ fn run_daemon_stats(use_case: &DaemonStatsUseCase) -> CallToolResult {
 
 #[cfg(feature = "port_forward")]
 #[tool_router]
-impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg>
-    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg>>
+impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
+    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -1252,6 +1445,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     /// Build an [`McpSshServer`] with the provided container, peer
     /// table, and shared idempotency cache.
@@ -1261,7 +1458,9 @@ where
         reason = "the Arc<UseCases<...>> generic surface is the natural shape of the production wiring; the prod alias `ProdUseCases` collapses it at the call site"
     )]
     pub fn new(
-        use_cases: Arc<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg>>,
+        use_cases: Arc<
+            UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>,
+        >,
         peer_table: Arc<PeerTable>,
         idempotency: Arc<IdempotencyCache>,
     ) -> Self {
@@ -1868,7 +2067,7 @@ where
             destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- IMMEDIATELY after upload start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
+        description = "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- IMMEDIATELY after upload start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n- Set `resume=true` (ADR 0010) to retry an interrupted upload from the first non-overlapping byte; `RESUMED_FROM:` in the response reports the offset.\n- Pair `resume=true` with `verify=true` to guard against silent prefix corruption — costs one extra ssh_exec round-trip plus O(offset) bytes hashed remotely.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n- `RESUMED_FROM`: byte offset the transfer resumed from (`0` for fresh transfers).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR, RESUME_OVERSHOOT, RESUME_MISMATCH.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
         output_schema = schema_for_type::<SshUploadResult>()
     )]
     async fn ssh_upload(
@@ -1887,6 +2086,8 @@ where
                     local_path: args.local_path,
                     remote_path: args.remote_path,
                     lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                    resume: args.resume.unwrap_or(false),
+                    verify: args.verify.unwrap_or(false),
                 };
                 match self.use_cases.upload_file.execute(req).await {
                     Ok(outcome) => {
@@ -1913,7 +2114,7 @@ where
             destructive_hint = false,
             idempotent_hint = false
         ),
-        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- IMMEDIATELY after download start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
+        description = "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- IMMEDIATELY after download start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes — strictly preferred over polling ssh_transfer_progress(wait=true).\n- Set `resume=true` (ADR 0010) to retry an interrupted download from the first non-overlapping byte; `RESUMED_FROM:` in the response reports the offset.\n- Pair `resume=true` with `verify=true` to guard against silent prefix corruption.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED — push delivery).\n- `RESUMED_FROM`: byte offset the transfer resumed from (`0` for fresh transfers).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR, RESUME_OVERSHOOT, RESUME_MISMATCH.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
         output_schema = schema_for_type::<SshDownloadResult>()
     )]
     async fn ssh_download(
@@ -1932,6 +2133,8 @@ where
                     remote_path: args.remote_path,
                     local_path: args.local_path,
                     lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                    resume: args.resume.unwrap_or(false),
+                    verify: args.verify.unwrap_or(false),
                 };
                 match self.use_cases.download_file.execute(req).await {
                     Ok(outcome) => {
@@ -2414,6 +2617,77 @@ where
     ) -> Result<CallToolResult, McpError> {
         Ok(serial_tool_helpers::run_serial_list_open(&args))
     }
+
+    // ---------- v7.0 — ADR 0011 rsync hybrid transport (stub) -------
+    //
+    // Phase 11 ships the inbound MCP surface frozen against the ADR
+    // tool catalogue; the bodies return `RSYNC_NOT_IMPLEMENTED` until
+    // phases 5–10 wire the agent fallback + wire-compat client + push
+    // lane. Future sessions only have to swap the body — the args
+    // structs, schema, and tool metadata stay byte-identical.
+
+    #[tool(
+        title = "Sync a directory tree over SSH (rsync)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Drives a recursive sync over an existing SSH session. v7.0.0-alpha.2: Wire (rsync v31 wire-compat) and Sftp (universal) transports are being implemented; surface stubs return descriptive RSYNC_PROTOCOL_ERROR with a transport-specific detail line until the next slice.\n\nTransport selection:\n- `transport=auto` (default) — probe the remote; rsync v31+ routes to the Wire transport, otherwise routes to the SFTP fallback.\n- `transport=wire` — force the wire-compat rsync v31 client; returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older than v3.2.0.\n- `transport=sftp` — universal fallback; drives plain SFTP `readdir` + `stat` + `read` + `write` + `setstat` against any host with a working SFTP subsystem.\n\nWhen to use:\n- Recursive directory mirror over SSH (with `--delete`, `--exclude`, `--bwlimit`, attribute preservation).\n- Delta-syncing large append-only files (logs, dumps, container layers) — only changed blocks cross the wire (Wire transport only).\n\nIdentifiers:\n- `RSYNC_ID`: pass to ssh_rsync_stats (snapshot) and ssh_rsync_cancel (terminal cancel). ALSO subscribe via `sub_open uri=rsync://<RSYNC_ID>/progress` for live per-file + aggregate push events (PREFERRED over polling stats).\n\nWorkflow:\n1. ssh_connect.\n2. ssh_rsync (returns STARTED + RSYNC_ID).\n3. sub_open uri=rsync://<RSYNC_ID>/progress.\n4. Drain `notifications/resources/updated` events.\n5. sub_close + ssh_rsync_cancel (or wait for `SyncCompleted`).\n\nStatus values: STARTED.\n\nErrors: RSYNC_NOT_FOUND, RSYNC_VERSION_TOO_OLD, RSYNC_PROTOCOL_ERROR, RSYNC_FILE_LIST_TOO_LARGE, RSYNC_PARTIAL_TRANSFER, SFTP_FEATURE_MISSING, SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED.\n\nCost: O(N) over file count + delta bytes. Idempotency: pass `_meta.idempotency_key` to dedup retries."
+    )]
+    async fn ssh_rsync(
+        &self,
+        Parameters(args): Parameters<SshRsyncArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
+    }
+
+    #[tool(
+        title = "Cancel an in-flight rsync session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Cancel a running rsync session by RSYNC_ID. Flips the session aggregate to `Cancelled` and tears down the russh channel + reader/writer task pair. Idempotent: cancelling a missing or already-terminal session returns OK.\n\nWhen to use:\n- Operator-driven abort (subscribed lane shows runaway file list).\n- Cleanup before ssh_disconnect.\n\nWorkflow:\n1. Look up RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_cancel.\n3. Drain any final lane events; sub_close.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND."
+    )]
+    async fn ssh_rsync_cancel(
+        &self,
+        Parameters(args): Parameters<SshRsyncCancelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync_cancel(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
+    }
+
+    #[tool(
+        title = "Get rsync session stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Snapshot stats for an in-flight or completed rsync session. Returns the live `RsyncStats` aggregate (files_total, files_done, files_deleted, files_failed, bytes_total, bytes_transferred, bytes_skipped) plus the current session status (pending / probing / running / completed / failed / cancelled).\n\nWhen to use:\n- Polling caller without a subscription lane.\n- Aggregate snapshot after `SyncCompleted` event for final summary.\n\nPush: subscribe to `rsync://<RSYNC_ID>/progress` instead of polling — same data flows through the lane debouncer at 200ms granularity.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND."
+    )]
+    async fn ssh_rsync_stats(
+        &self,
+        Parameters(args): Parameters<SshRsyncStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync_stats(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,8 +2696,8 @@ where
 
 #[cfg(not(feature = "port_forward"))]
 #[tool_router]
-impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg>
-    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg>>
+impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
+    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -2438,6 +2712,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     /// Build an [`McpSshServer`] with the provided container, peer
     /// table, and shared idempotency cache.
@@ -2447,7 +2725,9 @@ where
         reason = "the Arc<UseCases<...>> generic surface is the natural shape of the production wiring; the prod alias `ProdUseCases` collapses it at the call site"
     )]
     pub fn new(
-        use_cases: Arc<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg>>,
+        use_cases: Arc<
+            UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>,
+        >,
         peer_table: Arc<PeerTable>,
         idempotency: Arc<IdempotencyCache>,
     ) -> Self {
@@ -3073,6 +3353,8 @@ where
                     local_path: args.local_path,
                     remote_path: args.remote_path,
                     lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                    resume: args.resume.unwrap_or(false),
+                    verify: args.verify.unwrap_or(false),
                 };
                 match self.use_cases.upload_file.execute(req).await {
                     Ok(outcome) => {
@@ -3118,6 +3400,8 @@ where
                     remote_path: args.remote_path,
                     local_path: args.local_path,
                     lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                    resume: args.resume.unwrap_or(false),
+                    verify: args.verify.unwrap_or(false),
                 };
                 match self.use_cases.download_file.execute(req).await {
                     Ok(outcome) => {
@@ -3551,6 +3835,74 @@ where
         Parameters(args): Parameters<SerialListOpenArgs>,
     ) -> Result<CallToolResult, McpError> {
         Ok(serial_tool_helpers::run_serial_list_open(&args))
+    }
+
+    // ---------- v7.0 — ADR 0011 rsync hybrid transport (stub) -------
+    //
+    // Mirror of the port_forward-enabled impl. Bodies return
+    // `RSYNC_NOT_IMPLEMENTED`; phases 5–10 wire the real path.
+
+    #[tool(
+        title = "Sync a directory tree over SSH (rsync)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        ),
+        description = "Drives a recursive sync over an existing SSH session. v7.0.0-alpha.2: Wire (rsync v31 wire-compat) and Sftp (universal) transports are being implemented; surface stubs return descriptive RSYNC_PROTOCOL_ERROR with a transport-specific detail line until the next slice.\n\nTransport selection:\n- `transport=auto` (default) — probe the remote; rsync v31+ routes to the Wire transport, otherwise routes to the SFTP fallback.\n- `transport=wire` — force the wire-compat rsync v31 client; returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older than v3.2.0.\n- `transport=sftp` — universal fallback; drives plain SFTP `readdir` + `stat` + `read` + `write` + `setstat` against any host with a working SFTP subsystem.\n\nWhen to use:\n- Recursive directory mirror over SSH (with `--delete`, `--exclude`, `--bwlimit`, attribute preservation).\n- Delta-syncing large append-only files (logs, dumps, container layers) — only changed blocks cross the wire (Wire transport only).\n\nIdentifiers:\n- `RSYNC_ID`: pass to ssh_rsync_stats (snapshot) and ssh_rsync_cancel (terminal cancel). ALSO subscribe via `sub_open uri=rsync://<RSYNC_ID>/progress` for live per-file + aggregate push events (PREFERRED over polling stats).\n\nWorkflow:\n1. ssh_connect.\n2. ssh_rsync (returns STARTED + RSYNC_ID).\n3. sub_open uri=rsync://<RSYNC_ID>/progress.\n4. Drain `notifications/resources/updated` events.\n5. sub_close + ssh_rsync_cancel (or wait for `SyncCompleted`).\n\nStatus values: STARTED.\n\nErrors: RSYNC_NOT_FOUND, RSYNC_VERSION_TOO_OLD, RSYNC_PROTOCOL_ERROR, RSYNC_FILE_LIST_TOO_LARGE, RSYNC_PARTIAL_TRANSFER, SFTP_FEATURE_MISSING, SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED.\n\nCost: O(N) over file count + delta bytes. Idempotency: pass `_meta.idempotency_key` to dedup retries."
+    )]
+    async fn ssh_rsync(
+        &self,
+        Parameters(args): Parameters<SshRsyncArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
+    }
+
+    #[tool(
+        title = "Cancel an in-flight rsync session",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Cancel a running rsync session by RSYNC_ID. Flips the session aggregate to `Cancelled` and tears down the russh channel + reader/writer task pair. Idempotent: cancelling a missing or already-terminal session returns OK.\n\nWhen to use:\n- Operator-driven abort (subscribed lane shows runaway file list).\n- Cleanup before ssh_disconnect.\n\nWorkflow:\n1. Look up RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_cancel.\n3. Drain any final lane events; sub_close.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND."
+    )]
+    async fn ssh_rsync_cancel(
+        &self,
+        Parameters(args): Parameters<SshRsyncCancelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync_cancel(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
+    }
+
+    #[tool(
+        title = "Get rsync session stats",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        description = "Snapshot stats for an in-flight or completed rsync session. Returns the live `RsyncStats` aggregate (files_total, files_done, files_deleted, files_failed, bytes_total, bytes_transferred, bytes_skipped) plus the current session status (pending / probing / running / completed / failed / cancelled).\n\nWhen to use:\n- Polling caller without a subscription lane.\n- Aggregate snapshot after `SyncCompleted` event for final summary.\n\nPush: subscribe to `rsync://<RSYNC_ID>/progress` instead of polling — same data flows through the lane debouncer at 200ms granularity.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND."
+    )]
+    async fn ssh_rsync_stats(
+        &self,
+        Parameters(args): Parameters<SshRsyncStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(run_ssh_rsync_stats(
+            self.use_cases.rsync_sync.as_ref(),
+            self.id_lister.as_ref(),
+            args,
+        )
+        .await)
     }
 }
 
@@ -4748,8 +5100,10 @@ lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 
 #[cfg(feature = "port_forward")]
 #[tool_handler]
-impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg> ServerHandler
-    for McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg>>
+impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs> ServerHandler
+    for McpSshServer<
+        UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>,
+    >
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -4765,6 +5119,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(server_capabilities())
@@ -4778,11 +5136,17 @@ where
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        resource_handlers::list_resources_impl(
+        let mut result = resource_handlers::list_resources_impl(
             &self.use_cases.list_resources,
             self.leak_probe.as_ref(),
         )
-        .await
+        .await?;
+        // ADR 0011 — splice in live `rsync://<id>/progress` URIs so
+        // host enumerations see every active session.
+        resource_handlers::attach_rsync_resources(&mut result, &self.use_cases.rsync_sync)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(result)
     }
 
     async fn list_resource_templates(
@@ -4800,6 +5164,15 @@ where
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        // ADR 0011 — short-circuit `rsync://<id>/progress` reads
+        // before falling through to the generic dispatcher.
+        if let Some(outcome) =
+            resource_handlers::try_rsync_read(&self.use_cases.rsync_sync, &request.uri).await
+        {
+            return outcome
+                .map(|content| ReadResourceResult::new(vec![content]))
+                .map_err(|e| resource_handlers::map_rsync_read_error(&e));
+        }
         resource_handlers::read_resource_impl(
             &self.use_cases.read_resource,
             request,
@@ -4857,8 +5230,8 @@ where
 
 #[cfg(not(feature = "port_forward"))]
 #[tool_handler]
-impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg> ServerHandler
-    for McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg>>
+impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs> ServerHandler
+    for McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -4873,6 +5246,10 @@ where
     C: ClockPort + Send + Sync + 'static,
     Cfg: ConfigPort + Send + Sync + 'static,
     Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
 {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(server_capabilities())
@@ -4886,11 +5263,17 @@ where
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        resource_handlers::list_resources_impl(
+        let mut result = resource_handlers::list_resources_impl(
             &self.use_cases.list_resources,
             self.leak_probe.as_ref(),
         )
-        .await
+        .await?;
+        // ADR 0011 — splice in live `rsync://<id>/progress` URIs so
+        // host enumerations see every active session.
+        resource_handlers::attach_rsync_resources(&mut result, &self.use_cases.rsync_sync)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(result)
     }
 
     async fn list_resource_templates(
@@ -4908,6 +5291,15 @@ where
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        // ADR 0011 — short-circuit `rsync://<id>/progress` reads
+        // before falling through to the generic dispatcher.
+        if let Some(outcome) =
+            resource_handlers::try_rsync_read(&self.use_cases.rsync_sync, &request.uri).await
+        {
+            return outcome
+                .map(|content| ReadResourceResult::new(vec![content]))
+                .map_err(|e| resource_handlers::map_rsync_read_error(&e));
+        }
         resource_handlers::read_resource_impl(
             &self.use_cases.read_resource,
             request,

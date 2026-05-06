@@ -14,6 +14,7 @@ pub mod connection;
 pub mod execute;
 #[cfg(feature = "port_forward")]
 pub mod forward;
+pub mod rsync;
 pub mod serial;
 pub mod sftp;
 pub mod shell;

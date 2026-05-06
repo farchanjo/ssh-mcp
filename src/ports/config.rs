@@ -93,6 +93,15 @@ pub trait ConfigPort: Send + Sync + 'static {
 
     /// Maximum concurrent transfers per session.
     fn max_transfers_per_session(&self) -> usize;
+
+    /// Maximum concurrent rsync sessions per SSH session (ADR 0011).
+    ///
+    /// Default `4` matches the documented per-session ceiling. Mirrors
+    /// `SSH_MAX_RSYNC_PER_SESSION`. The default is provided so existing
+    /// `ConfigPort` impls outside the production path keep compiling.
+    fn max_rsync_per_session(&self) -> usize {
+        4
+    }
 }
 
 #[cfg(test)]
