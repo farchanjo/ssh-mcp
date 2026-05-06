@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 62cd3515f9afae2a17139a7509f83080c499e75db00a085343ccb807f876f27d # shrinks to entries = [Flist { path: "0", link: None, size: 0, mtime: 0, mode: 33188, uid: 0, gid: 1, flags: 0 }]
+cc b83e82d348bcc3768af510d20e7060fdc1f0bf0d0e2af925d13ce6963728e514 # shrinks to entries = [Flist { path: "a", link: None, size: 0, mtime: 0, mode: 33188, uid: 0, gid: 1, flags: 0 }]
