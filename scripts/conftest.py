@@ -24,3 +24,7 @@ def pytest_configure(config) -> None:
         "markers",
         "requires_sshd: test needs a real SSH server (set SSH_MCP_TEST_TARGET to enable)",
     )
+    config.addinivalue_line(
+        "markers",
+        "requires_vm: test needs a live VM with rsync 3.2.x (set SSH_MCP_E2E_HOST or skip)",
+    )
