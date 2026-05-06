@@ -7,19 +7,27 @@
 //!
 //! - `open_sftp_session`: Opens an SFTP subsystem on an SSH channel
 //! - `resolve_local_path`: Cross-platform path resolution (relative -> home dir)
+//! - `preflight_resume_upload` / `preflight_resume_download`: ADR 0010
+//!   length-prefix resume planner — pre-flights the destination size and
+//!   returns a [`ResumePlan`] that the streaming layer honours.
 //! - `sftp_upload_streaming`: Streams a local file to remote via SFTP
 //! - `sftp_download_streaming`: Streams a remote file to local via SFTP
 
+use std::cmp::Ordering as CmpOrdering;
 use std::env;
+use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use russh::client;
+use russh::{ChannelMsg, client::Msg as ClientMsg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::File as SftpFile;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::protocol::OpenFlags;
+use sha2::{Digest, Sha256};
+use tokio::fs::{File, OpenOptions, metadata as tokio_metadata};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -55,6 +63,10 @@ pub struct TransferShared {
     /// Write-once failure reason. Set only when the transfer ends in
     /// `Failed`.
     pub error: Arc<OnceCell<String>>,
+    /// ADR 0010 — resume plan computed by the preflight phase. Defaults
+    /// to [`ResumePlan::Truncate`] (v6.0 semantics) when the caller did
+    /// not request resume.
+    pub resume_plan: ResumePlan,
 }
 
 /// Classify a raw transfer error into a structured, AI-identifiable error message.
@@ -113,6 +125,539 @@ fn match_error_pattern<'a>(lower: &str, operation: &str) -> (&'a str, &'a str) {
         ("SFTP_PROTOCOL", "SFTP protocol/channel error")
     } else {
         ("IO_ERROR", "I/O error")
+    }
+}
+
+/// Outcome of the ADR 0010 length-prefix resume preflight.
+///
+/// Computed once per transfer, before the streaming task spawns; carried
+/// through [`TransferShared`] into the chunk loop so the loop can decide
+/// whether to truncate, skip, or seek the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePlan {
+    /// Fresh transfer — open destination with `TRUNCATE` semantics and
+    /// stream from byte 0. Identical to v6.0 behaviour. This is also
+    /// what `resume = false` always returns.
+    Truncate,
+    /// Destination already matches the source length — short-circuit
+    /// the chunk loop and emit `Completed` synchronously. The transfer
+    /// reports `bytes_transferred = total_bytes` (everything was already
+    /// in place) and `resumed_from = total_bytes`.
+    Skip { total_bytes: u64 },
+    /// Destination is shorter than the source — open without `TRUNCATE`,
+    /// seek both endpoints to `offset`, and ramp progress from `offset`
+    /// to `total_bytes`.
+    Resume { offset: u64, total_bytes: u64 },
+}
+
+impl ResumePlan {
+    /// Byte offset the destination is positioned at when the chunk loop
+    /// starts. `0` for [`ResumePlan::Truncate`], `offset` for
+    /// [`ResumePlan::Resume`], `total_bytes` for [`ResumePlan::Skip`].
+    #[must_use]
+    pub const fn start_offset(&self) -> u64 {
+        match self {
+            Self::Truncate => 0,
+            Self::Skip { total_bytes } => *total_bytes,
+            Self::Resume { offset, .. } => *offset,
+        }
+    }
+
+    /// Convenience predicate — `true` only for [`ResumePlan::Skip`].
+    #[must_use]
+    pub const fn is_skip(&self) -> bool {
+        matches!(self, Self::Skip { .. })
+    }
+}
+
+/// Hash buffer block size for the `verify=true` prefix compare. 64 KiB
+/// matches the OS-level read-ahead window typical on modern Linux /
+/// macOS and keeps the loop allocation small.
+const VERIFY_HASH_BLOCK: usize = 64 * 1024;
+
+/// Compute the SHA-256 of the local file `[0..offset]` prefix,
+/// streaming in 64 KiB blocks.
+///
+/// Used by the ADR 0010 `verify=true` path. Never materialises the
+/// prefix in memory; the caller pays O(offset) bytes hashed locally.
+async fn sha256_local_prefix(local_path: &Path, offset: u64) -> Result<[u8; 32], String> {
+    let mut file = File::open(local_path).await.map_err(|e| {
+        classify_transfer_error(
+            &format!("open local for verify '{}'", local_path.display()),
+            &e.to_string(),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; VERIFY_HASH_BLOCK];
+    hash_prefix_loop(&mut file, &mut hasher, &mut buf, local_path, offset).await?;
+    Ok(hasher.finalize().into())
+}
+
+/// Drive the read-and-hash loop for [`sha256_local_prefix`]. Extracted
+/// so the parent stays under the project's 30-line clippy threshold.
+async fn hash_prefix_loop(
+    file: &mut File,
+    hasher: &mut Sha256,
+    buf: &mut [u8],
+    local_path: &Path,
+    offset: u64,
+) -> Result<(), String> {
+    let block_u64 = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+    let mut remaining = offset;
+    while remaining > 0 {
+        let want_u64 = remaining.min(block_u64);
+        // bounded by buf.len() (a usize), so the cast cannot truncate.
+        let want = usize::try_from(want_u64).unwrap_or(buf.len());
+        let n = file.read(&mut buf[..want]).await.map_err(|e| {
+            classify_transfer_error(
+                &format!("read local for verify '{}'", local_path.display()),
+                &e.to_string(),
+            )
+        })?;
+        if n == 0 {
+            return Err(format!(
+                "[RESUME_MISMATCH] local file '{}' shorter than verify offset {offset}; \
+                 destination prefix cannot be validated. Re-run with resume=false to overwrite.",
+                local_path.display()
+            ));
+        }
+        hasher.update(&buf[..n]);
+        remaining = remaining.saturating_sub(u64::try_from(n).unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// Execute a one-shot remote command on the russh handle and collect
+/// stdout/stderr/exit code. Used by the ADR 0010 verify path to drive
+/// `sha256sum` / `dd` on the remote host without depending on the SSH
+/// adapter's port-level surface.
+async fn exec_sync(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    command: &str,
+) -> Result<(String, String, Option<u32>), String> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| classify_transfer_error("open verify channel", &e.to_string()))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|e| classify_transfer_error("exec verify command", &e.to_string()))?;
+    let mut stdout = Vec::with_capacity(64);
+    let mut stderr = Vec::with_capacity(64);
+    let mut exit_code: Option<u32> = None;
+    collect_exec_output(&mut channel, &mut stdout, &mut stderr, &mut exit_code).await;
+    let stdout_s = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr_s = String::from_utf8_lossy(&stderr).into_owned();
+    Ok((stdout_s, stderr_s, exit_code))
+}
+
+/// Drain a russh channel into stdout / stderr buffers and capture the
+/// exit code. Mirrors the SSH adapter's `collect_sync_output` but lives
+/// here so the SFTP adapter does not pull a cross-module dependency.
+async fn collect_exec_output(
+    channel: &mut russh::Channel<ClientMsg>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    exit_code: &mut Option<u32>,
+) {
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, ext }) => {
+                if ext == 1 {
+                    stderr.extend_from_slice(&data);
+                }
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                *exit_code = Some(exit_status);
+            }
+            Some(ChannelMsg::Eof) => {
+                if exit_code.is_some() {
+                    break;
+                }
+            }
+            Some(ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+}
+
+/// Hash 64 hex chars from the head of `stdout` (sha256sum-style output)
+/// and return the digest bytes. Returns `None` when the input is too
+/// short or contains non-hex characters.
+fn parse_sha256_hex(out: &str) -> Option<[u8; 32]> {
+    let head: String = out.trim_start().chars().take(64).collect();
+    if head.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        let start = i * 2;
+        let pair = head.get(start..=start + 1)?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// Build the remote-side hash command for an upload-direction verify.
+///
+/// We hash the entire remote prefix because the local source already
+/// covers everything past the offset; if the remote is shorter than the
+/// resume offset the preflight would have routed to `Truncate`, so this
+/// path always sees `remote_size >= offset` and `sha256sum` over the
+/// full file is correct.
+fn upload_verify_command(remote_path: &str) -> String {
+    let escaped = shell_single_quote(remote_path);
+    format!("sha256sum -b -- {escaped} 2>/dev/null")
+}
+
+/// Build the remote-side hash command for a download-direction verify.
+///
+/// We hash only the first `offset` bytes of the remote source because
+/// the remote file is normally larger than the local prefix; piping
+/// `dd` into `sha256sum` keeps the hash bounded.
+fn download_verify_command(remote_path: &str, offset: u64) -> String {
+    let escaped = shell_single_quote(remote_path);
+    format!("dd if={escaped} bs=1 count={offset} 2>/dev/null | sha256sum")
+}
+
+/// Quote a path for safe inclusion in a remote shell command using
+/// POSIX single-quote rules. Replaces every embedded `'` with `'\''`.
+fn shell_single_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Verify that the resume prefix on the remote matches the local prefix
+/// by hashing both sides and comparing.
+///
+/// Used by [`preflight_resume_upload`] / [`preflight_resume_download`]
+/// when the caller passes `verify=true`. Pure precondition check —
+/// returns `Ok(())` on match, `Err("[RESUME_MISMATCH] ...")` on
+/// divergence. Skips entirely when `offset == 0` (no prefix to verify).
+async fn verify_resume_prefix(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    local_path: &Path,
+    remote_path: &str,
+    offset: u64,
+    direction: VerifyDirection,
+) -> Result<(), String> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let local_digest = sha256_local_prefix(local_path, offset).await?;
+    let command = match direction {
+        VerifyDirection::Upload => upload_verify_command(remote_path),
+        VerifyDirection::Download => download_verify_command(remote_path, offset),
+    };
+    let (stdout, stderr, exit_code) = exec_sync(handle, &command).await?;
+    let remote_digest = remote_digest_or_err(exit_code, &stdout, &stderr)?;
+    compare_resume_digests(offset, &local_digest, &remote_digest)
+}
+
+/// Translate an `exec` outcome into the remote sha256 digest, or a
+/// `[RESUME_MISMATCH]`-tagged error covering both the non-zero exit and
+/// the parse-failure cases.
+fn remote_digest_or_err(
+    exit_code: Option<u32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<[u8; 32], String> {
+    if exit_code != Some(0) {
+        return Err(format!(
+            "[RESUME_MISMATCH] remote verify command failed (exit={exit_code:?}); \
+             stderr='{}'. Required tools: sha256sum + dd. Re-run with resume=false to overwrite.",
+            stderr.trim()
+        ));
+    }
+    parse_sha256_hex(stdout).ok_or_else(|| {
+        format!(
+            "[RESUME_MISMATCH] could not parse remote sha256 output '{}' (need 64 hex chars). \
+             Required tools: sha256sum + dd.",
+            stdout.trim()
+        )
+    })
+}
+
+/// Final digest comparison — `Ok(())` on match, tagged error on
+/// divergence. Pure helper.
+fn compare_resume_digests(
+    offset: u64,
+    local_digest: &[u8; 32],
+    remote_digest: &[u8; 32],
+) -> Result<(), String> {
+    if local_digest == remote_digest {
+        Ok(())
+    } else {
+        Err(format!(
+            "[RESUME_MISMATCH] resume prefix sha256 differs (offset={offset}); \
+             local={} remote={}. Re-run with resume=false to overwrite, \
+             or fix the partial file.",
+            hex_encode(local_digest),
+            hex_encode(remote_digest)
+        ))
+    }
+}
+
+/// Direction tag for [`verify_resume_prefix`] so the helper picks the
+/// right remote-side hash command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyDirection {
+    Upload,
+    Download,
+}
+
+/// Lower-case hex encoding of a 32-byte sha256 digest. Used only for
+/// the human-readable error string; not on a hot path.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Pre-flight an upload destination and return the [`ResumePlan`] the
+/// streaming task must honour (ADR 0010).
+///
+/// Behaviour:
+/// - `resume == false` -> always returns [`ResumePlan::Truncate`]; v6.0
+///   semantics preserved.
+/// - `resume == true` and remote file missing -> [`ResumePlan::Truncate`]
+///   (resume from a non-existent prefix is identical to a fresh upload).
+/// - `resume == true` and remote size > local size -> error tagged
+///   `[RESUME_OVERSHOOT]`.
+/// - `resume == true` and remote size == local size ->
+///   [`ResumePlan::Skip`].
+/// - `resume == true` and remote size < local size ->
+///   [`ResumePlan::Resume { offset = remote_size }`].
+///
+/// # Errors
+///
+/// Returns a tagged string error on overshoot or on unrecoverable
+/// metadata failures. Caller maps this through [`DomainError::Sftp`] —
+/// the existing classification dispatch handles it.
+pub async fn preflight_resume_upload(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    local_path: &Path,
+    remote_path: &str,
+    resume: bool,
+    verify: bool,
+) -> Result<ResumePlan, String> {
+    let local_size = stat_local_for_resume(local_path).await?;
+    if !resume {
+        return Ok(ResumePlan::Truncate);
+    }
+    let sftp = open_sftp_session(handle).await?;
+    let remote_size = stat_remote_for_resume(&sftp, remote_path).await?;
+    drop(sftp);
+    let plan = decide_upload_plan(local_size, remote_size)?;
+    maybe_verify_prefix(
+        handle,
+        local_path,
+        remote_path,
+        plan,
+        verify,
+        VerifyDirection::Upload,
+    )
+    .await?;
+    Ok(plan)
+}
+
+/// Pre-flight a download destination and return the [`ResumePlan`] the
+/// streaming task must honour (ADR 0010).
+///
+/// Behaviour mirrors [`preflight_resume_upload`] with the local and
+/// remote roles swapped — the local destination plays the part of "the
+/// thing that may already hold a partial prefix".
+///
+/// # Errors
+///
+/// Returns a tagged string error on overshoot or on unrecoverable
+/// metadata failures.
+pub async fn preflight_resume_download(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    remote_path: &str,
+    local_path: &Path,
+    resume: bool,
+    verify: bool,
+) -> Result<ResumePlan, String> {
+    let sftp = open_sftp_session(handle).await?;
+    let remote_size = open_remote_size_required(&sftp, remote_path).await?;
+    drop(sftp);
+    if !resume {
+        return Ok(ResumePlan::Truncate);
+    }
+    let local_size = stat_local_for_resume_optional(local_path).await?;
+    let plan = decide_download_plan(local_size, remote_size)?;
+    maybe_verify_prefix(
+        handle,
+        local_path,
+        remote_path,
+        plan,
+        verify,
+        VerifyDirection::Download,
+    )
+    .await?;
+    Ok(plan)
+}
+
+/// Run the ADR 0010 verify-prefix hash compare when:
+/// - the caller passed `verify=true`, AND
+/// - the resume plan is [`ResumePlan::Resume`] with a non-zero offset
+///   (Truncate has nothing to verify; Skip already implies prefix match
+///   by length, but we still re-hash to surface mid-prefix corruption).
+///
+/// Returns `Ok(())` on match or when the verify pass should be skipped.
+async fn maybe_verify_prefix(
+    handle: &Arc<client::Handle<SshClientHandler>>,
+    local_path: &Path,
+    remote_path: &str,
+    plan: ResumePlan,
+    verify: bool,
+    direction: VerifyDirection,
+) -> Result<(), String> {
+    if !verify {
+        return Ok(());
+    }
+    let offset = match plan {
+        ResumePlan::Resume { offset, .. } => offset,
+        ResumePlan::Skip { total_bytes } => total_bytes,
+        ResumePlan::Truncate => return Ok(()),
+    };
+    if offset == 0 {
+        return Ok(());
+    }
+    verify_resume_prefix(handle, local_path, remote_path, offset, direction).await
+}
+
+/// Stat a local path and return its byte length. Surfaces metadata
+/// failures with the existing `[FILE_NOT_FOUND]` / `[PERMISSION_DENIED]`
+/// classification.
+async fn stat_local_for_resume(local_path: &Path) -> Result<u64, String> {
+    tokio_metadata(local_path)
+        .await
+        .map(|m| m.len())
+        .map_err(|err| {
+            classify_transfer_error(
+                &format!("stat local for resume '{}'", local_path.display()),
+                &err.to_string(),
+            )
+        })
+}
+
+/// Stat a local path and return its byte length, or `0` when the file is
+/// absent. Used by the download preflight where a missing local file is
+/// the legitimate "fresh download" base case.
+async fn stat_local_for_resume_optional(local_path: &Path) -> Result<u64, String> {
+    match tokio_metadata(local_path).await {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(classify_transfer_error(
+            &format!("stat local for resume '{}'", local_path.display()),
+            &err.to_string(),
+        )),
+    }
+}
+
+/// Stat a remote path through an SFTP session and return its byte
+/// length. Returns `0` when the file does not exist (resume base case).
+async fn stat_remote_for_resume(sftp: &SftpSession, remote_path: &str) -> Result<u64, String> {
+    match sftp.metadata(remote_path).await {
+        Ok(meta) => Ok(meta.size.unwrap_or(0)),
+        Err(err) => {
+            let raw = err.to_string();
+            let lower = raw.to_lowercase();
+            if lower.contains("no such file") || lower.contains("not found") {
+                Ok(0)
+            } else {
+                Err(classify_transfer_error(
+                    &format!("preflight remote metadata '{remote_path}'"),
+                    &raw,
+                ))
+            }
+        }
+    }
+}
+
+/// Stat a remote path through an SFTP session and **require** the file
+/// to exist. Used by the download preflight where a missing remote file
+/// is fatal (no source to copy from).
+async fn open_remote_size_required(sftp: &SftpSession, remote_path: &str) -> Result<u64, String> {
+    sftp.metadata(remote_path)
+        .await
+        .map(|meta| meta.size.unwrap_or(0))
+        .map_err(|err| {
+            classify_transfer_error(
+                &format!("preflight remote metadata '{remote_path}'"),
+                &err.to_string(),
+            )
+        })
+}
+
+/// Decision matrix for upload preflight given the two sizes.
+///
+/// Pure function (no I/O) so the 9-case decision matrix is unit-testable
+/// without a live SFTP server. Re-exported through
+/// [`super::resume::decide_upload_plan`] for external property tests.
+///
+/// # Errors
+///
+/// Returns a `[RESUME_OVERSHOOT]`-tagged error when `remote_size >
+/// local_size`. The caller surfaces this through `DomainError::Sftp`.
+pub(super) fn decide_upload_plan(local_size: u64, remote_size: u64) -> Result<ResumePlan, String> {
+    match remote_size.cmp(&local_size) {
+        CmpOrdering::Greater => Err(format!(
+            "[RESUME_OVERSHOOT] preflight resume upload: remote size {remote_size} \
+             exceeds local size {local_size}; refusing to resume. \
+             Re-run with resume=false to overwrite, or fix the partial file."
+        )),
+        CmpOrdering::Equal => Ok(ResumePlan::Skip {
+            total_bytes: local_size,
+        }),
+        CmpOrdering::Less => Ok(ResumePlan::Resume {
+            offset: remote_size,
+            total_bytes: local_size,
+        }),
+    }
+}
+
+/// Decision matrix for download preflight; mirror of
+/// [`decide_upload_plan`] with local and remote roles swapped.
+/// Re-exported through [`super::resume::decide_download_plan`].
+///
+/// # Errors
+///
+/// Returns a `[RESUME_OVERSHOOT]`-tagged error when `local_size >
+/// remote_size`.
+pub(super) fn decide_download_plan(
+    local_size: u64,
+    remote_size: u64,
+) -> Result<ResumePlan, String> {
+    match local_size.cmp(&remote_size) {
+        CmpOrdering::Greater => Err(format!(
+            "[RESUME_OVERSHOOT] preflight resume download: local size {local_size} \
+             exceeds remote size {remote_size}; refusing to resume. \
+             Re-run with resume=false to overwrite, or fix the partial file."
+        )),
+        CmpOrdering::Equal => Ok(ResumePlan::Skip {
+            total_bytes: remote_size,
+        }),
+        CmpOrdering::Less => Ok(ResumePlan::Resume {
+            offset: local_size,
+            total_bytes: remote_size,
+        }),
     }
 }
 
@@ -184,12 +729,25 @@ fn home_dir() -> Option<PathBuf> {
 /// Reads the local file in 32KB chunks and writes to the remote file,
 /// emitting a `ProgressEvent::Tick` after each chunk and a terminal
 /// `Completed` / `Failed` / `Cancelled` event before returning.
+///
+/// Honours the [`ResumePlan`] carried in `shared`:
+/// - [`ResumePlan::Truncate`] — v6.0 behaviour: create + truncate the
+///   remote file, stream from byte 0.
+/// - [`ResumePlan::Skip`] — short-circuit: emit `Completed` synchronously
+///   without opening either file.
+/// - [`ResumePlan::Resume`] — open the remote file with `WRITE | CREATE`
+///   (no `TRUNCATE`), seek both endpoints to the resume offset, ramp
+///   progress from `offset` to `total_bytes`.
 pub async fn sftp_upload_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     local_path: PathBuf,
     remote_path: String,
     shared: TransferShared,
 ) {
+    if shared.resume_plan.is_skip() {
+        handle_transfer_result(Ok(false), "upload", &local_path, &remote_path, &shared);
+        return;
+    }
     let result = sftp_upload_inner(
         &handle,
         &local_path,
@@ -200,6 +758,7 @@ pub async fn sftp_upload_streaming(
         &shared.progress_tx,
         &shared.data_notify,
         &shared.total_bytes,
+        shared.resume_plan,
     )
     .await;
 
@@ -299,10 +858,16 @@ async fn sftp_upload_inner(
     progress_tx: &broadcast::Sender<ProgressEvent>,
     data_notify: &Notify,
     total_bytes: &Arc<AtomicU64>,
+    resume_plan: ResumePlan,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
     let mut local_file = open_local_file(local_path).await?;
-    let mut remote_file = create_remote_file(&sftp, remote_path).await?;
+    let mut remote_file = open_remote_file_for_write(&sftp, remote_path, resume_plan).await?;
+
+    if let ResumePlan::Resume { offset, .. } = resume_plan {
+        seek_local_file(&mut local_file, offset, local_path).await?;
+        seek_remote_file(&mut remote_file, offset, remote_path).await?;
+    }
 
     let cancelled = upload_chunks(
         &mut local_file,
@@ -343,6 +908,68 @@ async fn create_remote_file(sftp: &SftpSession, remote_path: &str) -> Result<Sft
             &e.to_string(),
         )
     })
+}
+
+/// Open a remote file for writing, honouring the ADR 0010 [`ResumePlan`].
+///
+/// - [`ResumePlan::Truncate`] reuses [`create_remote_file`] (v6.0 path:
+///   `WRITE | CREATE | TRUNCATE`).
+/// - [`ResumePlan::Resume`] opens with `WRITE | CREATE` (no truncate)
+///   so the existing prefix is preserved. The streaming caller seeks
+///   to the resume offset before writing the next chunk.
+/// - [`ResumePlan::Skip`] never reaches this helper — the caller
+///   short-circuits at the streaming wrapper.
+async fn open_remote_file_for_write(
+    sftp: &SftpSession,
+    remote_path: &str,
+    resume_plan: ResumePlan,
+) -> Result<SftpFile, String> {
+    match resume_plan {
+        ResumePlan::Truncate => create_remote_file(sftp, remote_path).await,
+        ResumePlan::Resume { .. } => {
+            let flags = OpenFlags::WRITE | OpenFlags::CREATE;
+            sftp.open_with_flags(remote_path, flags).await.map_err(|e| {
+                classify_transfer_error(
+                    &format!("open remote file for resume '{remote_path}'"),
+                    &e.to_string(),
+                )
+            })
+        }
+        ResumePlan::Skip { .. } => Err(format!(
+            "[INTERNAL_ERROR] open_remote_file_for_write reached on Skip plan: {remote_path}"
+        )),
+    }
+}
+
+/// Seek a remote SFTP file to `offset`. Surfaces seek failures with the
+/// existing transfer-error classifier.
+async fn seek_remote_file(
+    file: &mut SftpFile,
+    offset: u64,
+    remote_path: &str,
+) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+        classify_transfer_error(
+            &format!("seek remote file '{remote_path}' to offset {offset}"),
+            &e.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Seek a local file (`tokio::fs::File`) to `offset`. Mirror of
+/// [`seek_remote_file`].
+async fn seek_local_file(file: &mut File, offset: u64, local_path: &Path) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+        classify_transfer_error(
+            &format!(
+                "seek local file '{}' to offset {offset}",
+                local_path.display()
+            ),
+            &e.to_string(),
+        )
+    })?;
+    Ok(())
 }
 
 /// Flushes and shuts down a remote SFTP file.
@@ -450,12 +1077,22 @@ async fn write_to_sftp_file(
 /// Reads the remote file in 32KB chunks and writes to the local file,
 /// emitting a `ProgressEvent::Tick` after each chunk and a terminal
 /// `Completed` / `Failed` / `Cancelled` event before returning.
+///
+/// Honours the [`ResumePlan`] carried in `shared`: see the upload twin
+/// for the per-variant semantics. The local destination is opened with
+/// `OpenOptions::write+create+truncate(false)` for resume; v6.0
+/// `File::create` truncating semantics are preserved for the
+/// [`ResumePlan::Truncate`] path.
 pub async fn sftp_download_streaming(
     handle: Arc<client::Handle<SshClientHandler>>,
     remote_path: String,
     local_path: PathBuf,
     shared: TransferShared,
 ) {
+    if shared.resume_plan.is_skip() {
+        handle_transfer_result(Ok(false), "download", &local_path, &remote_path, &shared);
+        return;
+    }
     let result = sftp_download_inner(
         &handle,
         &remote_path,
@@ -466,6 +1103,7 @@ pub async fn sftp_download_streaming(
         &shared.progress_tx,
         &shared.data_notify,
         &shared.total_bytes,
+        shared.resume_plan,
     )
     .await;
 
@@ -487,10 +1125,16 @@ async fn sftp_download_inner(
     progress_tx: &broadcast::Sender<ProgressEvent>,
     data_notify: &Notify,
     total_bytes: &Arc<AtomicU64>,
+    resume_plan: ResumePlan,
 ) -> Result<bool, String> {
     let sftp = open_sftp_session(handle).await?;
     let mut remote_file = open_remote_file(&sftp, remote_path).await?;
-    let mut local_file = create_local_file(local_path).await?;
+    let mut local_file = open_local_file_for_write(local_path, resume_plan).await?;
+
+    if let ResumePlan::Resume { offset, .. } = resume_plan {
+        seek_remote_file(&mut remote_file, offset, remote_path).await?;
+        seek_local_file(&mut local_file, offset, local_path).await?;
+    }
 
     let cancelled = download_chunks(
         &mut remote_file,
@@ -528,6 +1172,39 @@ async fn create_local_file(local_path: &Path) -> Result<File, String> {
             &e.to_string(),
         )
     })
+}
+
+/// Open a local file for writing, honouring the ADR 0010 [`ResumePlan`].
+///
+/// - [`ResumePlan::Truncate`] reuses [`create_local_file`] (v6.0 path:
+///   truncate-on-open).
+/// - [`ResumePlan::Resume`] opens with `OpenOptions::write+create+
+///   truncate(false)` so the existing prefix is preserved. The streaming
+///   caller seeks to the resume offset before writing the next chunk.
+/// - [`ResumePlan::Skip`] never reaches this helper.
+async fn open_local_file_for_write(
+    local_path: &Path,
+    resume_plan: ResumePlan,
+) -> Result<File, String> {
+    match resume_plan {
+        ResumePlan::Truncate => create_local_file(local_path).await,
+        ResumePlan::Resume { .. } => OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(local_path)
+            .await
+            .map_err(|e| {
+                classify_transfer_error(
+                    &format!("open local file for resume '{}'", local_path.display()),
+                    &e.to_string(),
+                )
+            }),
+        ResumePlan::Skip { .. } => Err(format!(
+            "[INTERNAL_ERROR] open_local_file_for_write reached on Skip plan: {}",
+            local_path.display()
+        )),
+    }
 }
 
 /// Flushes a local file after writing.
@@ -599,6 +1276,210 @@ async fn download_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod resume_plan_decision_matrix {
+        use super::*;
+
+        // ---- decide_upload_plan ----------------------------------------
+
+        #[test]
+        fn upload_remote_missing_returns_resume_from_zero() {
+            // remote_size = 0 (file absent), local_size = 1024
+            let plan = decide_upload_plan(1024, 0).expect("plan ok");
+            assert_eq!(
+                plan,
+                ResumePlan::Resume {
+                    offset: 0,
+                    total_bytes: 1024,
+                }
+            );
+            assert_eq!(plan.start_offset(), 0);
+        }
+
+        #[test]
+        fn upload_remote_partial_returns_resume_at_remote_size() {
+            // remote 512 bytes, local 1024 bytes — resume from 512
+            let plan = decide_upload_plan(1024, 512).expect("plan ok");
+            assert_eq!(
+                plan,
+                ResumePlan::Resume {
+                    offset: 512,
+                    total_bytes: 1024,
+                }
+            );
+            assert_eq!(plan.start_offset(), 512);
+        }
+
+        #[test]
+        fn upload_remote_equal_returns_skip() {
+            let plan = decide_upload_plan(1024, 1024).expect("plan ok");
+            assert_eq!(plan, ResumePlan::Skip { total_bytes: 1024 });
+            assert!(plan.is_skip());
+            assert_eq!(plan.start_offset(), 1024);
+        }
+
+        #[test]
+        fn upload_remote_larger_returns_resume_overshoot() {
+            let err = decide_upload_plan(1024, 2048).expect_err("overshoot");
+            assert!(err.starts_with("[RESUME_OVERSHOOT] preflight resume upload"));
+            assert!(err.contains("remote size 2048"));
+            assert!(err.contains("exceeds local size 1024"));
+            assert!(err.contains("resume=false to overwrite"));
+        }
+
+        #[test]
+        fn upload_zero_byte_local_returns_skip_when_remote_zero() {
+            // edge case: empty local file, no remote — both 0, equal -> skip
+            let plan = decide_upload_plan(0, 0).expect("plan ok");
+            assert_eq!(plan, ResumePlan::Skip { total_bytes: 0 });
+        }
+
+        // ---- decide_download_plan --------------------------------------
+
+        #[test]
+        fn download_local_missing_returns_resume_from_zero() {
+            // local_size = 0 (file absent), remote_size = 1024
+            let plan = decide_download_plan(0, 1024).expect("plan ok");
+            assert_eq!(
+                plan,
+                ResumePlan::Resume {
+                    offset: 0,
+                    total_bytes: 1024,
+                }
+            );
+        }
+
+        #[test]
+        fn download_local_partial_returns_resume_at_local_size() {
+            let plan = decide_download_plan(384, 1024).expect("plan ok");
+            assert_eq!(
+                plan,
+                ResumePlan::Resume {
+                    offset: 384,
+                    total_bytes: 1024,
+                }
+            );
+        }
+
+        #[test]
+        fn download_local_equal_returns_skip() {
+            let plan = decide_download_plan(2048, 2048).expect("plan ok");
+            assert_eq!(plan, ResumePlan::Skip { total_bytes: 2048 });
+            assert!(plan.is_skip());
+        }
+
+        #[test]
+        fn download_local_larger_returns_resume_overshoot() {
+            let err = decide_download_plan(4096, 2048).expect_err("overshoot");
+            assert!(err.starts_with("[RESUME_OVERSHOOT] preflight resume download"));
+            assert!(err.contains("local size 4096"));
+            assert!(err.contains("exceeds remote size 2048"));
+        }
+
+        // ---- ResumePlan helpers ----------------------------------------
+
+        #[test]
+        fn truncate_plan_start_offset_is_zero() {
+            assert_eq!(ResumePlan::Truncate.start_offset(), 0);
+            assert!(!ResumePlan::Truncate.is_skip());
+        }
+
+        #[test]
+        fn skip_predicate_only_true_for_skip_variant() {
+            assert!(ResumePlan::Skip { total_bytes: 1 }.is_skip());
+            assert!(!ResumePlan::Truncate.is_skip());
+            assert!(
+                !ResumePlan::Resume {
+                    offset: 1,
+                    total_bytes: 2,
+                }
+                .is_skip()
+            );
+        }
+    }
+
+    mod verify_helpers {
+        use super::*;
+
+        #[test]
+        fn shell_quote_wraps_in_single_quotes() {
+            assert_eq!(shell_single_quote("/tmp/foo"), "'/tmp/foo'");
+        }
+
+        #[test]
+        fn shell_quote_escapes_embedded_single_quote() {
+            // POSIX rule: close quote, escape with backslash, reopen.
+            assert_eq!(
+                shell_single_quote("/path/to/it's-a-file"),
+                "'/path/to/it'\\''s-a-file'"
+            );
+        }
+
+        #[test]
+        fn shell_quote_passes_spaces_unchanged() {
+            assert_eq!(shell_single_quote("/tmp/my file"), "'/tmp/my file'");
+        }
+
+        #[test]
+        fn parse_sha256_round_trip() {
+            // sha256 of empty string
+            let canonical = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+            let bytes = parse_sha256_hex(canonical).expect("parse ok");
+            let hex = hex_encode(&bytes);
+            assert_eq!(hex, canonical);
+        }
+
+        #[test]
+        fn parse_sha256_handles_sha256sum_prefix() {
+            // sha256sum prints "<hex>  <filename>\n"
+            let line =
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /tmp/empty\n";
+            let bytes = parse_sha256_hex(line).expect("parse ok");
+            assert_eq!(
+                hex_encode(&bytes),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            );
+        }
+
+        #[test]
+        fn parse_sha256_rejects_short_input() {
+            assert!(parse_sha256_hex("deadbeef").is_none());
+        }
+
+        #[test]
+        fn parse_sha256_rejects_non_hex() {
+            // 64 chars but with a 'g' poisoning the back half
+            let bad = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8gg";
+            assert!(parse_sha256_hex(bad).is_none());
+        }
+
+        #[test]
+        fn upload_verify_command_uses_sha256sum_full_file() {
+            let cmd = upload_verify_command("/srv/data.bin");
+            assert!(cmd.contains("sha256sum -b -- '/srv/data.bin'"));
+            assert!(cmd.contains("2>/dev/null"));
+        }
+
+        #[test]
+        fn download_verify_command_uses_dd_pipe_sha256sum() {
+            let cmd = download_verify_command("/srv/data.bin", 1024);
+            assert!(cmd.contains("dd if='/srv/data.bin' bs=1 count=1024"));
+            assert!(cmd.contains("sha256sum"));
+        }
+
+        #[test]
+        fn hex_encode_matches_lowercase_format() {
+            let mut digest = [0_u8; 32];
+            for (i, b) in digest.iter_mut().enumerate() {
+                *b = u8::try_from(i & 0xFF).unwrap_or(0);
+            }
+            let hex = hex_encode(&digest);
+            assert_eq!(
+                hex,
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            );
+        }
+    }
 
     mod resolve_local_path {
         use super::*;

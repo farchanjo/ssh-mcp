@@ -68,6 +68,13 @@ pub struct DownloadRequest {
     pub local_path: String,
     /// v5 Phase 3 — optional lifecycle policy override.
     pub lifecycle_policy: Option<LifecyclePolicy>,
+    /// ADR 0010 — opt-in resume from the local tail. Default `false`
+    /// preserves v6.0 semantics: every download truncates the destination.
+    pub resume: bool,
+    /// ADR 0010 — when `resume == true`, hash the resume prefix on both
+    /// sides and abort with `RESUME_MISMATCH` on divergence. Default
+    /// `false` trusts the prefix verbatim.
+    pub verify: bool,
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
@@ -94,6 +101,9 @@ pub struct DownloadOutcome {
     /// progress events on `transfer://<id>/progress` deliver the
     /// authoritative running counter.
     pub total_bytes: u64,
+    /// ADR 0010 — byte offset the transfer resumed from. `0` for fresh
+    /// downloads.
+    pub resumed_from: u64,
     /// RFC 3339 timestamp of when the use case spawned the streaming task.
     pub started_at: String,
 }
@@ -194,8 +204,32 @@ where
         let resolved_local = entity.local_path.clone();
         let resolved_remote = entity.remote_path.clone();
         let total_bytes = entity.total_bytes;
+        let resumed_from = entity.resumed_from;
         let started_at = entity.started_at;
-        self.persist_or_rollback(&transfer_id, entity).await?;
+        self.persist_and_track(&transfer_id, &req, entity).await?;
+        Ok(DownloadOutcome {
+            transfer_id,
+            session_id: req.session_id,
+            agent_id: session.agent_id,
+            local_path: resolved_local,
+            remote_path: resolved_remote,
+            total_bytes,
+            resumed_from,
+            started_at: started_at.to_rfc3339(),
+        })
+    }
+
+    /// Persist the entity, register lifecycle binding, poke subscribers,
+    /// and tick the clock. Extracted from [`Self::execute`] to keep the
+    /// orchestrator under the 30-line clippy threshold after ADR 0010
+    /// added the `resumed_from` snapshot.
+    async fn persist_and_track(
+        &self,
+        transfer_id: &TransferId,
+        req: &DownloadRequest,
+        entity: TransferEntity,
+    ) -> Result<(), DomainError> {
+        self.persist_or_rollback(transfer_id, entity).await?;
         // v5 lifecycle binding: register the freshly spawned download.
         // The policy comes from the inbound DTO when set (Phase 3
         // release_when_no_subs / grace_ms knobs); `None` falls back to
@@ -213,15 +247,7 @@ where
         // can route every timestamp through the clock without another
         // constructor churn.
         let _ = self.clock.utc_now();
-        Ok(DownloadOutcome {
-            transfer_id,
-            session_id: req.session_id,
-            agent_id: session.agent_id,
-            local_path: resolved_local,
-            remote_path: resolved_remote,
-            total_bytes,
-            started_at: started_at.to_rfc3339(),
-        })
+        Ok(())
     }
 
     /// Drive the SFTP adapter to spawn the download streaming task and
@@ -238,6 +264,8 @@ where
                     session_id: req.session_id.clone(),
                     remote_path: req.remote_path.clone(),
                     local_path: req.local_path.clone(),
+                    resume: req.resume,
+                    verify: req.verify,
                 },
             )
             .await
@@ -489,6 +517,8 @@ mod tests {
             remote_path: "/srv/source.bin".to_string(),
             local_path: "/tmp/dest.bin".to_string(),
             lifecycle_policy: None,
+            resume: false,
+            verify: false,
         }
     }
 

@@ -192,6 +192,17 @@ enum ExecuteAsyncOutcome {
     Err(DomainError),
 }
 
+/// Scripted outcome for an `execute` (one-shot) call.
+#[derive(Debug, Clone)]
+enum ExecuteOutcome {
+    /// `execute` succeeds with the supplied stdout payload and an
+    /// exit code of 0. The fake fills `stderr` with an empty buffer
+    /// and `timed_out=false`.
+    OkStdout(String),
+    /// `execute` fails with the supplied domain error.
+    Err(DomainError),
+}
+
 /// Scripted outcome for an `open_shell` call. The fake mints the
 /// returned [`ShellEntity`] from the queued shell id together with the
 /// session id and terminal description supplied by the caller, so tests
@@ -244,6 +255,10 @@ struct FakeSshClientInner {
     /// defaults to success so tests that only care about call recording do
     /// not need to seed the queue first.
     execute_async_queue: Mutex<Vec<ExecuteAsyncOutcome>>,
+    /// Scripted `execute` (one-shot) outcomes, popped FIFO. An empty
+    /// queue defaults to a benign empty-stdout success so existing
+    /// callers that only care about the call log are unaffected.
+    execute_queue: Mutex<Vec<ExecuteOutcome>>,
     /// Scripted `open_shell` outcomes, popped FIFO. An empty queue
     /// defaults to a success that mints a deterministic shell id of the
     /// shape `<session>-shell-<n>` (n = `shell_open_counter` + 1).
@@ -300,6 +315,23 @@ impl FakeSshClient {
     /// Queue a failed `disconnect` outcome with the supplied domain error.
     pub fn queue_disconnect_error(&self, error: DomainError) {
         Self::push(&self.inner.disconnect_queue, DisconnectOutcome::Err(error));
+    }
+
+    /// Queue a successful `execute` (one-shot) outcome with the
+    /// supplied stdout payload. The fake stamps `exit_code=Some(0)`,
+    /// empty stderr, `timed_out=false`. Useful for the v7 rsync probe
+    /// path and other one-shot exec assertions.
+    pub fn queue_exec_string(&self, stdout: &str) {
+        Self::push(
+            &self.inner.execute_queue,
+            ExecuteOutcome::OkStdout(stdout.to_string()),
+        );
+    }
+
+    /// Queue a failed `execute` outcome with the supplied domain
+    /// error.
+    pub fn queue_exec_error(&self, error: DomainError) {
+        Self::push(&self.inner.execute_queue, ExecuteOutcome::Err(error));
     }
 
     /// Queue a successful `execute_async` outcome. The fake derives the
@@ -417,6 +449,19 @@ impl FakeSshClient {
                     DisconnectOutcome::Ok
                 } else {
                     guard.remove(0)
+                }
+            },
+        )
+    }
+
+    fn pop_execute_outcome(&self) -> Option<ExecuteOutcome> {
+        self.inner.execute_queue.lock().map_or_else(
+            |_| None,
+            |mut guard| {
+                if guard.is_empty() {
+                    None
+                } else {
+                    Some(guard.remove(0))
                 }
             },
         )
@@ -545,15 +590,21 @@ impl SshClientPort for FakeSshClient {
             session_id: request.session_id,
             command: request.command,
         });
-        // The H10 use case routes liveness through `health_check`; if a future
-        // use case scripts `execute` we can extend the queues. Default to a
-        // benign success so this branch never trips an unrelated test.
-        Ok(CommandOutcome {
-            exit_code: Some(0),
-            stdout: Bytes::new(),
-            stderr: Bytes::new(),
-            timed_out: false,
-        })
+        match self.pop_execute_outcome() {
+            None => Ok(CommandOutcome {
+                exit_code: Some(0),
+                stdout: Bytes::new(),
+                stderr: Bytes::new(),
+                timed_out: false,
+            }),
+            Some(ExecuteOutcome::OkStdout(stdout)) => Ok(CommandOutcome {
+                exit_code: Some(0),
+                stdout: Bytes::from(stdout),
+                stderr: Bytes::new(),
+                timed_out: false,
+            }),
+            Some(ExecuteOutcome::Err(err)) => Err(err),
+        }
     }
 
     async fn execute_async(

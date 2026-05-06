@@ -23,6 +23,7 @@ pub fn upload_render(outcome: UploadOutcome) -> String {
         local_path,
         remote_path,
         total_bytes,
+        resumed_from,
         started_at: _,
     } = outcome;
     render_started(
@@ -33,6 +34,7 @@ pub fn upload_render(outcome: UploadOutcome) -> String {
         &local_path,
         &remote_path,
         total_bytes,
+        resumed_from,
         TransferDirection::Upload,
     )
 }
@@ -48,6 +50,7 @@ pub fn download_render(outcome: DownloadOutcome) -> String {
         local_path,
         remote_path,
         total_bytes,
+        resumed_from,
         started_at: _,
     } = outcome;
     render_started(
@@ -58,6 +61,7 @@ pub fn download_render(outcome: DownloadOutcome) -> String {
         &local_path,
         &remote_path,
         total_bytes,
+        resumed_from,
         TransferDirection::Download,
     )
 }
@@ -74,6 +78,7 @@ fn render_started(
     local_path: &str,
     remote_path: &str,
     total_bytes: u64,
+    resumed_from: u64,
     direction: TransferDirection,
 ) -> String {
     let (from, to) = match direction {
@@ -91,8 +96,20 @@ fn render_started(
         to,
         total_bytes,
     );
+    append_resumed_from_line(&mut out, resumed_from);
     append_started_advisories(&mut out, transfer_id);
     out
+}
+
+/// Emit the ADR 0010 `RESUMED_FROM:` line when the transfer resumed
+/// from a non-zero offset. Skipped on fresh transfers so the v6.0 wire
+/// shape is byte-identical for callers who never set `resume=true`.
+fn append_resumed_from_line(out: &mut String, resumed_from: u64) {
+    if resumed_from == 0 {
+        return;
+    }
+    out.push_str("\nRESUMED_FROM: ");
+    out.push_str(&resumed_from.to_string());
 }
 
 #[allow(
@@ -297,6 +314,7 @@ pub fn upload_structured(outcome: &UploadOutcome) -> Value {
         "from":        outcome.local_path,
         "to":          outcome.remote_path,
         "size_bytes":  outcome.total_bytes,
+        "resumed_from": outcome.resumed_from,
         "next": [
             "ssh_transfer_progress(wait=true)",
         ],
@@ -315,6 +333,7 @@ pub fn download_structured(outcome: &DownloadOutcome) -> Value {
         "from":        outcome.remote_path,
         "to":          outcome.local_path,
         "size_bytes":  outcome.total_bytes,
+        "resumed_from": outcome.resumed_from,
         "next": [
             "ssh_transfer_progress(wait=true)",
         ],
@@ -379,12 +398,33 @@ mod tests {
             local_path: "/tmp/f.txt".to_string(),
             remote_path: "/home/user/f.txt".to_string(),
             total_bytes: 1_048_576,
+            resumed_from: 0,
             started_at: "2026-04-18T10:30:00+00:00".to_string(),
         });
         assert!(m.contains("SSH_UPLOAD: STARTED"));
         assert!(m.contains("FROM: /tmp/f.txt"));
         assert!(m.contains("TO: /home/user/f.txt"));
         assert!(m.contains("SIZE: 1.0MB (1048576 bytes)"));
+        // RESUMED_FROM is suppressed for fresh uploads (resumed_from == 0)
+        // so the v6.0 wire shape stays byte-identical when callers do
+        // not opt into resume.
+        assert!(!m.contains("RESUMED_FROM"));
+    }
+
+    #[test]
+    fn upload_emits_resumed_from_when_offset_non_zero() {
+        let m = upload_render(UploadOutcome {
+            transfer_id: TransferId::new("xfer-2".to_string()),
+            session_id: SessionId::new("sess-2".to_string()),
+            agent_id: None,
+            local_path: "/tmp/big.bin".to_string(),
+            remote_path: "/srv/big.bin".to_string(),
+            total_bytes: 10_485_760,
+            resumed_from: 4_194_304,
+            started_at: "2026-05-05T00:00:00+00:00".to_string(),
+        });
+        assert!(m.contains("SSH_UPLOAD: STARTED"));
+        assert!(m.contains("RESUMED_FROM: 4194304"));
     }
 
     #[test]

@@ -50,6 +50,11 @@ const FORWARD_BROADCAST_CAP_FALLBACK: usize = 256;
 /// documented by the [`ConfigPort`] stub used in tests.
 const MAX_COMMANDS_PER_SESSION_FALLBACK: usize = 100;
 
+/// Default cap on concurrent rsync sessions per SSH session (ADR 0011).
+/// Mirrors the documented `SSH_MAX_RSYNC_PER_SESSION` knob; resolver
+/// will land alongside the production transport adapter.
+const MAX_RSYNC_PER_SESSION_FALLBACK: usize = 4;
+
 impl ConfigPort for EnvConfig {
     fn connect_timeout(&self) -> Duration {
         resolve_connect_timeout(None)
@@ -170,6 +175,10 @@ impl ConfigPort for EnvConfig {
 
     fn max_transfers_per_session(&self) -> usize {
         MAX_TRANSFERS_PER_SESSION
+    }
+
+    fn max_rsync_per_session(&self) -> usize {
+        MAX_RSYNC_PER_SESSION_FALLBACK
     }
 }
 

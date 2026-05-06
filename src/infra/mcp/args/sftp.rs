@@ -37,6 +37,24 @@ const fn default_lifecycle_grace_ms() -> Option<u32> {
     Some(2_000)
 }
 
+/// ADR 0010 default — `resume = false` preserves v6.0 behaviour.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_resume() -> Option<bool> {
+    Some(false)
+}
+
+/// ADR 0010 default — `verify = false` skips the prefix hash compare.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde requires the fn return type to match the field type Option<T>"
+)]
+const fn default_verify() -> Option<bool> {
+    Some(false)
+}
+
 /// Arguments for the `ssh_upload` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshUploadArgs {
@@ -59,6 +77,24 @@ pub struct SshUploadArgs {
     /// Default: 2000.
     #[schemars(default = "default_lifecycle_grace_ms")]
     pub grace_ms: Option<u32>,
+
+    /// ADR 0010 — opt-in resume from the remote tail. When `true`, the
+    /// adapter pre-flights the remote file size and resumes from the
+    /// first non-overlapping byte. When `false` (default), every upload
+    /// truncates the destination and starts from byte zero (v6.0
+    /// semantics). Set together with `verify=true` for a stronger
+    /// guarantee that the remote prefix matches the local prefix.
+    #[schemars(default = "default_resume")]
+    pub resume: Option<bool>,
+
+    /// ADR 0010 — when `resume=true`, hash the resume prefix on both
+    /// sides and abort with `RESUME_MISMATCH` if the hashes diverge.
+    /// Default `false` trusts the prefix verbatim. The hash compare
+    /// costs one extra `ssh_exec` round-trip plus O(offset) bytes
+    /// hashed remotely; only worth enabling if mid-transfer corruption
+    /// has been observed in deployment.
+    #[schemars(default = "default_verify")]
+    pub verify: Option<bool>,
 }
 
 /// Arguments for the `ssh_download` MCP tool.
@@ -83,6 +119,17 @@ pub struct SshDownloadArgs {
     /// Default: 2000.
     #[schemars(default = "default_lifecycle_grace_ms")]
     pub grace_ms: Option<u32>,
+
+    /// ADR 0010 — opt-in resume from the local tail. See
+    /// [`SshUploadArgs::resume`] for the full contract.
+    #[schemars(default = "default_resume")]
+    pub resume: Option<bool>,
+
+    /// ADR 0010 — when `resume=true`, hash the resume prefix on both
+    /// sides and abort with `RESUME_MISMATCH` on divergence. See
+    /// [`SshUploadArgs::verify`] for the cost trade-off.
+    #[schemars(default = "default_verify")]
+    pub verify: Option<bool>,
 }
 
 /// Arguments for the `ssh_transfer_progress` MCP tool.

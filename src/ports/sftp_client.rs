@@ -17,6 +17,15 @@ pub struct UploadRequest {
     pub local_path: String,
     /// Destination path on the remote host.
     pub remote_path: String,
+    /// Pre-flight the destination size and resume from the first
+    /// non-overlapping byte (ADR 0010). Default `false` preserves v6.0
+    /// semantics — every transfer truncates the destination and starts
+    /// from byte zero.
+    pub resume: bool,
+    /// When `resume == true`, hash the resume prefix on both sides
+    /// before continuing the transfer. A divergent hash aborts with
+    /// `RESUME_MISMATCH`. Default `false` trusts the prefix verbatim.
+    pub verify: bool,
 }
 
 /// Description of a download request.
@@ -28,6 +37,13 @@ pub struct DownloadRequest {
     pub remote_path: String,
     /// Destination path on the local filesystem.
     pub local_path: String,
+    /// Pre-flight the destination size and resume from the first
+    /// non-overlapping byte (ADR 0010). Default `false` preserves v6.0
+    /// semantics.
+    pub resume: bool,
+    /// When `resume == true`, hash the resume prefix on both sides
+    /// before continuing. Default `false`.
+    pub verify: bool,
 }
 
 /// SFTP client port. Implementations are async (network I/O).

@@ -69,6 +69,13 @@ pub struct UploadRequest {
     pub remote_path: String,
     /// v5 Phase 3 — optional lifecycle policy override.
     pub lifecycle_policy: Option<LifecyclePolicy>,
+    /// ADR 0010 — opt-in resume from the remote tail. Default `false`
+    /// preserves v6.0 semantics: every upload truncates the destination.
+    pub resume: bool,
+    /// ADR 0010 — when `resume == true`, hash the resume prefix on both
+    /// sides and abort with `RESUME_MISMATCH` on divergence. Default
+    /// `false` trusts the prefix verbatim.
+    pub verify: bool,
 }
 
 /// Outbound DTO surfacing every observable result the rmcp tool wrapper
@@ -90,6 +97,10 @@ pub struct UploadOutcome {
     /// progress events deliver the moving counter via the `transfer://`
     /// MCP resource.
     pub total_bytes: u64,
+    /// ADR 0010 — byte offset the transfer resumed from. `0` for fresh
+    /// uploads. Equal to `total_bytes` when the resume preflight
+    /// short-circuited via the Skip plan (destination already matched).
+    pub resumed_from: u64,
     /// RFC 3339 timestamp of when the use case spawned the streaming task.
     pub started_at: String,
 }
@@ -194,9 +205,34 @@ where
         let resolved_local = entity.local_path.clone();
         let resolved_remote = entity.remote_path.clone();
         let total_bytes = entity.total_bytes;
+        let resumed_from = entity.resumed_from;
         let started_at = entity.started_at;
 
-        self.persist_or_rollback(&transfer_id, entity).await?;
+        self.persist_and_track(&transfer_id, &req, entity).await?;
+
+        Ok(UploadOutcome {
+            transfer_id,
+            session_id: req.session_id,
+            agent_id: session.agent_id,
+            local_path: resolved_local,
+            remote_path: resolved_remote,
+            total_bytes,
+            resumed_from,
+            started_at: started_at.to_rfc3339(),
+        })
+    }
+
+    /// Persist the entity, register lifecycle binding, poke subscribers,
+    /// and tick the clock. Extracted from [`Self::execute`] to keep the
+    /// orchestrator under the 30-line clippy threshold after ADR 0010
+    /// added the `resumed_from` snapshot.
+    async fn persist_and_track(
+        &self,
+        transfer_id: &TransferId,
+        req: &UploadRequest,
+        entity: TransferEntity,
+    ) -> Result<(), DomainError> {
+        self.persist_or_rollback(transfer_id, entity).await?;
         // v5 lifecycle binding: register the freshly spawned upload.
         // The policy comes from the inbound DTO when set (Phase 3
         // release_when_no_subs / grace_ms knobs); `None` falls back to
@@ -212,16 +248,7 @@ where
         // Touching the clock keeps the port plumbed even though the
         // adapter owns the canonical `started_at`.
         let _ = self.clock.utc_now();
-
-        Ok(UploadOutcome {
-            transfer_id,
-            session_id: req.session_id,
-            agent_id: session.agent_id,
-            local_path: resolved_local,
-            remote_path: resolved_remote,
-            total_bytes,
-            started_at: started_at.to_rfc3339(),
-        })
+        Ok(())
     }
 
     /// Hand the upload off to the SFTP adapter and surface the snapshot
@@ -240,6 +267,8 @@ where
                     session_id: req.session_id.clone(),
                     local_path: req.local_path.clone(),
                     remote_path: req.remote_path.clone(),
+                    resume: req.resume,
+                    verify: req.verify,
                 },
             )
             .await
@@ -541,6 +570,8 @@ mod tests {
             local_path: seed_local_file("base"),
             remote_path: "/srv/dest.bin".to_string(),
             lifecycle_policy: None,
+            resume: false,
+            verify: false,
         }
     }
 

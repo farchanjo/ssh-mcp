@@ -35,6 +35,7 @@ use crate::application::list_resources::{
 use crate::application::read_resource::{
     ReadResourceOutcome, ReadResourceRequest, ReadResourceUseCase,
 };
+use crate::application::rsync_sync::{RsyncStatsSnapshot, RsyncSyncUseCase};
 use crate::application::subscribe_resource::{
     SubscribeResourceOutcome, SubscribeResourceRequest, SubscribeResourceUseCase,
 };
@@ -42,13 +43,20 @@ use crate::application::unsubscribe_resource::{
     UnsubscribeResourceRequest, UnsubscribeResourceUseCase,
 };
 use crate::domain::error::DomainError;
+use crate::domain::rsync_ids::RsyncId;
 use crate::ports::command_repo::CommandRepository;
+use crate::ports::config::ConfigPort;
 #[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
+use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::PeerHandle;
 use crate::ports::output_stream::OutputStreamPort;
+use crate::ports::rsync_repo::RsyncRepository;
+use crate::ports::rsync_sftp_fs::RsyncSftpFsPort;
+use crate::ports::rsync_transport::RsyncTransportPort;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
+use crate::ports::ssh_client::SshClientPort;
 use crate::ports::subscriber_registry::{
     ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort,
 };
@@ -99,7 +107,11 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         | DomainError::ForwardNotFound(_)
         | DomainError::SerialNotFound(_)
         | DomainError::ResourceGone(_)
-        | DomainError::SubNotFound(_) => ResourceErrorCategory::NotFound,
+        | DomainError::SubNotFound(_)
+        // ADR 0011 — rsync transport "not found" maps onto the
+        // resource-NOT_FOUND class (the rsync binary is the missing
+        // resource; same wire shape as `SESSION_NOT_FOUND`).
+        | DomainError::RsyncNotFound(_) => ResourceErrorCategory::NotFound,
         DomainError::Auth(_)
         | DomainError::ConnectFailed(_)
         | DomainError::Transport(_)
@@ -118,7 +130,12 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         | DomainError::MaxSubsTotalExceeded { .. }
         | DomainError::LaneBufferFull { .. }
         | DomainError::LagDetected { .. }
-        | DomainError::MuxBackpressure => ResourceErrorCategory::Internal,
+        | DomainError::MuxBackpressure
+        | DomainError::RsyncVersionTooOld(_)
+        | DomainError::RsyncProtocolError(_)
+        | DomainError::RsyncFileListTooLarge { .. }
+        | DomainError::RsyncPartialTransfer(_)
+        | DomainError::SftpFeatureMissing(_) => ResourceErrorCategory::Internal,
     }
 }
 
@@ -247,6 +264,7 @@ const fn kind_label(k: ResourceKind) -> &'static str {
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
         ResourceKind::Serial => "serial",
+        ResourceKind::Rsync => "rsync",
     }
 }
 
@@ -465,6 +483,170 @@ fn try_serial_read(uri: &str) -> Option<ResourceContents> {
         text,
         meta: Some(serde_json::from_value(meta).unwrap_or_default()),
     })
+}
+
+/// Error mapping helper specific to the rsync read short-circuit.
+///
+/// Mirrors [`map_resource_error`] but pre-classifies
+/// [`DomainError::ResourceGone`] onto `resource_not_found` so
+/// the MCP host can branch on the not-found shape.
+#[must_use]
+pub fn map_rsync_read_error(err: &DomainError) -> McpError {
+    map_resource_error(err)
+}
+
+/// Short-circuit `resources/read` for `rsync://<id>/progress` URIs.
+///
+/// ADR 0011 phase 3 — read the latest progress snapshot directly
+/// from the [`RsyncSyncUseCase`].
+///
+/// Reads atomic counters in the
+/// [`crate::domain::rsync::RsyncSession`] aggregate. Returns `None`
+/// for any non-rsync URI so the caller can fall through to the
+/// existing flow. Returns `Some(Err(...))` when the URI is rsync but
+/// the id is unknown — the `ServerHandler` maps that onto
+/// `RESOURCE_NOT_FOUND`.
+///
+/// # Errors
+///
+/// Surfaces [`DomainError::ResourceGone`] for unknown ids and
+/// propagates any storage-layer error from the repository.
+pub async fn try_rsync_read<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>(
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>,
+    uri: &str,
+) -> Option<Result<ResourceContents, DomainError>>
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    R: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    let id = parse_rsync_progress_uri(uri)?;
+    Some(render_rsync_progress(use_case, id).await)
+}
+
+async fn render_rsync_progress<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>(
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>,
+    rsync_id: String,
+) -> Result<ResourceContents, DomainError>
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    R: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    use crate::domain::ids::SessionId;
+    let id = RsyncId::new(rsync_id);
+    let snapshot = use_case
+        .try_stats(&id)
+        .await?
+        .ok_or_else(|| DomainError::ResourceGone(format!("rsync://{id}/progress")))?;
+    let session_id = use_case.owning_session(&id).await?;
+    let canonical = format!("rsync://{}/progress", snapshot.rsync_id);
+    let body = rsync_progress_body(&snapshot, session_id.as_ref().map(SessionId::as_str));
+    let meta = build_snapshot_meta("rsync", 0, rsync_status_label(&snapshot));
+    Ok(ResourceContents::TextResourceContents {
+        uri: canonical,
+        mime_type: Some("application/json".to_string()),
+        text: body,
+        meta: Some(meta),
+    })
+}
+
+/// Render the JSON body for a `rsync://<id>/progress` snapshot.
+/// Mirrors the `transfer://` shape: a single JSON object with the
+/// stable counter fields plus the latest [`crate::domain::rsync::RsyncStatus`]
+/// label. Reads bypass the `_seq` cursor used by byte-stream
+/// resources — rsync events are point-in-time aggregate counters
+/// rebuilt on every read.
+fn rsync_progress_body(snapshot: &RsyncStatsSnapshot, session_id: Option<&str>) -> String {
+    let stats = &snapshot.stats;
+    serde_json::json!({
+        "rsync_id": snapshot.rsync_id.as_str(),
+        "session_id": session_id,
+        "status": rsync_status_label(snapshot),
+        "files_total": stats.files_total,
+        "files_done": stats.files_done,
+        "bytes_total": stats.bytes_total,
+        "bytes_transferred": stats.bytes_transferred,
+        "bytes_skipped": stats.bytes_skipped,
+        "files_deleted": stats.files_deleted,
+        "files_failed": stats.files_failed,
+    })
+    .to_string()
+}
+
+const fn rsync_status_label(snapshot: &RsyncStatsSnapshot) -> &'static str {
+    use crate::domain::rsync::RsyncStatus;
+    match snapshot.status {
+        RsyncStatus::Pending => "pending",
+        RsyncStatus::Probing => "probing",
+        RsyncStatus::Running => "running",
+        RsyncStatus::Completed => "completed",
+        RsyncStatus::Failed => "failed",
+        RsyncStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Parse an `rsync://<id>/progress` URI and extract the id segment.
+/// Returns `None` for non-rsync URIs so the caller can fall through
+/// to the regular dispatcher.
+fn parse_rsync_progress_uri(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    if scheme != "rsync" {
+        return None;
+    }
+    let (id, sub_path) = rest.split_once('/')?;
+    if id.is_empty() || sub_path != "progress" {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Append `rsync://<id>/progress` entries onto the [`ListResourcesResult`].
+///
+/// Mirrors the v6 `transfer://` injection — runs before the
+/// leak-warning attachment so warnings see the full live URI set.
+///
+/// # Errors
+///
+/// Propagates any storage-layer error from the repository.
+pub async fn attach_rsync_resources<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>(
+    result: &mut ListResourcesResult,
+    use_case: &RsyncSyncUseCase<W, Sf, Sfs, R, SR, Ssh, Idg, Cfg>,
+) -> Result<(), DomainError>
+where
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    R: RsyncRepository + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    Ssh: SshClientPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+{
+    let snapshots = use_case.list_active().await?;
+    for snapshot in snapshots {
+        let uri = format!("rsync://{}/progress", snapshot.rsync_id);
+        let resource = RawResource::new(uri.clone(), format!("Rsync {}", snapshot.rsync_id))
+            .with_description(format!(
+                "Rsync session {} progress (status={})",
+                snapshot.rsync_id,
+                rsync_status_label(&snapshot),
+            ))
+            .with_mime_type("application/json")
+            .no_annotation();
+        result.resources.push(resource);
+    }
+    Ok(())
 }
 
 /// Render a [`ReadResourceOutcome`] as a single

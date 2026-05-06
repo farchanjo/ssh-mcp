@@ -6,6 +6,7 @@
 //! can swap a deterministic counter so snapshots stay stable.
 
 use crate::domain::ids::{CommandId, ForwardId, SessionId, ShellId, TransferId};
+use crate::domain::rsync_ids::RsyncId;
 
 /// Sync, dyn-safe id generator.
 pub trait IdGeneratorPort: Send + Sync + 'static {
@@ -23,6 +24,16 @@ pub trait IdGeneratorPort: Send + Sync + 'static {
 
     /// Mint a fresh [`ForwardId`].
     fn new_forward_id(&self) -> ForwardId;
+
+    /// Mint a fresh [`RsyncId`] (ADR 0011).
+    ///
+    /// Default impl falls back to a session-id-shaped value so existing
+    /// adapters (test stubs, downstream forks) keep compiling without an
+    /// explicit override; the production [`crate::adapters::id_generator::uuid::UuidIds`]
+    /// adapter overrides this with a fresh `UUIDv7`.
+    fn new_rsync_id(&self) -> RsyncId {
+        RsyncId::new(self.new_session_id().into_inner())
+    }
 }
 
 #[cfg(test)]

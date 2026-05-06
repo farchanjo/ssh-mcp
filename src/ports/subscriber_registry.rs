@@ -33,6 +33,9 @@ pub enum ResourceKind {
     /// `serial://<id>/output` — UART / TTY / COM serial-port output
     /// (v5.2; ADR 0009).
     Serial,
+    /// `rsync://<id>/progress` — rsync hybrid-transport sync progress
+    /// (v7.0; ADR 0011).
+    Rsync,
 }
 
 /// Snapshot of a single subscription record returned by the registry.

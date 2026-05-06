@@ -406,6 +406,7 @@ const fn resource_kind_label(k: ResourceKind) -> &'static str {
         ResourceKind::Session => "session",
         ResourceKind::Forward => "forward",
         ResourceKind::Serial => "serial",
+        ResourceKind::Rsync => "rsync",
     }
 }
 

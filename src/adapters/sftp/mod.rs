@@ -17,6 +17,7 @@
 //! composition root so both adapters reference the same instance.
 
 pub mod internal;
+pub mod rsync_fs_impl;
 pub mod russh_sftp_adapter;
 
 #[cfg(any(test, feature = "test-fixtures"))]

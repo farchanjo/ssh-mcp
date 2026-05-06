@@ -337,7 +337,12 @@ where
         // exists before any subscribe call reaches this path,
         // so we accept the attach with the same forward-style
         // semantics.
-        ResourceKind::Forward | ResourceKind::Serial => Ok(()),
+        // v7.0 (ADR 0011): rsync sessions live outside the application
+        // repositories — the infra-layer `ssh_rsync` mints the rsync_id
+        // and registers the lane before any subscribe call reaches this
+        // path, so we accept the attach with the same forward-style
+        // semantics.
+        ResourceKind::Forward | ResourceKind::Serial | ResourceKind::Rsync => Ok(()),
     }
 }
 

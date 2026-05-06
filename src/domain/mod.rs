@@ -16,6 +16,8 @@ pub mod keys;
 pub mod lifecycle;
 pub mod policy;
 pub mod ringbuffer;
+pub mod rsync;
+pub mod rsync_ids;
 pub mod session;
 pub mod shell;
 pub mod subscription;

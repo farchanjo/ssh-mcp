@@ -50,6 +50,8 @@ pub mod download_file;
 pub mod get_transfer_progress;
 pub mod upload_file;
 
+pub mod rsync_sync;
+
 #[cfg(feature = "port_forward")]
 pub mod forward_port;
 pub mod list_resources;
