@@ -27,7 +27,7 @@ The `list_changed` advertisement is reserved for tool-driven lifecycle events. T
 | `session://<id>/health`             | Session health snapshot           | `application/json` | no                       |
 | `forward://<id>/events`             | Port-forward event log            | `application/json` | yes                      |
 | `serial://<id>/output`              | UART / TTY / COM byte stream (v5.2 — ADR 0009) | `text/plain`       | yes                      |
-| `rsync://<id>/progress`             | Rsync per-file + aggregate progress events (v7.0 — ADR 0011; agent path in progress) | `application/json` | no                       |
+| `rsync://<id>/progress`             | Rsync per-file + aggregate progress events (v7.0 — ADR 0011) | `application/json` | no                       |
 
 Reference implementation: `src/application/{list_resources,read_resource,subscribe_resource,unsubscribe_resource}.rs` (use cases), `src/infra/mcp/resource_handlers.rs` (rmcp wiring + URI parser), and `src/adapters/subscription/memory_registry.rs` (registry + per-resource debouncer + per-peer cursor).
 
@@ -60,7 +60,7 @@ The new `rsync://` push lane carries per-file + aggregate sync progress as `appl
 
 | `kind`            | Fields                                                                                                                | When emitted                                                |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `session_started` | `transport: wire \| agent`, `files_planned: u64`, `bytes_planned: u64`                                                | Once, after the planner walks the source tree.              |
+| `session_started` | `transport: wire \| sftp`, `files_planned: u64`, `bytes_planned: u64`                                                 | Once, after the planner walks the source tree.              |
 | `file_started`    | `rel_path: String`, `bytes_total: u64`                                                                                | Per file, before the delta phase begins.                    |
 | `file_progress`   | `rel_path`, `bytes_done: u64`, `bytes_total: u64`                                                                     | Mid-file, debounced by the standard 200 ms / 1 s windows.   |
 | `file_completed`  | `rel_path`, `bytes_transferred: u64`, `bytes_skipped: u64`                                                            | Per file, after the file finishes successfully.             |
@@ -72,7 +72,11 @@ The new `rsync://` push lane carries per-file + aggregate sync progress as `appl
 
 Backpressure default: `Snapshot` (matches v5 default for any push resource); switch to `DropOldest` per ADR 0006 when sync covers millions of small files. The byte-threshold flush (ADR 0006 Amendment 1, default 64 KiB) is reused — `sync_progress` ticks fire fast on multi-million-file trees and would otherwise wait on the 50 ms debounce window.
 
-> **Status (v7.0.0-alpha.4):** `transport=Sftp` lanes carry live `RsyncProgressEvent` frames end-to-end — `SessionStarted` → `FileStarted` / `FileProgress` / `FileCompleted` / `FileSkipped` / `FileFailed` → `SyncCompleted`. The `SessionStarted` discriminator carries `transport: "sftp"` (or `"wire"` once the Wire transport lands). Value-object types (`RsyncProgressEvent`, `RsyncTransportKind`, `SkipReason`, `ErrorCode`) live under `src/adapters/rsync/types.rs`. The Wire transport remains stubbed; lanes opened with `transport=Wire` close before any event reaches the subscriber until that slice lands.
+**Cursor support.** None today. Rsync sessions are short-lived (typical sync completes within seconds to minutes) and the lane closes deterministically after `SyncCompleted` / `SessionFailed`. Subscribers that join after the terminal frame receive nothing on read; subscribe before or immediately after `ssh_rsync` returns. A future revision may expose a cursor that replays the per-file event stream from offset N if operational data shows demand.
+
+**Lifecycle binding.** Like every other long-lived resource, `RsyncSession` is wrapped in the `Owned → Observed → Releasing → Closed` CAS state machine ([ADR 0003](./adr/0003-lifecycle-binding.md)). `release_when_no_subs` defaults to `false` on `ssh_rsync` so a session that completes without any subscriber is preserved for one final `ssh_rsync_stats` read. Set `release_when_no_subs=true` to opt into the v5 lifecycle behaviour where the session is GC'd as soon as the last subscriber detaches.
+
+> **Status (v7.0.0):** both transports emit live `RsyncProgressEvent` frames end-to-end. `transport=Wire` push + pull verified byte-identical against `rsync 3.2.7` (six wire e2e tests in `tests/v7_rsync_wire_e2e_vm.rs`); `transport=Sftp` verified against the same VM (two SFTP e2e tests in `tests/v7_rsync_e2e_vm.rs`). The `SessionStarted` discriminator carries `transport: "wire"` or `transport: "sftp"`. Value-object types (`RsyncProgressEvent`, `RsyncTransportKind`, `SkipReason`, `ErrorCode`) live under `src/adapters/rsync/types.rs`.
 
 ## Resource Templates (v4.7)
 

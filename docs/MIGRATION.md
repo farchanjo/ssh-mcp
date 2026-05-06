@@ -858,16 +858,86 @@ Operational follow-on:
 
 ## v6.1 → v7.0
 
-For **MCP host operators, contributors, and downstream automations** moving from v6.1 to v7.0. **Wire-additive on the MCP surface** — the existing 36 tool catalogue is unchanged. Three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) and a new `rsync://<id>/progress` resource scheme go live in v7.0. **v7.0.0-alpha.2 architectural retrenchment**: the deployed-agent path was retracted in favour of two integrated transports — `transport=Wire` (rsync v31 wire-compat against a remote `rsync --server`) and `transport=Sftp` (universal SFTP fallback). Both transports live in-process inside the host crate; the workspace collapsed back to a single package. Both transports return descriptive `RSYNC_PROTOCOL_ERROR` "being implemented" stubs in this slice; the next slice fills the bodies. Reference: [ADR 0011 — rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
+For **MCP host operators, contributors, and downstream automations** moving from v6.1 to v7.0. **Wire-additive on the MCP surface** — the existing 36 tool catalogue is unchanged. Three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) and a new `rsync://<id>/progress` resource scheme go live in v7.0. Two integrated transports ship in-process inside the host crate: `WireRsyncTransport` (canonical port of OpenBSD `openrsync` speaking rsync wire protocol v31 against a remote `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback). Both are live for the supported feature set; push and pull both byte-identical against `rsync 3.2.7` on a real Linux VM. Reference: [ADR 0011 — rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
 
-### What's new
+### v7.0.0 — final
 
-- **In-process Wire + Sftp transports** — `WireRsyncTransport` (`src/adapters/rsync/wire/mod.rs`) drives a remote `rsync --server` over the existing russh exec channel speaking protocol v31. `SftpRsyncTransport` (`src/adapters/rsync/sftp/mod.rs`) drives a recursive sync entirely through SFTP. Both adapters are surface stubs in v7.0.0-alpha.2: every method returns `RSYNC_PROTOCOL_ERROR` with a transport-specific "being implemented" detail line. The composition wiring is the permanent shape; the next slice replaces the stub bodies without touching anything else.
-- **`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`** — three live MCP tools backed by `RsyncSyncUseCase`. The tool body returns `STARTED` immediately and the caller drives progress via `sub_open rsync://<id>/progress`. **v7.0.0-alpha.2**: every code path returns the surface-stub error from the chosen transport.
-- **`rsync://<id>/progress`** — new push-resource scheme registered alongside `transfer://`. Per-event JSON body carries `files_total / files_done / bytes_total / bytes_transferred / bytes_skipped / files_deleted / files_failed / status`. `resources/list` enumerates live `rsync://*` URIs alongside the other six push schemes.
-- **`ResourceKind::Rsync`** — new variant on the `ResourceKind` enums in both `adapters::subscription::legacy` and `ports::subscriber_registry`. URIs of the shape `rsync://<id>/progress` parse and format end-to-end through the registry helpers; `format_uri` / `parse_uri` route to the new variant.
-- **6 new error codes** — `RSYNC_NOT_FOUND`, `RSYNC_VERSION_TOO_OLD`, `RSYNC_PROTOCOL_ERROR`, `RSYNC_FILE_LIST_TOO_LARGE`, `RSYNC_PARTIAL_TRANSFER`, `SFTP_FEATURE_MISSING`. Total error-taxonomy size grows from 40 to 46. See [ADR 0007](./adr/0007-error-taxonomy.md) and [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
-- **5 new env vars** — `SSH_RSYNC_PROBE_TIMEOUT_MS`, `SSH_RSYNC_BLOCK_SIZE`, `SSH_RSYNC_FILE_LIST_LIMIT` (the agent-cache env vars `SSH_RSYNC_AGENT_CACHE_TTL_DAYS` / `SSH_RSYNC_AGENT_CACHE_DIR` were dropped along with the agent path). See [CONFIGURATION.md → v7.0 / ADR 0011](./CONFIGURATION.md).
+Final state shipped in v7.0.0 (2026-05-06). The original v7.0 plan (cross-compiled deployed-agent transport with sha256 verification) was retracted in v7.0.0-alpha.2 in favour of "tudo integrado". The slice-by-slice narrative below the [v7.0.0-alpha.4](#v700-alpha4--sftp-transport-live) section is kept for traceability — they document the incremental landings; this section is the canonical migration contract.
+
+#### What's new
+
+- **In-process Wire + SFTP transports.** Both run inside the host binary. `transport=Auto` (default) probes the remote and prefers Wire when rsync >= 3.2.0 is installed, otherwise routes to SFTP. `transport=Wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older). `transport=Sftp` skips the probe and uses the universal SFTP fallback.
+- **3 new MCP tools.** `ssh_rsync` returns `STARTED` immediately + `RSYNC_ID`; `ssh_rsync_stats` reads the live aggregate; `ssh_rsync_cancel` is idempotent. Block-markdown wire shape with the same `KEY: value` + 8-hex-char nonce conventions as the v5/v6 carry-over surface.
+- **1 new push scheme.** `rsync://<RSYNC_ID>/progress` carries `application/json` events: `SessionStarted`, `FileStarted`, `FileProgress`, `FileCompleted`, `FileSkipped { reason: SizeMatch | MtimeMatch | DryRun }`, `FileFailed`, `SyncProgress`, `SyncCompleted`, `SessionFailed`. Default lag policy `Snapshot`; ADR 0006 byte-threshold flush (default 64 KiB) hooks the lane.
+- **`ResourceKind::Rsync`** variant on both `adapters::subscription::legacy` and `ports::subscriber_registry` enums. URIs of shape `rsync://<id>/progress` parse + format through the registry helpers.
+- **6 new error codes** — `RSYNC_NOT_FOUND` (RESOURCE), `RSYNC_VERSION_TOO_OLD` (POLICY), `RSYNC_PROTOCOL_ERROR` (TRANSPORT), `RSYNC_FILE_LIST_TOO_LARGE` (POLICY), `RSYNC_PARTIAL_TRANSFER` (TRANSPORT), `SFTP_FEATURE_MISSING` (POLICY). Total error-taxonomy size grows from 40 to 46. See [ADR 0007](./adr/0007-error-taxonomy.md) and [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
+- **3 new env vars** — `SSH_RSYNC_PROBE_TIMEOUT_MS` (default `2000`), `SSH_RSYNC_BLOCK_SIZE` (default auto), `SSH_RSYNC_FILE_LIST_LIMIT` (default `1_000_000`). The agent-cache env vars from the original plan (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped during the v7.0.0-alpha.2 retrenchment.
+
+#### DTO surface (`src/infra/mcp/args/rsync.rs`)
+
+```rust
+pub struct SshRsyncArgs {
+    pub session_id: String,
+    pub src: String,
+    pub dst: String,
+    #[serde(default)] pub opts: RsyncOptsArg,
+    #[serde(default)] pub transport: RsyncTransportArg,        // Auto | Wire | Sftp
+    pub release_when_no_subs: Option<bool>,                    // ADR 0003 binding
+}
+
+pub struct RsyncOptsArg {
+    pub recursive: bool,
+    pub archive: bool,                  // -a (alias for -rlptgoD)
+    pub delete: bool,
+    pub exclude: Vec<String>,
+    pub include: Vec<String>,
+    pub dry_run: bool,
+    pub bwlimit_kbps: Option<u64>,
+    pub compress: bool,                 // wire-only
+    pub partial: bool,                  // ADR 0010 resume semantics
+    pub verify_checksum: bool,          // wire-only -> SFTP_FEATURE_MISSING on Sftp
+    pub preserve: PreserveFlagsArg,
+}
+
+pub struct PreserveFlagsArg {
+    pub perms: bool,        // -p (default true)
+    pub mtime: bool,        // -t (default true)
+    pub owner: bool,        // -o (default true; root only on remote)
+    pub group: bool,        // -g (default true)
+    pub links: bool,        // -l (default true)
+    pub hardlinks: bool,    // -H (default false; wire-only -> SFTP_FEATURE_MISSING on Sftp)
+    pub sparse: bool,       // -S (default false)
+    pub devices: bool,      // -D (default false; root only)
+}
+
+pub enum RsyncTransportArg { Auto, Wire, Sftp }
+pub struct SshRsyncCancelArgs { pub rsync_id: String }
+pub struct SshRsyncStatsArgs  { pub rsync_id: String }
+```
+
+#### What does NOT change
+
+- Tool catalogue: still 36 tools (35 without `port_forward`) for the v6.x carry-over surface. Three new tools land on top.
+- Resource URI schemes for v6.x: byte-identical — `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://` all unchanged.
+- Default behaviour: every existing knob (`release_when_no_subs`, lag policy, debouncer windows, broadcast caps, resume / verify) keeps its v6.1 value.
+- MSRV: still Rust 1.95.
+
+#### Recommended upgrade path for hosts that want to opt into rsync
+
+1. **Bump dependency** — `ssh-mcp = "7.0"` in your host (or rebuild from source). No code change required to keep v6.1 behaviour.
+2. **Try the SFTP path against any host** — `ssh_rsync(session_id, src, dst, opts={ recursive: true })` with `transport=Auto` falls back to SFTP when the remote has no rsync. Works against every host where `ssh_upload` already works.
+3. **Use the Wire path for delta-sync** — install `rsync >= 3.2.0` on the remote and let `transport=Auto` pick it. Block-match path collapses unchanged blocks; `bytes_skipped` accumulates the wire-saved bytes.
+4. **Subscribe to progress** — `sub_open uri=rsync://<RSYNC_ID>/progress` immediately after `ssh_rsync` returns. The lane streams per-file + aggregate events; `SyncCompleted` is the terminal frame.
+5. **Cancel + retry with idempotency** — pass `_meta.idempotency_key` on the retry path. `ssh_rsync_cancel rsync_id=<id>` is idempotent; combining with `opts.partial=true` resumes from the deterministic tempfile.
+6. **Branch on the new error codes** — `SFTP_FEATURE_MISSING` for Sftp + hardlinks / verify_checksum / unsupported setstat / unsupported symlink; `RSYNC_VERSION_TOO_OLD` for forced Wire on a host without rsync >= 3.2.0; `RSYNC_PARTIAL_TRANSFER` for mid-flight session loss (re-run with `partial=true`).
+
+#### Deferred (out of v7.0 scope)
+
+- `-c` checksum delta over wire-format extension — surfaces as `SFTP_FEATURE_MISSING` on both transports. Successor ADR.
+- `-H` hardlinks — same.
+- Encoder symmetry for owner/group bytes when `-o`/`-g` negotiated — partial; decode honoured, encode skips bytes the strict round-trip would expect.
+- `chown` syscall wiring on the receiver (root-only path).
+- `-D` devices, `-X` xattrs, `-A` ACLs — out of scope for v7.x.
 
 ### What was retracted in v7.0.0-alpha.2
 
@@ -881,22 +951,11 @@ The original v7.0 plan shipped a deployed-agent transport (linux-x86_64 binary c
 - Cargo features `embed-linux-x86_64`, `embed-linux-aarch64`, `embed-macos-aarch64`, `embed-all` are all gone.
 - 4 error codes removed: `AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`, `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`. 1 new code added: `SFTP_FEATURE_MISSING` (returned when the SFTP path is asked to deliver a Wire-only feature like hardlinks or delta-sync).
 
-### What does NOT change
-
-- Tool catalogue: still 36 tools (35 without `port_forward`) for the v6.x carry-over surface. Three new tools land on top.
-- Resource URI schemes for v6.x: byte-identical — `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://` all unchanged.
-- Default behaviour: every existing knob (`release_when_no_subs`, lag policy, debouncer windows, broadcast caps, resume / verify) keeps its v6.1 value.
-- MSRV: still Rust 1.95.
-
-### Recommended upgrade path
-
-1. **Bump dependency** — `ssh-mcp = "7.0"` in your host (or rebuild from source). No code change required to keep v6.1 behaviour.
-2. **Wait for the next slice** — the `ssh_rsync*` tool surface accepts requests today and returns descriptive "being implemented" `RSYNC_PROTOCOL_ERROR` responses; full v7.0 GA gates on Wire + Sftp transport bodies landing.
-3. **When the next slice ships** — to drive recursive sync, call `ssh_rsync session_id=<sid> src=<local|remote> dst=<remote|local> transport=Auto`. Auto picks Wire when rsync >= 3.2.0 is on the remote, Sftp otherwise. Open a `sub_open rsync://<id>/progress` lane for live event push. Cancel via `ssh_rsync_cancel rsync_id=<id>`.
-
 ### Pre-existing bug fix
 
 v6.1 `cargo build --no-default-features` failed with E0004 — `ResourceKind::Serial` was missing from one exhaustive match (`src/application/read_resource.rs`). v7.0 fixes the bug. Operators who only build `--all-features` see no functional difference; operators tracking the `port_forward = false` profile gain a clean build.
+
+> The slice-by-slice sub-sections below this point document the incremental landings (alpha.4 → slice 10) that produced the v7.0.0 final state. They are kept for traceability; the canonical migration contract is [v7.0.0 — final](#v700--final) above.
 
 ### v7.0.0-alpha.4 — SFTP transport live
 

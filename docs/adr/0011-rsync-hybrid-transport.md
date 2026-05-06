@@ -1,8 +1,15 @@
-# ADR 0011: Rsync hybrid transport (wire-compat client + self-deploy agent fallback)
+# ADR 0011: Rsync hybrid transport (wire-compat client + SFTP fallback)
 
 ## Status
 
-Proposed. Targets v7.0.0. **Major-version bump** because of the scope (~22–30 weeks of focused engineering, new sub-crate, embedded binaries, new push-resource scheme) — but **wire-additive on the MCP surface**: no v6.x tool changes shape; v7 adds `ssh_rsync` and `rsync://<id>/progress` on top.
+**Accepted — v7.0.0 final** (2026-05-06). **Wire-additive on the MCP surface**: no v6.x tool changes shape; v7.0 adds `ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats` and the `rsync://<id>/progress` push scheme on top.
+
+Both transports are live for the supported feature set:
+
+- **`SftpRsyncTransport`** — universal SFTP fallback (recursive mirror, dry-run, `--delete`, exclude/include, attribute preservation gated on a per-session `SftpFeatures` capability probe). Verified against a real Linux VM via `tests/v7_rsync_e2e_vm.rs`.
+- **`WireRsyncTransport`** — canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v31 against a remote `rsync --server`. Push + pull both byte-identical against `rsync 3.2.7`. Slices 1–10 merged; slices 11–12 (`-c` checksum delta over the wire-format extension and `-H` hardlinks) deferred to v7.1+ — see [Final slice status](#final-slice-status).
+
+The original v7.0 plan (deployed-agent transport with cross-compiled binaries and SFTP self-deploy) was retracted in v7.0.0-alpha.2 in favour of "tudo integrado" — both transports live in-process inside the host crate. See [Architectural retrenchment](#v700-alpha2--architectural-retrenchment-appendix) for the deletions.
 
 Depends on ADR 0003 (Lifecycle Binding), ADR 0004 (Channel Mux), ADR 0005 (LLM UX), ADR 0006 (Backpressure), ADR 0007 (Error Taxonomy), and ADR 0010 (SFTP Resume). Co-exists with — does not replace — `ssh_upload` / `ssh_download`.
 
@@ -466,6 +473,148 @@ Total new test surface: ~165 unit + integration cases + 10 property strategies +
 - rsync protocol v31 — `tech_report.tex`, `csprotocol.txt` in https://github.com/RsyncProject/rsync.
 - openrsync — https://www.openrsync.org/ (BSD-licensed C reference impl).
 
+### Final architecture
+
+Both transports collapse into the same use-case + push-lane shape; only the bytes-on-the-wire layer differs.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart TB
+    subgraph IN[Inbound MCP]
+        Tool["tool_router::ssh_rsync*"]
+    end
+    subgraph APP[Application]
+        UC["RsyncSyncUseCase<br/>(probe + select + start)"]
+    end
+    subgraph PORTS[Ports]
+        TPort["RsyncTransportPort"]
+        SshPort["SshClientPort<br/>(probe via execute)"]
+        SftpFs["RsyncSftpFsPort"]
+        Repo["RsyncRepository"]
+    end
+    subgraph ADAPT[Adapters]
+        Wire["WireRsyncTransport<br/>(openrsync port)"]
+        Sftp["SftpRsyncTransport<br/>(walker + comparator + executor)"]
+        Russh["RusshRsyncSftpFs"]
+        DashRepo["DashMapRsyncRepo"]
+    end
+    subgraph LANE[Push lane]
+        Mux["ChannelMux<br/>(rsync://&lt;id&gt;/progress)"]
+        Out["rmcp Peer / NDJSON writer"]
+    end
+
+    Tool --> UC
+    UC --> SshPort
+    UC --> TPort
+    UC --> Repo
+    TPort -.-> Wire
+    TPort -.-> Sftp
+    Sftp --> SftpFs
+    SftpFs -.-> Russh
+    Repo -.-> DashRepo
+    Wire --> Mux
+    Sftp --> Mux
+    Mux --> Out
+
+    classDef in fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    classDef app fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    classDef port fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    classDef adapter fill:#238636,color:#f0f6fc,stroke:#2ea043
+    classDef lane fill:#21262d,color:#8b949e,stroke:#30363d
+    class Tool in
+    class UC app
+    class TPort,SshPort,SftpFs,Repo port
+    class Wire,Sftp,Russh,DashRepo adapter
+    class Mux,Out lane
+```
+
+**Push pipeline (Wire transport).**
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    participant H as Host (RsyncSyncUseCase)
+    participant W as WireRsyncTransport
+    participant CH as russh exec channel
+    participant S as remote rsync --server
+
+    H->>W: start_session(Push)
+    W->>CH: open exec "rsync --server -e.LsfxCIu -r . <dst>"
+    W->>CH: handshake — write lver=31
+    CH->>W: rver=31 + compat_flags varint + seed
+    W->>W: gen_flist_local(src) — BFS + sort
+    W->>CH: emit SessionStarted on lane
+    Note over W,CH: enable mplex_writes at proto >= 30
+    W->>CH: send flist (16-bit XMIT flags + varint30/varlong30)
+    loop per file (until idx == NDX_DONE)
+        S->>W: ndx + iflags + blockset signature
+        W->>CH: ndx + zero-blockset header
+        W->>CH: token stream (literal / block_match)
+        W->>CH: 16-byte MD5 trailer (proto >= 30)
+        W-->>H: FileCompleted lane event
+    end
+    Note over W,CH: phase loop — echo NDX_DONE per phase, final NDX_DONE per sender.c:464
+    W->>CH: read_final_goodbye (NDX_DONE in / NDX_DONE out / NDX_DONE in at proto >= 31)
+    W-->>H: SyncCompleted lane event
+```
+
+**Pull pipeline (Wire transport).** Same channel, dual roles — the client now plays receiver and the server plays sender.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+sequenceDiagram
+    participant H as Host (RsyncSyncUseCase)
+    participant W as WireRsyncTransport
+    participant CH as russh exec channel
+    participant S as remote rsync --server --sender
+
+    H->>W: start_session(Pull)
+    W->>CH: open exec "rsync --server --sender -e.LsfxCIu -r <src> ."
+    W->>CH: handshake — write lver=31
+    CH->>W: rver=31 + compat_flags varint + seed
+    Note over W,CH: enable mplex_writes at proto >= 30
+    W->>CH: empty filter rule list (int32 0 terminator)
+    S->>W: flist (16-bit XMIT + varint30/varlong30 + post-sort indices + IO_ERROR_ENDLIST)
+    W-->>H: SessionStarted lane event
+    loop per regular file
+        W->>CH: ndx + null_sum blockset (whole-file pull)
+        S->>W: token stream (literal-only at slice 7)
+        W->>W: write to deterministic tempfile
+        S->>W: 16-byte MD5 trailer
+        W->>W: verify trailer + atomic rename into dst tree
+        W-->>H: FileCompleted lane event
+    end
+    W->>CH: NDX_DONE per phase echo
+    Note over W,CH: phase loop + final NDX_DONE
+    S->>W: goodbye sentinel
+    W-->>H: SyncCompleted lane event
+```
+
+**SFTP fallback pipeline.** No remote helper, no rsync binary required; the transport drives a recursive mirror over plain SFTP ops gated on a per-session capability probe.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    Probe["SFTP capability probe<br/>(mkdir + setstat + symlink)<br/>cached per-session"]
+    Walk["SftpWalker<br/>(BFS + globset filter)"]
+    Cmp["compare_trees<br/>→ SyncAction list"]
+    Exec["SftpExecutor<br/>(read + write + setstat<br/>+ token-bucket bwlimit)"]
+    Lane["rsync://&lt;id&gt;/progress lane"]
+
+    Probe --> Walk
+    Walk --> Cmp
+    Cmp --> Exec
+    Exec --> Lane
+
+    style Probe fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    style Walk fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Cmp fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Exec fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Lane fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
+
+The SFTP probe surfaces `SFTP_FEATURE_MISSING` for `preserve.symlinks=true` (server refused `SSH_FXP_SYMLINK`), `preserve.perms=true` (server refused `SSH_FXP_SETSTAT`), `preserve.hardlinks=true` (Wire-only), or `verify_checksum=true` (Wire-only) — all gated **before** the recursive walk burns RTT, so the lane never observes a half-failed run.
+
 ---
 
 ## v7.0.0-alpha.2 — Architectural retrenchment (appendix)
@@ -577,65 +726,104 @@ implemented" detail line. The MCP surface, error taxonomy, push-lane
 URI shape, and lifecycle binding are the permanent shape; the next
 slice fills the transport bodies without churning anything else.
 
-## Wire transport implementation status (v7.0.0-alpha.8)
+## Final slice status
 
-The handcrafted alpha.5 / alpha.6 wire client was retired in alpha.7
-in favour of a canonical port of OpenBSD's `openrsync` (BSD/ISC).
-The status table tracks the per-slice port progress.
+Both transports closed their respective backlogs in v7.0.0. The Wire transport's openrsync port shipped across ten slices; slices 11–12 (`-c` checksum delta and `-H` hardlinks) require wire-format extensions outside the openrsync canon and are deferred to a successor ADR.
 
 ### Per-slice openrsync port rollout
 
-| Slice | Coverage | Verified against rsync 3.2.7 | Files |
+| Slice | Coverage | Status | Files |
 |---|---|---|---|
-| Slice 1 (alpha.7) | Handshake + mplex I/O re-port | ✓ handshake reaches negotiated=31 + valid seed | `wire/session.rs`, `wire/io.rs` |
-| Slice 2 (alpha.8) | File-list encode/decode + local walker | ✓ generator subsystem accepts our flist bytes | `wire/flist.rs` |
-| Slice 3 | Block-checksum signature exchange + token stream + sender state machine | ✗ pending | `wire/blocks.rs` (TBD), `wire/hash.rs` (TBD), `wire/sender.rs` (TBD) |
-| Slice 4 | Receiver / downloader / attribute apply | ✗ pending | `wire/receiver.rs` (TBD), `wire/downloader.rs` (TBD) |
-| Slice 5 | `--delete`, `--exclude`, `--include`, `--bwlimit` policy | ✗ pending | — |
+| 1 | Handshake + mplex I/O re-port | merged — handshake reaches `negotiated=31` + valid seed | `wire/session.rs`, `wire/io.rs` |
+| 2 | File-list encode/decode + local walker | merged — server's generator accepts our flist bytes | `wire/flist.rs` |
+| 3 | Block-checksum decode + Adler32/MD4 hash kernels + whole-file token stream + sender state machine | merged — first byte-identical push | `wire/blocks.rs`, `wire/hash.rs`, `wire/tokens.rs`, `wire/sender.rs` |
+| 4 | Protocol 31 lift (`XMIT_EXTENDED_FLAGS` 16-bit, varint30/varlong30, ndx codec, iflags) | merged — flist parses cleanly against rsync 3.2.7 | `wire/flist.rs`, `wire/ndx.rs`, `wire/sender.rs` |
+| 5 | Per-file digest = MD5 at proto >= 30 + multi-phase `send_files` loop + final `NDX_DONE` + proto-31 goodbye | merged — 3 files land sha256-equivalent on disk | `wire/hash.rs`, `wire/sender.rs` |
+| 6 | Block-match path (Adler32 hashtable + sliding window + MD4-with-seed strong verify + literal/match tokens) | merged — incremental push collapses unchanged blocks | `wire/match_.rs`, `wire/blocks.rs` |
+| 7 | Pull direction + receiver state machine + flist decode (`XMIT_MOD_NSEC` + `IO_ERROR_ENDLIST` + post-sort indices) | merged — first byte-identical pull | `wire/receiver.rs`, `wire/flist.rs` |
+| 8 | Incremental pull (local block-signature emit + match-token consume on the receiver side) | merged | `wire/receiver.rs` |
+| 9 | `--delete` pass + attrs apply (`-p -t -o -g -l`) plumbed end-to-end | merged | `wire/receiver.rs`, `wire/sender.rs`, `wire/flist.rs` |
+| 10 | `--partial` (deterministic tempfile + skip-unlink-on-error) + `-S` sparse hole detection | merged | `wire/receiver.rs` |
+| 11 | `-c` (checksum delta over a wire-format extension) | **deferred** — requires bytes outside the openrsync canon | — |
+| 12 | `-H` (hardlink graph preservation) | **deferred** — same | — |
+
+Deferral rationale: slices 11–12 need wire-format paths that openrsync 27 never grew and that rsync 3.2.x emits behind compat-flag gates we have not yet ported. The work is bounded but does not block the v7.0 GA contract — the SFTP transport's capability gate already surfaces `SFTP_FEATURE_MISSING` for `verify_checksum=true` / `preserve.hardlinks=true`, and the Wire path raises the same error code today. A successor ADR will scope the byte-shape work; until then, callers that need either feature accept the SFTP whole-block path or wait.
 
 ### Cumulative layer status
 
 | Layer | Status | File |
 |---|---|---|
-| v31 handshake (version + compat_flags + seed) | ✓ live (slice 1) | `src/adapters/rsync/wire/session.rs` |
-| Multiplex I/O framing (`MSG_*` tags + frame codec) | ✓ live (slice 1); 11 unit tests + e2e-vm coverage | `src/adapters/rsync/wire/io.rs` |
-| File-list encode / decode (`FLIST_*` flag matrix, varint64 size, symlink target) | ✓ live (slice 2); 16 unit tests covering every flag combination + e2e-vm round-trip against real rsync | `src/adapters/rsync/wire/flist.rs` |
-| Local-source walker (`gen_flist_local`) | ✓ live (slice 2); BFS + sort, `--exclude`/`--include` deferred to slice 5 | `src/adapters/rsync/wire/flist.rs` |
-| Empty filter-list terminator (`MSG_DATA` frame with `0u32` LE payload) | ✓ live (slice 2); sent before flist on every push | `src/adapters/rsync/wire/mod.rs` |
-| Block-checksum signature exchange | ✗ slice 3 | — |
-| Token stream (literal / block_match) apply via `fast_rsync` | ✗ slice 3 | — |
-| Sender / generator / receiver state machines | ✗ slice 3 / slice 4 | — |
-| Attribute apply (perms, mtime, owner, group) | ✗ slice 4 | — |
-| `--delete` pass | ✗ slice 5 | — |
-| `--bwlimit` / `--exclude` / `--include` | ✗ slice 5 | — |
+| v31 handshake (version + compat_flags + seed) | live | `src/adapters/rsync/wire/session.rs` |
+| Multiplex I/O framing (`MSG_*` tags + frame codec) | live | `src/adapters/rsync/wire/io.rs` |
+| File-list encode / decode (16-bit `XMIT_EXTENDED_FLAGS` + varint30/varlong30 + symlink target + post-sort indices) | live | `src/adapters/rsync/wire/flist.rs` |
+| Local-source walker (`gen_flist_local`) | live; `--exclude` / `--include` enforced inline at proto 31 | `src/adapters/rsync/wire/flist.rs` |
+| Block-checksum signature exchange + null_sum tolerance | live | `src/adapters/rsync/wire/blocks.rs` |
+| Adler32 rolling hash + MD4 (proto < 30) / MD5 (proto >= 30) per-file digest | live | `src/adapters/rsync/wire/hash.rs` |
+| Token stream — literal / EOF / block-match arms | live | `src/adapters/rsync/wire/tokens.rs`, `wire/match_.rs` |
+| ndx codec (1–6 byte diff-from-prev encoding for file indices) | live | `src/adapters/rsync/wire/ndx.rs` |
+| Sender state machine (per-file request loop + multi-phase `send_files` + post-loop sentinel + goodbye) | live | `src/adapters/rsync/wire/sender.rs` |
+| Receiver state machine + downloader (token apply + atomic rename + tempfile staging) | live | `src/adapters/rsync/wire/receiver.rs` |
+| Attribute apply (`-p` mode, `-t` mtime, `-l` symlink, `-o`/`-g` owner/group decode) | live | `src/adapters/rsync/wire/receiver.rs` |
+| `--delete` pass | live | `src/adapters/rsync/wire/receiver.rs`, `wire/sender.rs` |
+| `--partial` (deterministic tempfile + skip-unlink-on-error) | live | `src/adapters/rsync/wire/receiver.rs` |
+| `-S` sparse hole detection on receive | live | `src/adapters/rsync/wire/receiver.rs` |
+| `chown` syscall wiring (root-only) | deferred | — |
+| Encoder symmetry for owner/group when `-o`/`-g` negotiated | partial — decode honoured, encode skips bytes the server would otherwise expect | `src/adapters/rsync/wire/flist.rs` |
+| `-c` checksum delta over wire-format extension | deferred to v7.1+ | — |
+| `-H` hardlinks | deferred to v7.1+ | — |
+| `-D` devices, `-X` xattrs, `-A` ACLs | out of scope for v7.x | — |
 
-The `WireRsyncTransport::start_session` wraps the live work in a
-5-second deadline: when the post-handshake mplex pump deadlocks
-waiting on bytes the next slice's state machines must emit, the
-transport surfaces a clean `DomainError::Timeout` (lane code
-`TIMEOUT`) rather than pinning the consumer's `recv_event` lane
-forever. This is the documented "honest deferral" surface for this
-slice.
+### End-to-end verification (against `rsync 3.2.7`)
 
-### Wire-compat compatibility notes (against rsync 3.2.7)
+`tests/v7_rsync_wire_e2e_vm.rs` (gated `e2e-vm`) drives the live wire transport against a real Linux VM. Six tests cover the production matrix:
 
-1. The original brief's textual `@RSYNCD: 31\n` handshake greeting
-   is the **daemon-mode** (`rsync://` URL scheme) startup. The
-   SSH-tunnelled path uses 4-byte LE u32 binary fields. The
-   handshake module documents this verbatim.
-2. The brief's bidirectional checksum-seed exchange is incorrect —
-   rsync emits the seed unilaterally (server -> client). Both sides
-   feed the same seed into the rolling-checksum kernel.
-3. v31 file-list entries encode `mode` / `mtime` / `uid` / `gid` as
-   rsync varints, not raw little-endian. The flist codec follows
-   `flist.c::send_file` (rsync 3.2.7).
-4. `MPLEX_BASE = 7`: every mplex tag byte on the wire is biased by
-   this offset. `MplexTag::from_wire` / `MplexTag::to_wire` hide the
-   bias from callers.
-5. The rsync server-sender path **waits** for the client to send an
-   empty filter-list terminator (single `MSG_DATA` mplex frame with
-   `0u32` LE payload — `exclude.c::send_filter_list`) before it
-   starts emitting `MSG_FLIST` chunks. The current slice sends the
-   terminator but the full receiver-side state machine that
-   consumes the file-list and replies with the per-file
-   block-checksum requests lands in the next slice.
+1. **Push pipeline** — 3 files → byte-identical on remote disk.
+2. **Incremental sync push** — second pass over a populated tree skips unchanged files; `bytes_skipped` accumulates.
+3. **Pull pipeline** — 3 files → byte-identical on local disk.
+4. **Incremental pull** — same as push but reversed.
+5. **Sparse pull** — 16 400-byte file with holes lands sparse on local disk (`-S` honoured).
+6. **Partial naming contract** — interrupted transfer leaves the deterministic tempfile name; retry resumes from the surviving prefix.
+
+`tests/v7_rsync_e2e_vm.rs` (gated `e2e-vm`) runs the SFTP transport against the same VM: round-trip + idempotent second-pass + symlink + perms preservation.
+
+### Wire-shape deviations from upstream rsync 3.2.7
+
+The openrsync port follows OpenBSD's protocol-27-pinned shape; rsync 3.2.x demands a strict superset for protocol 31 negotiation. Each deviation below is documented inline in the source.
+
+| Area | openrsync canon | Our port (proto 31) | Reason |
+|---|---|---|---|
+| Flist flag width | 8-bit `FLIST_*` | 16-bit `XMIT_*` (`XMIT_EXTENDED_FLAGS = 0x04` always set in the low byte) | rsync server enforces 16-bit form at proto >= 28 |
+| File size / mtime / uid / gid | i32 / i64 sentinel pairs | varint30 / varlong30 (`io.c::read_varint` + 64-entry byte-extra table) | proto >= 30 wire encoding |
+| Per-file checksum | MD4 with seed prepended (`MD4(seed_le \|\| file_bytes)`) | MD5 plain (`MD5(file_bytes)`, no seed) at proto >= 30 | `checksum.c::parse_csum_name` `CSUM_MD5` arm |
+| File-list indices | i32 `read_int` | 1–6 byte ndx codec (diff-from-prev with `NDX_DONE = -1` collapsing to 0x00) | proto >= 30 reduces wire bytes |
+| Multi-phase loop | single phase + sender done sentinel | 2-phase loop + per-phase NDX echo + final `NDX_DONE` per `sender.c` line 464 | proto >= 29 generator redo phase |
+| Goodbye exchange | single `NDX_DONE` read | read + write + read at proto >= 31 | `main.c::read_final_goodbye` lines 875..906 |
+| Mplex tag space | contiguous block at `MPLEX_BASE = 7` | sparse: `MSG_DATA = 0`, `MSG_REDO = 9`, `MSG_STATS = 10`, `MSG_IO_ERROR = 22`, `MSG_NOOP = 42`, `MSG_SUCCESS = 100`, `MSG_DELETED = 101`, `MSG_NO_SEND = 102` | upstream `enum msgcode` in `rsync.h` |
+| Filter list terminator | always emit `int32(0)` before flist | omit when `am_sender && !receiver_wants_list` (no `--delete` / `--prune-empty-dirs`) | `exclude.c::send_filter_list` lines 1644..1660 |
+| Post-flist `io_error` sentinel | always read trailing `int32` | only at proto < 30; at proto >= 30 the io_error encodes into the flist's end-of-list `XMIT_IO_ERROR_ENDLIST` short | `flist.c::recv_file_list` line 2728 |
+| `compat_flags` varint | not present | conditional on `negotiated >= 30`, server → client only, multi-byte (e.g. `0x81 0x7f` for `0x17e`) | `compat.c::setup_protocol` |
+| Mplex output framing on client side | client writes raw | client mplex-frames its output too at proto >= 30 (`io_start_multiplex_out`) | `main.c::client_run` lines 1297..1300 |
+| Handshake leftover bytes | discarded | preserved + chained in front of channel reader via `AsyncReadExt::chain` | server frequently piggy-backs first inner-protocol bytes on the seed segment |
+
+### Lock-free invariants (closing statement)
+
+Zero new `Mutex<T>` on hot paths landed across the v7.0 cycle. The single documented exception (`LaneState::{rx, join}` wrapping a per-session `mpsc::Receiver` and `JoinHandle` in both `wire/mod.rs` and `sftp/mod.rs`) is per-lane, per-session, never held across an `.await` of another resource. Every flist value-object, block-set, hash kernel, sender / receiver state machine, ndx cursor, phase counter, and bandwidth token bucket lives by-value on the per-task stack or threads as `&mut` through the call chain. The `mpsc::Sender` half of the lane is `Sync` and crosses tasks freely; the `Receiver` half lives behind the documented mutex slot and never crosses a `.await` boundary.
+
+`grep -rn "Mutex" src/adapters/rsync/{wire,sftp}/` reports four matches across the two transports, all in the documented `LaneState::{rx, join}` exception. `cargo clippy --release --all-features -- -D warnings` passes the strict `mutex_atomic = "deny"` + `await_holding_lock = "deny"` baseline.
+
+### Test coverage summary
+
+| Surface | Counts | Notes |
+|---|---|---|
+| Library tests | 1966 passing (release build, deterministic) | Includes the rsync transport, value objects, use case, and rendering layers. |
+| Integration smoke (`tests/v7_rsync_smoke.rs`) | 9 tests | Transport selection, capability gates, cancel idempotency, both-transport drive against fakes. |
+| Rsync chaos suite (`tests/chaos_rsync.rs`) | 16 scenarios | Rsync-specific chaos coverage layered on the existing v5 + v6 chaos baseline. |
+| Rsync property suite (`tests/property_rsync.rs`) | 9 strategies | Rsync property coverage on top of the v5 + v6 strategies. |
+| Rsync loom invariants (`tests/lockfree_invariants_rsync.rs`, gated `#[cfg(loom)]`) | 7 scenarios | Lane mpsc + atomic counter contention modeled for the rsync transport. |
+| Wire e2e (`tests/v7_rsync_wire_e2e_vm.rs`, gated `e2e-vm`) | 6 tests | Push, pull, incremental push, incremental pull, sparse pull, partial naming contract — all against rsync 3.2.7 on a real Linux VM. |
+| SFTP e2e (`tests/v7_rsync_e2e_vm.rs`, gated `e2e-vm`) | 2 tests | Round-trip + idempotent second-pass against a real Linux VM. |
+| Carry-over chaos (`tests/chaos/`) | 41 scenarios | Pre-v7 coverage; preserved without regression. |
+| Carry-over property (`tests/property/`) | 32 strategies | Pre-v7 coverage; preserved without regression. |
+| Carry-over loom invariants (`tests/lockfree_invariants.rs`, gated `#[cfg(loom)]`) | 20 scenarios | Pre-v7 coverage; preserved without regression. |
+
+`cargo build --release` and `cargo build --release --no-default-features` both stay warning-free under the strict 3-layer lint baseline.

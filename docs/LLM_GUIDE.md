@@ -922,7 +922,7 @@ Cost: one extra `ssh_exec` round-trip plus O(offset) bytes hashed remotely (`sha
 
 Three new tools: `ssh_rsync` (start), `ssh_rsync_cancel` (terminate), `ssh_rsync_stats` (snapshot). Two-tier transport: `transport=Auto` probes the remote and prefers wire-compat (rsync v31+); falls back to the universal SFTP transport when rsync is missing or older than v31. `transport=Wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older). `transport=Sftp` skips the probe and uses the universal SFTP fallback — slower than the Wire path because every block crosses the wire, but works against any host with a working SFTP subsystem.
 
-> **v7.0.0-alpha.4 status.** `transport=Sftp` is **live** for the supported subset (recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` continues to surface `RSYNC_PROTOCOL_ERROR` "wire transport is being implemented" — that slice lands next. The MCP surface, error taxonomy, push-lane URI shape, and lifecycle binding are all the permanent shape.
+> **v7.0.0 status.** Both transports are live. Push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM. `transport=Sftp` covers the supported subset (recursive mirror, dry-run, `--delete`, exclude/include, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` covers the same plus the rolling-checksum block-match path, `--partial`, `-S` sparse holes, and attribute apply (`-p -t -o -g -l`). Slices 11–12 (`-c` checksum delta over a wire-format extension and `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today.
 
 #### When SFTP transport is enough
 
@@ -1002,11 +1002,12 @@ When `delete=true`, files present at the destination but missing from the source
 
 2. (retry — re-uses the partial files)
    ssh_rsync(session_id=<sid>, src=..., dst=..., opts={ recursive: true, partial: true })
-   -> agent skips files that already match by size + mtime;
-      delta-syncs files where the partial dst sha differs.
+   -> transport skips files that already match by size + mtime;
+      delta-syncs files where the partial dst sha differs (Wire path)
+      or copies the missing tail (Sftp path).
 ```
 
-`partial=true` inherits ADR 0010's resume primitive — partial files at the destination are kept and the agent resumes from the first non-overlapping block. `partial=false` (default) truncates the destination and starts from byte zero on every retry.
+`partial=true` inherits ADR 0010's resume primitive — partial files at the destination are kept under a deterministic tempfile name and the transport resumes from the first non-overlapping block. `partial=false` (default) truncates the destination and starts from byte zero on every retry.
 
 #### Happy path E — exclude / include patterns
 
@@ -1757,7 +1758,7 @@ Bugs. Never retry. Collect logs and report.
 
 ### v7.0 / ADR 0011 — rsync hybrid transport
 
-Nine new codes covering the wire-compat probe, the agent deploy lifecycle, and the per-file / per-session error surface. Total error-taxonomy size: 40 -> 49.
+Six new codes covering the wire-compat probe, the SFTP capability gates, and the per-file / per-session error surface. Total error-taxonomy size: 40 -> 46. The 4 agent-specific codes (`AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`, `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`) from the original v7.0 plan were dropped during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
 #### [RSYNC_NOT_FOUND] rsync binary missing on remote
 
@@ -1783,9 +1784,9 @@ Nine new codes covering the wire-compat probe, the agent deploy lifecycle, and t
 
 - **Category:** TRANSPORT
 - **Retryable:** yes (one retry on the same channel; the russh session is reused)
-- **When:** Handshake or frame parsing failed mid-protocol on the Wire transport, OR an SFTP-side stat/read/write failed in a way the SFTP transport could not classify under `SFTP_FEATURE_MISSING`. v7.0.0-alpha.2: the transport bodies are stubs returning a descriptive "being implemented" detail per transport choice.
-- **Why:** Network corruption, server-side rsync stderr, or (in v7.0.0-alpha.2) the surface stub.
-- **Cure:** Switch transports (Wire ↔ Sftp) and retry. Inspect the detail line for guidance on the alternative path.
+- **When:** Handshake or frame parsing failed mid-protocol on the Wire transport, OR an SFTP-side stat/read/write failed in a way the SFTP transport could not classify under `SFTP_FEATURE_MISSING`.
+- **Why:** Network corruption, server-side rsync stderr, or an SFTP server returning an unexpected error code mid-walk.
+- **Cure:** Switch transports (`transport=Wire` ↔ `transport=Sftp`) and retry. Inspect the detail line for guidance on the alternative path.
 - **Prevention:** Default to `transport=Auto`; the host picks the path that maximises liveness.
 - **Related:** [RSYNC_PARTIAL_TRANSFER], [SFTP_FEATURE_MISSING].
 
