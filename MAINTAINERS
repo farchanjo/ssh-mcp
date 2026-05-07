@@ -1,0 +1,8 @@
+# ssh-mcp maintainers
+#
+# Format: one maintainer per line, in `Name <email> (@github-handle) [scope]` form.
+# Scope is one of: lead, core, area:<area>, security, release.
+# Areas mirror the docs/ARCHITECTURE.md layer map (domain, ports, application,
+# adapters, infra, composition) and the v7 transports (rsync, sftp, serial).
+
+Fabricio Archanjo <fabricio@eonf.ltd> (@farchanjo) [lead, core, security, release]
