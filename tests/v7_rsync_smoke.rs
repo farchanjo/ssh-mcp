@@ -128,6 +128,9 @@ fn req(session_id: &SessionId, transport: RsyncTransportSelection) -> RsyncSyncR
         preserve_perms: false,
         preserve_mtime: false,
         delete: false,
+        dry_run: false,
+        exclude: Vec::new(),
+        include: Vec::new(),
         release_when_no_subs: false,
     }
 }

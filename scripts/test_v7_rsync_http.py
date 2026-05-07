@@ -173,14 +173,6 @@ def test_rsync_no_session_returns_session_not_found(http_client: McpClient) -> N
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport bug: opts.dry_run=true is ignored "
-    "by the SFTP path; bytes are still written to the destination. The "
-    "STARTED block correctly carries DRY_RUN: true and the structured "
-    "twin reports dry_run=true, so the inbound DTO -> domain hop is OK; "
-    "the SFTP transport's writer just doesn't honour the flag yet.",
-    strict=False,
-)
 def test_rsync_dry_run_against_local_sshd(
     http_client: McpClient, ssh_target: SshTarget, tmp_path: Path
 ) -> None:
@@ -460,14 +452,6 @@ def test_rsync_stats_returns_canonical_counters(
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport bug: opts.exclude patterns are "
-    "not enforced by the SFTP comparator; every source file lands on the "
-    "destination regardless of pattern. The pattern reaches the use case "
-    "(opts.exclude is wired through RsyncOptsArg) but the SFTP-side walk "
-    "does not consult it.",
-    strict=False,
-)
 def test_rsync_exclude_pattern_skips_matching_files(
     http_client: McpClient, ssh_target: SshTarget, tmp_path: Path
 ) -> None:
