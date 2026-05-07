@@ -408,30 +408,23 @@ def test_rsync_vm_wire_push_against_real_rsync(
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.xfail(
-    reason="v7.0.0-alpha.X Bug-A partial fix — Wire transport now bundles "
-    "`n` into the leading short-flag header (mirrors upstream rsync 3.2.7 "
-    "cmdline shape `-vvvnlogDtpre.iLsfxCIvu`), so the server is invoked "
-    "with the correct dry-run wire intent. The remaining issue is "
-    "state-machine semantics: with `-n` the rsync v31 generator emits a "
-    "different phase-boundary cadence than the wire transport's sender "
-    "state machine expects, and the session hangs after flist send. The "
-    "SFTP transport honours dry_run end-to-end (see "
-    "test_rsync_dry_run_against_local_sshd in test_v7_rsync_http.py); "
-    "Wire-side dry-run is deferred to a follow-up slice that ports the "
-    "upstream `generator.c::generate_files` dry-run branch (lines "
-    "2255..2275) into our sender driver.",
-    strict=False,
-)
 def test_rsync_vm_wire_push_with_dry_run_does_not_write_remote(
     vm_stdio_client: McpClient, tmp_path: Path
 ) -> None:
     """Bug A regression — wire push with ``dry_run=true`` MUST NOT write
-    to the remote tree. Pre-fix the wire transport silently dropped the
-    flag and shipped the file anyway. Post-fix the cmdline carries the
-    bundled `n` flag (so the SERVER intent is correct on the wire), but
-    the receiver-side sender state machine still hangs against rsync
-    3.2.7 — see xfail reason.
+    to the remote tree, AND the session must complete cleanly without
+    hanging.
+
+    Slice 13 fix — pre-fix the v31 generator's `do_xfers = 0` path
+    (`generator.c::recv_generator` line 1939) skipped the
+    `write_sum_head` blockset write, but the wire sender's
+    `process_one_file` unconditionally called `read_blockset` after the
+    iflags read, deadlocking the session after flist send. Post-fix the
+    sender mirrors upstream rsync 3.2.7's `sender.c::send_files` lines
+    343..347 dry-run branch: when `request.dry_run` is true the
+    `ITEM_TRANSFER` frame echoes `ndx + iflags` only (no blockset, no
+    tokens, no digest) and surfaces a `FileSkipped { DryRun }` event on
+    the progress lane.
     """
     src = tmp_path / "wire-dryrun-src"
     _make_tree(src, {"hello.txt": b"dry-run payload\n"})
