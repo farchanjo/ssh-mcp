@@ -211,9 +211,7 @@ where
     fn spawn_session_task(&self, fs: Arc<F>, request: RsyncStartRequest) -> Arc<LaneState> {
         let (tx, rx) = mpsc::channel(self.lane_capacity);
         let cancel = CancellationToken::new();
-        let mut opts = self.opts.clone();
-        opts.delete = request.delete;
-        opts.preserve = request.preserve;
+        let opts = merge_request_opts(&self.opts, &request);
         let cancel_for_task = cancel.clone();
         let RsyncStartRequest {
             session_id,
@@ -222,6 +220,9 @@ where
             direction: _,
             delete: _,
             preserve: _,
+            dry_run: _,
+            exclude: _,
+            include: _,
         } = request;
         let join = tokio::spawn(async move {
             run_session(fs, session_id, src, dst, opts, tx, cancel_for_task).await;
@@ -232,6 +233,25 @@ where
             join: AsyncMutex::new(Some(join)),
         })
     }
+}
+
+/// Merge per-call `RsyncStartRequest` flags over the adapter's
+/// baseline [`SftpRsyncOpts`]. Per-call `dry_run` is OR'd with the
+/// baseline so existing wirings that pre-set the flag keep working
+/// while per-call requests can opt in dynamically. Non-empty
+/// per-call exclude / include lists override the baseline.
+fn merge_request_opts(base: &SftpRsyncOpts, request: &RsyncStartRequest) -> SftpRsyncOpts {
+    let mut opts = base.clone();
+    opts.delete = request.delete;
+    opts.preserve = request.preserve;
+    opts.dry_run = opts.dry_run || request.dry_run;
+    if !request.exclude.is_empty() {
+        opts.excludes.clone_from(&request.exclude);
+    }
+    if !request.include.is_empty() {
+        opts.includes.clone_from(&request.include);
+    }
+    opts
 }
 
 impl<F> RsyncTransportPort for SftpRsyncTransport<F>

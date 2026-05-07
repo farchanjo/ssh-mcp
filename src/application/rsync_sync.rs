@@ -19,7 +19,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::adapters::rsync::sftp::probe::{SftpFeatures, probe as probe_sftp_features};
-use crate::adapters::rsync::types::PreserveFlags;
+use crate::adapters::rsync::types::{PreserveFlags, RsyncProgressEvent};
 use crate::domain::command::CommandRequest;
 use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
@@ -102,6 +102,14 @@ pub struct RsyncSyncRequest {
     /// `rsync --server`; pull direction post-walks the local
     /// destination tree against the flist after the per-file phase.
     pub delete: bool,
+    /// `-n` / `--dry-run` — both transports short-circuit every
+    /// destructive op into a `FileSkipped { reason: DryRun }` event
+    /// without touching the destination tree.
+    pub dry_run: bool,
+    /// `--exclude=PATTERN` — gitignore-style exclude glob list.
+    pub exclude: Vec<String>,
+    /// `--include=PATTERN` — overrides matching `--exclude`.
+    pub include: Vec<String>,
     /// ADR 0003 lifecycle binding flag — auto-release the rsync
     /// session when the last subscriber detaches.
     pub release_when_no_subs: bool,
@@ -304,7 +312,8 @@ where
         }
         let outcome = self.start_transport(&req, picked).await?;
         let rsync_id = outcome.rsync_id.clone();
-        self.register_session(&req.session_id, &rsync_id).await?;
+        let session = self.register_session(&req.session_id, &rsync_id).await?;
+        self.spawn_progress_pump(picked, &rsync_id, session);
         Ok(RsyncStartedOutcome {
             rsync_id,
             session_id: req.session_id,
@@ -312,6 +321,37 @@ where
             files_planned: 0,
             bytes_planned: 0,
         })
+    }
+
+    /// Spawn a per-session background task that drains `recv_event` from
+    /// the chosen transport and folds events into the
+    /// [`RsyncSession`] aggregate's atomic counters / status byte.
+    ///
+    /// Terminates on `SyncCompleted` / `SessionFailed` (terminal events)
+    /// or when the transport closes the lane (`recv_event -> Ok(None)`
+    /// or transport error). Lock-free: zero `Mutex`, the spawned task
+    /// owns its `recv_event` future end-to-end.
+    fn spawn_progress_pump(
+        &self,
+        picked: RsyncTransportPicked,
+        rsync_id: &RsyncId,
+        session: Arc<RsyncSession>,
+    ) {
+        let id = rsync_id.clone();
+        match picked {
+            RsyncTransportPicked::Wire => {
+                let transport = Arc::clone(&self.wire);
+                tokio::spawn(async move {
+                    pump_progress_events(transport.as_ref(), &id, &session).await;
+                });
+            }
+            RsyncTransportPicked::Sftp => {
+                let transport = Arc::clone(&self.sftp);
+                tokio::spawn(async move {
+                    pump_progress_events(transport.as_ref(), &id, &session).await;
+                });
+            }
+        }
     }
 
     /// Probe the live SFTP server for capability flags, cache the
@@ -371,6 +411,9 @@ where
             // [`crate::adapters::rsync::sftp::mod::start_session`]).
             delete: req.delete,
             preserve: build_preserve_flags(req),
+            dry_run: req.dry_run,
+            exclude: req.exclude.clone(),
+            include: req.include.clone(),
         };
         match picked {
             RsyncTransportPicked::Wire => self.wire.start_session(request).await,
@@ -382,10 +425,13 @@ where
         &self,
         session_id: &SessionId,
         rsync_id: &RsyncId,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Arc<RsyncSession>, DomainError> {
         let session = Arc::new(RsyncSession::new(rsync_id.clone(), session_id.clone()));
         let cap = self.config.max_rsync_per_session();
-        self.rsync_repo.insert_if_under_cap(session, cap).await
+        self.rsync_repo
+            .insert_if_under_cap(Arc::clone(&session), cap)
+            .await?;
+        Ok(session)
     }
 
     /// Cancel a live rsync session.
@@ -608,6 +654,106 @@ fn guard_capabilities(
     Ok(())
 }
 
+/// Drain progress events off the chosen transport and fold them into
+/// the [`RsyncSession`] aggregate. Spawned by `execute()` after the
+/// session is registered.
+///
+/// The pump exits when a terminal event lands (`SyncCompleted`,
+/// `SessionFailed`), when the lane closes (`recv_event -> Ok(None)`),
+/// or when the transport bubbles a transport-level error.
+///
+/// Lock-free: zero `Mutex`, the pump owns its `recv_event` future
+/// end-to-end. Updates ride the `RsyncSession`'s atomic counters /
+/// status byte.
+async fn pump_progress_events<T>(transport: &T, rsync_id: &RsyncId, session: &RsyncSession)
+where
+    T: RsyncTransportPort + ?Sized,
+{
+    loop {
+        match transport.recv_event(rsync_id).await {
+            Ok(Some(event)) => {
+                if apply_progress_event(session, &event) {
+                    return;
+                }
+            }
+            Ok(None) => {
+                // Lane closed without a terminal event — surface as
+                // `Failed` so the snapshot eventually flips off
+                // `Pending` for callers polling `ssh_rsync_stats`.
+                session.fail();
+                return;
+            }
+            Err(_) => {
+                session.fail();
+                return;
+            }
+        }
+    }
+}
+
+/// Fold a single [`RsyncProgressEvent`] into the [`RsyncSession`]
+/// aggregate. Returns `true` when the event is terminal (the pump
+/// should exit).
+fn apply_progress_event(session: &RsyncSession, event: &RsyncProgressEvent) -> bool {
+    if apply_terminal_event(session, event) {
+        return true;
+    }
+    apply_counter_event(session, event);
+    false
+}
+
+/// Drive terminal status transitions on the [`RsyncSession`].
+/// Returns `true` for the two terminal variants so the caller can
+/// short-circuit; non-terminal variants return `false` without
+/// mutating state.
+fn apply_terminal_event(session: &RsyncSession, event: &RsyncProgressEvent) -> bool {
+    match event {
+        RsyncProgressEvent::SyncCompleted { .. } => {
+            session.complete();
+            true
+        }
+        RsyncProgressEvent::SessionFailed { .. } => {
+            session.fail();
+            true
+        }
+        RsyncProgressEvent::SessionStarted { .. }
+        | RsyncProgressEvent::FileStarted { .. }
+        | RsyncProgressEvent::FileProgress { .. }
+        | RsyncProgressEvent::FileCompleted { .. }
+        | RsyncProgressEvent::FileSkipped { .. }
+        | RsyncProgressEvent::FileFailed { .. }
+        | RsyncProgressEvent::SyncProgress { .. } => false,
+    }
+}
+
+/// Update the [`RsyncSession`] aggregate's atomic counters from a
+/// non-terminal [`RsyncProgressEvent`].
+fn apply_counter_event(session: &RsyncSession, event: &RsyncProgressEvent) {
+    match event {
+        RsyncProgressEvent::SessionStarted {
+            files_planned,
+            bytes_planned,
+            ..
+        } => {
+            session.with_files_total(*files_planned);
+            session.with_bytes_total(*bytes_planned);
+            let _ = session.transition(RsyncStatus::Pending, RsyncStatus::Running);
+        }
+        RsyncProgressEvent::FileCompleted {
+            bytes_transferred,
+            bytes_skipped,
+            ..
+        } => session.record_file_done(*bytes_transferred, *bytes_skipped),
+        RsyncProgressEvent::FileSkipped { .. } => session.record_file_done(0, 0),
+        RsyncProgressEvent::FileFailed { .. } => session.record_file_failed(),
+        RsyncProgressEvent::FileStarted { .. }
+        | RsyncProgressEvent::FileProgress { .. }
+        | RsyncProgressEvent::SyncProgress { .. }
+        | RsyncProgressEvent::SyncCompleted { .. }
+        | RsyncProgressEvent::SessionFailed { .. } => {}
+    }
+}
+
 /// Parse the first line of `rsync --version` and pull the protocol
 /// version number out of it. Returns `None` when the binary is missing
 /// (`MISSING` sentinel) or the line cannot be parsed.
@@ -721,6 +867,9 @@ mod tests {
             preserve_perms: false,
             preserve_mtime: false,
             delete: false,
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
             release_when_no_subs: false,
         }
     }
