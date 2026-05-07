@@ -1,8 +1,8 @@
-# Resources Reference (v6.0)
+# Resources Reference (v7.0)
 
-Source of truth for the MCP `resources/*` family in ssh-mcp: 6 subscribe-friendly URI schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial`), URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)); v5.2 added the `serial://` scheme ([ADR 0009](./adr/0009-serial-transport.md)); v6.0 split the tool catalogue across `ssh_*` / `sub_*` / `serial_*` eixos but kept resource URI schemes byte-identical.
+Source of truth for the MCP `resources/*` family in ssh-mcp: **7 subscribe-friendly URI schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), URI grammar, cursor semantics, `_meta` fields, subscribe lifecycle, backpressure, and the v4.7 `resources/templates/list` advertisement. Wire contract is byte-compatible with v3.0.0 (see [MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v4.5 added `_meta` envelope + stable `PeerId` derivation; v4.6 layered the LLM steering surface (`HINT:` / `NEXT:`); v4.7 added parameterised templates (see [Resource Templates](#resource-templates-v47)); v5.2 added the `serial://` scheme ([ADR 0009](./adr/0009-serial-transport.md)); v6.0 split the tool catalogue across `ssh_*` / `sub_*` / `serial_*` eixos but kept resource URI schemes byte-identical; v6.1 layered SFTP resume + verify on top of `transfer://` ([ADR 0010](./adr/0010-sftp-resume.md)); **v7.0 adds the `rsync://` scheme** with per-file + aggregate sync events ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)).
 
-> **v6.0 — no resource changes.** Wire-breaking on tool name strings only; resource URI schemes / push narrative / `_meta` envelope / cursor semantics are byte-identical to v5.3.x.
+> **v7.0 — wire-additive on URI schemes.** The new `rsync://<id>/progress` scheme is the only addition; the other six schemes / push narrative / `_meta` envelope / cursor semantics are byte-identical to v6.x.
 
 Cross-refs: [API.md](./API.md) (tool reference) · [LLM_GUIDE.md](./LLM_GUIDE.md) (subscribe vs poll decision table) · [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants) (lock-free patterns underpinning the broadcast / cursor layer).
 
@@ -90,9 +90,12 @@ Backpressure default: `Snapshot` (matches v5 default for any push resource); swi
 | `command://{command_id}/output{?cursor}`      | Async command output stream        | `text/plain`         | yes (`{?cursor}`)            | always          |
 | `transfer://{transfer_id}/progress`           | SFTP transfer progress snapshot    | `application/json`   | no                           | always          |
 | `session://{session_id}/health`               | SSH session health snapshot        | `application/json`   | no                           | always          |
+| `serial://{serial_id}/output{?cursor}`        | Serial UART/TTY output stream      | `text/plain`         | yes (`{?cursor}`)            | always          |
 | `forward://{forward_id}/events{?cursor}`      | Port-forward event log             | `application/json`   | yes (`{?cursor}`)            | `port_forward`  |
 
-Builds without `port_forward` advertise four templates (`shell`, `command`, `transfer`, `session`); builds with the feature advertise five. Order is stable across builds — clients can index into the list without name-matching.
+Builds without `port_forward` advertise five templates (`shell`, `command`, `transfer`, `session`, `serial`); builds with the feature advertise six. Order is stable across builds — clients can index into the list without name-matching.
+
+The v7.0 `rsync://<rsync_id>/progress` lane is intentionally **omitted from `resources/templates/list`**: rsync sessions are short-lived and the lane closes deterministically after `SyncCompleted` / `SessionFailed`, so a parameterised template adds no value over the `RSYNC_ID` returned synchronously by `ssh_rsync`. Subscribe directly via `sub_open uri=rsync://<RSYNC_ID>/progress` immediately after the tool returns.
 
 ### Field shape
 

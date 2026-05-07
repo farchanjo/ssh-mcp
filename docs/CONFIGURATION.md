@@ -1,8 +1,8 @@
-# SSH MCP Configuration Guide (v6.0)
+# SSH MCP Configuration Guide (v7.0)
 
-Every tunable on the v6.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX). Every legacy v4 var name, default, floor, and cap carries forward unchanged ([MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v5 adds the lifecycle / lane / mux / daemon families; v6.0 only renames tool strings — env-var surface is byte-identical to v5.3.x.
+Every tunable on the v7.0 ssh-mcp server: env vars, parameter priority, validation ranges, plus a tuning guide for common deployment shapes (verbose shells, many subscribers, embedded / low-RAM, real-time interactive UX, rsync probe). Every legacy v4 var name, default, floor, and cap carries forward unchanged ([MIGRATION.md → v3 → v4](./MIGRATION.md#v3--v4)). v5 adds the lifecycle / lane / mux / daemon families; v6.0 only renames tool strings; v6.1 adds resume / verify on `ssh_upload` / `ssh_download` (no new env vars); **v7.0 adds three rsync probe / planner knobs** (`SSH_RSYNC_PROBE_TIMEOUT_MS`, `SSH_RSYNC_BLOCK_SIZE`, `SSH_RSYNC_FILE_LIST_LIMIT`) on top of an env-var surface byte-identical to v5.3.x.
 
-> **v6.0 — no env-var changes.** Strictly additive on `tools/list[]` name strings; every entry below carries forward byte-identical to v5.3.x.
+> **v7.0 — three new env vars (rsync only).** Every existing var carries forward byte-identical from v6.x. The deployed-agent path was retracted in v7.0.0-alpha.2; agent-cache env vars (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) from the original plan were dropped. See [v7.0 / ADR 0011 — rsync hybrid transport](#v70--adr-0011--rsync-hybrid-transport-3-env-vars) below.
 
 [[_TOC_]]
 

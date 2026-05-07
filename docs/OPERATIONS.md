@@ -1,6 +1,6 @@
 # Operations Runbook
 
-Operator-facing reference for ssh-mcp. Symptom-to-cure decision tree, common failure shapes, the wire-format error envelope and per-tool error catalogue, and recovery sequence diagrams. Pairs with [LLM_GUIDE.md](./LLM_GUIDE.md) (the LLM-side handbook) and [DAEMON.md](./DAEMON.md) (the `ssh-mcp-tail` reference). For the full 38-code error taxonomy with retry semantics, see [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
+Operator-facing reference for ssh-mcp v7.0. Symptom-to-cure decision tree, common failure shapes, the wire-format error envelope and per-tool error catalogue, and recovery sequence diagrams. Pairs with [LLM_GUIDE.md](./LLM_GUIDE.md) (the LLM-side handbook) and [DAEMON.md](./DAEMON.md) (the `ssh-mcp-tail` reference). For the full **46-code error taxonomy** (38 base + 2 v6.1 resume + 6 v7.0 rsync) with retry semantics, see [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -546,15 +546,21 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 
 ### ssh_upload
 
+`ssh_upload` accepts the v6.1 / ADR 0010 args `resume: bool` (default `false`) and `verify: bool` (default `false`). Responses include a `RESUMED_FROM: <u64>` line whenever the preflight returns a non-zero offset.
+
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/upload_file.rs::execute` | Reconnect via `ssh_connect`. |
 | `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap (10) reached. `DETAIL: limit=10`. | `src/application/upload_file.rs::execute` | Wait for an in-flight transfer or cancel one via session disconnect. |
 | `LOCAL_FILE_ERROR` | `fs::metadata` failed on `local_path` (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `stat`) | Inspect `REASON`; verify path, permissions, and that the file is reachable locally. |
 | `LOCAL_NOT_FILE` | `local_path` resolved but is not a regular file (directory, symlink loop, special file). | `src/application/upload_file.rs::UploadFileUseCase::guard_local_path_is_file` | Pass an actual regular-file path. |
+| `RESUME_OVERSHOOT` *(v6.1)* | Destination is **larger** than the source — corrupted partial file or wrong target. STATE, no retry. | `src/application/upload_file.rs::UploadFileUseCase::resume_preflight` | Re-run with `resume=false` to overwrite, or pick the correct target path. |
+| `RESUME_MISMATCH` *(v6.1)* | `verify=true` hash diverges between local and remote prefixes (mtime drift, concurrent writers, partial corruption). STATE, no retry. | `src/application/upload_file.rs::UploadFileUseCase::verify_resume_prefix` | Re-run with `resume=false` to overwrite, or fix the partial file before retrying. |
 | `SFTP_ERROR` | Untagged catch-all for `DomainError::Sftp` (any other SFTP failure). | `src/adapters/sftp/russh_sftp_adapter.rs` | Inspect `REASON`; check remote disk, permissions, SFTP availability. |
 
 ### ssh_download
+
+`ssh_download` accepts the v6.1 / ADR 0010 args `resume: bool` (default `false`) and `verify: bool` (default `false`). Responses include a `RESUMED_FROM: <u64>` line whenever the preflight returns a non-zero offset.
 
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
@@ -562,6 +568,8 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap (10) reached. `DETAIL: limit=10`. | `src/application/download_file.rs::execute` | Wait for an in-flight transfer. |
 | `SFTP_OPEN_FAILED` | Failed to open the SFTP subsystem on the SSH session (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `open`) | Verify the remote host has SFTP enabled (`Subsystem sftp`); fall back to `ssh_exec` + manual `cat`. |
 | `REMOTE_METADATA_ERROR` | Remote `stat` failed during download — file missing, permission denied, transport blip mid-stat. | `src/adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` | Inspect `REASON`; verify the remote path and the download user's permissions. |
+| `RESUME_OVERSHOOT` *(v6.1)* | Local destination is **larger** than the remote source. STATE, no retry. | `src/application/download_file.rs::DownloadFileUseCase::resume_preflight` | Re-run with `resume=false` to overwrite, or pick the correct target path. |
+| `RESUME_MISMATCH` *(v6.1)* | `verify=true` hash diverges between local and remote prefixes. STATE, no retry. | `src/application/download_file.rs::DownloadFileUseCase::verify_resume_prefix` | Re-run with `resume=false` to overwrite, or fix the partial file before retrying. |
 | `SFTP_ERROR` | Untagged catch-all for `DomainError::Sftp`. | `src/adapters/sftp/russh_sftp_adapter.rs` | Inspect `REASON`; check remote disk, permissions, SFTP availability. |
 
 ### ssh_transfer_progress
@@ -580,6 +588,33 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | `PORT_IN_USE` | Local port already bound. `DETAIL: port=<n>`. | `src/adapters/ssh/russh_adapter.rs::start_port_forward` | Pick a different `local_port` or release the current binder. |
 | `FEATURE_DISABLED` | Resource subscribe to `forward://` on a build compiled without `--features port_forward` (tagged invalid argument). | `src/application/read_resource.rs::execute` + `subscribe_resource.rs::execute` | Use a build with the feature enabled (default). |
 | `FORWARD_FAILED` | Local listener bind failed for reasons other than `AddrInUse` (e.g. `EACCES` on a privileged port, `EADDRNOTAVAIL` on a host without the requested address, IPv6/IPv4 family mismatch). | `src/application/forward_port.rs::ForwardPortUseCase::preflight_bind` | Inspect `REASON`; common causes: insufficient privileges (try a port >= 1024), invalid bind address, or the host lacks the requested family. `PORT_IN_USE` is still emitted separately for `AddrInUse`. |
+
+### ssh_rsync *(v7.0)*
+
+`ssh_rsync` runs through the hybrid rsync transport — `transport=Auto` probes the remote, `transport=Wire` forces the rsync v31 client, `transport=Sftp` uses the universal SFTP fallback. The agent transport from the original v7.0 plan was retracted in v7.0.0-alpha.2; both surviving transports run in-process.
+
+| Code | Trigger | Emitted from | Recommended action |
+|---|---|---|---|
+| `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/rsync_sync.rs::execute` | Reconnect via `ssh_connect`. |
+| `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap reached. | `src/application/rsync_sync.rs::execute` | Wait for an in-flight rsync session or cancel one via `ssh_rsync_cancel`. |
+| `RSYNC_NOT_FOUND` | Remote `which rsync` failed AND `transport=Wire` was forced. RESOURCE, no retry on the same host. | `src/adapters/rsync/wire/probe.rs::probe_rsync` | Install `rsync >= 3.2.0` on the remote, or set `transport=Sftp` (or `transport=Auto` to fall through automatically). |
+| `RSYNC_VERSION_TOO_OLD` | Remote rsync protocol < v31 AND `transport=Wire` was forced. POLICY, conditional retry. | `src/adapters/rsync/wire/probe.rs::probe_rsync` | Upgrade remote rsync to >= 3.2.0, or set `transport=Sftp`. |
+| `RSYNC_PROTOCOL_ERROR` | Wire-compat negotiation failed mid-handshake (server rejected greeting / multiplex frame). TRANSPORT, retryable. | `src/adapters/rsync/wire/wire_transport.rs` | Inspect remote `rsync --server` stderr; retry, or fall back to `transport=Sftp`. |
+| `RSYNC_FILE_LIST_TOO_LARGE` | File list exceeds `SSH_RSYNC_FILE_LIST_LIMIT` (default 1 000 000). POLICY, conditional retry. | `src/application/rsync_sync.rs::guard_file_list_size` | Tighten `opts.exclude` (`.git/`, `node_modules/`, `target/`), or raise the limit. |
+| `RSYNC_PARTIAL_TRANSFER` | Transfer interrupted mid-stream (russh channel drop). TRANSPORT, retryable. | `src/adapters/rsync/wire/sender.rs` + `src/adapters/rsync/sftp/sftp_transport.rs` | Re-run with `--partial` to resume from the existing partial files. |
+| `SFTP_FEATURE_MISSING` | Selected option requires an SFTP capability the server refuses (`SSH_FXP_SETSTAT` for `preserve.perms`, `SSH_FXP_SYMLINK` for `preserve.symlinks`, `-c` checksum delta, `-H` hardlinks). POLICY, conditional retry. | `src/adapters/rsync/sftp/probe.rs::probe_features` | Drop the unsupported option, or switch to `transport=Wire` if the remote has rsync >= 3.2.0. |
+
+### ssh_rsync_cancel *(v7.0)*
+
+| Code | Trigger | Emitted from | Recommended action |
+|---|---|---|---|
+| `RSYNC_NOT_FOUND` | No rsync session with the given `RSYNC_ID`. | `src/application/rsync_sync.rs::cancel` | Treat as success — cancellation is idempotent; missing IDs return OK by design (the table entry covers the cold-cache lookup race only). |
+
+### ssh_rsync_stats *(v7.0)*
+
+| Code | Trigger | Emitted from | Recommended action |
+|---|---|---|---|
+| `RSYNC_NOT_FOUND` | No rsync session with the given `RSYNC_ID`. May indicate cleanup after the session completed and was reaped. | `src/application/rsync_sync.rs::stats` | Re-trigger via `ssh_rsync` if you still need the sync; otherwise treat as already terminal. Prefer `sub_open uri=rsync://<id>/progress` over polling. |
 
 ### resources/list
 
@@ -899,7 +934,7 @@ File a bug when:
 
 Capture in the bug report:
 
-- ssh-mcp version (e.g. `v6.0.0` or branch + commit SHA).
+- ssh-mcp version (e.g. `v7.0.0` or branch + commit SHA).
 - The exact tool / op call sequence that reproduces the issue.
 - `RUST_LOG=ssh_mcp=debug` output for the relevant time window.
 - `sub_stats_all` snapshot at the moment of the issue.
@@ -912,9 +947,9 @@ Use this checklist verbatim when filing the issue at <https://github.com/farchan
 
 ## See also
 
-- [LLM_GUIDE.md](./LLM_GUIDE.md) — golden rules, anti-patterns, full 38-code error handbook.
+- [LLM_GUIDE.md](./LLM_GUIDE.md) — golden rules, anti-patterns, full 46-code error handbook (38 base + 2 v6.1 resume + 6 v7.0 rsync).
 - [DAEMON.md](./DAEMON.md) — `ssh-mcp-tail` op + event schema.
 - [DEVELOPMENT.md](./DEVELOPMENT.md) — lock-free invariants, hot-path data flow.
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — hexagonal layout, v5 layers.
-- [CONFIGURATION.md](./CONFIGURATION.md) — env var table and tuning profiles.
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — hexagonal layout, v5/v6/v7 layers.
+- [CONFIGURATION.md](./CONFIGURATION.md) — env var table and tuning profiles (incl. v7.0 rsync probe knobs).
 - [adr/](./adr/) — eight architecture decision records.

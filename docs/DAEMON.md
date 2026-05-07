@@ -1,8 +1,8 @@
 # `ssh-mcp-tail` — NDJSON Daemon Reference
 
-`ssh-mcp-tail` is the v6.0 NDJSON-daemon binary for running ssh-mcp as a Unix-composable NDJSON pipe. It embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired to itself through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON commands; stdout emits NDJSON events; stderr emits `RUST_LOG`-controlled tracing.
+`ssh-mcp-tail` is the v7.0 NDJSON-daemon binary for running ssh-mcp as a Unix-composable NDJSON pipe. It embeds the same `composition::prod` adapters as `ssh-mcp` (HTTP) and `ssh-mcp-stdio` (stdio MCP), wired to itself through an in-process `tokio::io::duplex` MCP transport. Stdin reads NDJSON commands; stdout emits NDJSON events; stderr emits `RUST_LOG`-controlled tracing.
 
-The binary is shipped (Phase 4 merged into v5.x; carried forward unchanged into v6.0). Wire shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` is forthcoming and will become the authoritative contract once published.
+The binary is shipped (Phase 4 merged into v5.x; carried forward unchanged into v6.0 / v6.1 / v7.0). Wire shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` is forthcoming and will become the authoritative contract once published. The v7.0 rsync tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) are driven through the embedded MCP client surface — no new NDJSON ops were added; rsync progress events surface as `push` events on `uri="rsync://<RSYNC_ID>/progress"` ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)).
 
 ## When to use this binary
 
@@ -85,7 +85,7 @@ cat ops.ndjson | ssh-mcp-tail daemon | tee out.ndjson
 
 One JSON object per line, terminated by `\n`. Each op is `serde`-tagged on the `op` field. The optional `id` field on every op is echoed on every event tied to that op for correlation.
 
-The 13 ops below are the v5.0 schema (carried forward unchanged into v6.0). The shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes the binding contract once published.
+The 13 ops below are the v5.0 schema (carried forward unchanged into v6.0 / v6.1 / v7.0). The shape is locked by [ADR 0008](./adr/0008-ndjson-daemon-protocol.md); the JSON schema at `docs/api/ssh-mcp-ndjson.schema.json` becomes the binding contract once published. v7.0 rsync tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) are driven through the embedded MCP client surface, not via new NDJSON ops — subscribe to the `rsync://<RSYNC_ID>/progress` URI through the existing `subscribe` op to drive a sync from the daemon.
 
 ### `connect`
 
@@ -318,10 +318,16 @@ Async command launched.
 
 ### `push`
 
-Subscriber received a push event. `seq_local` is the per-sub_id sequence; `seq_global` is the per-resource sequence; `cursor` is the byte cursor into the resource ring buffer; `delta` is the new bytes appended since the previous push (subject to `filter`). `ts` is RFC 3339.
+Subscriber received a push event. `seq_local` is the per-sub_id sequence; `seq_global` is the per-resource sequence; `cursor` is the byte cursor into the resource ring buffer; `delta` is the new bytes appended since the previous push (subject to `filter`). `ts` is RFC 3339. Across all 7 push schemes (`shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://`, **`rsync://`**) the wire shape is identical — only the `uri` discriminator and `delta` payload type change.
 
 ```json
 {"ev":"push","sub_id":"<sub-uuid>","uri":"command://<cmd-uuid>/output","seq_local":1,"seq_global":1893,"cursor":102400,"delta":"....","ts":"2026-05-04T12:34:56.789Z"}
+```
+
+v7.0 rsync progress events ride the same envelope, with `delta` carrying a JSON-encoded `RsyncProgressEvent` ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)):
+
+```json
+{"ev":"push","sub_id":"<sub-uuid>","uri":"rsync://<rsync-uuid>/progress","seq_local":4,"seq_global":17,"cursor":0,"delta":"{\"kind\":\"file_progress\",\"rel_path\":\"src/main.rs\",\"bytes_done\":1024,\"bytes_total\":2048}","ts":"2026-05-04T12:34:56.789Z"}
 ```
 
 ### `completed`

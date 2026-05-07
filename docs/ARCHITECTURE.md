@@ -1,12 +1,16 @@
-# SSH MCP Architecture (v6.0 — subscribe-first hexagonal)
+# SSH MCP Architecture (v7.0 — rsync hybrid transport on subscribe-first hexagonal)
 
-Architecture of the SSH Model Context Protocol (MCP) server on `master` (v6.0.0). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with five v5 layers stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), and the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, and v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos (36 tools / 35 without `port_forward`).
+Architecture of the SSH Model Context Protocol (MCP) server on `master` (v7.0.0). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with seven layered deltas stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged), the **SFTP resume + verify** primitive ([ADR 0010](./adr/0010-sftp-resume.md), v6.1 — merged), and the **rsync hybrid transport** ([ADR 0011](./adr/0011-rsync-hybrid-transport.md), v7.0 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos, and v7.0 adds 3 rsync tools (39 tools / 38 without `port_forward`).
 
 Version trail (one line each):
 
 - **v4.0 / v4.1** — original hexagonal restructuring; `src/mcp/` deleted; `async-trait` dropped. See [ADR 0002](./adr/0002-adopt-hexagonal-architecture.md).
 - **v4.5 / v4.6 / v4.7 / v4.8** — LLM UX foundation (`PeerId`, `_meta` envelope, granular wire codes, `Implementation` identity, `ToolAnnotations`, `NEXT:` / `HINT:` lines, JSON Schema defaults, `Cost:` hints, `AGENT_ID:` rename), MCP inter-tool conversation surface (`structured_content`, `resources/templates/list`, `notifications/progress`, prompts catalog, idempotency cache, NOT_FOUND closest-match), full `output_schema` coverage. Tool catalogue grew 18 → 21.
 - **v5.0** — subscribe-first refresh. See ADRs [0003](./adr/0003-lifecycle-binding.md), [0004](./adr/0004-channel-mux-fairness.md), [0005](./adr/0005-llm-ux-priorities.md), [0006](./adr/0006-backpressure-policies.md), [0007](./adr/0007-error-taxonomy.md), [0008](./adr/0008-ndjson-daemon-protocol.md). 9 net-new MCP tools, `ssh-mcp-tail` daemon binary, MSRV bumped to Rust 1.95.
+- **v5.2** — native serial / UART / TTY / COM transport. See [ADR 0009](./adr/0009-serial-transport.md). 6 net-new tools, `serial://` push lane.
+- **v6.0** — three-axis tool catalogue rename (`ssh_*` / `sub_*` / `serial_*`); wire-additive on tool name strings only.
+- **v6.1** — SFTP resume + verify on `ssh_upload` / `ssh_download`. See [ADR 0010](./adr/0010-sftp-resume.md). Adds `RESUME_OVERSHOOT` / `RESUME_MISMATCH` codes (40-code taxonomy).
+- **v7.0** — rsync hybrid transport. See [ADR 0011](./adr/0011-rsync-hybrid-transport.md). 3 net-new tools (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`), `rsync://` push lane, `WireRsyncTransport` (port of OpenBSD `openrsync`, byte-identical against `rsync 3.2.7`) + `SftpRsyncTransport` (universal SFTP fallback). The `transport` enum collapsed back to `Auto | Wire | Sftp` after the v7.0.0-alpha.2 architectural retrenchment retracted the deployed-agent path; workspace returned to a single package. Adds `RSYNC_NOT_FOUND` / `RSYNC_VERSION_TOO_OLD` / `RSYNC_PROTOCOL_ERROR` / `RSYNC_FILE_LIST_TOO_LARGE` / `RSYNC_PARTIAL_TRANSFER` / `SFTP_FEATURE_MISSING` codes (46-code taxonomy).
 
 [[_TOC_]]
 
@@ -33,7 +37,7 @@ flowchart TB
     end
     subgraph INFRA["infra/mcp — inbound MCP"]
         SERVER["server.rs"]
-        TR["tool_router.rs<br/>30 #[tool] fns"]
+        TR["tool_router.rs<br/>39 #[tool] fns"]
         RES["resource_handlers.rs"]
         PROMPTS["prompts.rs"]
         RESULTS["results.rs"]
@@ -44,7 +48,8 @@ flowchart TB
         UEXE["execute_command<br/>get_command_output"]
         USHELL["open_shell<br/>read_shell"]
         USFTP["upload_file<br/>download_file"]
-        URES["subscribe_resource<br/>unsubscribe_resource"]
+        URES["subscribe_resource<br/>unsubscribe_resource<br/>subscription_admin"]
+        URSYNC["rsync_sync<br/>(v7.0)"]
     end
     subgraph PORTS["ports — trait skeletons"]
         SSHP["ssh_client / sftp_client"]
@@ -168,7 +173,7 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 
 ### `src/application/` — use cases
 
-24 files (excl. `mod.rs`), one per business operation or admin slice. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 added the consolidated `subscription_admin` slice that powers all 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`). The serial transport (ADR 0009) is wired through `infra::mcp` directly against the in-process `SerialPortRegistry` adapter.
+25 files (excl. `mod.rs`), one per business operation or admin slice. Each is a `*UseCase<Ports...>` struct with a single `pub async fn execute(&self, req: Request) -> Result<Outcome, DomainError>` entry point. Phase 1 wired the lifecycle layer into `open_shell`, `execute_command`, `upload_file`, `download_file` (commit `525b795`); Phase 2 wired the subscriber lane into `subscribe_resource` and `unsubscribe_resource` (commit `30fbdd9`). Phase 3 added the consolidated `subscription_admin` slice that powers all 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`). The serial transport (ADR 0009) is wired through `infra::mcp` directly against the in-process `SerialPortRegistry` adapter. v7.0 adds `rsync_sync.rs` (`RsyncSyncUseCase`) which drives `ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats` over both `WireRsyncTransport` and `SftpRsyncTransport` ([Phase 5 below](#phase-5--rsync-hybrid-transport-v70-final)).
 
 | Domain | Use cases |
 |--------|-----------|
@@ -205,7 +210,7 @@ All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s).
 | File | Role |
 |------|------|
 | `server.rs` | `McpSshServer<UC>` — generic over the `UseCases<…>` container. |
-| `tool_router.rs` | `#[tool_router]` impl populating the 21 `ssh_*` + 9 `sub_*` + 6 `serial_*` = 36 `#[tool]` entry points (35 without `port_forward`). |
+| `tool_router.rs` | `#[tool_router]` impl populating the 24 `ssh_*` + 9 `sub_*` + 6 `serial_*` = 39 `#[tool]` entry points (38 without `port_forward`). The `ssh_*` family adds `ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats` in v7.0. |
 | `results.rs` | Typed Rust output structs for every tool's `structured_content` payload. |
 | `prompts.rs` | `prompts/list` + `prompts/get` catalog — 10 workflows in v5 (5 carry-overs + 5 push-first). See [LLM_GUIDE.md → Prompts catalogue](./LLM_GUIDE.md#prompts-catalogue). |
 | `idempotency.rs` | DashMap-backed LRU cache — dedup mutating tool calls by `_meta.idempotency_key`. |
@@ -414,7 +419,7 @@ Subscribers cannot extend or shorten a resource's lifetime — only its creator 
 
 ## Resource scheme topology
 
-6 push-capable URI schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial`) map to the 5 long-running tool families. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
+7 push-capable URI schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`) map to the 6 long-running tool families. Subscribers fan in through `(SubId, Uri)` lanes and exit through the `ChannelMux`.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -424,6 +429,8 @@ flowchart LR
         TExec["ssh_exec"]
         TSftp["ssh_upload<br/>ssh_download"]
         TFwd["ssh_forward<br/>(feature-gated)"]
+        TSerial["serial_open"]
+        TRsync["ssh_rsync"]
     end
     subgraph SCHEMES["Resource URI schemes"]
         Sshell["shell://&lt;id&gt;/output<br/>(cursor)"]
@@ -431,6 +438,8 @@ flowchart LR
         Stransfer["transfer://&lt;id&gt;/progress<br/>(snapshot)"]
         Ssession["session://&lt;id&gt;/health<br/>(snapshot)"]
         Sforward["forward://&lt;id&gt;/events<br/>(cursor, gated)"]
+        Sserial["serial://&lt;id&gt;/output<br/>(cursor)"]
+        Srsync["rsync://&lt;id&gt;/progress<br/>(snapshot, terminal)"]
     end
     Sub["sub_open<br/>(SubId, Uri) lane"]
     Push["resources/updated<br/>push events"]
@@ -439,22 +448,30 @@ flowchart LR
     TExec --> Scmd
     TSftp --> Stransfer
     TFwd --> Sforward
+    TSerial --> Sserial
+    TRsync --> Srsync
     Sshell --> Sub
     Scmd --> Sub
     Stransfer --> Sub
     Ssession --> Sub
     Sforward --> Sub
+    Sserial --> Sub
+    Srsync --> Sub
     Sub --> Push
 
     style TShell fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style TExec fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style TSftp fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style TFwd fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TSerial fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style TRsync fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style Sshell fill:#238636,color:#f0f6fc,stroke:#2ea043
     style Scmd fill:#238636,color:#f0f6fc,stroke:#2ea043
     style Stransfer fill:#238636,color:#f0f6fc,stroke:#2ea043
     style Ssession fill:#238636,color:#f0f6fc,stroke:#2ea043
     style Sforward fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Sserial fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Srsync fill:#238636,color:#f0f6fc,stroke:#2ea043
     style Sub fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
     style Push fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
     style TOOLS fill:#161b22,color:#f0f6fc,stroke:#30363d
@@ -465,7 +482,7 @@ Per-scheme cursor + sequence semantics: [RESOURCES.md](./RESOURCES.md). Per-`(Su
 
 ## Phase 3 — LLM UX surface (merged)
 
-ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](./adr/0007-error-taxonomy.md)).
+ADR: [adr/0005-llm-ux-priorities.md](./adr/0005-llm-ux-priorities.md). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher; 46-code error taxonomy after the v6.1 + v7.0 deltas ([ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0010](./adr/0010-sftp-resume.md), [ADR 0011](./adr/0011-rsync-hybrid-transport.md)).
 
 This document tracks names; the canonical LLM reference is [LLM_GUIDE.md](./LLM_GUIDE.md) (golden rules, prompts catalogue, anti-patterns, error handbook).
 
@@ -684,7 +701,7 @@ The full table — every atomic, every channel, every guard — lives in [DEVELO
 - **Subscription mux atomics** (Phase 2): per-lane mpsc, `cursor_lane` AtomicUsize, `pause_flag` AtomicBool, 8 stats atomics.
 - **Cascade refcount** (Phase 1): `SessionLifecycle.active_refs` AtomicUsize. CAS Active -> Idle -> Releasing -> Closed.
 
-`cargo clippy --release --all-features -- -D warnings` exit-0 invariant holds under v5. Loom coverage extends from v4's 8 invariants to 16 with Phase 1 + Phase 2.
+`cargo clippy --release --all-features -- -D warnings` exit-0 invariant holds under v7.0. Loom coverage extends from v4's 8 invariants to 27 across two files: `tests/lockfree_invariants.rs` (20 — lifecycle CAS, mux fairness, lane mpsc, cascade refcount) + `tests/lockfree_invariants_rsync.rs` (7 — `RsyncSession` state transitions, rsync lane pause/resume under concurrent producer, file-list ordering, sparse-file handling races).
 
 ## Configuration
 
@@ -698,7 +715,7 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 
 | Capability | Status |
 |------------|--------|
-| `tools/list` | 36 tools registered (35 without `port_forward`); every tool advertises a typed `outputSchema` |
+| `tools/list` | 39 tools registered (38 without `port_forward`); every tool advertises a typed `outputSchema` |
 | `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
 | `resources/list` | 6 schemes (`shell`, `command`, `transfer`, `session`, `forward`, `serial`) — see [RESOURCES.md](./RESOURCES.md) |
 | `resources/read` | All 6 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` / `serial` |

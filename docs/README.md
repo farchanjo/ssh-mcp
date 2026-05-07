@@ -11,9 +11,10 @@ flowchart TD
     Q -->|"Contributor /<br/>code reviewer"| DEV["DEVELOPMENT.md"]
     Q -->|"Host implementer"| API["API.md"]
     Q -->|"NDJSON pipeline<br/>integrator"| DAEM["DAEMON.md"]
-    Q -->|"Migrating from<br/>v2 / v3 / v4"| MIG["MIGRATION.md"]
+    Q -->|"Migrating from<br/>v2..v6"| MIG["MIGRATION.md"]
     Q -->|"Tuning<br/>env vars"| CFG["CONFIGURATION.md"]
     Q -->|"Architectural<br/>question"| ARCH["ARCHITECTURE.md"]
+    Q -->|"Push schemes<br/>+ cursors"| RES["RESOURCES.md"]
 
     style LLM fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
     style OPS fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
@@ -23,19 +24,20 @@ flowchart TD
     style MIG fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style CFG fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style ARCH fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style RES fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
 ```
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | Hexagonal layout, v5 layers (lifecycle / mux / LLM UX / daemon), per-module map, sequence diagrams. |
-| [API.md](./API.md) | All 36 MCP tools (35 without `port_forward`) — inputs, outputs, structured content, error codes. |
-| [RESOURCES.md](./RESOURCES.md) | Six resource schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial`), cursor and sequence semantics, `_meta` envelope, `resources/templates/list`. |
-| [CONFIGURATION.md](./CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles (verbose shells, many subscribers, low-RAM, real-time UX). |
-| [LLM_GUIDE.md](./LLM_GUIDE.md) | Single canonical LLM doc — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 38-code error handbook. |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Hexagonal layout, v5/v6/v7 layers (lifecycle / mux / LLM UX / daemon / serial / resume / rsync hybrid), per-module map, sequence diagrams. |
+| [API.md](./API.md) | All 39 MCP tools (38 without `port_forward`) — inputs, outputs, structured content, error codes. |
+| [RESOURCES.md](./RESOURCES.md) | Seven push schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), cursor + sequence semantics, `_meta` envelope, `resources/templates/list`. |
+| [CONFIGURATION.md](./CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles (verbose shells, many subscribers, low-RAM, real-time UX, rsync probe). |
+| [LLM_GUIDE.md](./LLM_GUIDE.md) | Single canonical LLM doc — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 46-code error handbook. |
 | [OPERATIONS.md](./OPERATIONS.md) | Symptom → cure runbook, wire-format error envelope, per-tool error catalogue, recovery sequence diagrams, diagnostic toolbox. |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | Build / test / clippy gates, lock-free invariants, hot-path sequence diagrams (lifecycle CAS, mux drain, debouncer), Cargo features. |
 | [DAEMON.md](./DAEMON.md) | `ssh-mcp-tail` reference — NDJSON op and event schema, architecture, shutdown sequence, composition recipes. |
-| [MIGRATION.md](./MIGRATION.md) | Migration paths: v2 → v3 (client), v3 → v4 (contributor), v4 → v5 (host), v5 → v6 (host — tool name eixos). |
-| [adr/](./adr/) | Nine architecture decision records (`0001` rmcp · `0002` hexagonal · `0003` lifecycle · `0004` mux+sub_id · `0005` LLM UX · `0006` backpressure · `0007` errors · `0008` daemon · `0009` serial). |
+| [MIGRATION.md](./MIGRATION.md) | Migration paths: v2 → v3 → v4 → v5 → v6.0 → v6.1 → v7.0. |
+| [adr/](./adr/) | Eleven architecture decision records (`0001` rmcp · `0002` hexagonal · `0003` lifecycle · `0004` mux+sub_id · `0005` LLM UX · `0006` backpressure · `0007` errors · `0008` daemon · `0009` serial · `0010` SFTP resume · `0011` rsync hybrid transport). |
