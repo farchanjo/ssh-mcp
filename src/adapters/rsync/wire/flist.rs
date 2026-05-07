@@ -1649,6 +1649,16 @@ async fn process_dir_entry(
     let metadata = fs::symlink_metadata(&entry_path).await.map_err(|e| {
         DomainError::RsyncProtocolError(format!("gen_flist: lstat({}): {e}", entry_path.display()))
     })?;
+    // Mirror upstream rsync 3.2.7's `flist.c::send_file_name` skip-on-
+    // non-regular guard (lines 2090-2098): when `-l` (preserve.links)
+    // is not negotiated, drop symlinks at the walker before they reach
+    // the wire flist. Without this filter the server emits "skipping
+    // non-regular file" Info advisories and the per-file ack stream
+    // diverges from our sender state machine — the session deadlines
+    // out without progress.
+    if metadata.file_type().is_symlink() && !preserve.links {
+        return Ok(());
+    }
     let rel = entry_path
         .strip_prefix(root)
         .map_or_else(|_| entry_path.clone(), Path::to_path_buf);
