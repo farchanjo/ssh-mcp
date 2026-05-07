@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0] — post-release fixes (2026-05-06)
+
+Five follow-up commits closing the gap between the v7.0.0 transport bodies and the live MCP-host call path. Each bug surfaced when the Python integration suite (`scripts/test_v7_rsync_*.py`) drove `ssh_rsync` end-to-end against `rsync 3.2.7` on a real Linux VM rather than against the in-process direct-transport tests in `tests/v7_rsync_wire_e2e_vm.rs`. Wire-additive — no DTO field shapes changed, no error codes added, no env var defaults moved.
+
+### Fixed
+
+- **Composition root reached the no-registry stub** ([`bfc68c6`](https://github.com/farchanjo/ssh-mcp/commit/bfc68c6)). `composition::prod` instantiated `WireRsyncTransport::new()` instead of `with_registry(sftp.handle_registry().clone())`, so every `transport=Wire` (and every `transport=Auto` route that picked Wire) short-circuited at `start_session` with the `RSYNC_PROTOCOL_ERROR` "Wire transport (rsync v31 wire-compat) is being implemented" detail line — even though slices 1–10 had landed the full openrsync wire driver. Fix: wire the production constructor with the shared `SshHandleRegistry` so the wire transport reuses the russh handle that `ssh_exec` / `ssh_upload` already own.
+- **`RsyncSyncUseCase::execute()` never drained the progress lane** ([`4fb0b35`](https://github.com/farchanjo/ssh-mcp/commit/4fb0b35)). The use case returned `STARTED` immediately but never spawned a task to fold `RsyncProgressEvent` into the `RsyncSession` aggregate, so `ssh_rsync_stats` reported `STATUS: pending` forever and the lane closed without a terminal status flip. Fix: `spawn_progress_pump(picked, &rsync_id, session)` after `register_session`; `pump_progress_events` calls `transport.recv_event(rsync_id)` in a loop, folds non-terminal events through `apply_counter_event`, and exits on `SyncCompleted` / `SessionFailed` (or marks `Failed` on lane close / transport error). Lock-free: zero new `Mutex`; the spawned task owns its `recv_event` future end-to-end.
+- **`opts.dry_run` / `opts.exclude` / `opts.include` were silently dropped** ([`4fb0b35`](https://github.com/farchanjo/ssh-mcp/commit/4fb0b35)). Each field rode `SshRsyncArgs.opts` correctly, but neither flowed through `RsyncSyncRequest` → `RsyncStartRequest` to the per-call adapter merge — the SFTP walker + executor were already wired correctly; they just received empty / `false` baseline values. Fix: extend both request types with `dry_run` / `exclude` / `include`; the SFTP transport's per-call opts now OR `dry_run` over the baseline and override exclude / include when non-empty (preserves the `with_fs(opts)` test pattern).
+- **Wire transport shipped `host:path` to the remote `rsync --server` cmdline** ([`81e3573`](https://github.com/farchanjo/ssh-mcp/commit/81e3573)). The MCP DTO accepts `dst="vm.services:/tmp/foo/"`; the wire transport passed the spec verbatim into `build_rsync_server_cmdline`, so the server saw `rsync --server -e.LsfxC -r . vm.services:/tmp/foo/` and aborted with `MSG_IO_ERROR` "0 files transferred". The host-prefix is an rsync-CLI directive that the server never expects to see in its argv. Fix: new `strip_host_prefix(spec) -> &str` helper splits on the first `:`; called at both push (`request.dst`) and pull (`request.src`) sites before `build_rsync_server_cmdline`. The Rust `tests/v7_rsync_wire_e2e_vm.rs` suite always passed bare paths (no host prefix) so the bug only surfaced through the MCP-host call path.
+
 ### Tests
+
+- **Python integration suite** ([`99262b1`](https://github.com/farchanjo/ssh-mcp/commit/99262b1)) — 21 pytest tests across HTTP / stdio / VM (`scripts/test_v7_rsync_http.py` 10, `scripts/test_v7_rsync_stdio.py` 7, `scripts/test_v7_rsync_vm.py` 4 + `scripts/helpers/rsync_client.py` test client). Drives the `ssh_rsync*` MCP surface against paramiko fixtures and (gated `requires_vm`) the live `rsync 3.2.7` VM. Result after the four fixes above: **19 passed + 2 xfailed** — the two xfails cover Bug 3 (SFTP push/pull bytes-do-not-flow against real OpenSSH `internal-sftp`), an architectural limitation rather than a regression: the SFTP transport walks both `src` and `dst` through a single `RsyncSftpFsPort`, so end-to-end push from a local source onto a remote dst needs a local-FS adapter for `RsyncSftpFsPort` (deferred follow-up slice).
+- **Fixture alignment** ([`4d13e72`](https://github.com/farchanjo/ssh-mcp/commit/4d13e72)) — `tests/{v7_rsync_smoke,chaos_rsync,v7_rsync_e2e_vm,v7_rsync_wire_e2e_vm}.rs` thread the new `dry_run` / `exclude` / `include` request fields through the existing fixtures; `scripts/test_v7_rsync_http.py` flips `test_rsync_dry_run` and `test_rsync_exclude` from xfail to passing; `scripts/test_v7_rsync_vm.py` flips `test_rsync_vm_wire_push_against_real_rsync` from xfail to passing.
+
+### Verified
+
+- **End-to-end MCP-path** vs real `rsync 3.2.7` on `vm.services` — `ssh_rsync` with `transport=Wire` from `/tmp/mcp-fixed-001/` to `vm.services:/tmp/mcp-fixed-001/` produces byte-identical sha256 across the 3-file fixture (`a.txt`, `b.txt`, `nested/c.txt`).
+
+### Tests (chaos + property + loom)
 
 - **chaos + property + loom coverage for v7.0 rsync hybrid transport**.
   - `tests/property_rsync.rs` — 9 proptest strategies fuzzing the

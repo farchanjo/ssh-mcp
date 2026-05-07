@@ -922,7 +922,7 @@ Cost: one extra `ssh_exec` round-trip plus O(offset) bytes hashed remotely (`sha
 
 Three new tools: `ssh_rsync` (start), `ssh_rsync_cancel` (terminate), `ssh_rsync_stats` (snapshot). Two-tier transport: `transport=Auto` probes the remote and prefers wire-compat (rsync v31+); falls back to the universal SFTP transport when rsync is missing or older than v31. `transport=Wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older). `transport=Sftp` skips the probe and uses the universal SFTP fallback — slower than the Wire path because every block crosses the wire, but works against any host with a working SFTP subsystem.
 
-> **v7.0.0 status.** Both transports are live. Push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM. `transport=Sftp` covers the supported subset (recursive mirror, dry-run, `--delete`, exclude/include, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` covers the same plus the rolling-checksum block-match path, `--partial`, `-S` sparse holes, and attribute apply (`-p -t -o -g -l`). Slices 11–12 (`-c` checksum delta over a wire-format extension and `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today.
+> **v7.0.0 status.** Both transports are live. Push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM. End-to-end MCP-path verified — `ssh_rsync transport=Wire` against a live `rsync 3.2.7` server produces byte-identical sha256 across the test fixture, riding the full `tool_router::ssh_rsync` → `RsyncSyncUseCase::execute` → `WireRsyncTransport::start_session` chain. `transport=Sftp` covers the supported subset (recursive mirror, dry-run, `--delete`, exclude/include, attribute preservation gated on a probed [`SftpFeatures`](../src/adapters/rsync/sftp/probe.rs) snapshot). `transport=Wire` covers the same plus the rolling-checksum block-match path, `--partial`, `-S` sparse holes, and attribute apply (`-p -t -o -g -l`). Slices 11–12 (`-c` checksum delta over a wire-format extension and `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today.
 
 #### When SFTP transport is enough
 
@@ -1020,7 +1020,7 @@ ssh_rsync(session_id=<sid>,
                  include: [".gitignore"] })  # overrides exclude on match
 ```
 
-Patterns match gitignore-style. `include` wins over `exclude` when both rules match the same path. The agent enforces the rule list locally before frame emission, so the wire never carries excluded bytes.
+Patterns match gitignore-style. `include` wins over `exclude` when both rules match the same path. The transport enforces the rule list locally (Wire path: inline at proto 31 in `gen_flist_local`; SFTP path: in the walker comparator) before frame emission, so the wire never carries excluded bytes. Both `exclude` / `include` and `dry_run` flow through `RsyncSyncRequest` → `RsyncStartRequest` to the per-call adapter merge — fixed in [`4fb0b35`](https://github.com/farchanjo/ssh-mcp/commit/4fb0b35).
 
 #### Happy path F — bandwidth limit (`bwlimit_kbps`)
 
@@ -1030,7 +1030,7 @@ ssh_rsync(session_id=<sid>,
           opts={ recursive: true, bwlimit_kbps: 5_000 })  # 5 MB/s cap
 ```
 
-Token-bucket implementation on the agent's writer side; 60 ms tick granularity. Suitable for shaping background syncs against a production host.
+Token-bucket implementation on the transport's writer side (Wire path: 60 ms tick granularity around the openrsync token writer; SFTP path: same envelope around `write_chunk`). Suitable for shaping background syncs against a production host.
 
 #### Happy path G — dry-run
 

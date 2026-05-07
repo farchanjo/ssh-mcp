@@ -537,7 +537,7 @@ The transports ride the existing russh session via the shared `SshHandleRegistry
 | Ports | `RsyncTransportPort` | `ports/rsync_transport.rs` | AFIT — `start_session`, `recv_event`, `close`. |
 | Ports | `RsyncRepository` | `ports/rsync_repo.rs` | AFIT — `insert`, `insert_if_under_cap`, `get`, `remove`, `count_by_session`, `list_filtered`. |
 | Ports | `RsyncSftpFsPort` | `ports/rsync_sftp_fs.rs` | AFIT — `readdir`, `lstat`, `read_link`, `mkdir`, `rmdir`, `remove_file`, `symlink`, `set_metadata`, `read_chunk`, `write_chunk`. Narrow remote-fs slice distinct from the legacy `SftpClientPort`. |
-| Application | `RsyncSyncUseCase` | `application/rsync_sync.rs` | Generic over `W: RsyncTransportPort` (wire) + `Sf: RsyncTransportPort` (sftp) + `Sfs: RsyncSftpFsPort` (probe) + `R: RsyncRepository` + `SR: SessionRepository` + `Ssh: SshClientPort` + `Idg` + `Cfg`. Drives probe + select + start + register. The probe runs the rsync version `ssh_exec` directly through `SshClientPort::execute`. The SFTP capability probe (`mkdir + setstat + symlink`) is cached per-session in a `DashMap<SessionId, SftpFeatures>`. |
+| Application | `RsyncSyncUseCase` | `application/rsync_sync.rs` | Generic over `W: RsyncTransportPort` (wire) + `Sf: RsyncTransportPort` (sftp) + `Sfs: RsyncSftpFsPort` (probe) + `R: RsyncRepository` + `SR: SessionRepository` + `Ssh: SshClientPort` + `Idg` + `Cfg`. Drives probe + select + start + register, then `spawn_progress_pump` (one `tokio::spawn` per session) to fold `RsyncProgressEvent` into the `RsyncSession` aggregate. The pump exits on `SyncCompleted` / `SessionFailed` (terminal events) or marks `Failed` on lane close / transport error. Lock-free: zero new `Mutex`; the spawned task owns its `recv_event` future end-to-end. The probe runs the rsync version `ssh_exec` directly through `SshClientPort::execute`. The SFTP capability probe (`mkdir + setstat + symlink`) is cached per-session in a `DashMap<SessionId, SftpFeatures>`. |
 | Adapters | `WireRsyncTransport` | `adapters/rsync/wire/` | Tier 1 transport. Drives `rsync --server` over the russh exec channel speaking protocol v31. Sub-modules: `session.rs` (handshake), `io.rs` (mplex framing), `flist.rs` (file-list codec + local walker), `blocks.rs` (block-checksum codec), `hash.rs` (Adler32 + MD4 + MD5 kernels), `tokens.rs` (literal/EOF/match token stream), `match_.rs` (block-match Adler32 hashtable + sliding window), `ndx.rs` (file-index codec), `sender.rs` (multi-phase `send_files`), `receiver.rs` (downloader + atomic rename + tempfile staging). |
 | Adapters | `SftpRsyncTransport` | `adapters/rsync/sftp/` | Tier 2 transport. Sub-modules: `walker.rs` (BFS over `readdir`), `comparator.rs` (sync-action derivation), `executor.rs` (action apply + per-file event emission), `bwlimit.rs` (token bucket), `probe.rs` (capability probe). |
 | Adapters | `RusshRsyncSftpFs` | `adapters/sftp/rsync_fs_impl.rs` | Production `RsyncSftpFsPort` impl over the shared russh-sftp session. Honours OpenSSH's `SSH_FXP_SYMLINK` argument-order quirk. |
@@ -585,6 +585,8 @@ sequenceDiagram
 
 ### Push pipeline (Wire transport)
 
+The wire driver task feeds `RsyncProgressEvent` over a per-session `mpsc::Sender`; a parallel `pump_progress_events` task (spawned by `RsyncSyncUseCase::execute`) drains the receiver into the `RsyncSession` aggregate's atomic counters. `ssh_rsync_stats` reads the same atomics with `Acquire` ordering, so the snapshot lane and the live counters never disagree.
+
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
@@ -594,12 +596,15 @@ flowchart LR
     SS["sender state machine<br/>(per-file request loop +<br/>multi-phase send_files +<br/>final NDX_DONE)"]
     M["MD5 trailer<br/>(proto >= 30)"]
     G["read_final_goodbye<br/>(NDX_DONE in / out / in)"]
+    P["pump_progress_events<br/>(parallel task; folds<br/>RsyncProgressEvent →<br/>RsyncSession atomics)"]
 
     H --> F
     F --> SF
     SF --> SS
     SS --> M
     M --> G
+    SS -.->|mpsc::Sender per file event| P
+    M -.->|SyncCompleted| P
 
     style H fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style F fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
@@ -607,6 +612,7 @@ flowchart LR
     style SS fill:#238636,color:#f0f6fc,stroke:#2ea043
     style M fill:#238636,color:#f0f6fc,stroke:#2ea043
     style G fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
 ```
 
 ### Pull pipeline (Wire transport)
@@ -620,12 +626,15 @@ flowchart LR
     CT["consume tokens<br/>(literal / match)<br/>+ tempfile staging"]
     V["verify MD5 trailer<br/>+ atomic rename"]
     A["apply attrs<br/>(perms / mtime / symlinks)"]
+    P["pump_progress_events<br/>(parallel task; folds<br/>RsyncProgressEvent →<br/>RsyncSession atomics)"]
 
     H --> R
     R --> BS
     BS --> CT
     CT --> V
     V --> A
+    CT -.->|mpsc::Sender per file event| P
+    A -.->|SyncCompleted| P
 
     style H fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style R fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
@@ -633,6 +642,7 @@ flowchart LR
     style CT fill:#238636,color:#f0f6fc,stroke:#2ea043
     style V fill:#238636,color:#f0f6fc,stroke:#2ea043
     style A fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style P fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
 ```
 
 ### Lock-free invariants
