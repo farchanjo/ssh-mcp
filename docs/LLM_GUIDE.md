@@ -1,6 +1,6 @@
 # LLM Guide
 
-Single canonical reference for LLM hosts driving ssh-mcp. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full 38-code error handbook. Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md), [ADR 0009](./adr/0009-serial-transport.md).
+Single canonical reference for LLM hosts driving ssh-mcp v7.0. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full **46-code error handbook** (38 base + 2 v6.1 resume + 6 v7.0 rsync). Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md), [ADR 0009](./adr/0009-serial-transport.md), [ADR 0010](./adr/0010-sftp-resume.md), [ADR 0011](./adr/0011-rsync-hybrid-transport.md).
 
 Cross references:
 
@@ -54,7 +54,7 @@ flowchart LR
 
 ### Rule 1 — Every long-running resource MUST have at least one active subscriber
 
-Long-running resources are `shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `forward://<id>/events`. A bare resource without an observer accumulates output in the per-resource ring buffer until eviction; the operator never knows the resource exists; the LLM never sees the events.
+Long-running resources are `shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events`, `serial://<id>/output`, and (v7.0) `rsync://<id>/progress`. A bare resource without an observer accumulates output in the per-resource ring buffer until eviction; the operator never knows the resource exists; the LLM never sees the events.
 
 **Violation.** Caller invokes `ssh_shell_open` then immediately disconnects without subscribing. The PTY stays alive, output fills the ring buffer, the session zombies until the inactivity TTL fires.
 
@@ -123,7 +123,9 @@ The `agent_id` parameter passed at `ssh_connect` time scopes ownership of every 
 Compact root prompt embedded verbatim into `Implementation.instructions` when the host signals a 27B-class model (Gemma 3 27B IT, Mistral Small 3, Qwen 2.5 32B). Stop here for those models.
 
 ```text
-SSH MCP v6.0. Subscribe-first. 36 tools (35 without port_forward).
+SSH MCP v7.0. Subscribe-first. 39 tools (38 without port_forward).
+7 push streams: shell:// command:// transfer:// session://
+forward:// serial:// rsync://.
 
 GOLDEN RULES:
  1. Long-running resource MUST have ≥1 subscriber.
@@ -131,7 +133,7 @@ GOLDEN RULES:
  2. sub_close(sub_id) when done. Track every sub_id.
  3. lag_drops > 0 in sub_stats? Use lag_policy=snapshot.
  4. On error: ssh_disconnect_agent(agent_id) wipes your scope.
- 5. NEVER hot-poll ssh_shell_read. Use sub_open + drain.
+ 5. NEVER hot-poll ssh_shell_read / ssh_rsync_stats. Use sub_open + drain.
 
 PUSH-FIRST HAPPY PATHS:
 1) Async cmd:
@@ -143,14 +145,19 @@ PUSH-FIRST HAPPY PATHS:
    -> sub_open(uri=shell://<sid>/output)
    -> ssh_shell_write / ssh_shell_press.
 3) Upload + progress:
-   ssh_upload(release_when_no_subs=true)
+   ssh_upload(release_when_no_subs=true, resume=false)
    -> sub_open(uri=transfer://<tid>/progress).
+4) Recursive rsync sync (v7.0):
+   ssh_connect -> ssh_rsync(transport=auto, src=..., dst=...)
+   -> sub_open(uri=rsync://<rsync_id>/progress)
+   -> drain per-file + sync_completed events.
+   Auto picks Wire (rsync v3.2+) or Sftp (universal fallback).
 
 FALLBACK:
-4) ssh_exec -> ssh_exec_output(wait=true,
+5) ssh_exec -> ssh_exec_output(wait=true,
                                          wait_timeout_secs=30).
    (Use when host lacks subscribe support; reuses session.)
-5) ssh_run (PENALIZED: connect+exec+disconnect every call).
+6) ssh_run (PENALIZED: connect+exec+disconnect every call).
    Pays full handshake (200-2000 ms) + tears session. Only when
    you will NEVER touch this host again. Two ssh_run calls cost
    as much as one ssh_connect + two ssh_exec calls.
@@ -212,17 +219,20 @@ flowchart TD
 ```
 
 ```text
-SSH MCP v6.0. Subscribe-first. 36 tools split across three eixos:
-ssh_* (21 ops over SSH), sub_* (9 lane management — cross-resource),
-serial_* (6 local UART/TTY/COM). 35 tools without port_forward. All
-responses: KEY: value markdown + structured_content JSON.
+SSH MCP v7.0. Subscribe-first. 39 tools split across three eixos:
+ssh_* (24 ops over SSH — incl. ssh_rsync / ssh_rsync_cancel /
+ssh_rsync_stats), sub_* (9 lane management — cross-resource),
+serial_* (6 local UART/TTY/COM). 38 tools without port_forward.
+7 push streams: shell:// command:// transfer:// session://
+forward:// serial:// rsync://. All responses: KEY: value markdown +
+structured_content JSON.
 
 GOLDEN RULES:
 1. Every long-running resource (shell://, command://, transfer://,
-   forward://) must have ≥1 active subscriber between creation and
-   close. If you cannot guarantee a subscriber, set
-   release_when_no_subs=true at creation time so the server
-   self-cleans after the configured grace window.
+   session://, forward://, serial://, rsync://) must have ≥1 active
+   subscriber between creation and close. If you cannot guarantee a
+   subscriber, set release_when_no_subs=true at creation time so
+   the server self-cleans after the configured grace window.
 2. Track every sub_id returned by sub_open (or the legacy
    resources/subscribe). Call sub_close(sub_id) before the
    workflow ends. Forgotten subs leak lanes until peer GC fires.
@@ -723,7 +733,7 @@ flowchart LR
 
 ## Prompts catalogue
 
-10 workflows advertised via `prompts/list` — 5 v4 carryovers plus 5 v5 push-first additions. Source: [ADR 0005](./adr/0005-llm-ux-priorities.md). Materialised in `src/infra/mcp/prompts.rs`.
+10 workflows advertised via `prompts/list` — 5 v4 carryovers plus 5 v5 push-first additions. Source: [ADR 0005](./adr/0005-llm-ux-priorities.md). Materialised in `src/infra/mcp/prompts.rs`. The v6.1 SFTP-resume narrative and the v7.0 rsync-sync narrative live below as guided sequences (no `prompts/list` entries yet — they ship as `## v6.1 / ADR 0010` and `## v7.0 / ADR 0011` sections that an LLM can mirror verbatim).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -1168,7 +1178,7 @@ For `RESOURCE_GONE` specifically: call the matching open/exec/upload tool, obser
 
 ## Error handbook
 
-Canonical reference for the 43+ wire codes defined by [ADR 0007](./adr/0007-error-taxonomy.md) and resolved by `src/infra/mcp/error_detail.rs`. One section per code, grouped into the seven categories. Every entry follows a uniform shape so an LLM can grep / jump to a single code without reading the rest. ADR 0007 baseline is 38 codes; v5.x added a handful of operational codes (`PORT_IN_USE`, `TIMEOUT`, `EMPTY_PATTERNS`, `PATTERN_TOO_LONG`, `TOO_MANY_PATTERNS`, `MODIFIER_NOT_ALLOWED`) covered below.
+Canonical reference for the **46 wire codes** defined by [ADR 0007](./adr/0007-error-taxonomy.md) (38 base) + [ADR 0010](./adr/0010-sftp-resume.md) (2 v6.1 resume codes) + [ADR 0011](./adr/0011-rsync-hybrid-transport.md) (6 v7.0 rsync codes), resolved by `src/infra/mcp/error_detail.rs`. One section per code, grouped into the seven categories. Every entry follows a uniform shape so an LLM can grep / jump to a single code without reading the rest. ADR 0007 baseline is 38 codes; v5.x added a handful of operational codes (`PORT_IN_USE`, `TIMEOUT`, `EMPTY_PATTERNS`, `PATTERN_TOO_LONG`, `TOO_MANY_PATTERNS`, `MODIFIER_NOT_ALLOWED`) covered below; v6.1 adds `RESUME_OVERSHOOT` / `RESUME_MISMATCH` (`STATE` category, neither retryable); v7.0 adds `RSYNC_NOT_FOUND` (`RESOURCE`), `RSYNC_VERSION_TOO_OLD` (`POLICY`, conditional retry), `RSYNC_PROTOCOL_ERROR` (`TRANSPORT`, retryable), `RSYNC_FILE_LIST_TOO_LARGE` (`POLICY`, conditional retry), `RSYNC_PARTIAL_TRANSFER` (`TRANSPORT`, retryable), and `SFTP_FEATURE_MISSING` (`POLICY`, conditional retry — surface for unsupported `-c` / `-H` slices on the SFTP fallback).
 
 The wire format is unchanged from v4:
 

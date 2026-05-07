@@ -1,8 +1,8 @@
-# SSH MCP API Reference (v6.0)
+# SSH MCP API Reference (v7.0)
 
-Complete API reference for the **36 MCP tools** (or 35 without `port_forward`) split across three semantic eixos — **`ssh_*`** (21), **`sub_*`** (9), **`serial_*`** (6) — the **6 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v6.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), and v6.0 only renames tool strings (resource URIs / push narrative / error taxonomy / structured content payloads carry forward unchanged). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v5 → v6](./MIGRATION.md#v5--v6).
+Complete API reference for the **39 MCP tools** (or 38 without `port_forward`) split across three semantic eixos — **`ssh_*`** (24), **`sub_*`** (9), **`serial_*`** (6) — the **7 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v7.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x / v6.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), v6.0 renamed tool strings, v6.1 added `resume` + `verify` to `ssh_upload` / `ssh_download` ([ADR 0010](./adr/0010-sftp-resume.md)), and **v7.0 adds 3 net-new rsync tools** (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`) plus the `rsync://` push lane ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)). Resource URIs / push narrative / structured-content payloads / env vars carry forward byte-identical from v6.0 except for the additive `rsync://` scheme and 8 new error codes (2 v6.1 resume codes + 6 v7.0 rsync codes). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x / v7.0 extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
-> **v6.0 — wire-breaking on tool name strings only.** Resource URI schemes, `_meta` envelope, structured-content schemas, error taxonomy (38 codes), and env vars are byte-identical to v5.3.x. Apply the sed snippet in [MIGRATION.md → v5 → v6](./MIGRATION.md#v5--v6) and ship.
+> **v7.0 — wire-additive on tool name strings.** Resource URI schemes (now 7 with `rsync://`), `_meta` envelope, structured-content schemas, error taxonomy (46 codes total — 38 base + 2 v6.1 + 6 v7.0), and env vars are byte-identical to v6.x except for the additive deltas. Existing v6.0 / v6.1 hosts work unchanged; opt into rsync by calling the new `ssh_rsync*` tools.
 
 > **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). v4.8 expanded `output_schema` advertisement from 9 / 21 to 21 / 21 tools. Errors render as `{ tool, status: "error", code, reason, detail }` on the structured channel. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
@@ -1283,15 +1283,15 @@ Returned by `get_info()`:
     "tools": { "listChanged": true },
     "resources": { "subscribe": true, "listChanged": true }
   },
-  "instructions": "SSH MCP. 36 tools, 6 push streams (shell://, command://, transfer://, session://, forward://, serial://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. Then sub_open command://<id>/output for push. sub_close when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then sub_open shell://<id>/output. Drive with ssh_shell_write or ssh_shell_press. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then sub_open transfer://<id>/progress, OR ssh_transfer_progress wait=true.\n4) Local serial (no SSH): serial_open path=/dev/ttyUSB0 baud_rate=115200. Then sub_open serial://<id>/output for push. Drive with serial_write or serial_press. serial_close when done.\n5) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_exec calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
+  "instructions": "SSH MCP. 39 tools, 7 push streams (shell://, command://, transfer://, session://, forward://, serial://, rsync://). All tools return block markdown (KEY: value, --- name [nonce] ---) + a typed JSON in structured_content. IDs end in _ID. NEXT: line lists successor tools.\n\nHappy paths (PREFERRED — keep sessions alive, never re-handshake):\n1) Run async (DEFAULT): ssh_connect (agent_id, reuse=Auto). Then ssh_exec. Then sub_open command://<id>/output for push. sub_close when done. Reuse the SESSION_ID for every follow-up call against this host.\n2) Interactive shell: ssh_connect, ssh_shell_open (returns INITIAL_BUFFER if the prompt arrives within 100ms). Then sub_open shell://<id>/output. Drive with ssh_shell_write or ssh_shell_press. Read deltas via resources/read?cursor=auto on each notification. ssh_shell_close, ssh_disconnect.\n3) Upload: ssh_upload. Then sub_open transfer://<id>/progress, OR ssh_transfer_progress wait=true.\n4) Local serial (no SSH): serial_open path=/dev/ttyUSB0 baud_rate=115200. Then sub_open serial://<id>/output for push. Drive with serial_write or serial_press. serial_close when done.\n5) Recursive sync (v7.0): ssh_connect. Then ssh_rsync transport=auto src=/local dst=/remote (returns RSYNC_ID + TRANSPORT_PICKED). Then sub_open rsync://<id>/progress for per-file + aggregate push. ssh_rsync_cancel for operator-driven abort; sub_close on completion.\n6) PENALIZED FALLBACK — ssh_run(address, username, command): only when you will NEVER touch this host again. Pays a full handshake every call and tears the session down. Two ssh_run calls cost as much as one ssh_connect + two ssh_exec calls. Default to path 1.\n\nCleanup: agent_id on connect, ssh_disconnect_agent for bulk-close. Watch HINT lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup."
 }
 ```
 
-The build without `port_forward` advertises `35 tools, 5 push streams (shell://, command://, transfer://, session://, serial://)` instead.
+The build without `port_forward` advertises `38 tools, 6 push streams (shell://, command://, transfer://, session://, serial://, rsync://)` instead.
 
 `Implementation.icons` is wired in v4.6 to a single hosted SVG entry (`https://raw.githubusercontent.com/farchanjo/ssh-mcp/master/assets/icon.svg`, `image/svg+xml`, `sizes=["any"]`). Source: `assets/icon.svg`. Implementation: `src/infra/mcp/tool_router.rs::build_implementation`.
 
-Each of the 36 tools (or 35 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (10 entries — 5 v4 carry-overs + 5 v5 push-first per ADR 0005) and `resources/templates/list` (5 / 6 entries depending on `port_forward`).
+Each of the 39 tools (or 38 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (10 entries — 5 v4 carry-overs + 5 v5 push-first per ADR 0005) and `resources/templates/list` (5 / 6 entries depending on `port_forward`; the `rsync://` lane is short-lived and is not advertised through the templates list — subscribe directly via the `RSYNC_ID` returned by `ssh_rsync`).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline-v5-layered-view) for the producer → debouncer → notification pipeline and [DEVELOPMENT.md → Hot-path sequence diagrams](./DEVELOPMENT.md#hot-path-sequence-diagrams) for end-to-end sequence diagrams.
 
@@ -1301,7 +1301,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline-v5-layered-view) for 
 
 Every tool response carries BOTH the block-style Markdown (`content[].text`) AND a typed JSON object (`structured_content`). Text channel byte-identical with v4.7.1.
 
-**v4.8 — full coverage on `tools/list[].outputSchema`.** All 21 tools (or 20 without `port_forward`) now advertise a typed JSON Schema on `tools/list`. The schemas live as Rust structs in `src/infra/mcp/results.rs`:
+**v4.8 — full coverage on `tools/list[].outputSchema`.** All 39 tools (or 38 without `port_forward`) now advertise a typed JSON Schema on `tools/list`. The schemas live as Rust structs in `src/infra/mcp/results.rs`:
 
 | Tool | Result struct |
 |:---|:---|
@@ -1322,10 +1322,15 @@ Every tool response carries BOTH the block-style Markdown (`content[].text`) AND
 | `ssh_shell_read` | `SshShellReadResult` |
 | `ssh_shell_wait_for` | `SshShellWaitForResult` |
 | `ssh_shell_close` | `SshShellCloseResult` |
-| `ssh_upload` | `SshUploadResult` |
-| `ssh_download` | `SshDownloadResult` |
+| `ssh_upload` | `SshUploadResult` (v6.1 adds `resumed_from`) |
+| `ssh_download` | `SshDownloadResult` (v6.1 adds `resumed_from`) |
 | `ssh_transfer_progress` | `SshTransferProgressResult` |
 | `ssh_forward` *(feature `port_forward`)* | `SshForwardResult` |
+| `ssh_rsync` *(v7.0)* | `SshRsyncResult` (with `transport: "wire" \| "sftp"`, `rsync_id`, `files_planned`, `bytes_planned`) |
+| `ssh_rsync_cancel` *(v7.0)* | `SshRsyncCancelResult` |
+| `ssh_rsync_stats` *(v7.0)* | `SshRsyncStatsResult` (with full `RsyncStats` aggregate) |
+| `sub_open` / `sub_close` / `sub_pause` / `sub_resume` / `sub_filter` / `sub_replay` / `sub_list` / `sub_stats` / `sub_stats_all` | `Sub*Result` (one struct per tool, see `src/infra/mcp/results.rs`) |
+| `serial_open` / `serial_close` / `serial_write` / `serial_press` / `serial_scan` / `serial_active` | `Serial*Result` (one struct per tool, see `src/infra/mcp/results.rs`) |
 
 Each struct is `#[non_exhaustive]` so callers cannot match exhaustively across versions; new optional fields can be added without bumping the major version. Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so absent values are not surfaced as JSON `null` on the wire.
 

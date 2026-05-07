@@ -1,6 +1,6 @@
 # Migration Guide
 
-Single source for every migration path through ssh-mcp's history. Three self-contained sections cover the v2 → v3 client migration, the v3 → v4 contributor migration (including the v4.1 deep-decouple addendum and the v4.7 → v4.8 / v4.8 → v4.8.1 addenda), and the v4 → v5 host migration.
+Single source for every migration path through ssh-mcp's history. Six self-contained sections cover the v2 → v3 client migration, the v3 → v4 contributor migration (including the v4.1 deep-decouple addendum and the v4.7 → v4.8 / v4.8 → v4.8.1 addenda), the v4 → v5 host migration, the v5 → v6.0 tool-name-eixos migration, the v6.0 → v6.1 SFTP-resume addendum, and the **v6.1 → v7.0 rsync hybrid transport** migration.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -10,17 +10,23 @@ flowchart LR
     V4["v4.x<br/>hexagonal layout"]
     V5["v5.x<br/>subscribe-first"]
     V6["v6.0<br/>tool name eixos"]
+    V61["v6.1<br/>SFTP resume + verify"]
+    V7["v7.0<br/>rsync hybrid transport"]
 
     V2 -->|client migration<br/>5 breaking changes| V3
     V3 -->|contributor migration<br/>file-path table| V4
     V4 -->|host migration<br/>0 breaking| V5
     V5 -->|host migration<br/>tool name strings only| V6
+    V6 -->|wire-additive<br/>2 opt-in flags| V61
+    V61 -->|wire-additive<br/>3 new tools + 1 push lane| V7
 
     style V2 fill:#21262d,color:#8b949e,stroke:#30363d
     style V3 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
     style V4 fill:#238636,color:#f0f6fc,stroke:#2ea043
     style V5 fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
     style V6 fill:#cf222e,color:#f0f6fc,stroke:#f85149
+    style V61 fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
+    style V7 fill:#bc8cff,color:#0d1117,stroke:#a371f7
 ```
 
 | Section | Audience | Scope |
@@ -29,8 +35,10 @@ flowchart LR
 | [v3 → v4](#v3--v4) | Codebase contributors | Hexagonal restructuring, `src/mcp/` deletion, AFIT ports, v4.1 deep decouple, v4.7→v4.8 addendum |
 | [v4 → v5](#v4--v5) | MCP host operators / contributors / downstream automations | Subscribe-first, lifecycle binding, channel mux, daemon binary |
 | [v5 → v6](#v5--v6) | MCP host operators / contributors / downstream automations | Tool name eixos (`ssh_*` / `sub_*` / `serial_*`); wire-breaking on tool name strings only |
+| [v6.0 → v6.1](#v60--v61) | MCP host operators | SFTP resume + verify on `ssh_upload` / `ssh_download`; 2 new error codes (`RESUME_OVERSHOOT`, `RESUME_MISMATCH`); wire-additive |
+| [v6.1 → v7.0](#v61--v70) | MCP host operators | Rsync hybrid transport (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`), `rsync://` push lane, `transport=Auto\|Wire\|Sftp`; 6 new error codes; v7.0.0-alpha.2 retracted the deployed-agent path; wire-additive |
 
-The 9 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md), [0009 serial](./adr/0009-serial-transport.md).
+The 11 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md), [0009 serial](./adr/0009-serial-transport.md), [0010 SFTP resume](./adr/0010-sftp-resume.md), [0011 rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
 
 ---
 
