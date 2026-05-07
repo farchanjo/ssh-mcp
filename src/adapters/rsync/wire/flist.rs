@@ -63,7 +63,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use tokio::fs;
+use globset::GlobSet;
+use tokio::fs::{self, DirEntry};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::adapters::rsync::types::PreserveFlags;
@@ -1512,6 +1513,38 @@ pub async fn gen_flist_local_with_opts(
     root: &Path,
     preserve: PreserveFlags,
 ) -> Result<Vec<Flist>, DomainError> {
+    gen_flist_local_with_filters(root, preserve, None).await
+}
+
+/// Bug-B fix — slice 9.5 — walker variant that consults
+/// gitignore-style include / exclude globsets before adding entries to
+/// the flist.
+///
+/// Match semantics mirror the SFTP walker (see
+/// [`crate::adapters::rsync::sftp::walker`]):
+///
+/// - When `filters` is `None`, every entry passes through (back-compat
+///   with the legacy [`gen_flist_local`] / [`gen_flist_local_with_opts`]
+///   callers).
+/// - When `filters` is `Some(...)`, the entry's `/`-separated relative
+///   path (POSIX style — Windows hosts also use forward slashes on the
+///   wire) is matched against `excludes`. Entries that match are
+///   dropped, unless the non-empty `includes` set rescues them.
+/// - Excluded directories are NOT recursed into, mirroring the SFTP
+///   walker — unless `includes` is non-empty (rsync's "exclude this dir
+///   but include these files inside it" semantics requires recursion to
+///   re-test the children).
+///
+/// # Errors
+///
+/// Same shape as [`gen_flist_local`]. Globset compilation lives at the
+/// caller site (the wire transport's [`crate::adapters::rsync::wire`]
+/// module builds the sets from the inbound `RsyncStartRequest`).
+pub async fn gen_flist_local_with_filters(
+    root: &Path,
+    preserve: PreserveFlags,
+    filters: Option<&FlistFilters<'_>>,
+) -> Result<Vec<Flist>, DomainError> {
     let metadata = fs::metadata(root).await.map_err(|e| {
         DomainError::RsyncProtocolError(format!("gen_flist: lstat({}): {e}", root.display()))
     })?;
@@ -1532,9 +1565,35 @@ pub async fn gen_flist_local_with_opts(
         gid: pick_gid(&metadata, preserve),
         flags: FLIST_TOP_LEVEL,
     });
-    walk_into(root, preserve, &mut out).await?;
+    walk_into(root, preserve, filters, &mut out).await?;
     sort_entries(&mut out);
     Ok(out)
+}
+
+/// Compiled exclude / include globsets handed to the wire-side walker
+/// for Bug-B filtering. Lifetime tied to the caller (the wire
+/// transport owns the globsets for the life of the session).
+#[derive(Debug, Clone, Copy)]
+pub struct FlistFilters<'a> {
+    /// Matched entries are dropped (unless rescued by `includes`).
+    pub excludes: &'a GlobSet,
+    /// When non-empty, an include match overrides a matching exclude.
+    pub includes: &'a GlobSet,
+}
+
+impl FlistFilters<'_> {
+    /// Decide whether the entry at `rel` (POSIX `/`-separated path)
+    /// passes the filter pipeline.
+    fn is_included(&self, rel: &str) -> bool {
+        let excluded = !self.excludes.is_empty() && self.excludes.is_match(rel);
+        if !excluded {
+            return true;
+        }
+        if self.includes.is_empty() {
+            return false;
+        }
+        self.includes.is_match(rel)
+    }
 }
 
 /// Iterate a directory tree using an explicit stack (avoids the
@@ -1542,11 +1601,12 @@ pub async fn gen_flist_local_with_opts(
 async fn walk_into(
     root: &Path,
     preserve: PreserveFlags,
+    filters: Option<&FlistFilters<'_>>,
     out: &mut Vec<Flist>,
 ) -> Result<(), DomainError> {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        push_dir_entries(root, &dir, preserve, &mut stack, out).await?;
+        push_dir_entries(root, &dir, preserve, filters, &mut stack, out).await?;
     }
     Ok(())
 }
@@ -1557,6 +1617,7 @@ async fn push_dir_entries(
     root: &Path,
     dir: &Path,
     preserve: PreserveFlags,
+    filters: Option<&FlistFilters<'_>>,
     stack: &mut Vec<PathBuf>,
     out: &mut Vec<Flist>,
 ) -> Result<(), DomainError> {
@@ -1568,23 +1629,54 @@ async fn push_dir_entries(
         .await
         .map_err(|e| DomainError::RsyncProtocolError(format!("gen_flist: readdir-next: {e}")))?
     {
-        let entry_path = entry.path();
-        let metadata = fs::symlink_metadata(&entry_path).await.map_err(|e| {
-            DomainError::RsyncProtocolError(format!(
-                "gen_flist: lstat({}): {e}",
-                entry_path.display()
-            ))
-        })?;
-        let rel = entry_path
-            .strip_prefix(root)
-            .map_or_else(|_| entry_path.clone(), Path::to_path_buf);
-        let item = build_flist_entry(&entry_path, &metadata, rel, preserve).await?;
-        if is_dir(item.mode) {
-            stack.push(entry_path);
-        }
+        process_dir_entry(root, &entry, preserve, filters, stack, out).await?;
+    }
+    Ok(())
+}
+
+/// Process a single `read_dir` result: lstat the path, build the
+/// [`Flist`] entry, decide whether the per-call filter set keeps it,
+/// and decide whether to recurse into the directory.
+async fn process_dir_entry(
+    root: &Path,
+    entry: &DirEntry,
+    preserve: PreserveFlags,
+    filters: Option<&FlistFilters<'_>>,
+    stack: &mut Vec<PathBuf>,
+    out: &mut Vec<Flist>,
+) -> Result<(), DomainError> {
+    let entry_path = entry.path();
+    let metadata = fs::symlink_metadata(&entry_path).await.map_err(|e| {
+        DomainError::RsyncProtocolError(format!("gen_flist: lstat({}): {e}", entry_path.display()))
+    })?;
+    let rel = entry_path
+        .strip_prefix(root)
+        .map_or_else(|_| entry_path.clone(), Path::to_path_buf);
+    let rel_posix = path_as_posix(&rel);
+    let entry_pass = filters.is_none_or(|f| f.is_included(&rel_posix));
+    let item = build_flist_entry(&entry_path, &metadata, rel, preserve).await?;
+    // Skip pruned directories entirely when there's no rescue
+    // include set; otherwise still recurse so children can be
+    // re-tested by the include matcher.
+    let recurse =
+        is_dir(item.mode) && (entry_pass || filters.is_some_and(|f| !f.includes.is_empty()));
+    if recurse {
+        stack.push(entry_path);
+    }
+    if entry_pass {
         out.push(item);
     }
     Ok(())
+}
+
+/// Render a [`Path`] as a `/`-separated string for globset matching.
+/// Matches the SFTP walker's POSIX-only convention so cross-platform
+/// callers see the same match semantics regardless of host OS.
+fn path_as_posix(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Build a single [`Flist`] entry from a [`Metadata`] result.
@@ -2250,6 +2342,74 @@ mod tests {
             .find(|e| e.path == PathBuf::from("a.txt"))
             .expect("entry");
         assert_eq!(entry.mtime, 0);
+    }
+
+    /// Bug-B regression — exclude pattern drops matching files from the
+    /// local flist before send.
+    #[tokio::test]
+    async fn gen_flist_local_with_filters_drops_excluded_files() {
+        use super::{FlistFilters, gen_flist_local_with_filters};
+        use crate::adapters::rsync::sftp::walker::build_globset;
+        use crate::adapters::rsync::types::PreserveFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("keep.txt"), b"keep").expect("write");
+        std::fs::write(dir.path().join("drop.tmp"), b"drop").expect("write");
+        let excludes = build_globset(&["*.tmp".to_string()]).expect("globset");
+        let includes = build_globset(&[]).expect("globset");
+        let filters = FlistFilters {
+            excludes: &excludes,
+            includes: &includes,
+        };
+        let got = gen_flist_local_with_filters(dir.path(), PreserveFlags::none(), Some(&filters))
+            .await
+            .expect("walk");
+        let names: Vec<&str> = got.iter().filter_map(|e| e.path.to_str()).collect();
+        assert!(names.contains(&"keep.txt"));
+        assert!(!names.contains(&"drop.tmp"));
+    }
+
+    /// Bug-B regression — non-empty include set rescues a matching
+    /// exclude.
+    #[tokio::test]
+    async fn gen_flist_local_with_filters_include_overrides_exclude() {
+        use super::{FlistFilters, gen_flist_local_with_filters};
+        use crate::adapters::rsync::sftp::walker::build_globset;
+        use crate::adapters::rsync::types::PreserveFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.tmp"), b"a").expect("write");
+        std::fs::write(dir.path().join("b.tmp"), b"b").expect("write");
+        let excludes = build_globset(&["*.tmp".to_string()]).expect("excludes");
+        let includes = build_globset(&["a.tmp".to_string()]).expect("includes");
+        let filters = FlistFilters {
+            excludes: &excludes,
+            includes: &includes,
+        };
+        let got = gen_flist_local_with_filters(dir.path(), PreserveFlags::none(), Some(&filters))
+            .await
+            .expect("walk");
+        let names: Vec<&str> = got.iter().filter_map(|e| e.path.to_str()).collect();
+        assert!(names.contains(&"a.tmp"));
+        assert!(!names.contains(&"b.tmp"));
+    }
+
+    /// Bug-B regression — `None` filters preserves the legacy walk
+    /// shape so v6.x callers keep emitting every file.
+    #[tokio::test]
+    async fn gen_flist_local_with_filters_none_keeps_all_entries() {
+        use super::gen_flist_local_with_filters;
+        use crate::adapters::rsync::types::PreserveFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.tmp"), b"a").expect("write");
+        std::fs::write(dir.path().join("b.txt"), b"b").expect("write");
+        let got = gen_flist_local_with_filters(dir.path(), PreserveFlags::none(), None)
+            .await
+            .expect("walk");
+        let names: Vec<&str> = got.iter().filter_map(|e| e.path.to_str()).collect();
+        assert!(names.contains(&"a.tmp"));
+        assert!(names.contains(&"b.txt"));
     }
 
     // ============================================================

@@ -101,9 +101,10 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::adapters::rsync::sftp::walker::build_globset;
 use crate::adapters::rsync::types::{RsyncProgressEvent, RsyncTransportKind};
 use crate::adapters::rsync::wire::flist::{
-    Flist, FlistSendOpts, gen_flist_local_with_opts, is_reg, send_flist,
+    Flist, FlistFilters, FlistSendOpts, gen_flist_local_with_filters, is_reg, send_flist,
 };
 use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
 use crate::adapters::rsync::wire::receiver::{ReceiverApplyOpts, drive_receiver_with_opts};
@@ -341,10 +342,9 @@ async fn drive_push_session(
     tx: &Sender<RsyncProgressEvent>,
     cancel: &CancellationToken,
 ) -> Result<RsyncStats, DomainError> {
-    let mut channel =
-        open_rsync_channel(handle, strip_host_prefix(&request.dst), request).await?;
+    let mut channel = open_rsync_channel(handle, strip_host_prefix(&request.dst), request).await?;
     let (mut sess, leftover) = run_handshake_via_msg(&mut channel, cancel).await?;
-    let entries = gen_flist_local_with_opts(Path::new(&request.src), request.preserve).await?;
+    let entries = walk_local_flist_for_push(request).await?;
     emit_session_started(tx, &entries).await;
     drive_post_handshake_push(
         channel,
@@ -359,6 +359,28 @@ async fn drive_push_session(
     .await
 }
 
+/// Bug-B fix — compile per-call exclude / include patterns into
+/// globsets and walk the local source tree, dropping entries that match
+/// the exclude set unless the include set rescues them. The wire
+/// transport is the sender for push; filtering at flist generation is
+/// equivalent to the upstream `--exclude` / `--include` cmdline emit
+/// and avoids re-engineering the filter-frame writer (see
+/// [`build_rsync_server_cmdline`] for the rationale).
+async fn walk_local_flist_for_push(request: &RsyncStartRequest) -> Result<Vec<Flist>, DomainError> {
+    let excludes = build_globset(&request.exclude)?;
+    let includes = build_globset(&request.include)?;
+    let filters = FlistFilters {
+        excludes: &excludes,
+        includes: &includes,
+    };
+    let filters_arg = if request.exclude.is_empty() && request.include.is_empty() {
+        None
+    } else {
+        Some(&filters)
+    };
+    gen_flist_local_with_filters(Path::new(&request.src), request.preserve, filters_arg).await
+}
+
 /// Pull direction — remote tree → local tree. Drives the receiver
 /// state machine.
 async fn drive_pull_session(
@@ -367,8 +389,7 @@ async fn drive_pull_session(
     tx: &Sender<RsyncProgressEvent>,
     cancel: &CancellationToken,
 ) -> Result<RsyncStats, DomainError> {
-    let mut channel =
-        open_rsync_channel(handle, strip_host_prefix(&request.src), request).await?;
+    let mut channel = open_rsync_channel(handle, strip_host_prefix(&request.src), request).await?;
     let (mut sess, leftover) = run_handshake_via_msg(&mut channel, cancel).await?;
     drive_post_handshake_pull(channel, &mut sess, leftover, request, tx, cancel).await
 }
@@ -635,6 +656,28 @@ fn strip_host_prefix(spec: &str) -> &str {
 /// Build the `rsync --server` cmdline. Pulled out of
 /// [`open_rsync_channel`] so it can be unit-tested without a live ssh
 /// channel.
+///
+/// Bug-A fix — when `request.dry_run` is set, the `n` short flag is
+/// folded into the leading capability bundle (`-Ne.LsfxC` — `N` is
+/// not a flag, but the upstream rsync 3.2.7 client emits `-n` adjacent
+/// to the engine-version delimiter on the server cmdline; see
+/// `options.c::server_options` line 2350 + verified strace output:
+/// `rsync --server -vvvnlogDtpre.iLsfxCIvu`). Emitting `-n` as a
+/// separate token between `--server` and the bundle works against
+/// rsync 3.2.7 invoked locally but causes the v31 server to wait
+/// indefinitely after the handshake when driven over an exec channel.
+/// Bundling `-n` with the leading shortflags resolves the hang.
+///
+/// Bug-B fix — exclude / include patterns flow through to the wire
+/// client's local flist walker (see [`gen_flist_local_with_filters`]),
+/// not through extra cmdline flags. Reason: `rsync --server`'s filter
+/// pipeline expects the rules over a delimited frame after handshake
+/// (see `exclude.c::send_filter_list`), but our protocol-30+ filter
+/// channel today writes a single empty terminator per the upstream
+/// "client is sender, no `--delete`/`--prune-empty-dirs`" branch
+/// (see [`drive_post_handshake_push`]). Filtering at flist generation
+/// is equivalent for the non-delete case and avoids re-engineering the
+/// filter-frame writer.
 fn build_rsync_server_cmdline(remote_path: &str, request: &RsyncStartRequest) -> String {
     let short_flags = build_short_flags(request);
     let delete_flag = if request.delete { " --delete" } else { "" };
@@ -649,18 +692,31 @@ fn build_rsync_server_cmdline(remote_path: &str, request: &RsyncStartRequest) ->
     }
 }
 
-/// Assemble the short-flag suffix that follows the canonical
-/// `-e.LsfxC` capability handshake bits. Mirrors upstream rsync 3.2.7's
-/// `options.c::server_options` flag emission order: `l` (links) →
-/// `p` (perms) → `t` (times) → `g` (group) → `o` (owner).
+/// Assemble the short-flag bundle. Mirrors upstream rsync 3.2.7's
+/// `options.c::server_options` cmdline shape (verified by strace:
+/// `rsync --server -vvvnlogDtpre.iLsfxCIvu . dst/`).
 ///
-/// The capability bits `e.LsfxC` are: leading `-e.` engine-version
-/// delimiter, `L` = preserve-symlinks-handshake, `s` = "secluded args",
-/// `f` = "filter rule", `x` = "x-attrs OFF", `C` = "cks-cap". They are
-/// always emitted — upstream rsync uses them to negotiate transport
-/// capabilities, semantically distinct from per-call preserve flags.
+/// Bundle layout (in order):
+///
+/// 1. Leading `-`.
+/// 2. Bug-A fix — `n` (dry-run) prefix when `request.dry_run`. Bundling
+///    `n` here instead of as a separate `-n` token mirrors the upstream
+///    cmdline shape AND avoids a deadlock observed when the v31 server
+///    is invoked with an isolated `-n` token over an exec channel
+///    (the server hangs after the handshake).
+/// 3. Capability bundle `e.LsfxC` — leading `e.` engine-version
+///    delimiter, `L` = preserve-symlinks-handshake, `s` = "secluded
+///    args", `f` = "filter rule", `x` = "x-attrs OFF", `C` = "cks-cap".
+///    Always emitted — rsync uses these to negotiate transport
+///    capabilities, semantically distinct from per-call preserve flags.
+/// 4. Per-call preserve flags in canonical rsync order: `l` (links) →
+///    `p` (perms) → `t` (times) → `g` (group) → `o` (owner).
 fn build_short_flags(request: &RsyncStartRequest) -> String {
-    let mut flags = String::from("-e.LsfxC");
+    let mut flags = String::from("-");
+    if request.dry_run {
+        flags.push('n');
+    }
+    flags.push_str("e.LsfxC");
     let preserve = &request.preserve;
     if preserve.links {
         flags.push('l');
@@ -1062,5 +1118,44 @@ mod tests {
             cmd,
             "rsync --server --sender --delete -e.LsfxClpt -r . /tmp/src/"
         );
+    }
+
+    /// Bug-A regression — Wire transport must forward `dry_run=true` by
+    /// bundling `n` into the short-flag header so the remote
+    /// `rsync --server` skips destructive ops. Mirrors upstream rsync
+    /// 3.2.7's cmdline shape (`-vvvnlogDtpre.iLsfxCIvu`); emitting `-n`
+    /// as a separate token deadlocks the v31 server over an exec channel.
+    #[test]
+    fn cmdline_push_with_dry_run_bundles_n_into_short_flags() {
+        let mut req = start_request();
+        req.preserve = PreserveFlags::none();
+        req.delete = false;
+        req.dry_run = true;
+        let cmd = build_rsync_server_cmdline("/tmp/dst", &req);
+        assert_eq!(cmd, "rsync --server -ne.LsfxC -r . /tmp/dst");
+    }
+
+    /// Bug-A regression on pull — the receiver-side server also honours
+    /// the bundled `n` flag.
+    #[test]
+    fn cmdline_pull_with_dry_run_bundles_n_into_short_flags() {
+        let mut req = start_request();
+        req.direction = RsyncDirection::Pull;
+        req.preserve = PreserveFlags::none();
+        req.dry_run = true;
+        let cmd = build_rsync_server_cmdline("/tmp/src", &req);
+        assert_eq!(cmd, "rsync --server --sender -ne.LsfxC -r . /tmp/src/");
+    }
+
+    /// Bug-A regression — `dry_run` and `delete` co-exist; `n` lands in
+    /// the bundle, `--delete` lands as a long flag.
+    #[test]
+    fn cmdline_push_with_dry_run_and_delete_emits_both_flags() {
+        let mut req = start_request();
+        req.preserve = PreserveFlags::none();
+        req.delete = true;
+        req.dry_run = true;
+        let cmd = build_rsync_server_cmdline("/tmp/dst", &req);
+        assert_eq!(cmd, "rsync --server --delete -ne.LsfxC -r . /tmp/dst");
     }
 }

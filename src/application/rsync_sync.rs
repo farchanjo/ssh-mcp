@@ -395,15 +395,20 @@ where
         req: &RsyncSyncRequest,
         picked: RsyncTransportPicked,
     ) -> Result<RsyncStartOutcome, DomainError> {
+        let direction = infer_direction(&req.src, &req.dst);
         let request = RsyncStartRequest {
             session_id: req.session_id.clone(),
             src: req.src.clone(),
             dst: req.dst.clone(),
-            // Slice 7: the use case currently always pushes (the
-            // public DTO has no caller-supplied direction yet); the
-            // pull path is wired via the transport directly in
-            // tests until a follow-up DTO field lands.
-            direction: RsyncDirection::Push,
+            // Bug-C fix — direction is now derived from which side of
+            // the (`src`, `dst`) pair carries the `host:` prefix. The
+            // SshRsyncArgs DTO documents the contract: exactly one
+            // side is remote. Push when only `dst` is remote; Pull when
+            // only `src` is remote. When neither carries a colon (or
+            // both do — degenerate input) we default to Push to
+            // preserve historical behaviour against composition-wired
+            // tests.
+            direction,
             // Slice 9 — `--delete` + attribute preservation. The use
             // case derives the wire flags from the public
             // [`RsyncSyncRequest`]; the SFTP transport merges the same
@@ -637,6 +642,46 @@ const fn build_preserve_flags(req: &RsyncSyncRequest) -> PreserveFlags {
     }
 }
 
+/// Bug-C fix — infer [`RsyncDirection`] from which side of the
+/// (`src`, `dst`) pair carries the `host:` prefix. Mirrors the rsync
+/// CLI convention documented on
+/// [`crate::infra::mcp::args::rsync::SshRsyncArgs`]: exactly one of
+/// `src` / `dst` is expected to be remote.
+///
+/// - `dst` remote, `src` local → [`RsyncDirection::Push`].
+/// - `src` remote, `dst` local → [`RsyncDirection::Pull`].
+/// - both / neither remote → [`RsyncDirection::Push`] (preserves the
+///   historical default, keeps composition-wired tests green).
+///
+/// Detection rule: a path is "remote" when it contains a `:` AND the
+/// part before the first `:` is non-empty AND does not contain `/` (so
+/// Windows paths like `C:\foo` are correctly classified as local). The
+/// rule mirrors upstream rsync's own host-prefix sniffer
+/// (`util2.c::check_for_hostspec`).
+const fn is_remote_spec(spec: &str) -> bool {
+    // const-friendly manual scan — no `Iterator` adapters in const fn.
+    let bytes = spec.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b':' => return idx > 0,
+            b'/' => return false,
+            _ => idx += 1,
+        }
+    }
+    false
+}
+
+const fn infer_direction(src: &str, dst: &str) -> RsyncDirection {
+    let src_remote = is_remote_spec(src);
+    let dst_remote = is_remote_spec(dst);
+    if src_remote && !dst_remote {
+        RsyncDirection::Pull
+    } else {
+        RsyncDirection::Push
+    }
+}
+
 fn guard_capabilities(
     req: &RsyncSyncRequest,
     picked: RsyncTransportPicked,
@@ -775,8 +820,8 @@ fn not_found(rsync_id: &RsyncId) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RsyncSyncDeps, RsyncSyncRequest, RsyncSyncUseCase, RsyncTransportPicked,
-        RsyncTransportSelection, parse_rsync_protocol,
+        RsyncDirection, RsyncSyncDeps, RsyncSyncRequest, RsyncSyncUseCase, RsyncTransportPicked,
+        RsyncTransportSelection, infer_direction, is_remote_spec, parse_rsync_protocol,
     };
     use crate::adapters::config::env::EnvConfig;
     use crate::adapters::id_generator::uuid::UuidIds;
@@ -890,6 +935,59 @@ mod tests {
     fn parse_rsync_protocol_returns_lower_for_old_rsync() {
         let raw = "rsync  version 3.0.9  protocol version 30";
         assert_eq!(parse_rsync_protocol(raw), Some(30));
+    }
+
+    /// Bug-C regression — `dst` carries the `host:` prefix → push.
+    #[test]
+    fn infer_direction_dst_remote_classifies_as_push() {
+        assert_eq!(
+            infer_direction("/local/src", "vm.services:/remote/dst"),
+            RsyncDirection::Push
+        );
+    }
+
+    /// Bug-C regression — `src` carries the `host:` prefix → pull.
+    #[test]
+    fn infer_direction_src_remote_classifies_as_pull() {
+        assert_eq!(
+            infer_direction("vm.services:/remote/src", "/local/dst"),
+            RsyncDirection::Pull
+        );
+    }
+
+    /// Bug-C regression — neither side remote (legacy / fixture path) →
+    /// fall back to push to keep historical behaviour.
+    #[test]
+    fn infer_direction_no_host_prefix_defaults_to_push() {
+        assert_eq!(
+            infer_direction("/local/src", "/local/dst"),
+            RsyncDirection::Push
+        );
+    }
+
+    /// Bug-C regression — both remote (degenerate input) → push, keeps
+    /// the use case from emitting an unsolicited Pull when the operator
+    /// hands two `host:` paths.
+    #[test]
+    fn infer_direction_both_remote_defaults_to_push() {
+        assert_eq!(infer_direction("h1:/a", "h2:/b"), RsyncDirection::Push);
+    }
+
+    /// Plain absolute POSIX paths must not be classified as remote.
+    #[test]
+    fn is_remote_spec_rejects_plain_absolute_path() {
+        assert!(!is_remote_spec("/local/path"));
+        assert!(!is_remote_spec("/"));
+        assert!(!is_remote_spec(""));
+    }
+
+    /// Plain `host:path` is the canonical hostspec form — must be
+    /// classified as remote.
+    #[test]
+    fn is_remote_spec_accepts_canonical_hostspec() {
+        assert!(is_remote_spec("vm.services:/tmp/x"));
+        assert!(is_remote_spec("user@host:relative"));
+        assert!(is_remote_spec("h:"));
     }
 
     #[tokio::test]
