@@ -864,6 +864,23 @@ For **MCP host operators, contributors, and downstream automations** moving from
 
 Final state shipped in v7.0.0 (2026-05-06). The original v7.0 plan (cross-compiled deployed-agent transport with sha256 verification) was retracted in v7.0.0-alpha.2 in favour of "tudo integrado". The slice-by-slice narrative below the [v7.0.0-alpha.4](#v700-alpha4--sftp-transport-live) section is kept for traceability — they document the incremental landings; this section is the canonical migration contract.
 
+> **Post-release fixes (2026-05-06).** Five follow-up commits closed the gap between the v7.0.0 transport bodies and the live MCP-host call path. Hosts using the wire transport via the MCP surface (`ssh_rsync transport=Wire` or `transport=Auto` routing to Wire) need binaries built from [`81e3573`](https://github.com/farchanjo/ssh-mcp/commit/81e3573) or later — earlier v7.0.0 binaries surface `RSYNC_PROTOCOL_ERROR` "Wire transport (rsync v31 wire-compat) is being implemented" on every call. See [Post-release fixes](#v700--post-release-fixes-2026-05-06) below for the per-bug breakdown.
+
+#### v7.0.0 — post-release fixes (2026-05-06)
+
+Wire-additive — no DTO field shapes changed, no error codes added, no env var defaults moved. After the four fixes below, the Python integration suite (`scripts/test_v7_rsync_{http,stdio,vm}.py`) reports **19 passed + 2 xfailed**, and `ssh_rsync transport=Wire` against a live `rsync 3.2.7` on `vm.services` produces byte-identical sha256 across the 3-file fixture (`a.txt`, `b.txt`, `nested/c.txt`).
+
+| # | Bug | Commit | Symptom on v7.0.0 binaries before the fix |
+|---|---|---|---|
+| 1 | Composition root reached the no-registry stub. `composition::prod` instantiated `WireRsyncTransport::new()` instead of `with_registry(sftp.handle_registry().clone())`. | [`bfc68c6`](https://github.com/farchanjo/ssh-mcp/commit/bfc68c6) | Every `transport=Wire` (and every `transport=Auto` route picking Wire) returned `RSYNC_PROTOCOL_ERROR` "Wire transport (rsync v31 wire-compat) is being implemented". |
+| 2 | `RsyncSyncUseCase::execute()` never spawned a task to fold `RsyncProgressEvent` into the `RsyncSession` aggregate. | [`4fb0b35`](https://github.com/farchanjo/ssh-mcp/commit/4fb0b35) | `ssh_rsync_stats` reported `STATUS: pending` indefinitely; the lane closed without a terminal status flip. |
+| 3 | `opts.dry_run` / `opts.exclude` / `opts.include` rode `SshRsyncArgs.opts` correctly but were not threaded through `RsyncSyncRequest` → `RsyncStartRequest` to the per-call adapter merge. | [`4fb0b35`](https://github.com/farchanjo/ssh-mcp/commit/4fb0b35) | The SFTP walker received `dry_run=false` + empty exclude/include; every "preview" call wrote real bytes; every "skip `.git/`" call uploaded the directory. |
+| 4 | Wire transport shipped the full `host:path` spec into `build_rsync_server_cmdline`. The remote `rsync --server` interprets `host:path` as a path, not a directive. | [`81e3573`](https://github.com/farchanjo/ssh-mcp/commit/81e3573) | Server aborted with fatal mplex `MSG_IO_ERROR`; `0 files transferred`; lane terminated with `SessionFailed`. |
+
+**Action required:** rebuild from [`81e3573`](https://github.com/farchanjo/ssh-mcp/commit/81e3573) or later. No host-side DTO change, no env var change, no migration step beyond rebuild + redeploy.
+
+A fifth issue (Bug 3 in the Python suite numbering) remains a documented architectural limitation rather than a regression — the SFTP transport walks both `src` and `dst` through a single `RsyncSftpFsPort`, so end-to-end push from a local source onto a remote dst needs a local-FS adapter that lands in a follow-up slice. Today the e2e-vm test pre-creates the source on the remote side; the two related Python tests (`test_rsync_vm_sftp_push` / `test_rsync_vm_sftp_pull`) carry `@pytest.mark.xfail(strict=False)` and auto-pass when the bridge ships.
+
 #### What's new
 
 - **In-process Wire + SFTP transports.** Both run inside the host binary. `transport=Auto` (default) probes the remote and prefers Wire when rsync >= 3.2.0 is installed, otherwise routes to SFTP. `transport=Wire` forces the wire-compat client (returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older). `transport=Sftp` skips the probe and uses the universal SFTP fallback.
