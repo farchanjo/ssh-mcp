@@ -595,6 +595,9 @@ where
         preserve_perms: args.opts.preserve.perms,
         preserve_mtime: args.opts.preserve.mtime,
         delete: args.opts.delete,
+        dry_run: args.opts.dry_run,
+        exclude: args.opts.exclude.clone(),
+        include: args.opts.include.clone(),
         release_when_no_subs: args.release_when_no_subs.unwrap_or(false),
     };
     match use_case.execute(req).await {

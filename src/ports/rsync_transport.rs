@@ -69,6 +69,18 @@ pub struct RsyncStartRequest {
     /// transport keeps its own per-adapter mask (legacy plumbing) and
     /// merges this field into it on a per-call basis.
     pub preserve: PreserveFlags,
+    /// Per-call `--dry-run` flag. When `true`, the SFTP transport
+    /// short-circuits every destructive op into a `FileSkipped { reason:
+    /// DryRun }` event without touching the destination tree. The wire
+    /// transport passes the long flag straight to `rsync --server`.
+    pub dry_run: bool,
+    /// Per-call `--exclude=PATTERN` glob list (gitignore-style). The
+    /// SFTP walker skips matching entries; the wire transport forwards
+    /// the patterns to `rsync --server` via repeated `--exclude=` flags.
+    pub exclude: Vec<String>,
+    /// Per-call `--include=PATTERN` glob list. When non-empty, an
+    /// include match overrides a matching exclude (rsync semantics).
+    pub include: Vec<String>,
 }
 
 impl Default for RsyncStartRequest {
@@ -85,6 +97,9 @@ impl Default for RsyncStartRequest {
             direction: RsyncDirection::default(),
             delete: false,
             preserve: PreserveFlags::none(),
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         }
     }
 }
