@@ -341,7 +341,8 @@ async fn drive_push_session(
     tx: &Sender<RsyncProgressEvent>,
     cancel: &CancellationToken,
 ) -> Result<RsyncStats, DomainError> {
-    let mut channel = open_rsync_channel(handle, &request.dst, request).await?;
+    let mut channel =
+        open_rsync_channel(handle, strip_host_prefix(&request.dst), request).await?;
     let (mut sess, leftover) = run_handshake_via_msg(&mut channel, cancel).await?;
     let entries = gen_flist_local_with_opts(Path::new(&request.src), request.preserve).await?;
     emit_session_started(tx, &entries).await;
@@ -366,7 +367,8 @@ async fn drive_pull_session(
     tx: &Sender<RsyncProgressEvent>,
     cancel: &CancellationToken,
 ) -> Result<RsyncStats, DomainError> {
-    let mut channel = open_rsync_channel(handle, &request.src, request).await?;
+    let mut channel =
+        open_rsync_channel(handle, strip_host_prefix(&request.src), request).await?;
     let (mut sess, leftover) = run_handshake_via_msg(&mut channel, cancel).await?;
     drive_post_handshake_pull(channel, &mut sess, leftover, request, tx, cancel).await
 }
@@ -618,6 +620,16 @@ async fn open_rsync_channel(
         .await
         .map_err(|e| DomainError::RsyncProtocolError(format!("rsync exec failed: {e}")))?;
     Ok(channel)
+}
+
+/// Strip a leading `host:` prefix from a `host:path` rsync-style spec.
+/// Returns the remote-side path (i.e. the substring after the first `:`).
+/// If no `:` is present, returns the input unchanged. Used by the wire
+/// transport to extract the remote path before building the
+/// `rsync --server` cmdline — the server runs on the remote and only
+/// needs the local-to-it path.
+fn strip_host_prefix(spec: &str) -> &str {
+    spec.split_once(':').map_or(spec, |(_, p)| p)
 }
 
 /// Build the `rsync --server` cmdline. Pulled out of
