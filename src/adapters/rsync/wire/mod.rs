@@ -470,6 +470,7 @@ async fn drive_post_handshake_push(
         Path::new(src),
         tx,
         cancel,
+        request.dry_run,
     )
     .await
 }
