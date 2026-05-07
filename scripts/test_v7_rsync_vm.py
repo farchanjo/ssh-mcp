@@ -402,6 +402,212 @@ def test_rsync_vm_wire_push_against_real_rsync(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Wire transport regressions — Bug A (dry_run), Bug B (exclude), Bug C (pull)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.xfail(
+    reason="v7.0.0-alpha.X Bug-A partial fix — Wire transport now bundles "
+    "`n` into the leading short-flag header (mirrors upstream rsync 3.2.7 "
+    "cmdline shape `-vvvnlogDtpre.iLsfxCIvu`), so the server is invoked "
+    "with the correct dry-run wire intent. The remaining issue is "
+    "state-machine semantics: with `-n` the rsync v31 generator emits a "
+    "different phase-boundary cadence than the wire transport's sender "
+    "state machine expects, and the session hangs after flist send. The "
+    "SFTP transport honours dry_run end-to-end (see "
+    "test_rsync_dry_run_against_local_sshd in test_v7_rsync_http.py); "
+    "Wire-side dry-run is deferred to a follow-up slice that ports the "
+    "upstream `generator.c::generate_files` dry-run branch (lines "
+    "2255..2275) into our sender driver.",
+    strict=False,
+)
+def test_rsync_vm_wire_push_with_dry_run_does_not_write_remote(
+    vm_stdio_client: McpClient, tmp_path: Path
+) -> None:
+    """Bug A regression — wire push with ``dry_run=true`` MUST NOT write
+    to the remote tree. Pre-fix the wire transport silently dropped the
+    flag and shipped the file anyway. Post-fix the cmdline carries the
+    bundled `n` flag (so the SERVER intent is correct on the wire), but
+    the receiver-side sender state machine still hangs against rsync
+    3.2.7 — see xfail reason.
+    """
+    src = tmp_path / "wire-dryrun-src"
+    _make_tree(src, {"hello.txt": b"dry-run payload\n"})
+    sid = _vm_connect(vm_stdio_client, agent="rsync-vm-wire-dryrun")
+    remote_dst = _remote_dir("wire-dryrun")
+    try:
+        _exec_remote(vm_stdio_client, sid, f"mkdir -p {shlex.quote(remote_dst)}")
+        rs = RsyncTestClient(vm_stdio_client, sid)
+        text, _, _ = rs.start_rsync(
+            src=str(src),
+            dst=f"{_vm_host()}:{remote_dst}",
+            transport="wire",
+            timeout=30.0,
+            dry_run=True,
+        )
+        parsed = parse_block(text)
+        assert parsed.get("__status") == "STARTED", text
+        rsync_id = parsed.get("rsync_id")
+        assert rsync_id, text
+
+        # Drain to terminal — wait up to 30 s.
+        rs.subscribe_progress(rsync_id)
+        deadline = time.monotonic() + 30.0
+        terminal: str | None = None
+        while time.monotonic() < deadline:
+            snap = rs.read_snapshot(rsync_id) or {}
+            status = snap.get("status", "").lower()
+            if status in {"completed", "failed", "cancelled"}:
+                terminal = status
+                break
+            time.sleep(0.3)
+        assert terminal == "completed", terminal
+
+        # Remote tree must be empty — the dry-run skipped writes.
+        out = _exec_remote(vm_stdio_client, sid, f"ls -1 {shlex.quote(remote_dst)}")
+        files = {line.strip() for line in out.splitlines() if line.strip()}
+        assert "hello.txt" not in files, (
+            f"dry_run=true wrote hello.txt anyway: {files}"
+        )
+    finally:
+        try:
+            _exec_remote(vm_stdio_client, sid, f"rm -rf {shlex.quote(remote_dst)}")
+        except Exception:
+            pass
+        _vm_disconnect(vm_stdio_client, sid)
+
+
+@pytest.mark.timeout(60)
+def test_rsync_vm_wire_push_with_exclude_drops_matching_files(
+    vm_stdio_client: McpClient, tmp_path: Path
+) -> None:
+    """Bug B regression — wire push with ``exclude=['*.tmp']`` MUST drop
+    matching files from the local flist before sending. Pre-fix the
+    flist walker emitted every file regardless of the per-call patterns.
+    """
+    src = tmp_path / "wire-exclude-src"
+    _make_tree(src, {"keep.txt": b"keep me\n", "drop.tmp": b"drop me\n"})
+    sid = _vm_connect(vm_stdio_client, agent="rsync-vm-wire-exclude")
+    remote_dst = _remote_dir("wire-exclude")
+    try:
+        _exec_remote(vm_stdio_client, sid, f"mkdir -p {shlex.quote(remote_dst)}")
+        rs = RsyncTestClient(vm_stdio_client, sid)
+        text, _, _ = rs.start_rsync(
+            src=str(src),
+            dst=f"{_vm_host()}:{remote_dst}",
+            transport="wire",
+            timeout=30.0,
+            exclude=["*.tmp"],
+        )
+        parsed = parse_block(text)
+        assert parsed.get("__status") == "STARTED", text
+        rsync_id = parsed.get("rsync_id")
+        assert rsync_id, text
+
+        rs.subscribe_progress(rsync_id)
+        deadline = time.monotonic() + 30.0
+        terminal: str | None = None
+        while time.monotonic() < deadline:
+            snap = rs.read_snapshot(rsync_id) or {}
+            status = snap.get("status", "").lower()
+            if status in {"completed", "failed", "cancelled"}:
+                terminal = status
+                break
+            time.sleep(0.3)
+        assert terminal == "completed", terminal
+
+        out = _exec_remote(vm_stdio_client, sid, f"ls -1 {shlex.quote(remote_dst)}")
+        files = {line.strip() for line in out.splitlines() if line.strip()}
+        assert "keep.txt" in files, files
+        assert "drop.tmp" not in files, (
+            f"exclude pattern '*.tmp' did not skip drop.tmp: {files}"
+        )
+    finally:
+        try:
+            _exec_remote(vm_stdio_client, sid, f"rm -rf {shlex.quote(remote_dst)}")
+        except Exception:
+            pass
+        _vm_disconnect(vm_stdio_client, sid)
+
+
+@pytest.mark.timeout(60)
+def test_rsync_vm_wire_pull_byte_identical_against_real_rsync(
+    vm_stdio_client: McpClient, tmp_path: Path
+) -> None:
+    """Bug C regression — wire pull from ``host:`` must finish with
+    byte-identical local content. Pre-fix the use case hardcoded
+    ``RsyncDirection::Push`` regardless of which side carried the
+    ``host:`` prefix, so MCP-driven pulls returned ``files_total=0`` and
+    an empty local destination.
+    """
+    sid = _vm_connect(vm_stdio_client, agent="rsync-vm-wire-pull")
+    remote_src = _remote_dir("wire-pull")
+    local_dst = tmp_path / "wire-pull-dst"
+    local_dst.mkdir()
+    files: dict[str, bytes] = {
+        "alpha.txt": b"A" * 1024,
+        "beta.txt": b"B" * 2048,
+        "gamma.txt": b"C" * 4096,
+    }
+    try:
+        _exec_remote(vm_stdio_client, sid, f"mkdir -p {shlex.quote(remote_src)}")
+        for rel, blob in files.items():
+            char = chr(blob[0])
+            length = len(blob)
+            cmd = (
+                f"head -c {length} < /dev/zero | "
+                f"tr '\\0' {shlex.quote(char)} > "
+                f"{shlex.quote(f'{remote_src}/{rel}')}"
+            )
+            _exec_remote(vm_stdio_client, sid, cmd)
+        remote_hex = {
+            rel: _remote_sha256(vm_stdio_client, sid, f"{remote_src}/{rel}")
+            for rel in files
+        }
+
+        rs = RsyncTestClient(vm_stdio_client, sid)
+        text, _, _ = rs.start_rsync(
+            src=f"{_vm_host()}:{remote_src}",
+            dst=str(local_dst),
+            transport="wire",
+            timeout=30.0,
+        )
+        parsed = parse_block(text)
+        assert parsed.get("__status") == "STARTED", text
+        rsync_id = parsed.get("rsync_id")
+        assert rsync_id, text
+
+        rs.subscribe_progress(rsync_id)
+        deadline = time.monotonic() + 30.0
+        terminal: str | None = None
+        while time.monotonic() < deadline:
+            snap = rs.read_snapshot(rsync_id) or {}
+            status = snap.get("status", "").lower()
+            if status in {"completed", "failed", "cancelled"}:
+                terminal = status
+                break
+            time.sleep(0.3)
+        assert terminal == "completed", terminal
+
+        for rel, expected_hex in remote_hex.items():
+            local_path = local_dst / rel
+            assert local_path.exists(), f"local pull missing {rel}"
+            local_hex = _local_sha256(local_path)
+            assert local_hex == expected_hex, (
+                rel,
+                local_hex,
+                expected_hex,
+            )
+    finally:
+        try:
+            _exec_remote(vm_stdio_client, sid, f"rm -rf {shlex.quote(remote_src)}")
+        except Exception:
+            pass
+        _vm_disconnect(vm_stdio_client, sid)
+
+
 @pytest.mark.timeout(60)
 def test_rsync_vm_auto_transport_picks_wire_when_rsync_present(
     vm_stdio_client: McpClient, tmp_path: Path
