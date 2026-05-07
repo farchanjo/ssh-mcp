@@ -198,13 +198,18 @@ def _remote_dir(suffix: str) -> str:
 
 @pytest.mark.timeout(120)
 @pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport bug: against a real Linux host the "
-    "background pump for `transport=sftp` never moves bytes (status stays "
-    "pending; remote dst stays empty). Reproduces with both local-source -> "
-    "remote-dst (push) and remote-source -> local-dst (pull). The transport "
-    "works against the in-process paramiko fixture (HTTP + stdio suites cover "
-    "that), so the regression is in the russh SFTP adapter's interaction with "
-    "OpenSSH's sftp-server.",
+    reason="v7.0.0-alpha.8 SFTP transport architectural limitation: the "
+    "transport walks both `src` and `dst` through the same `RsyncSftpFsPort` "
+    "(see ADR 0011 v7.0.0-alpha.4 SFTP slice doc + tests/v7_rsync_e2e_vm.rs "
+    "fixture). When `src` is a local path (the test passes "
+    "`tmp_path / 'src'`) and `dst` is remote, the SFTP-side `readdir(src)` "
+    "is issued against the OpenSSH sftp-server which has no view of the "
+    "local FS — the walker yields zero entries and the comparator emits no "
+    "transfer actions. A local-FS adapter implementing `RsyncSftpFsPort` is "
+    "deferred to a follow-up slice (the `tests/v7_rsync_e2e_vm.rs` happy "
+    "path stages BOTH ends remotely as a workaround). Once the local-FS "
+    "adapter lands the use case can dispatch per-side, and this test will "
+    "exercise the canonical local-source -> remote-dst push path.",
     strict=False,
 )
 def test_rsync_vm_sftp_push_3_files_byte_identical(
@@ -265,9 +270,11 @@ def test_rsync_vm_sftp_push_3_files_byte_identical(
 
 @pytest.mark.timeout(120)
 @pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport bug: same root cause as the push "
-    "case — `transport=sftp` against OpenSSH sftp-server never advances. "
-    "See test_rsync_vm_sftp_push_3_files_byte_identical for detail.",
+    reason="v7.0.0-alpha.8 SFTP transport architectural limitation: same "
+    "root cause as `test_rsync_vm_sftp_push_3_files_byte_identical` — the "
+    "transport walks both ends through `RsyncSftpFsPort`, so a remote-src "
+    "+ local-dst pull cannot read the local destination tree to compare "
+    "against. Deferred to the follow-up slice that adds a local-FS adapter.",
     strict=False,
 )
 def test_rsync_vm_sftp_pull_3_files_byte_identical(
@@ -345,14 +352,6 @@ def test_rsync_vm_sftp_pull_3_files_byte_identical(
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 wire transport: signature + tokens + sender state "
-    "machines (slice 3) are not landed yet. Against a real rsync 3.2.7 host "
-    "the wire client opens the channel + sends file-list bytes (slice 2) but "
-    "then surfaces RSYNC_PROTOCOL_ERROR with the slice-3 boundary message. "
-    "Flip to passing once the slice 3 PR lands.",
-    strict=False,
-)
 def test_rsync_vm_wire_push_against_real_rsync(
     vm_stdio_client: McpClient, tmp_path: Path
 ) -> None:

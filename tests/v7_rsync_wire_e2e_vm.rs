@@ -236,6 +236,9 @@ async fn rsync_wire_push_pipeline_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session");
@@ -394,6 +397,9 @@ async fn rsync_wire_incremental_sync_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("phase 1 start_session");
@@ -445,6 +451,9 @@ async fn rsync_wire_incremental_sync_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("phase 2 start_session");
@@ -583,6 +592,9 @@ async fn rsync_wire_pull_pipeline_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session pull");
@@ -719,6 +731,9 @@ async fn rsync_wire_incremental_pull_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session pull #1");
@@ -773,6 +788,9 @@ async fn rsync_wire_incremental_pull_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session pull #2");
@@ -878,6 +896,9 @@ async fn rsync_wire_pull_with_sparse_against_real_vm() {
                 sparse: true,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session pull sparse");

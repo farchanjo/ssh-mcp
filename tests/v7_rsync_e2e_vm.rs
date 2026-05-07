@@ -308,6 +308,9 @@ async fn rsync_sftp_round_trip_against_real_vm() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session");
@@ -437,6 +440,9 @@ async fn rsync_sftp_idempotent_second_pass_skips_unchanged() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session 1");
@@ -467,6 +473,9 @@ async fn rsync_sftp_idempotent_second_pass_skips_unchanged() {
                 sparse: false,
                 devices: false,
             },
+            dry_run: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
         })
         .await
         .expect("start_session 2");
