@@ -54,7 +54,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::rsync::types::RsyncProgressEvent;
+use crate::adapters::rsync::types::{RsyncProgressEvent, SkipReason};
 use crate::adapters::rsync::wire::blocks::{read_blockset, write_blockset_header};
 use crate::adapters::rsync::wire::flist::Flist;
 use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
@@ -86,6 +86,15 @@ where
     ndx_in: &'a mut NdxState,
     /// Codec state for `write_ndx`. See [`Self::ndx_in`] for invariants.
     ndx_out: &'a mut NdxState,
+    /// `--dry-run` mode flag. When set, the sender mirrors upstream
+    /// rsync 3.2.7's `sender.c::send_files` lines 343..347 dry-run
+    /// branch: per-file `ITEM_TRANSFER` frames echo `ndx + iflags` only
+    /// (no blockset read, no token stream, no digest trailer) because
+    /// the generator's `do_xfers = 0` path
+    /// (`generator.c::recv_generator` line 1939) skips the
+    /// `write_sum_head` write. Surfacing `FileSkipped { DryRun }` keeps
+    /// the lane symmetric with the SFTP transport.
+    dry_run: bool,
 }
 
 /// Drive the sender state machine to completion.
@@ -108,6 +117,10 @@ where
 ///   file index outside the flist range.
 /// - [`DomainError::RsyncProtocolError`] when the receiver ships a
 ///   `count > 0` blockset (slice-4 territory).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "drive_sender threads channel halves + session + flist + source root + progress lane + cancel + dry_run; bundling into a struct just for one call site is more obscuring than helpful and the signature mirrors upstream rsync 3.2.7 sender.c::rsync_sender's parameter shape."
+)]
 pub async fn drive_sender<R, W>(
     reader: &mut MplexReader<R>,
     writer: &mut MplexWriter<W>,
@@ -116,6 +129,7 @@ pub async fn drive_sender<R, W>(
     source_root: &Path,
     progress_tx: &Sender<RsyncProgressEvent>,
     cancel: &CancellationToken,
+    dry_run: bool,
 ) -> Result<RsyncStats, DomainError>
 where
     R: AsyncRead + Unpin + Send,
@@ -124,7 +138,6 @@ where
     let mut stats = ZeroStats::new(flist);
     let mut ndx_in = NdxState::new();
     let mut ndx_out = NdxState::new();
-    let negotiated = sess.negotiated;
     let mut ctx = SenderCtx {
         reader,
         writer,
@@ -135,15 +148,28 @@ where
         cancel,
         ndx_in: &mut ndx_in,
         ndx_out: &mut ndx_out,
+        dry_run,
     };
     drive_send_files_loop(&mut ctx, &mut stats).await?;
-    // Final post-loop `NDX_DONE` — mirrors upstream rsync 3.2.7
-    // `sender.c::send_files` line 464 (`write_ndx(f_out, NDX_DONE);`
-    // immediately before the function returns). Without this third
-    // `NDX_DONE` the server-side `recv_files` never breaks out of
-    // its own phase loop and the generator never reaches the
-    // post-phase wait that emits the final goodbye sentinel — sender
-    // would hang in `read_goodbye` forever.
+    finalise_sender(&mut ctx).await?;
+    Ok(stats.finalize())
+}
+
+/// Emit the post-loop `NDX_DONE` and read the receiver goodbye pair.
+///
+/// Direct port of upstream rsync 3.2.7's `sender.c::send_files` lines
+/// 462..464 (`write_ndx(f_out, NDX_DONE);` immediately before the
+/// function returns) plus `main.c::read_final_goodbye` (lines
+/// 875..906). Without the post-loop `NDX_DONE` the server-side
+/// `recv_files` never breaks out of its own phase loop and the
+/// generator never reaches the post-phase wait that emits the final
+/// goodbye sentinel — sender would hang in `read_goodbye` forever.
+async fn finalise_sender<R, W>(ctx: &mut SenderCtx<'_, R, W>) -> Result<(), DomainError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let negotiated = ctx.sess.negotiated;
     write_ndx(ctx.writer, ctx.sess, ctx.ndx_out, negotiated, NDX_DONE).await?;
     // best-effort: tolerate channel close mid-goodbye since the
     // receiver-side rsync may already have shut down its mplex out.
@@ -157,7 +183,7 @@ where
         negotiated,
     )
     .await;
-    Ok(stats.finalize())
+    Ok(())
 }
 
 /// Drive the multi-phase `send_files` loop.
@@ -297,22 +323,92 @@ where
     let iflags = read_iflags(ctx.reader, ctx.sess, negotiated).await?;
     consume_iflags_attrs(ctx.reader, ctx.sess, iflags).await?;
     if iflags & ITEM_TRANSFER == 0 {
-        // Itemize-only frame (directory entries, metadata-only updates,
-        // skipped files). Mirrors the `!(iflags & ITEM_TRANSFER)` arm of
-        // upstream rsync 3.2.7's `sender.c::send_files` (lines 288..307):
-        // the sender just echoes `write_ndx_and_attrs` and continues —
-        // no `read_sum_head`, no token stream, no MD4 trailer.
-        write_ndx(ctx.writer, ctx.sess, ctx.ndx_out, negotiated, idx).await?;
-        write_iflags(ctx.writer, ctx.sess, negotiated, iflags).await?;
-        tracing::debug!(
-            target: "rsync.wire.sender",
-            idx,
-            iflags = format_args!("0x{iflags:04x}"),
-            path = %entry.path.display(),
-            "itemize-only frame (no ITEM_TRANSFER) — echoed and skipped"
-        );
-        return Ok(());
+        return process_itemize_only(ctx, idx, iflags, entry).await;
     }
+    if ctx.dry_run {
+        return process_dry_run_transfer(ctx, idx, iflags, entry).await;
+    }
+    process_full_transfer(ctx, idx, iflags, entry, stats).await
+}
+
+/// Itemize-only frame (directory entries, metadata-only updates,
+/// skipped files). Mirrors the `!(iflags & ITEM_TRANSFER)` arm of
+/// upstream rsync 3.2.7's `sender.c::send_files` (lines 288..307):
+/// the sender just echoes `write_ndx_and_attrs` and continues —
+/// no `read_sum_head`, no token stream, no MD4 trailer.
+async fn process_itemize_only<R, W>(
+    ctx: &mut SenderCtx<'_, R, W>,
+    idx: i32,
+    iflags: u16,
+    entry: &Flist,
+) -> Result<(), DomainError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let negotiated = ctx.sess.negotiated;
+    write_ndx(ctx.writer, ctx.sess, ctx.ndx_out, negotiated, idx).await?;
+    write_iflags(ctx.writer, ctx.sess, negotiated, iflags).await?;
+    tracing::debug!(
+        target: "rsync.wire.sender",
+        idx,
+        iflags = format_args!("0x{iflags:04x}"),
+        path = %entry.path.display(),
+        "itemize-only frame (no ITEM_TRANSFER) — echoed and skipped"
+    );
+    Ok(())
+}
+
+/// Dry-run `ITEM_TRANSFER` frame. Direct port of upstream rsync 3.2.7's
+/// `sender.c::send_files` lines 343..347 (`if (!do_xfers) { ... continue; }`):
+///
+/// - the generator emits `ndx + iflags` only — `do_xfers = 0` skips
+///   the `write_sum_head` call at `generator.c::recv_generator` lines
+///   1949..1960 (the `if (!do_xfers)` short-circuit at line 1939
+///   `goto cleanup`s past the blockset write);
+/// - the sender therefore must NOT call `read_blockset` (it would
+///   deadlock waiting for bytes the generator never sent);
+/// - the sender just echoes `write_ndx + write_iflags` and emits a
+///   `FileSkipped { reason: DryRun }` beacon to keep the push lane
+///   symmetric with the SFTP transport's dry-run reporting shape.
+async fn process_dry_run_transfer<R, W>(
+    ctx: &mut SenderCtx<'_, R, W>,
+    idx: i32,
+    iflags: u16,
+    entry: &Flist,
+) -> Result<(), DomainError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let negotiated = ctx.sess.negotiated;
+    write_ndx(ctx.writer, ctx.sess, ctx.ndx_out, negotiated, idx).await?;
+    write_iflags(ctx.writer, ctx.sess, negotiated, iflags).await?;
+    tracing::debug!(
+        target: "rsync.wire.sender",
+        idx,
+        iflags = format_args!("0x{iflags:04x}"),
+        path = %entry.path.display(),
+        "dry-run ITEM_TRANSFER — echoed without blockset/tokens"
+    );
+    emit_file_skipped(ctx.progress_tx, entry, SkipReason::DryRun).await;
+    Ok(())
+}
+
+/// Full per-file transfer — read blockset, echo ndx + iflags + header,
+/// emit token stream + digest trailer.
+async fn process_full_transfer<R, W>(
+    ctx: &mut SenderCtx<'_, R, W>,
+    idx: i32,
+    iflags: u16,
+    entry: &Flist,
+    stats: &mut ZeroStats,
+) -> Result<(), DomainError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let negotiated = ctx.sess.negotiated;
     let blockset = read_blockset(ctx.reader, ctx.sess).await?;
     write_ndx(ctx.writer, ctx.sess, ctx.ndx_out, negotiated, idx).await?;
     // Echo the same iflags + attrs back to the receiver per
@@ -494,6 +590,20 @@ async fn emit_file_completed(progress_tx: &Sender<RsyncProgressEvent>, entry: &F
         .await;
 }
 
+/// Push a `FileSkipped` beacon onto the progress lane. Used by the
+/// dry-run path so the lane consumer can report would-be transfers
+/// without seeing a `FileCompleted` event. Tolerates a closed channel.
+async fn emit_file_skipped(
+    progress_tx: &Sender<RsyncProgressEvent>,
+    entry: &Flist,
+    reason: SkipReason,
+) {
+    let rel_path = entry.path.to_string_lossy().into_owned();
+    let _ = progress_tx
+        .send(RsyncProgressEvent::FileSkipped { rel_path, reason })
+        .await;
+}
+
 /// Read the final receiver "goodbye" pair.
 ///
 /// Direct port of upstream rsync 3.2.7's `main.c::read_final_goodbye`
@@ -604,7 +714,7 @@ mod tests {
     /// `sess_sender.negotiated = 0` so the codec falls back to the
     /// proto-27 plain `read_int` / `write_int` shape.
     const PHASE_END_SENTINEL: i32 = -1;
-    use crate::adapters::rsync::types::RsyncProgressEvent;
+    use crate::adapters::rsync::types::{RsyncProgressEvent, SkipReason};
     use crate::adapters::rsync::wire::flist::Flist;
     use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
     use crate::adapters::rsync::wire::session::WireSession;
@@ -732,6 +842,7 @@ mod tests {
             dir.path(),
             &tx,
             &cancel,
+            false,
         )
         .await
         .expect("sender");
@@ -791,6 +902,7 @@ mod tests {
             dir.path(),
             &tx,
             &cancel,
+            false,
         )
         .await
         .expect_err("must err");
@@ -901,6 +1013,7 @@ mod tests {
             dir.path(),
             &tx,
             &cancel,
+            false,
         )
         .await
         .expect("sender drives matcher path without error");
@@ -1073,6 +1186,7 @@ mod tests {
             dir.path(),
             &tx,
             &cancel,
+            false,
         )
         .await
         .expect("sender");
@@ -1106,5 +1220,114 @@ mod tests {
         assert_eq!(bs.block_count, 0);
         assert_eq!(bs.strong_len, 0);
         assert!(bs.is_whole_file());
+    }
+
+    /// Slice-13: dry-run `ITEM_TRANSFER` frame must NOT consume a
+    /// blockset off the wire. Mirrors upstream rsync 3.2.7's
+    /// `sender.c::send_files` lines 343..347 (`if (!do_xfers) { ...
+    /// continue; }`) and `generator.c::recv_generator` line 1939 — the
+    /// generator's `do_xfers = 0` path emits `ndx + iflags` only and
+    /// the sender must echo `ndx + iflags` only, no blockset, no
+    /// tokens, no digest. Pre-fix the sender hung on `read_blockset`
+    /// after the iflags read.
+    ///
+    /// Wire shape (proto >= 29, dry-run):
+    /// - generator: `ndx=0 + iflags=0x8000`  (ITEM_TRANSFER set)
+    /// - sender:    `ndx=0 + iflags=0x8000`  (echo, no blockset)
+    /// - phase end: `-1` (server) → `-1` echo (sender) → `-1` (server)
+    ///   → post-loop `-1` (sender) → `-1` goodbye (server)
+    #[tokio::test]
+    async fn dry_run_transfer_frame_skips_blockset_and_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload: &[u8] = b"dry-run payload\n";
+        std::fs::write(dir.path().join("hello.txt"), payload).expect("write");
+        let flist = vec![Flist::regular(
+            PathBuf::from("hello.txt"),
+            payload.len() as i64,
+            0,
+            0o644,
+            0,
+            0,
+        )];
+
+        let (server_w_left, client_r_right) = duplex(64 * 1024);
+        let (client_w_left, server_r_right) = duplex(64 * 1024);
+        let (cl_r, _cl_w_unused) = tokio::io::split(client_r_right);
+        let (_cl_r_unused, cl_w) = tokio::io::split(client_w_left);
+        let (_sv_r_unused, sv_w) = tokio::io::split(server_w_left);
+        let (sv_r, _sv_w_unused) = tokio::io::split(server_r_right);
+        let mut sender_reader = MplexReader::new(cl_r);
+        let mut sender_writer = MplexWriter::new(cl_w);
+        let mut server_writer = MplexWriter::new(sv_w);
+        let mut server_reader = MplexReader::new(sv_r);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let mut sess_sender = WireSession::new();
+        sess_sender.rver = 31;
+        // proto < 29 keeps the synthetic generator simple: the sender
+        // synthesises `ITEM_TRANSFER | ITEM_MISSING_DATA` per upstream
+        // `read_ndx_and_attrs` line 384, so the dry-run echo path
+        // exercises the same `process_dry_run_transfer` branch as a
+        // proto-31 wire would.
+        sess_sender.negotiated = 0;
+
+        let server_task = tokio::spawn(async move {
+            let mut sess_srv = WireSession::new();
+            // Frame: file index 0. (proto < 29 → no iflags short.)
+            server_writer
+                .write_int(&mut sess_srv, 0)
+                .await
+                .expect("idx");
+            // No blockset bytes — the dry-run sender must NOT read any.
+            // Read the sender's echo: ndx only (proto < 29 → no iflags).
+            let echoed = server_reader.read_int(&mut sess_srv).await.expect("echo");
+            assert_eq!(echoed, 0);
+            // Phase boundaries (proto < 29 → max_phase = 1).
+            server_writer
+                .write_int(&mut sess_srv, -1)
+                .await
+                .expect("phase0");
+            let d1 = server_reader.read_int(&mut sess_srv).await.expect("d1");
+            assert_eq!(d1, -1);
+            server_writer
+                .write_int(&mut sess_srv, -1)
+                .await
+                .expect("phase1");
+            let d2 = server_reader.read_int(&mut sess_srv).await.expect("d2");
+            assert_eq!(d2, -1);
+            server_writer
+                .write_int(&mut sess_srv, -1)
+                .await
+                .expect("goodbye");
+        });
+
+        let stats = drive_sender(
+            &mut sender_reader,
+            &mut sender_writer,
+            &mut sess_sender,
+            &flist,
+            dir.path(),
+            &tx,
+            &cancel,
+            true,
+        )
+        .await
+        .expect("dry-run sender completes without hang");
+        server_task.await.expect("server task");
+
+        // No file was transferred — files_done stays 0.
+        assert_eq!(stats.files_done, 0, "dry-run skips transfer");
+        assert_eq!(stats.bytes_transferred, 0);
+
+        // The lane carries one FileSkipped(DryRun), no FileCompleted.
+        let evt = rx.recv().await.expect("file skipped");
+        match evt {
+            RsyncProgressEvent::FileSkipped { rel_path, reason } => {
+                assert_eq!(rel_path, "hello.txt");
+                assert_eq!(reason, SkipReason::DryRun);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 }
