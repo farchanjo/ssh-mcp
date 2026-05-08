@@ -134,14 +134,14 @@ pub const FORWARD_BROADCAST_CAP_MAX: usize = 4096;
 pub const FORWARD_BROADCAST_CAP_MIN: usize = 8;
 
 /// Default debounce window (milliseconds) for the subscription registry.
-pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 200;
+pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 1_000;
 /// Floor for the debounce window.
 pub const NOTIFY_DEBOUNCE_MS_MIN: u64 = 5;
 /// Cap for the debounce window.
 pub const NOTIFY_DEBOUNCE_MS_MAX: u64 = 5_000;
 
 /// Default force-flush interval (milliseconds) for the subscription registry.
-pub const DEFAULT_NOTIFY_FORCE_FLUSH_MS: u64 = 1_000;
+pub const DEFAULT_NOTIFY_FORCE_FLUSH_MS: u64 = 5_000;
 /// Floor for the force-flush interval.
 pub const NOTIFY_FORCE_FLUSH_MS_MIN: u64 = 100;
 /// Cap for the force-flush interval.
