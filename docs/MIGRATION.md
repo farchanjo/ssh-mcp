@@ -188,8 +188,8 @@ See [CONFIGURATION.md](./CONFIGURATION.md) for the full list. Highlights:
 
 | New in v3                          | Default | Purpose                                                                          |
 | ---------------------------------- | ------- | -------------------------------------------------------------------------------- |
-| `SSH_NOTIFY_DEBOUNCE_MS`           | 200     | Debounce window for `notifications/resources/updated`.                           |
-| `SSH_NOTIFY_FORCE_FLUSH_MS`        | 1000    | Maximum gap between notifications under continuous activity.                     |
+| `SSH_NOTIFY_DEBOUNCE_MS`           | 1000    | Debounce window for `notifications/resources/updated`.                           |
+| `SSH_NOTIFY_FORCE_FLUSH_MS`        | 5000    | Maximum gap between notifications under continuous activity.                     |
 | `SSH_NOTIFY_KEEPALIVE_S`           | 30      | Idle keepalive interval per resource.                                            |
 | `SSH_MCP_PEER_GC_INTERVAL_S`       | 30      | Period of the peer-GC scan (drops subscriptions for closed transports).          |
 | `SSH_SHELL_BROADCAST_CAP`          | 1024    | Capacity of the shell `output_tx` broadcast channel.                             |
