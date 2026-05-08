@@ -381,7 +381,7 @@ LagPolicy variants and per-fronteira behaviour: [ADR 0006](./adr/0006-backpressu
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
     Prod["Producer<br/>russh / SFTP /<br/>health"]
-    Deb["per-resource debouncer<br/>SSH_NOTIFY_DEBOUNCE_MS=200<br/>SSH_NOTIFY_FORCE_FLUSH_MS=1000"]
+    Deb["per-resource debouncer<br/>SSH_NOTIFY_DEBOUNCE_MS=1000<br/>SSH_NOTIFY_FORCE_FLUSH_MS=5000"]
 
     subgraph LANES["per-(SubId, Uri) lanes"]
         direction TB
@@ -676,7 +676,7 @@ Every flist value-object, block-set, hash kernel, sender / receiver state machin
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart TB
     P1["Producer<br/>russh PTY / async cmd /<br/>SFTP / health"]
-    P2["MemoryRegistry&lt;N&gt;<br/>per-resource debouncer task<br/>coalesce 200 ms / flush 1 s /<br/>keepalive 30 s"]
+    P2["MemoryRegistry&lt;N&gt;<br/>per-resource debouncer task<br/>coalesce 1 s / flush 5 s /<br/>keepalive 30 s"]
     P3["per (SubId, Uri) lane<br/>filter -> LagPolicy -><br/>stats atomics -><br/>mpsc(SSH_LANE_BUFFER=1024)"]
     P4["ChannelMux<br/>cursor_lane AtomicUsize<br/>round-robin try_recv<br/>mux_waker Notify"]
     P5["Outbound writer<br/>rmcp Peer notifications/<br/>resources/updated<br/>or NDJSON formatter"]
