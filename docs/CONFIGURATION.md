@@ -115,8 +115,8 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 
 | Variable | Type | Default | Floor | Cap | Description |
 |----------|------|---------|-------|-----|-------------|
-| `SSH_NOTIFY_DEBOUNCE_MS` | `u64` (ms) | `200` | `5` | `5000` | Debounce window. Producer pokes inside this window collapse into a single `notifications/resources/updated`. |
-| `SSH_NOTIFY_FORCE_FLUSH_MS` | `u64` (ms) | `1000` | `100` | `60000` | Force-flush ticker. Guarantees a notification fires at least every N ms even when poke storms keep resetting the debouncer. |
+| `SSH_NOTIFY_DEBOUNCE_MS` | `u64` (ms) | `1000` | `5` | `5000` | Debounce window. Producer pokes inside this window collapse into a single `notifications/resources/updated`. |
+| `SSH_NOTIFY_FORCE_FLUSH_MS` | `u64` (ms) | `5000` | `100` | `60000` | Force-flush ticker. Guarantees a notification fires at least every N ms even when poke storms keep resetting the debouncer. |
 | `SSH_NOTIFY_KEEPALIVE_S` | `u64` (s) | `30` | `5` | `300` | Keepalive ticker. Sends a notification this often even when no fresh data arrived (warms SSE / stdio frames). |
 | `SSH_NOTIFY_FLUSH_BYTES` | `usize` (bytes) or bytesize string (`8k`, `64k`, `1m`, `1mib`) | `64k` (`65_536`) | `1024` | `1_048_576` | ADR 0006 Amendment 1 — byte-threshold flush. The per-resource debouncer flushes immediately when bytes-since-last-broadcast cross this value, regardless of `SSH_NOTIFY_DEBOUNCE_MS`. Set to `0` to disable byte-threshold (time-only debouncer, v5.0 behaviour). Hooked on `command://*/output` (stdout/stderr) and `transfer://*/progress` (per-chunk delta). |
 
@@ -254,7 +254,7 @@ A 20 ms debounce keeps p95 round-trip < 50 ms; a 10 s keepalive frequently warms
 ## Validation behaviour
 
 - **Out-of-range values are clamped.** For example, setting `SSH_NOTIFY_DEBOUNCE_MS=99999` resolves to `5000` (the cap); `SSH_SHELL_BROADCAST_CAP=2` resolves to `16` (the floor).
-- **Unparseable values fall back to the default.** `SSH_NOTIFY_DEBOUNCE_MS=banana` resolves to `200`.
+- **Unparseable values fall back to the default.** `SSH_NOTIFY_DEBOUNCE_MS=banana` resolves to `1000`.
 - **Boolean parsing** accepts `true`/`TRUE`/`1` for true, `false`/`FALSE`/`0` for false. Anything else is treated as false.
 - **Byte-size suffixes** (`SSH_SHELL_MAX_BUFFER_SIZE`, `SSH_COMMAND_MAX_BUFFER_SIZE`) accept plain bytes or `b/k/kb/m/mb/g/gb/t/tb` (case-insensitive).
 - **Compression**: `SSH_COMPRESSION` is the only setting where falling through to default is `true`; every other env var without a value defaults to its built-in.

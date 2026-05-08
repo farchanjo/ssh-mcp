@@ -62,7 +62,7 @@ The new `rsync://` push lane carries per-file + aggregate sync progress as `appl
 | ----------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
 | `session_started` | `transport: wire \| sftp`, `files_planned: u64`, `bytes_planned: u64`                                                 | Once, after the planner walks the source tree.              |
 | `file_started`    | `rel_path: String`, `bytes_total: u64`                                                                                | Per file, before the delta phase begins.                    |
-| `file_progress`   | `rel_path`, `bytes_done: u64`, `bytes_total: u64`                                                                     | Mid-file, debounced by the standard 200 ms / 1 s windows.   |
+| `file_progress`   | `rel_path`, `bytes_done: u64`, `bytes_total: u64`                                                                     | Mid-file, debounced by the standard 1 s / 5 s windows.      |
 | `file_completed`  | `rel_path`, `bytes_transferred: u64`, `bytes_skipped: u64`                                                            | Per file, after the file finishes successfully.             |
 | `file_skipped`    | `rel_path`, `reason: size_match \| mtime_match \| dry_run`                                                            | Per file when the heuristic short-circuits the transfer.    |
 | `file_failed`     | `rel_path`, `code: ErrorCode`, `detail: String`                                                                       | Per file on a non-fatal failure (sync continues).           |
@@ -284,7 +284,7 @@ sequenceDiagram
         Server->>Peer: notifications/resources/updated
     end
 
-    Note over Deb: Force-flush ticker fires even without pokes (every SSH_NOTIFY_FORCE_FLUSH_MS, default 1 s).
+    Note over Deb: Force-flush ticker fires even without pokes (every SSH_NOTIFY_FORCE_FLUSH_MS, default 5 s).
     Note over Deb: Keepalive ticker fires every SSH_NOTIFY_KEEPALIVE_S (default 30 s).
     Note over Deb: Byte-threshold flush bypasses the debounce window when bytes_counter crosses SSH_NOTIFY_FLUSH_BYTES (default 64 KiB).
 
@@ -338,7 +338,7 @@ Per resource, the debouncer task fires a `notifications/resources/updated` every
 
 ### D. Cumulative chunks
 
-The debouncer collapses N producer pokes inside a single debounce window into one outbound notification. The chunks themselves accumulate in the producer's `ArcSwap<RingBuffer>` / `ArcSwap<OutputBuffer>`; the `resources/read` step does the actual coalescing of bytes through the per-peer cursor. Result: subscribers see one notification per ~200 ms regardless of how chatty the producer is.
+The debouncer collapses N producer pokes inside a single debounce window into one outbound notification. The chunks themselves accumulate in the producer's `ArcSwap<RingBuffer>` / `ArcSwap<OutputBuffer>`; the `resources/read` step does the actual coalescing of bytes through the per-peer cursor. Result: subscribers see one notification per ~1 s regardless of how chatty the producer is.
 
 ## Per-peer cursor behaviour
 
@@ -372,8 +372,8 @@ All knobs live under `SSH_NOTIFY_*` and `SSH_*_BROADCAST_CAP`. Defaults are sane
 
 | Env var                          | Default | Range / cap     | Effect                                                                      |
 | -------------------------------- | ------- | --------------- | --------------------------------------------------------------------------- |
-| `SSH_NOTIFY_DEBOUNCE_MS`         | 200     | clamped         | Delay between first poke and outbound notification.                         |
-| `SSH_NOTIFY_FORCE_FLUSH_MS`      | 1000    | clamped         | Maximum gap between notifications when pokes keep arriving.                 |
+| `SSH_NOTIFY_DEBOUNCE_MS`         | 1000    | clamped         | Delay between first poke and outbound notification.                         |
+| `SSH_NOTIFY_FORCE_FLUSH_MS`      | 5000    | clamped         | Maximum gap between notifications when pokes keep arriving.                 |
 | `SSH_NOTIFY_KEEPALIVE_S`         | 30      | clamped         | Idle keepalive interval per resource.                                       |
 | `SSH_MCP_PEER_GC_INTERVAL_S`     | 30      | min 1           | Period of the peer-GC scan that drops disconnected peers' subscriptions.    |
 | `SSH_SHELL_BROADCAST_CAP`        | 1024    | 16..=65536      | Capacity of the shell `output_tx` broadcast channel (Bytes chunks).         |
