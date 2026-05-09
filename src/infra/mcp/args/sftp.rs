@@ -70,6 +70,8 @@ pub struct SshUploadArgs {
 
     /// v5 Phase 3 — auto-release when the transfer resource has zero
     /// subscribers. Default: false (legacy v4 behaviour).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_release_when_no_subs")]
     pub release_when_no_subs: Option<bool>,
 
@@ -84,6 +86,8 @@ pub struct SshUploadArgs {
     /// truncates the destination and starts from byte zero (v6.0
     /// semantics). Set together with `verify=true` for a stronger
     /// guarantee that the remote prefix matches the local prefix.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_resume")]
     pub resume: Option<bool>,
 
@@ -93,6 +97,8 @@ pub struct SshUploadArgs {
     /// costs one extra `ssh_exec` round-trip plus O(offset) bytes
     /// hashed remotely; only worth enabling if mid-transfer corruption
     /// has been observed in deployment.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_verify")]
     pub verify: Option<bool>,
 }
@@ -112,6 +118,8 @@ pub struct SshDownloadArgs {
 
     /// v5 Phase 3 — auto-release when the transfer resource has zero
     /// subscribers. Default: false (legacy v4 behaviour).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_release_when_no_subs")]
     pub release_when_no_subs: Option<bool>,
 
@@ -122,12 +130,16 @@ pub struct SshDownloadArgs {
 
     /// ADR 0010 — opt-in resume from the local tail. See
     /// [`SshUploadArgs::resume`] for the full contract.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_resume")]
     pub resume: Option<bool>,
 
     /// ADR 0010 — when `resume=true`, hash the resume prefix on both
     /// sides and abort with `RESUME_MISMATCH` on divergence. See
     /// [`SshUploadArgs::verify`] for the cost trade-off.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_verify")]
     pub verify: Option<bool>,
 }
@@ -140,6 +152,8 @@ pub struct SshTransferProgressArgs {
 
     /// Block until completion or `wait_timeout_secs` expires. Default:
     /// false.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_wait")]
     pub wait: Option<bool>,
 

@@ -140,6 +140,8 @@ pub struct SshConnectArgs {
 
     /// Enable zlib compression for the SSH transport. Default: true.
     /// Env: `SSH_COMPRESSION`.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     #[schemars(default = "default_compress")]
     pub compress: Option<bool>,
 
@@ -150,6 +152,8 @@ pub struct SshConnectArgs {
 
     /// Keep the session open indefinitely (disables inactivity timeout).
     /// Default: false. Set true for long-lived backends or daemons.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_persistent")]
     pub persistent: Option<bool>,
 

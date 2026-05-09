@@ -41,10 +41,14 @@ pub struct SerialOpenArgs {
     pub max_buffer_size: u64,
     /// Initial DTR (Data Terminal Ready) line. `None` leaves the
     /// driver default; `Some(true)` raises, `Some(false)` lowers.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: null (driver default).
     #[serde(default)]
     pub initial_dtr: Option<bool>,
     /// Initial RTS (Request To Send) line. Same semantics as
     /// `initial_dtr`.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: null (driver default).
     #[serde(default)]
     pub initial_rts: Option<bool>,
     /// Optional human label (e.g. `"GPS-1"`) surfaced on
