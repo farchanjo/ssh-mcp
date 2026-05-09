@@ -38,6 +38,18 @@ flowchart TD
 
 Per-call parameter overrides are documented per tool in [API.md](./API.md). The rest of this document focuses on env vars.
 
+## Wire shape
+
+| Variable | Type | Default | Range | Description |
+|----------|------|---------|-------|-------------|
+| `SSH_MCP_STRUCTURED_CONTENT` | `bool` | `true` | — | Emit the v4.7 `structured_content` JSON twin alongside the markdown body. Set `false` to silence the JSON payload (markdown-only wire). Schema advertisement via `output_schema` is unchanged regardless. |
+
+Every MCP tool returns two parallel payloads: the legacy block-style markdown body in `content[0]` and a typed JSON object on `result.structured_content`. The JSON twin lets smaller LLMs (27B class) index by key without parsing prose, but some hosts (notably the Claude Code UI) render BOTH payloads, which clutters the human view.
+
+The default is `true` — preserves the v4.7 contract byte-identically. When set to `false` / `FALSE` / `0` (matching `SSH_COMPRESSION` semantics), both `ok_text_and_structured` and `error_text_and_structured` skip setting `structured_content`, so the wire becomes markdown-only. The text channel stays byte-identical regardless of this flag, and the `is_error` flag on error responses is preserved. The schema published per tool via `output_schema` on `#[tool]` describes the contract and is independent of this runtime gate.
+
+The gate is resolved once per process via `OnceLock`, so the env var is read exactly once on first tool invocation and cached for the binary lifetime. Recommended default: leave unset (on). Disable per process when running against a host that surfaces JSON dumps to humans (e.g. `SSH_MCP_STRUCTURED_CONTENT=false ssh-mcp`).
+
 ## Connection
 
 | Variable | Type | Default | Range | Description |
