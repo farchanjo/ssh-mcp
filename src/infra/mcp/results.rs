@@ -51,9 +51,13 @@ pub struct SessionEntry {
     /// RFC 3339 timestamp of when the session was first established.
     pub connected_at: String,
     /// Last health-check verdict; `null` until the first check fires.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healthy: Option<bool>,
     /// Whether SSH zlib compression was negotiated.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub compression_enabled: bool,
 }
 
@@ -89,9 +93,13 @@ pub struct SshConnectResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
     /// Whether SSH zlib compression was negotiated.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_enabled: Option<bool>,
     /// Whether the session opted out of the inactivity sweeper.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistent: Option<bool>,
     /// RFC 3339 deadline; `null` when `persistent = true` or the
@@ -218,11 +226,17 @@ pub struct SshExecOutputResult {
     /// Stderr snapshot (head-truncated to 16 KiB).
     pub stderr: String,
     /// `true` when the snapshot dropped trailing stdout bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stdout_truncated: bool,
     /// `true` when the snapshot dropped trailing stderr bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stderr_truncated: bool,
     /// `true` when the command exited because the configured timeout
     /// fired.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub timed_out: bool,
     /// Optional error string set when the command failed before producing
     /// an exit status.
@@ -290,10 +304,14 @@ pub struct SshExecCancelResult {
     pub stderr: Option<String>,
     /// `true` when the stdout snapshot dropped trailing bytes. Absent on
     /// the `"noop"` branch.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout_truncated: Option<bool>,
     /// `true` when the stderr snapshot dropped trailing bytes. Absent on
     /// the `"noop"` branch.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_truncated: Option<bool>,
     /// Status of the command at the moment the cancel arrived; only set
@@ -389,8 +407,12 @@ pub struct SshShellReadResult {
     /// Total bytes the buffer held at snapshot time.
     pub buffer_size_at_snapshot: usize,
     /// `true` when the buffer was drained as part of the read.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub cleared: bool,
     /// `true` when the snapshot dropped leading bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub truncated: bool,
 }
 
@@ -527,6 +549,8 @@ pub struct SshForwardResult {
     pub remote: String,
     /// Always `true` on the success path; the value is included so the
     /// schema documents the field shape.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub active: bool,
     /// Successor tool calls advertised to the LLM.
     pub next: Vec<String>,
@@ -552,6 +576,8 @@ pub struct SshRunResult {
     /// `true` when the session was disconnected after the command
     /// finished (default), `false` when the caller opted to keep the
     /// session alive for follow-up calls.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub disconnected: bool,
     /// Captured exit code; `None` for terminal states other than
     /// `"completed"`.
@@ -562,10 +588,16 @@ pub struct SshRunResult {
     /// Stderr snapshot.
     pub stderr: String,
     /// `true` when the snapshot dropped trailing stdout bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stdout_truncated: bool,
     /// `true` when the snapshot dropped trailing stderr bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stderr_truncated: bool,
     /// `true` when the wait budget fired before completion.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub timed_out: bool,
     /// Optional error description set when the command failed before
     /// producing an exit status.
@@ -599,11 +631,17 @@ pub struct SshExecuteBatchEntry {
     /// Stderr snapshot.
     pub stderr: String,
     /// `true` when the stdout snapshot dropped trailing bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stdout_truncated: bool,
     /// `true` when the stderr snapshot dropped trailing bytes.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub stderr_truncated: bool,
     /// `true` when the per-command wait budget fired before
     /// completion.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`).
     pub timed_out: bool,
     /// Optional error description when the command failed before
     /// producing an exit status.
