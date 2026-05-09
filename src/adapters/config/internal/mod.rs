@@ -235,6 +235,20 @@ pub const NOTIFY_KEEPALIVE_S_ENV_VAR: &str = "SSH_NOTIFY_KEEPALIVE_S";
 /// Environment variable name for the binary peer-GC scan interval.
 pub const PEER_GC_INTERVAL_S_ENV_VAR: &str = "SSH_MCP_PEER_GC_INTERVAL_S";
 
+/// Environment variable name for the v4.7 `structured_content` runtime gate.
+///
+/// The v4.7 contract emits a typed JSON twin alongside the legacy
+/// markdown body so smaller LLMs can index keys without parsing prose.
+/// Some MCP hosts (notably the Claude Code UI) render BOTH payloads,
+/// which clutters the human view. This env var lets operators silence
+/// the JSON payload per process while keeping the markdown body and
+/// the schema advertisement (`output_schema` on `#[tool]`) untouched.
+///
+/// Accepted values match `SSH_COMPRESSION` semantics:
+/// - `false` / `FALSE` / `0` — disable `structured_content` emission.
+/// - `true` / `TRUE` / `1` / unset / parse-error — enable (v4.7 default).
+pub const STRUCTURED_CONTENT_ENV_VAR: &str = "SSH_MCP_STRUCTURED_CONTENT";
+
 /// v5 Phase 2 — env var for the per-`SubId` lane mpsc capacity.
 pub const LANE_BUFFER_ENV_VAR: &str = "SSH_LANE_BUFFER";
 /// v5 Phase 2 — env var for the `ChannelMux` outbound mpsc capacity.
