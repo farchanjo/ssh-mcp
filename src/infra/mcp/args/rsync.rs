@@ -50,21 +50,37 @@ pub enum RsyncTransportArg {
 )]
 pub struct PreserveFlagsArg {
     /// Preserve POSIX mode bits (`-p`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     pub perms: bool,
     /// Preserve modification time (`-t`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     pub mtime: bool,
     /// Preserve numeric owner (`-o`; root only on remote).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     pub owner: bool,
     /// Preserve numeric group (`-g`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     pub group: bool,
     /// Preserve symbolic links as-is, never follow (`-l`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     pub links: bool,
     /// Preserve hard-link graph (`-H`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     pub hardlinks: bool,
     /// Preserve sparse holes (`-S`).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     pub sparse: bool,
     /// Preserve block / character devices, fifos, sockets (`-D`;
     /// root only on remote).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     pub devices: bool,
 }
 
@@ -93,13 +109,19 @@ impl Default for PreserveFlagsArg {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RsyncOptsArg {
     /// `-r` — recurse into directories.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub recursive: bool,
     /// `-a` — alias for `-rlptgoD`. Pre-empts `recursive` and
     /// `preserve` when set.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub archive: bool,
     /// `--delete` — remove destination paths that are not in source.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub delete: bool,
     /// `--exclude=PATTERN` — gitignore-style exclude list.
@@ -110,6 +132,8 @@ pub struct RsyncOptsArg {
     pub include: Vec<String>,
     /// `-n` / `--dry-run` — emit `FileSkipped { reason: DryRun }`
     /// for every would-be op without changing the destination.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub dry_run: bool,
     /// `--bwlimit=KBPS` — token-bucket bandwidth cap on the
@@ -120,16 +144,22 @@ pub struct RsyncOptsArg {
     /// to `rsync --server` on the wire path; the agent path ignores
     /// this flag (the russh channel already gets compression for free
     /// if the SSH config enables it).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub compress: bool,
     /// `--partial` — inherit ADR 0010 resume semantics. When `false`
     /// (default), an interrupted transfer truncates the destination
     /// and starts from byte 0 on retry; when `true`, the destination
     /// is preserved between retries.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub partial: bool,
     /// `-c` / `--checksum` — force a content checksum even when size
     /// + mtime match.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[serde(default)]
     pub verify_checksum: bool,
     /// Attribute-preservation mask.
@@ -175,6 +205,8 @@ pub struct SshRsyncArgs {
     /// ADR 0003 lifecycle binding — auto-release the rsync session
     /// when the last subscriber detaches. Default `false` preserves
     /// v6.1 manual-close semantics.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_release_when_no_subs")]
     pub release_when_no_subs: Option<bool>,
 }

@@ -148,11 +148,15 @@ pub struct SshExecArgs {
     /// Use for commands that require a controlling terminal (e.g. `sudo`,
     /// `top`). All output is merged into stdout in PTY mode (no stderr
     /// separation).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_pty")]
     pub pty: Option<bool>,
 
     /// v5 Phase 3 — auto-release when the command resource has zero
     /// subscribers. Default: false (legacy v4 behaviour).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_release_when_no_subs")]
     pub release_when_no_subs: Option<bool>,
 
@@ -170,6 +174,8 @@ pub struct SshExecOutputArgs {
 
     /// Block until completion or `wait_timeout_secs` expires. Default:
     /// false.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_wait")]
     pub wait: Option<bool>,
 
@@ -245,6 +251,8 @@ pub struct SshRunArgs {
     pub agent_id: Option<String>,
 
     /// Allocate a pseudo-terminal for the command. Default: false.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_pty")]
     pub pty: Option<bool>,
 
@@ -261,6 +269,8 @@ pub struct SshRunArgs {
     /// Disconnect the session after the command finishes. Default:
     /// true (one-shot mode). Set false to keep the session open and
     /// reuse it for subsequent `ssh_exec` calls.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     #[schemars(default = "default_disconnect_after_run")]
     pub disconnect_after: Option<bool>,
 }
@@ -277,6 +287,8 @@ pub struct SshExecBatchArgs {
     pub commands: Vec<String>,
 
     /// Halt the loop on the first non-zero exit code. Default: true.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     #[schemars(default = "default_stop_on_failure")]
     pub stop_on_failure: Option<bool>,
 
@@ -290,6 +302,8 @@ pub struct SshExecBatchArgs {
     pub max_output_bytes_per_command: Option<usize>,
 
     /// Allocate a PTY for each command. Default: false.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_pty")]
     pub pty: Option<bool>,
 }

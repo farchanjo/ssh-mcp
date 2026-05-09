@@ -151,6 +151,8 @@ pub struct SshShellOpenArgs {
 
     /// v5 Phase 3 — auto-release when the resource has zero
     /// subscribers. Default: false (legacy v4 behaviour).
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_release_when_no_subs")]
     pub release_when_no_subs: Option<bool>,
 
@@ -200,11 +202,15 @@ pub struct SshShellPressArgs {
     /// Apply Shift modifier. Default: false. Valid on: arrows,
     /// navigation keys, F1-F12, and `tab` (back-tab). See the `key` field
     /// for the full per-key policy.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_modifier")]
     pub shift: Option<bool>,
 
     /// Apply Alt modifier. Default: false. Valid on: arrows, navigation
     /// keys, and F1-F12. See the `key` field for the full per-key policy.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_modifier")]
     pub alt: Option<bool>,
 
@@ -212,6 +218,8 @@ pub struct SshShellPressArgs {
     /// keys, and F1-F12. Cannot be combined with `ctrl_*` keys (already a
     /// complete control byte). See the `key` field for the full per-key
     /// policy.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_modifier")]
     pub ctrl: Option<bool>,
 
@@ -230,6 +238,8 @@ pub struct SshShellReadArgs {
     /// Drain the bytes that were rendered (head-based pagination).
     /// Default: true. With false the buffer is preserved (peek mode) for
     /// inspecting the same window multiple times.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     #[schemars(default = "default_clear")]
     pub clear: Option<bool>,
 
@@ -243,6 +253,8 @@ pub struct SshShellReadArgs {
     /// the shell closes, or `wait_timeout_secs` expires. Default: false.
     /// Prefer `resources/subscribe shell://<shell_id>/output` (realtime
     /// push) over polling.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: false.
     #[schemars(default = "default_wait")]
     pub wait: Option<bool>,
 
@@ -285,6 +297,8 @@ pub struct SshShellWaitForArgs {
 
     /// Drain matched output from the shell history (head) after
     /// returning so subsequent reads start fresh. Default: true.
+    ///
+    /// Type: boolean (JSON `true` or `false` — NOT the strings `"true"`/`"false"`). Default: true.
     #[schemars(default = "default_clear")]
     pub clear: Option<bool>,
 }
