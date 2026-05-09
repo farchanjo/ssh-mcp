@@ -199,7 +199,7 @@ All 36 (or 35 without `port_forward`) MCP tools return a single markdown `Text<S
 - Output blocks use an 8-hex-char nonce per response: `--- stdout [a3f2b1d7] ---\n<content>\n--- stderr [a3f2b1d7] (empty) ---`.
 - Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: <one-sentence cure>` plus structured `{ tool, status: "error", code, reason, detail }`. Codes: [ADR 0007](docs/adr/0007-error-taxonomy.md) and [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook).
 
-The v4 / v5 markdown shape is byte-identical to v3 on the legacy text channel (verified by snapshot tests in `tests/v4_smoke.rs`).
+The v4 / v5 markdown shape is byte-identical to v3 on the legacy text channel (verified by snapshot tests in `tests/v4_smoke.rs`). Operators can silence the v4.7 JSON twin per process with `SSH_MCP_STRUCTURED_CONTENT=false` (markdown body and `is_error` flag stay unchanged).
 
 ### Configuration
 
