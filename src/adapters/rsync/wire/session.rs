@@ -27,10 +27,11 @@
 //! server -> client: u32 LE  checksum_seed
 //! ```
 //!
-//! ssh-mcp targets the modern stock rsync 3.2.x (protocol 31) — a
+//! ssh-mcp targets the modern stock rsync 3.2.x / 3.4.x (protocol 31+) — a
 //! superset whose handshake injects a server-emitted *`compat_flags`*
 //! varint between the version exchange and the seed. We pin
-//! [`RSYNC_PROTOCOL`] at 31 (per the ADR 0011 phase 8 brief) and
+//! [`RSYNC_PROTOCOL`] at 32 (v32, wire-identical to v31 — per the ADR 0011
+//! phase 8 brief plus the administrative v31→v32 bump in rsync 3.4.0) and
 //! tolerate the additional varint in [`handshake`]. Everything else in
 //! this module follows openrsync byte-for-byte.
 
@@ -41,12 +42,18 @@ use crate::domain::error::DomainError;
 
 /// Protocol version we advertise on the wire.
 ///
-/// Pinned at **31** for the slice-4 wire upgrade. openrsync's
-/// `extern.h::RSYNC_PROTOCOL` is 27; ssh-mcp's wire client targets the
-/// modern stock rsync 3.2.x so it must speak the protocol-30+ flist
-/// shape (16-bit `XMIT_EXTENDED_FLAGS` flag bytes, varint30/varlong30
-/// length fields). The lift from 27 to 31 happens in lockstep with
-/// the proto-30+ encoders/decoders in [`super::flist`].
+/// Pinned at **32** (v32, wire-identical to v31) to match the rsync 3.4.x
+/// administrative bump. openrsync's `extern.h::RSYNC_PROTOCOL` is 27;
+/// ssh-mcp's wire client targets the modern stock rsync 3.2.x so it must
+/// speak the protocol-30+ flist shape (16-bit `XMIT_EXTENDED_FLAGS` flag
+/// bytes, varint30/varlong30 length fields). The lift from 27 to 31
+/// happens in lockstep with the proto-30+ encoders/decoders in
+/// [`super::flist`]; the v31 → v32 step is a no-op wire change: rsync
+/// 3.4.0 incremented the protocol number as an administrative signal for
+/// the CVE-2024-12084..12088 + 12747 fixes, but introduced zero new wire
+/// branches or encoding changes. Negotiation against a v31 server
+/// (e.g. rsync 3.2.7) yields `min(32, 31) = 31`, preserving full
+/// backward compatibility.
 ///
 /// We still accept anything in `RSYNC_PROTOCOL_MIN..=RSYNC_PROTOCOL_MAX`
 /// from the peer; `min(local, remote)` becomes the negotiated value
@@ -58,8 +65,8 @@ use crate::domain::error::DomainError;
 /// (also `i32`, mirroring openrsync's `int32_t`) avoid lossy `as`
 /// casts. Wire serialisation uses [`i32::to_le_bytes`] directly —
 /// the byte representation is identical to the `u32` form for the
-/// non-negative protocol values we ever emit (27..=31).
-pub const RSYNC_PROTOCOL: i32 = 31;
+/// non-negative protocol values we ever emit (27..=32).
+pub const RSYNC_PROTOCOL: i32 = 32;
 
 /// Hard floor on the remote protocol version (= 27).
 ///
@@ -70,7 +77,7 @@ pub const RSYNC_PROTOCOL_MIN: i32 = 27;
 
 /// Soft ceiling on remote protocol versions we will negotiate down to
 /// without complaining. `min(local, remote)` is the negotiated value.
-pub const RSYNC_PROTOCOL_MAX: i32 = 31;
+pub const RSYNC_PROTOCOL_MAX: i32 = 32;
 
 /// Boundary at which the flist wire shape switches to the protocol-28+
 /// 16-bit `XMIT_EXTENDED_FLAGS` flag byte. Below this, the encoder
@@ -312,8 +319,8 @@ const fn compat_flags_extra_bytes(prefix: u8) -> usize {
 )]
 mod tests {
     use super::{
-        RSYNC_PROTOCOL, RSYNC_PROTOCOL_MAX, RSYNC_PROTOCOL_MIN, WireSession,
-        compat_flags_extra_bytes, handshake, protocol_supported,
+        MPLEX_FRAMING_MIN_PROTOCOL, RSYNC_PROTOCOL, RSYNC_PROTOCOL_MAX, RSYNC_PROTOCOL_MIN,
+        WireSession, compat_flags_extra_bytes, handshake, protocol_supported,
     };
     use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
     use crate::domain::error::DomainError;
@@ -338,11 +345,12 @@ mod tests {
     fn protocol_constants_are_in_range() {
         assert!(RSYNC_PROTOCOL >= RSYNC_PROTOCOL_MIN);
         assert!(RSYNC_PROTOCOL <= RSYNC_PROTOCOL_MAX);
-        // Slice-4 lifts the pinned local protocol to 31 so the flist
-        // wire shape matches stock rsync 3.2.x (16-bit
-        // XMIT_EXTENDED_FLAGS + varint30 length fields). Mplex framing
-        // is enabled because RSYNC_PROTOCOL >= 30.
-        assert_eq!(RSYNC_PROTOCOL, 31);
+        // Slice-4 lifts the pinned local protocol to 31 (proto-30+ flist
+        // wire shape: 16-bit XMIT_EXTENDED_FLAGS + varint30 length fields).
+        // Bumped to 32 in v7.0.1 — wire-identical to 31 (rsync 3.4.x
+        // administrative bump). Mplex framing is enabled because
+        // RSYNC_PROTOCOL >= 30.
+        assert_eq!(RSYNC_PROTOCOL, 32);
     }
 
     #[test]
@@ -350,10 +358,12 @@ mod tests {
         let lver = RSYNC_PROTOCOL;
         // Same version is fine.
         assert!(protocol_supported(lver, lver));
-        // Floor.
-        assert!(protocol_supported(lver, RSYNC_PROTOCOL_MIN));
-        // Below floor is not.
-        assert!(!protocol_supported(lver, RSYNC_PROTOCOL_MIN - 1));
+        // Effective floor is max(RSYNC_PROTOCOL_MIN, lver - 4).
+        // With lver=32: max(27, 28) = 28. proto 28+ must be accepted.
+        let effective_floor = RSYNC_PROTOCOL_MIN.max(lver - 4);
+        assert!(protocol_supported(lver, effective_floor), "effective floor {effective_floor} must be accepted");
+        // One below effective floor is rejected.
+        assert!(!protocol_supported(lver, effective_floor - 1), "below effective floor must be rejected");
         // Higher remote protocol is fine — `rver < lver` would only
         // be rejected if rver is below `lver - 4` per openrsync.
         assert!(protocol_supported(lver, lver + 5));
@@ -461,5 +471,31 @@ mod tests {
         let mut mw = MplexWriter::new(w);
         let err = handshake(&mut mr, &mut mw).await.expect_err("must err");
         assert!(matches!(err, DomainError::RsyncProtocolError(_)));
+    }
+
+    #[test]
+    fn handshake_succeeds_against_v32_server() {
+        // Proto 32 == proto 31 wire-identical (rsync 3.4.0 administrative bump).
+        // Local advertises 32, remote advertises 32 → negotiated = 32.
+        let mut sess = WireSession::new();
+        sess.lver = RSYNC_PROTOCOL;
+        sess.rver = 32;
+        sess.negotiated = sess.rver.min(sess.lver);
+        assert_eq!(sess.negotiated, 32, "lver=32 + rver=32 must negotiate to 32");
+        assert!(
+            sess.negotiated >= MPLEX_FRAMING_MIN_PROTOCOL,
+            "proto 32 must enable mplex framing (min {MPLEX_FRAMING_MIN_PROTOCOL})"
+        );
+    }
+
+    #[test]
+    fn handshake_downgrades_to_v31_against_legacy_server() {
+        // rsync 3.2.7 / aragog scenario: lver=32, rver=31 → negotiated=31.
+        // Verifies backward compat with all servers below 3.4.0.
+        let mut sess = WireSession::new();
+        sess.lver = RSYNC_PROTOCOL;
+        sess.rver = 31;
+        sess.negotiated = sess.rver.min(sess.lver);
+        assert_eq!(sess.negotiated, 31, "lver=32 + rver=31 must downgrade to 31");
     }
 }

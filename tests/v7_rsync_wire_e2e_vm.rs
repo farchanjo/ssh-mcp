@@ -17,11 +17,17 @@
 //!
 //! What this exercises (ADR 0011 v7.0.0-alpha.6):
 //!
+//! # Proto-32 upgrade TODO
+//!
+//! TODO(proto-32): once `aragog` (10.182.0.21) upgrades from rsync 3.2.7 to >= 3.4.0,
+//! add a proto-32 e2e gate that verifies negotiated=32 over a live wire transport.
+//! Today this suite verifies the lver=32 → rver=31 → negotiated=31 downgrade path.
+//!
 //! 1. Builds a synthetic **local** source tree of small files.
 //! 2. Drives the live [`WireRsyncTransport`] in **push** direction —
 //!    `rsync --server -e.LsfxC -r . <remote_dst>` over the russh
 //!    exec channel.
-//! 3. Asserts the v31 handshake → empty filter list → flist → io_error
+//! 3. Asserts the v31 handshake (negotiated from lver=32 down to rver=31) → empty filter list → flist → io_error
 //!    → generator request loop with `count == 0` (whole-file) → token
 //!    stream + MD5 trailer pipeline succeeds.
 //! 4. Verifies each pushed file landed byte-identical on the remote

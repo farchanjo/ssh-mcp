@@ -229,6 +229,22 @@ proptest! {
         }
     }
 
+    /// `prop_flist_round_trip_proto32`
+    ///
+    /// Same property at `negotiated=32` — confirms zero new wire branches
+    /// are introduced by the v31→v32 administrative bump. Output must be
+    /// byte-identical to proto-31 because rsync 3.4.x made no encoding
+    /// changes.
+    #[test]
+    fn prop_flist_round_trip_proto32(entries in arb_flist_vec()) {
+        let decoded = run_async(flist_round_trip(&entries, 32));
+        prop_assert_eq!(decoded.len(), entries.len(), "entry count drift at proto 32");
+        for (i, (got, want)) in decoded.iter().zip(entries.iter()).enumerate() {
+            assert_flist_equal(got, want)
+                .map_err(|e| TestCaseError::fail(format!("entry {i} (proto 32): {e}")))?;
+        }
+    }
+
     /// `prop_flist_round_trip_proto27`
     ///
     /// Same property against the legacy 8-bit `FLIST_*` wire shape

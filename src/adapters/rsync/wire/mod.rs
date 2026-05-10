@@ -2,7 +2,7 @@
 //! Wire-compat rsync transport — openrsync-faithful port (ADR 0011 phase 8).
 //!
 //! Drives a remote `rsync --server` process over an existing russh
-//! exec channel and speaks rsync wire protocol v31. The handshake +
+//! exec channel and speaks rsync wire protocol v32 (downgrades to v31). The handshake +
 //! mplex framing layers are direct ports of OpenBSD's `openrsync`
 //! (ISC license — see [`LICENSES/openrsync-ISC.txt`]).
 //!
@@ -127,7 +127,7 @@ const DEFAULT_LANE_CAPACITY: usize = 256;
 /// [`WireRsyncTransport::with_registry`]. Slice 3 has the live wire
 /// transport but the stub path is still surfaced when the composition
 /// root cannot wire a registry (e.g. unit tests / fixtures).
-const STUB_DETAIL: &str = "Wire transport (rsync v31 wire-compat) is being implemented; pass transport=Sftp for the SFTP fallback or wait for the next slice";
+const STUB_DETAIL: &str = "Wire transport (rsync v32 wire-compat, downgrades to v31) is being implemented; pass transport=Sftp for the SFTP fallback or wait for the next slice";
 
 /// Hard deadline on the per-session task. Slice 3 transfers a single
 /// small file end-to-end; the cap stays generous so a hung server
