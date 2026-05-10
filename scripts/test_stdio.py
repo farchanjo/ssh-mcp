@@ -27,8 +27,8 @@ def test_stdio_initialize_returns_server_info(stdio_client: McpClient) -> None:
     assert info.get("protocolVersion") == "2025-06-18"
 
 
-def test_stdio_tools_list_returns_v47_catalogue(stdio_client: McpClient) -> None:
-    """v4.7 advertises 21 tools (20 without the `port_forward` Cargo feature).
+def test_stdio_tools_list_returns_v7_catalogue(stdio_client: McpClient) -> None:
+    """v7.0.1 advertises 39 tools (38 without `port_forward` Cargo feature).
 
     The catalogue grew by 3 over v4.6: ``ssh_run``, ``ssh_execute_batch``,
     and ``ssh_disconnect_many``. This test asserts both the headline count
@@ -37,7 +37,7 @@ def test_stdio_tools_list_returns_v47_catalogue(stdio_client: McpClient) -> None
     """
     tools = stdio_client.list_tools()
     names = {t["name"] for t in tools}
-    assert len(tools) in {20, 21}, f"expected 20 or 21 tools, got {len(tools)}: {sorted(names)}"
+    assert len(tools) in {38, 39}, f"expected 38 or 39 tools, got {len(tools)}: {sorted(names)}"
     # v4.7 additions
     assert "ssh_run" in names
     assert "ssh_exec_batch" in names
