@@ -2,7 +2,8 @@
 //!
 //! v7.0.0-alpha.2 architectural retrenchment: the deployed-agent path
 //! was retracted. The use case now selects between two integrated
-//! transports — `Wire` (rsync v31 wire-compat client) and `Sftp`
+//! transports — `Wire` (rsync v31+ wire-compat client; local advertises
+//! v32, downgrades to v31 against legacy rsync 3.2.x) and `Sftp`
 //! (universal SFTP fallback) — both implementing the same
 //! [`RsyncTransportPort`]. Auto mode probes the remote and prefers
 //! Wire when rsync >= v31 is present, otherwise routes to Sftp.
@@ -45,9 +46,10 @@ pub enum RsyncTransportSelection {
     /// Probe the remote and prefer wire-compat; fall back to SFTP.
     #[default]
     Auto,
-    /// Force the wire-compat client (rsync v31+). Returns
-    /// `RsyncVersionTooOld` when the remote rsync is missing or
-    /// older.
+    /// Force the wire-compat client (rsync v31+; local negotiates v32,
+    /// downgrades to v31 against legacy servers). Returns
+    /// `RsyncVersionTooOld` when the remote rsync is missing or older
+    /// than v3.2.0 (protocol < 31).
     Wire,
     /// Skip the probe; drive the SFTP fallback path.
     Sftp,
@@ -56,7 +58,7 @@ pub enum RsyncTransportSelection {
 /// Active transport tier reported back to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsyncTransportPicked {
-    /// Wire-compat client over rsync v31.
+    /// Wire-compat client over rsync v31+ (local advertises v32).
     Wire,
     /// Universal SFTP fallback.
     Sftp,
@@ -170,7 +172,7 @@ where
     Idg: IdGeneratorPort + 'static,
     Cfg: ConfigPort + 'static,
 {
-    /// Wire-compat transport adapter (rsync v31).
+    /// Wire-compat transport adapter (rsync v31+; local advertises v32).
     pub wire: Arc<W>,
     /// SFTP fallback transport adapter.
     pub sftp: Arc<Sf>,
@@ -577,7 +579,7 @@ where
         match caps.rsync_protocol {
             Some(v) if v >= 31 => Ok(RsyncTransportPicked::Wire),
             Some(v) => Err(DomainError::RsyncVersionTooOld(format!(
-                "remote rsync protocol={v}; need >= 31"
+                "remote rsync protocol={v}; need >= 31 (local advertises v32)"
             ))),
             None => Err(DomainError::RsyncVersionTooOld(
                 "remote rsync missing or unparseable; install rsync >= 3.2.0 or pass transport=Sftp".to_string(),

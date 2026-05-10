@@ -807,8 +807,9 @@ After all four fixes, the Python integration suite (`scripts/test_v7_rsync_http.
 
 The openrsync port follows OpenBSD's protocol-27-pinned shape; rsync 3.2.x demands a strict superset for protocol 31 negotiation. Each deviation below is documented inline in the source.
 
-| Area | openrsync canon | Our port (proto 31) | Reason |
+| Area | openrsync canon | Our port (proto 31/32) | Reason |
 |---|---|---|---|
+| `RSYNC_PROTOCOL` constant | 27 | **32** (was 31; bumped to match rsync 3.4.x administrative signal — wire-format identical to 31; negotiates down to 31 against rsync 3.2.x servers) | rsync 3.4.0 incremented the protocol number as part of CVE-2024-12084..12088 + 12747 fixes; zero new wire branches |
 | Flist flag width | 8-bit `FLIST_*` | 16-bit `XMIT_*` (`XMIT_EXTENDED_FLAGS = 0x04` always set in the low byte) | rsync server enforces 16-bit form at proto >= 28 |
 | File size / mtime / uid / gid | i32 / i64 sentinel pairs | varint30 / varlong30 (`io.c::read_varint` + 64-entry byte-extra table) | proto >= 30 wire encoding |
 | Per-file checksum | MD4 with seed prepended (`MD4(seed_le \|\| file_bytes)`) | MD5 plain (`MD5(file_bytes)`, no seed) at proto >= 30 | `checksum.c::parse_csum_name` `CSUM_MD5` arm |
