@@ -161,6 +161,24 @@ def parse_block(text: str) -> dict:
         if short_key in result and long_key not in result:
             result[long_key] = result[short_key]
 
+    # SSH_TRANSFER_PROGRESS convenience aliases.
+    # Wire format: "SSH_TRANSFER_PROGRESS: RUNNING" + "PROGRESS: n/total bytes".
+    # Tests address these via `status`, `bytes_transferred`, `total_bytes`.
+    if result.get("__tool") == "SSH_TRANSFER_PROGRESS":
+        if "status" not in result and "__status" in result:
+            result["status"] = result["__status"].lower()
+        if "bytes_transferred" not in result or "total_bytes" not in result:
+            progress_raw = result.get("progress") or ""
+            # Match: "23% (1234567/5242880 bytes)" or "1234567/5242880 bytes"
+            m = re.search(r"(\d+)\s*/\s*(\d+)", progress_raw)
+            if m:
+                bt = int(m.group(1))
+                tb = int(m.group(2))
+                if "bytes_transferred" not in result:
+                    result["bytes_transferred"] = bt
+                if "total_bytes" not in result:
+                    result["total_bytes"] = tb
+
     return result
 
 
@@ -201,7 +219,7 @@ def _hydrate_lists(result: dict, bullets: list[str]) -> None:
                     entry[k.strip()] = v.strip()
             sessions.append(entry)
         result["sessions"] = sessions
-    elif tool == "SSH_LIST_COMMANDS":
+    elif tool in ("SSH_LIST_COMMANDS", "SSH_COMMANDS"):
         commands: list[dict] = []
         for item in bullets:
             match = re.match(
