@@ -8,13 +8,16 @@
 //!
 //! ## Templates
 //!
-//! Five entries are advertised; the [`build_list`] helper returns four when
+//! Six entries are advertised; the [`build_list`] helper returns five when
 //! the `port_forward` Cargo feature is disabled (no `forward://` stream).
+//! The `serial://` template was added in v5.2 (ADR 0009) and is always
+//! advertised regardless of `port_forward`.
 //!
 //! - `shell://{shell_id}/output{?cursor}`
 //! - `command://{command_id}/output{?cursor}`
 //! - `transfer://{transfer_id}/progress`
 //! - `session://{session_id}/health`
+//! - `serial://{serial_id}/output{?cursor}` *(always advertised; v5.2)*
 //! - `forward://{forward_id}/events{?cursor}` *(feature `port_forward`)*
 //!
 //! Each template's `uri_template` follows RFC 6570 form-style query
