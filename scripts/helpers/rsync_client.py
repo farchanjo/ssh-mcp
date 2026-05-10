@@ -13,12 +13,12 @@ Notes on the v7.0 SFTP-transport surface (matters for assertions):
 - Progress notifications fire on ``rsync://<RSYNC_ID>/progress`` —
   but the snapshot the lane carries is rebuilt on every read from the
   domain aggregate's atomic counters.
-- Today (v7.0.0-alpha.4) the SFTP transport's status field can stay
-  at ``pending`` even after the bytes have landed; tests that need to
-  verify completion should also check the destination filesystem.
-- The Wire transport surfaces ``RSYNC_PROTOCOL_ERROR`` until slice 3
-  lands — ``transport=wire`` calls against a real rsync remote are
-  expected to error with that code on most VMs.
+- v7.0.1 SFTP transport status flips to ``completed`` on success; some
+  local-FS adapter cases still return ``pending`` (see ADR 0011). Tests
+  that need to verify completion should also check the destination filesystem
+  as a defensive fallback.
+- The Wire transport (RSYNC_PROTOCOL=32) completes byte-identical against
+  rsync 3.2.7 via min(local, remote)=31 protocol negotiation.
 """
 
 from __future__ import annotations
