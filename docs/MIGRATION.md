@@ -866,7 +866,7 @@ Operational follow-on:
 
 ## v6.1 → v7.0
 
-For **MCP host operators, contributors, and downstream automations** moving from v6.1 to v7.0. **Wire-additive on the MCP surface** — the existing 36 tool catalogue is unchanged. Three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) and a new `rsync://<id>/progress` resource scheme go live in v7.0. Two integrated transports ship in-process inside the host crate: `WireRsyncTransport` (canonical port of OpenBSD `openrsync` speaking rsync wire protocol v31 against a remote `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback). Both are live for the supported feature set; push and pull both byte-identical against `rsync 3.2.7` on a real Linux VM. Reference: [ADR 0011 — rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
+For **MCP host operators, contributors, and downstream automations** moving from v6.1 to v7.0. **Wire-additive on the MCP surface** — the existing 36 tool catalogue is unchanged. Three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) and a new `rsync://<id>/progress` resource scheme go live in v7.0. Two integrated transports ship in-process inside the host crate: `WireRsyncTransport` (canonical port of OpenBSD `openrsync` speaking rsync wire protocol v32 against a remote `rsync --server`; advertises v32, negotiates to v31 against rsync 3.x) and `SftpRsyncTransport` (universal SFTP fallback). Both are live for the supported feature set; push and pull both byte-identical against `rsync 3.2.7` on a real Linux VM. Reference: [ADR 0011 — rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
 
 ### v7.0.0 — final
 
