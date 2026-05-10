@@ -20,15 +20,14 @@ must xfail with ``RSYNC_NOT_FOUND`` / ``RSYNC_VERSION_TOO_OLD``.
 
 Notes on assertions:
 
-- ``files_total`` / ``files_done`` counters often stay at ``0`` on the
-  v7.0.0-alpha.4 SFTP path even after the bytes have landed (the SFTP
-  transport does not yet update the domain aggregate's atomic
-  counters from its background pump). Tests assert on the destination
-  filesystem state rather than counters.
-- ``status`` similarly can stay at ``pending`` on the SFTP path. The
-  lane fires notifications, but the snapshot status field is not
-  driven through to ``completed`` yet. Tests treat non-terminal status
-  as acceptable when the destination FS shows the expected files.
+- ``files_total`` / ``files_done`` counters are updated atomically by the
+  v7.0.1 SFTP transport. Tests assert on the destination filesystem state
+  as the primary signal; counter assertions are supplemental.
+- ``status`` flips to ``completed`` on the v7.0.1 SFTP transport happy path.
+  The ``_wait_terminal_or_files`` helper accepts ``pending`` + files-present
+  as a defensive fallback for edge cases (e.g., local-FS adapter boundary
+  conditions per ADR 0011), but ``status == "completed"`` is the expected
+  outcome in all covered scenarios.
 """
 
 from __future__ import annotations
@@ -95,10 +94,14 @@ def _wait_terminal_or_files(
     """Drive the SFTP-path completion check.
 
     Polls ``ssh_rsync_stats`` AND the destination filesystem until either
-    the snapshot status flips to a terminal value OR every expected
-    file has shown up on disk. Returns the final observed status — which
-    may still be ``pending`` on the v7.0.0-alpha.4 SFTP path even when
-    every file has landed (see the file's module docstring).
+    the snapshot status flips to a terminal value OR every expected file has
+    shown up on disk. Returns the final observed status.
+
+    Defensive: accepts ``pending`` + files-present as a fallback. In v7.0.1
+    the happy path is ``status == "completed"`` (SFTP transport properly
+    drains the progress lane and flips status — commits bfc68c6 + 4fb0b35).
+    The ``pending`` branch handles residual edge cases in local-FS adapter
+    scenarios (see ADR 0011).
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

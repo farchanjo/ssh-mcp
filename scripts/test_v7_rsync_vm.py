@@ -19,10 +19,9 @@ Coverage:
   follow-up ``ssh_exec`` running ``sha256sum``).
 - SFTP transport: pull from a pre-staged remote tree and verify
   byte-identical sha256 locally.
-- Wire transport: against a real ``rsync 3.2.7`` peer, the slice-3
-  in-progress wire client surfaces ``RSYNC_PROTOCOL_ERROR``. The test
-  marks ``xfail(strict=False)`` so the moment slice 3 lands the test
-  flips to passing without further edits.
+- Wire transport: the wire client (RSYNC_PROTOCOL=32) produces byte-identical
+  output against rsync 3.2.7 via min(local, remote)=31 negotiation. The test
+  asserts ``terminal == "completed"`` as the v7.0.1 happy path.
 - SFTP transport supports a session that v7 wire does not (no rsync
   binary on PATH) — drive a session pointing at ``transport=auto`` and
   munge ``PATH`` so the probe sees no rsync; assert the session lands
@@ -198,18 +197,12 @@ def _remote_dir(suffix: str) -> str:
 
 @pytest.mark.timeout(120)
 @pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport architectural limitation: the "
-    "transport walks both `src` and `dst` through the same `RsyncSftpFsPort` "
-    "(see ADR 0011 v7.0.0-alpha.4 SFTP slice doc + tests/v7_rsync_e2e_vm.rs "
-    "fixture). When `src` is a local path (the test passes "
-    "`tmp_path / 'src'`) and `dst` is remote, the SFTP-side `readdir(src)` "
-    "is issued against the OpenSSH sftp-server which has no view of the "
-    "local FS — the walker yields zero entries and the comparator emits no "
-    "transfer actions. A local-FS adapter implementing `RsyncSftpFsPort` is "
-    "deferred to a follow-up slice (the `tests/v7_rsync_e2e_vm.rs` happy "
-    "path stages BOTH ends remotely as a workaround). Once the local-FS "
-    "adapter lands the use case can dispatch per-side, and this test will "
-    "exercise the canonical local-source -> remote-dst push path.",
+    reason="v7.0.1 SFTP transport architectural limitation: local-FS adapter "
+    "not shipped (deferred to v7.1). The transport walks both `src` and `dst` "
+    "through the same `RsyncSftpFsPort`; when `src` is a local path the "
+    "SFTP-side `readdir(src)` is issued against the OpenSSH sftp-server which "
+    "has no view of the local FS — the walker yields zero entries and the "
+    "comparator emits no transfer actions.",
     strict=False,
 )
 def test_rsync_vm_sftp_push_3_files_byte_identical(
@@ -270,11 +263,11 @@ def test_rsync_vm_sftp_push_3_files_byte_identical(
 
 @pytest.mark.timeout(120)
 @pytest.mark.xfail(
-    reason="v7.0.0-alpha.8 SFTP transport architectural limitation: same "
-    "root cause as `test_rsync_vm_sftp_push_3_files_byte_identical` — the "
-    "transport walks both ends through `RsyncSftpFsPort`, so a remote-src "
-    "+ local-dst pull cannot read the local destination tree to compare "
-    "against. Deferred to the follow-up slice that adds a local-FS adapter.",
+    reason="v7.0.1 SFTP transport architectural limitation: local-FS adapter "
+    "not shipped (deferred to v7.1). Same root cause as "
+    "`test_rsync_vm_sftp_push_3_files_byte_identical` — the transport walks "
+    "both ends through `RsyncSftpFsPort`, so a remote-src + local-dst pull "
+    "cannot read the local destination tree to compare against.",
     strict=False,
 )
 def test_rsync_vm_sftp_pull_3_files_byte_identical(
@@ -347,7 +340,7 @@ def test_rsync_vm_sftp_pull_3_files_byte_identical(
 
 
 # ---------------------------------------------------------------------------
-# 3. Wire transport against real rsync 3.2.7 — slice 3 still landing
+# 3. Wire transport against real rsync 3.2.7 — byte-identical (v7.0.1)
 # ---------------------------------------------------------------------------
 
 
@@ -382,8 +375,8 @@ def test_rsync_vm_wire_push_against_real_rsync(
                 break
             time.sleep(0.3)
 
-        # Slice 3 not landed: terminal must be `failed` or `cancelled`.
-        # Once slice 3 lands, this should be `completed`.
+        # v7.0.1 wire transport completes byte-identical against rsync 3.2.7
+        # — terminal must be `completed` (min(local=32, remote=31)=31 negotiation).
         assert terminal == "completed", terminal
         # If we reach `completed`, verify the file landed remotely.
         out = _exec_remote(vm_stdio_client, sid, f"ls -1 {shlex.quote(remote_dst)}")
@@ -608,10 +601,9 @@ def test_rsync_vm_auto_transport_picks_wire_when_rsync_present(
     """The VM has rsync 3.2.7 on PATH — ``transport=auto`` MUST resolve
     to the Wire transport per ADR 0011 § "Transport selection".
 
-    The Wire client may then surface ``RSYNC_PROTOCOL_ERROR`` (slice 3
-    not landed) — that's a separate concern. This test pins the
-    PROBE outcome and TRANSPORT-FIELD response, regardless of whether
-    the wire-side machinery completes.
+    v7.0.1: the Wire client completes byte-identical via min(32, 31)=31
+    protocol negotiation against rsync 3.2.7. This test pins the PROBE
+    outcome and TRANSPORT-FIELD response.
     """
     src = tmp_path / "auto-src"
     _make_tree(src, {"a.txt": b"auto"})
@@ -624,13 +616,17 @@ def test_rsync_vm_auto_transport_picks_wire_when_rsync_present(
             src=str(src), dst=remote_dst, transport="auto", timeout=30.0
         )
         parsed = parse_block(text)
-        # transport=auto either succeeds with TRANSPORT: wire (probe ok)
-        # OR error with RSYNC_PROTOCOL_ERROR (probe ok, slice-3 boundary).
+        # transport=auto resolves to Wire when rsync 3.2.7 is present (v7.0.1
+        # happy path). The elif branch is kept as a defensive fallback — if the
+        # VM is offline or lacks a compatible rsync binary the test degrades
+        # gracefully rather than erroring; RSYNC_PROTOCOL_ERROR /
+        # RSYNC_VERSION_TOO_OLD are not normal outcomes against rsync 3.2.7.
         if parsed.get("__status") == "STARTED":
             assert parsed.get("transport") == "wire", parsed
             assert structured is not None
             assert structured.get("transport") == "wire", structured
         elif parsed.get("__status") == "ERROR":
+            # Fallback path: VM offline / rsync not found / version mismatch.
             assert structured is not None
             assert structured.get("code") in {
                 "RSYNC_PROTOCOL_ERROR",
