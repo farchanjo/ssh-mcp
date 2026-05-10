@@ -1,6 +1,6 @@
 # SSH MCP Architecture (v7.0 — rsync hybrid transport on subscribe-first hexagonal)
 
-Architecture of the SSH Model Context Protocol (MCP) server on `master` (v7.0.0). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with seven layered deltas stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged), the **SFTP resume + verify** primitive ([ADR 0010](./adr/0010-sftp-resume.md), v6.1 — merged), and the **rsync hybrid transport** ([ADR 0011](./adr/0011-rsync-hybrid-transport.md), v7.0 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos, and v7.0 adds 3 rsync tools (39 tools / 38 without `port_forward`).
+Architecture of the SSH Model Context Protocol (MCP) server on `master` (v7.0.1). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with seven layered deltas stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged), the **SFTP resume + verify** primitive ([ADR 0010](./adr/0010-sftp-resume.md), v6.1 — merged), and the **rsync hybrid transport** ([ADR 0011](./adr/0011-rsync-hybrid-transport.md), v7.0 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos, and v7.0 adds 3 rsync tools (39 tools / 38 without `port_forward`).
 
 Version trail (one line each):
 
@@ -537,7 +537,7 @@ flowchart TB
 
 ## Phase 5 — Rsync hybrid transport (v7.0 final)
 
-ADR: [adr/0011-rsync-hybrid-transport.md](./adr/0011-rsync-hybrid-transport.md). Two-tier transport behind a single `ssh_rsync` MCP tool. Both transports live in-process inside the host crate (workspace is a single package). `WireRsyncTransport` is a canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v31 against a remote `rsync --server` over the existing russh exec channel. `SftpRsyncTransport` is the universal fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat` (no remote helper). Both are live for the supported feature set; push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM.
+ADR: [adr/0011-rsync-hybrid-transport.md](./adr/0011-rsync-hybrid-transport.md). Two-tier transport behind a single `ssh_rsync` MCP tool. Both transports live in-process inside the host crate (workspace is a single package). `WireRsyncTransport` is a canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v32 (advertised; negotiates to v31 against rsync 3.x) against a remote `rsync --server` over the existing russh exec channel. `SftpRsyncTransport` is the universal fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat` (no remote helper). Both are live for the supported feature set; push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM.
 
 The transports ride the existing russh session via the shared `SshHandleRegistry` — one handshake per host, one channel per sync, zero new `Mutex` on the hot path. The progress lane registers under `rsync://<id>/progress` exactly like every other v5 push resource.
 
@@ -555,7 +555,7 @@ The transports ride the existing russh session via the shared `SshHandleRegistry
 | Ports | `RsyncRepository` | `ports/rsync_repo.rs` | AFIT — `insert`, `insert_if_under_cap`, `get`, `remove`, `count_by_session`, `list_filtered`. |
 | Ports | `RsyncSftpFsPort` | `ports/rsync_sftp_fs.rs` | AFIT — `readdir`, `lstat`, `read_link`, `mkdir`, `rmdir`, `remove_file`, `symlink`, `set_metadata`, `read_chunk`, `write_chunk`. Narrow remote-fs slice distinct from the legacy `SftpClientPort`. |
 | Application | `RsyncSyncUseCase` | `application/rsync_sync.rs` | Generic over `W: RsyncTransportPort` (wire) + `Sf: RsyncTransportPort` (sftp) + `Sfs: RsyncSftpFsPort` (probe) + `R: RsyncRepository` + `SR: SessionRepository` + `Ssh: SshClientPort` + `Idg` + `Cfg`. Drives probe + select + start + register, then `spawn_progress_pump` (one `tokio::spawn` per session) to fold `RsyncProgressEvent` into the `RsyncSession` aggregate. The pump exits on `SyncCompleted` / `SessionFailed` (terminal events) or marks `Failed` on lane close / transport error. Lock-free: zero new `Mutex`; the spawned task owns its `recv_event` future end-to-end. The probe runs the rsync version `ssh_exec` directly through `SshClientPort::execute`. The SFTP capability probe (`mkdir + setstat + symlink`) is cached per-session in a `DashMap<SessionId, SftpFeatures>`. |
-| Adapters | `WireRsyncTransport` | `adapters/rsync/wire/` | Tier 1 transport. Drives `rsync --server` over the russh exec channel speaking protocol v31. Sub-modules: `session.rs` (handshake), `io.rs` (mplex framing), `flist.rs` (file-list codec + local walker), `blocks.rs` (block-checksum codec), `hash.rs` (Adler32 + MD4 + MD5 kernels), `tokens.rs` (literal/EOF/match token stream), `match_.rs` (block-match Adler32 hashtable + sliding window), `ndx.rs` (file-index codec), `sender.rs` (multi-phase `send_files`), `receiver.rs` (downloader + atomic rename + tempfile staging). |
+| Adapters | `WireRsyncTransport` | `adapters/rsync/wire/` | Tier 1 transport. Drives `rsync --server` over the russh exec channel speaking protocol v32 (negotiates to v31 against remote). Sub-modules: `session.rs` (handshake), `io.rs` (mplex framing), `flist.rs` (file-list codec + local walker), `blocks.rs` (block-checksum codec), `hash.rs` (Adler32 + MD4 + MD5 kernels), `tokens.rs` (literal/EOF/match token stream), `match_.rs` (block-match Adler32 hashtable + sliding window), `ndx.rs` (file-index codec), `sender.rs` (multi-phase `send_files`), `receiver.rs` (downloader + atomic rename + tempfile staging). |
 | Adapters | `SftpRsyncTransport` | `adapters/rsync/sftp/` | Tier 2 transport. Sub-modules: `walker.rs` (BFS over `readdir`), `comparator.rs` (sync-action derivation), `executor.rs` (action apply + per-file event emission), `bwlimit.rs` (token bucket), `probe.rs` (capability probe). |
 | Adapters | `RusshRsyncSftpFs` | `adapters/sftp/rsync_fs_impl.rs` | Production `RsyncSftpFsPort` impl over the shared russh-sftp session. Honours OpenSSH's `SSH_FXP_SYMLINK` argument-order quirk. |
 | Adapters | `FakeRsyncTransport` + `FakeRsyncSftpFs` | `adapters/rsync/{fake.rs, sftp/fake.rs}` | Test-only fakes (gated `test-fixtures`). Used by `tests/v7_rsync_smoke.rs` + property strategies. |
@@ -607,7 +607,7 @@ The wire driver task feeds `RsyncProgressEvent` over a per-session `mpsc::Sender
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
-    H["handshake<br/>(proto 27 → 31)"]
+    H["handshake<br/>(proto 27 → 32)"]
     F["gen_flist_local<br/>(BFS + sort)"]
     SF["send_flist<br/>(16-bit XMIT + varint30/varlong30)"]
     SS["sender state machine<br/>(per-file request loop +<br/>multi-phase send_files +<br/>final NDX_DONE)"]
@@ -637,7 +637,7 @@ flowchart LR
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
-    H["handshake<br/>(proto 27 → 31)"]
+    H["handshake<br/>(proto 27 → 32)"]
     R["recv_flist<br/>(post-sort indices +<br/>IO_ERROR_ENDLIST)"]
     BS["request blocksets<br/>(null_sum whole-file<br/>or local block sigs)"]
     CT["consume tokens<br/>(literal / match)<br/>+ tempfile staging"]
@@ -717,8 +717,8 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 |------------|--------|
 | `tools/list` | 39 tools registered (38 without `port_forward`); every tool advertises a typed `outputSchema` |
 | `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
-| `resources/list` | 6 schemes (`shell`, `command`, `transfer`, `session`, `forward`, `serial`) — see [RESOURCES.md](./RESOURCES.md) |
-| `resources/read` | All 6 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` / `serial` |
+| `resources/list` | 7 schemes (`shell`, `command`, `transfer`, `session`, `forward`, `serial`, `rsync`) — see [RESOURCES.md](./RESOURCES.md) |
+| `resources/read` | All 7 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` / `serial` |
 | `resources/subscribe` + `resources/unsubscribe` | Per `(SubId, Uri)` cursor in v5; `(PeerId, Uri)` synthesised for legacy hosts |
 | `notifications/resources/updated` | Emitted by the per-resource debouncer task |
 | `notifications/resources/list_changed` | Capability advertised; emission still deferred (tracked under [Future work](#future-work)) |
