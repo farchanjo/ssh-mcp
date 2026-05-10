@@ -8,7 +8,7 @@ This checklist is the gate every pull request must satisfy before it is merged. 
 - [ ] `cargo build --release --no-default-features` succeeds clean (no `port_forward`).
 - [ ] `cargo fmt --all -- --check` passes.
 - [ ] `cargo clippy --release --all-features --all-targets --workspace -- -D warnings` passes.
-- [ ] `cargo test --lib --quiet` passes (1966 tests).
+- [ ] `cargo test --lib --quiet` passes (1986 tests).
 - [ ] `cargo test --tests --features test-fixtures --quiet` passes (134 tests).
 - [ ] No `#[allow(...)]` added without a `reason = "..."` justification.
 - [ ] No `unwrap()` / `expect()` outside `#[cfg(test)]` modules.
