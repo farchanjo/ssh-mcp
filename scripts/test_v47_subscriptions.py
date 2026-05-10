@@ -1149,12 +1149,31 @@ def test_s19_structured_content_meta_cross_link(stdio_client: McpClient, ssh_tar
 # ---------------------------------------------------------------------------
 
 
-def test_s20_progress_and_resources_updated_do_not_collide(stdio_client: McpClient, ssh_target) -> None:
+def test_s20_progress_and_resources_updated_do_not_collide(ssh_target) -> None:
     """Subscribe to a command:// URI AND drive a long-running
     ssh_get_command_output(wait=true) with `_meta.progressToken`. Both
     notification streams must arrive without dropping or interleaving
     incorrectly.
+
+    v7.0.1 raised SSH_NOTIFY_DEBOUNCE_MS (200→1000ms) and
+    SSH_NOTIFY_FORCE_FLUSH_MS (1000→5000ms).  The test spawns its own
+    stdio client with the tighter v5 defaults so push notifications
+    arrive before the 12-second deadline.
     """
+    client = _new_stdio_client(
+        {
+            "SSH_NOTIFY_DEBOUNCE_MS": "200",
+            "SSH_NOTIFY_FORCE_FLUSH_MS": "1000",
+        }
+    )
+    try:
+        _run_s20(client, ssh_target)
+    finally:
+        client.close()
+
+
+def _run_s20(stdio_client: McpClient, ssh_target) -> None:  # noqa: PLR0912
+    """Inner body of test_s20 (separated so the client lifetime is managed by the caller)."""
     sid = _connect(stdio_client, ssh_target, agent="s20")
     try:
         text = call_tool_text(

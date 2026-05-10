@@ -66,8 +66,12 @@ def test_subscribe_hint_mentions_flush_bytes_knob(flush_bytes_http_server):
     debounce and byte-threshold knobs in its `HINT: RECOMMENDED` line so
     LLM hosts know which budget governs their first push."""
     _proc, port = flush_bytes_http_server
-    transport = HttpTransport(host="127.0.0.1", port=port)
-    with McpClient(transport) as client:
+    # HttpTransport takes base_url as a positional arg; McpClient has no
+    # context-manager support in v7.0.1 — use explicit initialize/close.
+    transport = HttpTransport(f"http://127.0.0.1:{port}")
+    client = McpClient(transport)
+    client.initialize()
+    try:
         # Subscribe to a synthetic resource. The server happily mints a
         # SubId for any URI; the wire shape (HINT line) is what we
         # assert here, not the resource liveness.
@@ -76,13 +80,22 @@ def test_subscribe_hint_mentions_flush_bytes_knob(flush_bytes_http_server):
             "sub_open",
             {"uri": "command://placeholder/output"},
         )
-        assert "SSH_SUBSCRIBE" in body, body
+        # v7.0.1 renamed the tool from ssh_subscribe to sub_open; the header
+        # changed accordingly from SSH_SUBSCRIBE to SUB_OPEN.
+        assert "SUB_OPEN" in body or "SSH_SUBSCRIBE" in body, body
         # New v5.1 HINT line: must mention both knobs explicitly.
         assert "SSH_NOTIFY_FLUSH_BYTES" in body, body
         assert "SSH_NOTIFY_DEBOUNCE_MS" in body, body
         # Local-sleep guidance: must steer the LLM away from MCP-tool
         # sleep loops.
         assert "Do NOT use any MCP tool as a sleep" in body, body
-        # Specific sleep examples for both shells.
+        # PowerShell sleep example must be present.
         assert "Start-Sleep -Milliseconds" in body, body
-        assert "sleep 0.05" in body, body
+        # Unix sleep example — v7.0.1 updated the suggested cadence from
+        # 0.05s to 0.2s/0.5s; accept any sub-1s sleep value in the HINT.
+        import re as _re
+        assert _re.search(r"sleep\s+0\.\d+", body), (
+            "expected a sub-second 'sleep N.N' example in body", body
+        )
+    finally:
+        client.close()
