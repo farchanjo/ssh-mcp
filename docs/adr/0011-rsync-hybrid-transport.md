@@ -7,7 +7,7 @@
 Both transports are live for the supported feature set:
 
 - **`SftpRsyncTransport`** — universal SFTP fallback (recursive mirror, dry-run, `--delete`, exclude/include, attribute preservation gated on a per-session `SftpFeatures` capability probe). Verified against a real Linux VM via `tests/v7_rsync_e2e_vm.rs`.
-- **`WireRsyncTransport`** — canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v31 against a remote `rsync --server`. Push + pull both byte-identical against `rsync 3.2.7`. Slices 1–10 merged; slices 11–12 (`-c` checksum delta over the wire-format extension and `-H` hardlinks) deferred to v7.1+ — see [Final slice status](#final-slice-status).
+- **`WireRsyncTransport`** — canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v32 (negotiates down to v31 against rsync 3.2.x servers) against a remote `rsync --server`. Push + pull both byte-identical against `rsync 3.2.7`. Slices 1–10 merged; slices 11–12 (`-c` checksum delta over the wire-format extension and `-H` hardlinks) deferred to v7.1+ — see [Final slice status](#final-slice-status).
 
 The original v7.0 plan (deployed-agent transport with cross-compiled binaries and SFTP self-deploy) was retracted in v7.0.0-alpha.2 in favour of "tudo integrado" — both transports live in-process inside the host crate. See [Architectural retrenchment](#v700-alpha2--architectural-retrenchment-appendix) for the deletions.
 
@@ -833,7 +833,7 @@ Zero new `Mutex<T>` on hot paths landed across the v7.0 cycle. The single docume
 
 | Surface | Counts | Notes |
 |---|---|---|
-| Library tests | 1966 passing (release build, deterministic) | Includes the rsync transport, value objects, use case, and rendering layers. |
+| Library tests | 1986 passing (release build, deterministic) | Includes the rsync transport, value objects, use case, and rendering layers. |
 | Integration smoke (`tests/v7_rsync_smoke.rs`) | 9 tests | Transport selection, capability gates, cancel idempotency, both-transport drive against fakes. |
 | Rsync chaos suite (`tests/chaos_rsync.rs`) | 16 scenarios | Rsync-specific chaos coverage layered on the existing v5 + v6 chaos baseline. |
 | Rsync property suite (`tests/property_rsync.rs`) | 9 strategies | Rsync property coverage on top of the v5 + v6 strategies. |
