@@ -307,7 +307,8 @@ def test_same_key_different_tools_no_collision(
         parsed_exec = parse_block(text_exec)
         parsed_open = parse_block(text_open)
         # Each call hit its own use case path.
-        assert parsed_exec.get("__tool") == "SSH_EXECUTE"
+        # Current v7.0.1 emits SSH_EXEC (was SSH_EXECUTE in older builds).
+        assert parsed_exec.get("__tool") in {"SSH_EXEC", "SSH_EXECUTE"}, parsed_exec
         assert parsed_open.get("__tool") == "SSH_SHELL_OPEN"
         # Cleanup
         if parsed_open.get("shell_id"):
