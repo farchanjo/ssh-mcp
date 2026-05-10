@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.1] — 2026-05-10
+
+Wire-additive patch on top of `[7.0.0]`. No tool-name strings, response shapes, env-var defaults, or error-code IDs change. The `[Cargo.toml]` package version is bumped from `7.0.0` to `7.0.1`; `[Cargo.lock]` is refreshed in lockstep. Two semantic deltas land here — both have already merged into `master` ahead of this tag.
+
+### Changed
+
+- **Wire transport advertises rsync protocol v32** (was v31). rsync 3.4.0 incremented the protocol number as an administrative signal for the CVE-2024-12084..12088 + 12747 fixes; the wire encoding is identical to v31 with zero new branches. `RSYNC_PROTOCOL` (`src/adapters/rsync/wire/session.rs`) is pinned at 32, `RSYNC_PROTOCOL_MAX` is widened to 32, and `min(local, remote)` continues to drive negotiation — so against legacy v31 servers (rsync 3.2.7) the local advertisement downgrades cleanly to 31. ADR 0011 deviation table grows a `RSYNC_PROTOCOL` row tracing the v31→v32 administrative bump. Two new handshake unit tests cover the v32-server (`negotiated == 32`) and v31-downgrade (`negotiated == 31`) paths; one new proptest (`prop_flist_round_trip_proto32` in `tests/property_rsync.rs`) confirms zero new wire branches at proto 32.
+- **`SSH_MCP_STRUCTURED_CONTENT` env-gate for the v4.7 structured-content payload** ([`2dd3b99`](https://github.com/farchanjo/ssh-mcp/commit/2dd3b99), [`a4e2cdf`](https://github.com/farchanjo/ssh-mcp/commit/a4e2cdf), [`da204ab`](https://github.com/farchanjo/ssh-mcp/commit/da204ab)). Operators can silence the JSON twin per process with `SSH_MCP_STRUCTURED_CONTENT=false`; the markdown body and `is_error` flag stay byte-identical regardless. Default `true` preserves the v4.7 behaviour.
+- **Notification debounce / force-flush defaults raised** to 1000 ms / 5000 ms (was 200 ms / 1 s) — `SSH_NOTIFY_DEBOUNCE_MS` / `SSH_NOTIFY_FORCE_FLUSH_MS` ([`d066f9e`](https://github.com/farchanjo/ssh-mcp/commit/d066f9e), [`4453c14`](https://github.com/farchanjo/ssh-mcp/commit/4453c14), [`9fb3fde`](https://github.com/farchanjo/ssh-mcp/commit/9fb3fde)). Reduces churn on push lanes for hosts that do not actively read.
+
+### Fixed
+
+- **Bool args / results documented as JSON `boolean`** ([`62fc2db`](https://github.com/farchanjo/ssh-mcp/commit/62fc2db), [`22756fc`](https://github.com/farchanjo/ssh-mcp/commit/22756fc)). Doc strings on every `Option<bool>` field across `src/infra/mcp/args/{execute,shell,rsync,sftp,session}.rs` (and the corresponding result wrappers) now spell out: `Type: boolean (JSON true or false — NOT the strings "true"/"false")`. The schema itself was already correct (`#[derive(JsonSchema)]` emits `"type": "boolean"`); rmcp / serde reject string→bool coercion strictly, so callers that quote the value get a `-32602 invalid type: string "true", expected a boolean` from the deserialiser. The doc tweak is preventive — surfaces the contract directly to LLM hosts that infer schemas from descriptions.
+
+### Tests
+
+- **Lib test count: 1986 passed** (was 1966 in the v7.0.0 docs baseline). New: `handshake_succeeds_against_v32_server`, `handshake_downgrades_to_v31_against_legacy_server` (`src/adapters/rsync/wire/session.rs`), `prop_flist_round_trip_proto32` (`tests/property_rsync.rs`). The `protocol_supported` assertion was widened to use the `max(RSYNC_PROTOCOL_MIN, lver − 4)` effective floor.
+
+### Verified
+
+- `cargo clippy --release --all-features -- -D warnings`: clean.
+- `cargo test --lib --quiet`: 1986 passed.
+
 ## [7.0.0] — post-release fixes (2026-05-06)
 
 Five follow-up commits closing the gap between the v7.0.0 transport bodies and the live MCP-host call path. Each bug surfaced when the Python integration suite (`scripts/test_v7_rsync_*.py`) drove `ssh_rsync` end-to-end against `rsync 3.2.7` on a real Linux VM rather than against the in-process direct-transport tests in `tests/v7_rsync_wire_e2e_vm.rs`. Wire-additive — no DTO field shapes changed, no error codes added, no env var defaults moved.
