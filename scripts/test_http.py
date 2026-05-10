@@ -30,17 +30,17 @@ def test_initialize_handshake(http_client: McpClient) -> None:
     assert getattr(transport, "session_id", None), "Mcp-Session-Id header missing"
 
 
-def test_tools_list_returns_v47_catalogue(http_client: McpClient) -> None:
-    """v4.7 advertises 21 tools (20 without the `port_forward` Cargo feature).
+def test_tools_list_returns_v7_catalogue(http_client: McpClient) -> None:
+    """v7.0.1 advertises 39 tools (38 without `port_forward` Cargo feature).
 
     Renamed from ``test_tools_list_returns_eighteen_tools`` to reflect the
     v4.7 catalogue growth (added: ``ssh_run``, ``ssh_execute_batch``,
     ``ssh_disconnect_many``). Mirrors the stdio assertion in
-    ``test_stdio.py::test_stdio_tools_list_returns_v47_catalogue``.
+    ``test_stdio.py::test_stdio_tools_list_returns_v7_catalogue``.
     """
     tools = http_client.list_tools()
     names = sorted(t["name"] for t in tools)
-    assert len(names) in {20, 21}, f"expected 20 or 21 tools, got {len(names)}: {names}"
+    assert len(names) in {38, 39}, f"expected 38 or 39 tools, got {len(names)}: {names}"
     # v4.7 additions
     for new in ("ssh_run", "ssh_exec_batch", "ssh_disconnect_many"):
         assert new in names, f"missing v4.7 tool {new}: {names}"
