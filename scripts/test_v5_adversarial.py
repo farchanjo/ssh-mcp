@@ -1013,7 +1013,8 @@ class TestIdempotencyAdversarial:
                 {"session_id": sid, "command": "echo FIRST"},
                 meta=meta,
             )
-            assert first.status == "OK", first.text
+            # v7.0.1 emits SSH_EXEC: STARTED on first async exec call.
+            assert first.status in {"OK", "STARTED"}, first.text
             # Reusing the SAME key with DIFFERENT args must NOT replay
             # the cached body — strict fingerprint enforcement returns
             # INVALID_ARGUMENT with the IDEMPOTENCY_KEY_MISMATCH tag.
