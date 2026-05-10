@@ -111,15 +111,17 @@ where
                 Err(e) => return Err(e),
             }
         }
-        self.subscribers.unsubscribe(&req.peer_id, &canonical).await;
-        // v5 lifecycle: debit the resource refcount. Errors here are
-        // bug-class (underflow on a never-tracked resource); surface
-        // them so the caller can report the regression rather than
-        // silently swallow it. The legacy registry tolerates unknown
-        // (peer, uri) pairs, but the lifecycle adapter is permissive
-        // for unknown resources too — see
-        // `RefcountedLifecycleAdapter::on_unsubscribe`.
-        self.lifecycle.on_unsubscribe(parsed.kind, &parsed.id)?;
+        let was_subscribed = self.subscribers.unsubscribe(&req.peer_id, &canonical).await;
+        // v5 lifecycle: debit the resource refcount ONLY when the
+        // registry actually removed an entry. Calling on_unsubscribe
+        // unconditionally causes sub_count underflow on idempotent
+        // (peer, uri) pairs that were not subscribed — the second
+        // resources/unsubscribe for the same URI would decrement below
+        // zero, returning DomainError::Internal and surfacing as an
+        // internal-error RPC failure to the caller.
+        if was_subscribed {
+            self.lifecycle.on_unsubscribe(parsed.kind, &parsed.id)?;
+        }
         Ok(UnsubscribeResourceOutcome { uri: canonical })
     }
 }
@@ -183,10 +185,13 @@ mod tests {
         ) -> Result<(), DomainError> {
             Ok(())
         }
-        async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) {
+        async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) -> bool {
             if let Ok(mut g) = self.unsubs.lock() {
                 g.push((peer_id.clone(), uri.to_string()));
             }
+            // Test stub: always report that the peer was subscribed so
+            // the use case exercises the lifecycle on_unsubscribe path.
+            true
         }
         async fn drop_peer(&self, peer_id: &PeerId) {
             if let Ok(mut g) = self.drops.lock() {

@@ -519,7 +519,9 @@ mod tests {
             }
             Ok(())
         }
-        async fn unsubscribe(&self, _peer_id: &PeerId, _uri: &str) {}
+        async fn unsubscribe(&self, _peer_id: &PeerId, _uri: &str) -> bool {
+            false
+        }
         async fn drop_peer(&self, _peer_id: &PeerId) {}
     }
 

@@ -130,7 +130,15 @@ pub trait LocalSubscriberRegistryAsync: Sync {
     ) -> Result<(), DomainError>;
 
     /// Unregister `peer_id` from `uri`.
-    async fn unsubscribe(&self, peer_id: &PeerId, uri: &str);
+    ///
+    /// Returns `true` when the peer was actually subscribed and has now been
+    /// removed; `false` when the `(peer_id, uri)` pair was not found in the
+    /// registry (idempotent no-op). Callers that drive lifecycle refcount
+    /// bookkeeping MUST only call
+    /// [`crate::ports::lifecycle_policy::LifecyclePolicyPort::on_unsubscribe`]
+    /// when this returns `true` — calling it unconditionally causes a
+    /// `sub_count` underflow on repeated unsubscribe.
+    async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) -> bool;
 
     /// Drop every subscription owned by `peer_id` across all URIs.
     async fn drop_peer(&self, peer_id: &PeerId);

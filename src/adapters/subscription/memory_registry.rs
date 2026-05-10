@@ -389,7 +389,13 @@ where
 
     /// Sync flavour of `unsubscribe` shared by both the async port impl
     /// and `drop_peer_sync`.
-    fn unsubscribe_sync(&self, peer_id: &PeerId, uri: &str) {
+    ///
+    /// Returns `true` when the peer was actually subscribed and its entry
+    /// was removed; `false` when the `(peer_id, uri)` pair was not
+    /// present (idempotent no-op). Callers that drive lifecycle refcount
+    /// bookkeeping MUST gate `on_unsubscribe` on this return value to
+    /// avoid a `sub_count` underflow on repeated unsubscribe.
+    fn unsubscribe_sync(&self, peer_id: &PeerId, uri: &str) -> bool {
         // Snapshot the sub_ids attached to the peer on this URI so
         // we can clear matching `(sub_id, uri)` cursors after the
         // peer has been removed.
@@ -405,6 +411,9 @@ where
                     .collect()
             })
             .unwrap_or_default();
+        // `sub_ids` is non-empty iff the peer had at least one slot on
+        // this URI — capture it before the retain mutates the vec.
+        let was_subscribed = !sub_ids.is_empty();
         let became_empty = self.subscribers.get_mut(uri).is_some_and(|mut entry| {
             entry.retain(|s| &s.peer_id != peer_id);
             entry.is_empty()
@@ -420,6 +429,7 @@ where
         for sub_id in sub_ids {
             self.sub_progress.remove(&(sub_id, uri.to_string()));
         }
+        was_subscribed
     }
 
     /// v5 Phase 2 entry point — register a peer with an
@@ -736,8 +746,8 @@ where
         Ok(())
     }
 
-    async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) {
-        self.unsubscribe_sync(peer_id, uri);
+    async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) -> bool {
+        self.unsubscribe_sync(peer_id, uri)
     }
 
     async fn drop_peer(&self, peer_id: &PeerId) {
@@ -1149,6 +1159,53 @@ mod tests {
         let _progress = reg.peer_progress(&peer_id, "shell://abc/output");
         SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output").await;
         assert!(reg.snapshot_subscribers("shell://abc/output").is_empty());
+    }
+
+    /// Regression guard for the idempotent-unsubscribe lifecycle bug
+    /// (v7.0.1 backlog). The first unsubscribe must return `true`;
+    /// the second must return `false` — so callers can avoid calling
+    /// `LifecyclePolicyPort::on_unsubscribe` twice, which would
+    /// underflow `sub_count` and return `DomainError::Internal`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_idempotent_returns_false_on_second_call() {
+        let reg = registry();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-A");
+        let peer_id = PeerId::new("peer-A".to_string());
+        SubscriberRegistryAsync::subscribe(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "abc".to_string(),
+            "shell://abc/output".to_string(),
+            peer,
+        )
+        .await
+        .unwrap();
+
+        // First unsubscribe: peer was registered — must return true.
+        let first =
+            SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output")
+                .await;
+        assert!(first, "first unsubscribe must return true (peer was present)");
+
+        // Second unsubscribe: already removed — must return false, not panic,
+        // and not indicate a removal to lifecycle callers.
+        let second =
+            SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output")
+                .await;
+        assert!(
+            !second,
+            "second unsubscribe must return false (peer already gone — idempotent no-op)"
+        );
+
+        // And a completely unknown peer must also return false.
+        let ghost_id = PeerId::new("peer-ghost".to_string());
+        let ghost =
+            SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &ghost_id, "shell://abc/output")
+                .await;
+        assert!(
+            !ghost,
+            "unsubscribe for unknown peer must return false (idempotent no-op)"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
