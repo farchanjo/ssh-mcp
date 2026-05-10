@@ -55,7 +55,7 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 - [ ] New error codes get a row in [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook) and a structured variant in `src/domain/error.rs`.
 - [ ] New ADRs follow MADR 4.0 (status, context, decision drivers, considered options, decision outcome, consequences) and live under `docs/adr/NNNN-<kebab-title>.md`. ADR numbers are never reused.
 - [ ] Public MCP tool wire shape (markdown body) stays byte-compatible with v3 / v4 unless the change is gated behind a new tool or opt-in flag. Snapshot tests in `tests/v4_smoke.rs` must still pass.
-- [ ] Hot-path changes touching atomics or `ArcSwap` ship with a loom invariant in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`).
+- [ ] Hot-path changes touching atomics or `ArcSwap` ship with a loom invariant in `tests/lockfree_invariants.rs` or `tests/lockfree_invariants_rsync.rs` (gated `#[cfg(loom)]`).
 
 ## Architecture invariants (cheat sheet)
 
@@ -73,11 +73,11 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 
 | Command | Scope | Notes |
 |---|---|---|
-| `cargo test --lib --quiet` | ~1657 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop. |
+| `cargo test --lib --quiet` | ~1986 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop. |
 | `cargo test --tests --quiet` | Integration tests including the v4 smoke (`tests/v4_smoke.rs`) | Snapshot-checks the markdown wire shape. |
 | `cargo test --features test-fixtures` | Use cases against deterministic in-memory adapters (`FakeClock`, `DeterministicIdGenerator`) | Add this when authoring application-layer tests. |
 | `cargo test --features port_forward` | Toggles the `ssh_forward` tool and `forward://` resource | Keep parity for both feature combinations. |
-| `cargo +nightly test --cfg loom` (gated) | Loom invariants in `tests/lockfree_invariants.rs` | Currently blocked by upstream tokio/loom incompatibility — see the test file header. |
+| `cargo +nightly test --cfg loom` (gated) | Loom invariants in `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` | Currently blocked by upstream tokio/loom incompatibility — see the test file header. |
 
 Python integration suites under `scripts/test_*.py` and stress scripts under `scripts/stress_*.py` are optional locally but run on release branches. Ad-hoc developer workflow lives in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
