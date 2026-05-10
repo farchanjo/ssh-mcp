@@ -1,6 +1,6 @@
 """v4.7 structured_content channel coverage.
 
-For every one of the 21 tools (20 without ``port_forward``), verify that:
+For every one of the 39 tools (38 without ``port_forward``), verify that:
 
 1. The response carries a Markdown ``content[].text`` channel.
 2. The response carries a parallel ``structuredContent`` (camelCase per rmcp
