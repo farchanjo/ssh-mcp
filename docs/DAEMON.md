@@ -509,7 +509,7 @@ The state machine (Owned -> Observed -> Releasing -> Closed) and its CAS edges a
 
 ## Error codes
 
-The daemon's `err` events use the same wire taxonomy as the MCP server (38 codes, 7 categories, action-oriented `DETAIL` lines). The complete reference is at [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook). The categories are summarised in [ADR 0007](./adr/0007-error-taxonomy.md):
+The daemon's `err` events use the same wire taxonomy as the MCP server (46 codes, 7 categories, action-oriented `DETAIL` lines). The complete reference is at [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook). The categories are summarised in [ADR 0007](./adr/0007-error-taxonomy.md):
 
 | Category | Retry semantics |
 |---|---|
