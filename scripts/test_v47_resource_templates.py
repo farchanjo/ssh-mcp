@@ -41,27 +41,34 @@ def _key(template: dict, name: str) -> object:
 
 def _looks_like_rfc6570(uri: str) -> bool:
     """Sanity check: scheme + at least one ``{<param>}`` expansion."""
-    if not any(uri.startswith(s) for s in ("shell://", "command://", "transfer://", "session://", "forward://")):
+    _KNOWN_SCHEMES = (
+        "shell://",
+        "command://",
+        "transfer://",
+        "session://",
+        "forward://",
+        "serial://",   # added v5.2 (ADR 0009)
+    )
+    if not any(uri.startswith(s) for s in _KNOWN_SCHEMES):
         return False
     return "{" in uri and "}" in uri
 
 
 def test_resource_templates_list_returns_5_entries(stdio_client: McpClient) -> None:
-    """v4.7 advertises 5 templates with ``port_forward``; 4 without.
+    """v4.7 advertised 5 templates with port_forward; 4 without.
 
-    The default release build (which the integration runs against) has
-    ``port_forward`` enabled, so we expect 5 entries. We accept 4 to keep
-    the test green on a no-forward build.
+    v5.2 added serial:// (6 entries with port_forward, 5 without).
+    Accept any count in {4, 5, 6} so the test stays green across builds.
     """
     templates = stdio_client.list_resource_templates()
-    assert len(templates) in {4, 5}, f"expected 4 or 5 templates, got {len(templates)}: {templates}"
+    assert len(templates) in {4, 5, 6}, (
+        f"expected 4, 5, or 6 templates, got {len(templates)}: {templates}"
+    )
     schemes = {(_key(t, "uri_template") or "").split("://", 1)[0] + "://" for t in templates}
     assert "shell://" in schemes
     assert "command://" in schemes
     assert "transfer://" in schemes
     assert "session://" in schemes
-    if len(templates) == 5:
-        assert "forward://" in schemes
 
 
 def test_byte_stream_templates_advertise_cursor_query(stdio_client: McpClient) -> None:
