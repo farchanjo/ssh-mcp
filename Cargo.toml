@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "ssh-mcp"
-version = "7.0.1"
+version = "7.0.2"
 edition = "2024"
 rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"

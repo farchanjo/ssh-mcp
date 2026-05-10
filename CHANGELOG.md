@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.2] — 2026-05-10
+
+Patch release on top of `[7.0.1]`. One real product fix (idempotent unsubscribe lifecycle bug, surfaced via cross-LLM consensus pass post `[7.0.1]`) plus accumulated test/doc drift refresh from the v5/v6/v7 surface migration. No wire format or env-var default changes; fully backwards compatible with `[7.0.1]` clients. The `[Cargo.toml]` package version is bumped from `7.0.1` to `7.0.2`; `[Cargo.lock]` is refreshed in lockstep.
+
+### Fixed
+
+- **Idempotent `resources/unsubscribe` no longer underflows lifecycle `sub_count`** ([`558b7f0`](https://github.com/farchanjo/ssh-mcp/commit/558b7f0)). The second `resources/unsubscribe` call against the same `(peer_id, uri)` pair was decrementing the lifecycle `sub_count` atomic even when the registry had already removed the slot, surfacing as `DomainError::Internal("lifecycle sub_count underflow on Shell/...")` and propagating to the caller as a `-32603 internal error`. The `SubscriberRegistryAsync::unsubscribe` trait method now returns `bool` indicating whether a slot was actually removed; the use case at `src/application/unsubscribe_resource.rs` gates the lifecycle `on_unsubscribe` call on that bool, so idempotent unsubscribe is a true no-op on the second call. New Rust regression guard (`unsubscribe_idempotent_returns_false_on_second_call` in `src/adapters/subscription/memory_registry.rs`) locks the contract at the adapter boundary; covers first-call (`true`), second-call (`false`), and ghost-peer (`false`) paths.
+
+### Tests
+
+- **Test-drift refresh (12 tests across 8 files)** for the v5/v6/v7 tool-surface migration that landed in `[7.0.1]` and earlier ([`ca2a5d9`](https://github.com/farchanjo/ssh-mcp/commit/ca2a5d9), [`64b353d`](https://github.com/farchanjo/ssh-mcp/commit/64b353d), [`81c3cee`](https://github.com/farchanjo/ssh-mcp/commit/81c3cee), [`a31d214`](https://github.com/farchanjo/ssh-mcp/commit/a31d214), [`3cdbd01`](https://github.com/farchanjo/ssh-mcp/commit/3cdbd01)). Highlights:
+  - `parse_block` helper now accepts `SSH_COMMANDS` + `SSH_TRANSFER_PROGRESS` headers (legacy `SSH_LIST_COMMANDS` retained for backwards compat).
+  - `test_v47_idempotency` + `test_v5_adversarial` accept `SSH_EXEC: STARTED` (the current first-call wire shape) alongside the legacy `SSH_EXECUTE: OK`.
+  - `test_v47_prompts` recognises the v5 push-first catalog growth (5 → 10 prompts) via a `>= 5` floor + name-list verification of the original 5.
+  - `test_v47_resource_templates` tightened from a `{4, 5, 6}` permissive set to **exact** count gated on `port_forward` feature flag detection (5 without, 6 with) — the codex-flagged over-broad assertion that risked masking future template-catalog regressions.
+  - `test_transfer_progress` parses the `PROGRESS: n/total bytes` row shape and gracefully skips on fast paramiko fixtures where the 5MiB transfer completes before any mid-flight poll observes a partial sample.
+  - `test_v51_flush_bytes` updated to the current `HttpTransport(base_url)` + explicit `McpClient.initialize()` / `.close()` API.
+  - `test_v47_subscriptions::test_s20` spawns its own client with `SSH_NOTIFY_DEBOUNCE_MS=200` / `SSH_NOTIFY_FORCE_FLUSH_MS=1000` so the collision check is not subject to the v7.0.1 default raise (200ms→1000ms / 1s→5s).
+- **Lib test count: 1987 passed** (was 1986 in `[7.0.1]`). New: `unsubscribe_idempotent_returns_false_on_second_call` in `src/adapters/subscription/memory_registry.rs`.
+
+### Docs
+
+- **CHANGELOG `[7.0.1]` env-var defaults claim corrected** ([`bc4f3ca`](https://github.com/farchanjo/ssh-mcp/commit/bc4f3ca)). Intro line previously claimed "no env-var defaults change" while the **Changed** section documented `SSH_NOTIFY_DEBOUNCE_MS` / `SSH_NOTIFY_FORCE_FLUSH_MS` raises (200→1000ms / 1s→5s) and the new `SSH_MCP_STRUCTURED_CONTENT` env-gate. Surfaced via cross-LLM consensus pass.
+- **`src/infra/mcp/resource_templates.rs` module docstring** ([`49bba02`](https://github.com/farchanjo/ssh-mcp/commit/49bba02)). Refreshed from the v4.7 catalog (5 entries / 4 without `port_forward`) to the v5.2 catalog (6 entries / 5 without). Adds `serial://` to the bulleted list (v5.2, ADR 0009). Doc-only refresh; the implementation and unit tests already advertised the v5.2 shape.
+
+### Verified
+
+- `cargo clippy --release --all-features -- -D warnings`: clean.
+- `cargo test --lib --quiet`: 1987 passed (1986 baseline + 1 new lifecycle regression guard).
+- pytest `vm.services` suite: 5 passed + 2 xfailed in 124s (real rsync 3.2.7).
+- pytest paramiko fixture suite: 246 passed + 2 skipped + 1 expected timing flake (test_shell_send_key_ctrl_c_breaks_yes; passes isolated).
+
 ## [7.0.1] — 2026-05-10
 
 Wire-additive patch on top of `[7.0.0]`. No tool-name strings, response shapes, or error-code IDs change. Two notification env-var defaults are raised (`SSH_NOTIFY_DEBOUNCE_MS` / `SSH_NOTIFY_FORCE_FLUSH_MS` — see **Changed**) and one new env-gate is introduced (`SSH_MCP_STRUCTURED_CONTENT`, default `true` preserves v4.7 behaviour). The `[Cargo.toml]` package version is bumped from `7.0.0` to `7.0.1`; `[Cargo.lock]` is refreshed in lockstep. Two semantic deltas land here — both have already merged into `master` ahead of this tag.
