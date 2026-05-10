@@ -55,20 +55,33 @@ def _looks_like_rfc6570(uri: str) -> bool:
 
 
 def test_resource_templates_list_returns_5_entries(stdio_client: McpClient) -> None:
-    """v4.7 advertised 5 templates with port_forward; 4 without.
+    """Catalog count tightened to exactly 5 or 6 (gated on ``port_forward``).
 
-    v5.2 added serial:// (6 entries with port_forward, 5 without).
-    Accept any count in {4, 5, 6} so the test stays green across builds.
+    v5.2+ advertises 6 templates with the ``port_forward`` Cargo feature and
+    5 without. ``serial://`` is always advertised (added v5.2, ADR 0009).
+    ``forward://`` gates the 6th template behind the feature flag — its
+    presence in the scheme set is the runtime detector for which count
+    applies. The ``4`` baseline (pre-v5.2 v4.7) is no longer accepted.
     """
     templates = stdio_client.list_resource_templates()
-    assert len(templates) in {4, 5, 6}, (
-        f"expected 4, 5, or 6 templates, got {len(templates)}: {templates}"
-    )
     schemes = {(_key(t, "uri_template") or "").split("://", 1)[0] + "://" for t in templates}
+
+    # Core 4 always present.
     assert "shell://" in schemes
     assert "command://" in schemes
     assert "transfer://" in schemes
     assert "session://" in schemes
+
+    # serial:// is always advertised (v5.2+).
+    assert "serial://" in schemes, f"serial:// missing: {schemes}"
+
+    # Exact count, gated on port_forward feature detected via forward:// scheme.
+    expected = 6 if "forward://" in schemes else 5
+    assert len(templates) == expected, (
+        f"expected exactly {expected} templates "
+        f"(forward://={'present' if 'forward://' in schemes else 'absent'}), "
+        f"got {len(templates)}: {templates}"
+    )
 
 
 def test_byte_stream_templates_advertise_cursor_query(stdio_client: McpClient) -> None:
