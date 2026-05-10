@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [7.0.1] — 2026-05-10
 
-Wire-additive patch on top of `[7.0.0]`. No tool-name strings, response shapes, env-var defaults, or error-code IDs change. The `[Cargo.toml]` package version is bumped from `7.0.0` to `7.0.1`; `[Cargo.lock]` is refreshed in lockstep. Two semantic deltas land here — both have already merged into `master` ahead of this tag.
+Wire-additive patch on top of `[7.0.0]`. No tool-name strings, response shapes, or error-code IDs change. Two notification env-var defaults are raised (`SSH_NOTIFY_DEBOUNCE_MS` / `SSH_NOTIFY_FORCE_FLUSH_MS` — see **Changed**) and one new env-gate is introduced (`SSH_MCP_STRUCTURED_CONTENT`, default `true` preserves v4.7 behaviour). The `[Cargo.toml]` package version is bumped from `7.0.0` to `7.0.1`; `[Cargo.lock]` is refreshed in lockstep. Two semantic deltas land here — both have already merged into `master` ahead of this tag.
 
 ### Changed
 
