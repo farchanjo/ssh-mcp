@@ -1,6 +1,6 @@
 # SSH MCP Server
 
-This project ships a subscribe-first **Model Context Protocol (MCP) server** that lets any MCP-capable LLM host drive remote shells, async commands, SFTP transfers, **rsync v31 wire-compat sync**, TCP port forwards, and local UART/TTY/COM ports — over a single, lock-free, hexagonal Rust core. This server is maintained by [@farchanjo](https://github.com/farchanjo).
+This project ships a subscribe-first **Model Context Protocol (MCP) server** that lets any MCP-capable LLM host drive remote shells, async commands, SFTP transfers, **rsync v32 wire-compat sync** (downgrades to v31 against legacy servers), TCP port forwards, and local UART/TTY/COM ports — over a single, lock-free, hexagonal Rust core. This server is maintained by [@farchanjo](https://github.com/farchanjo).
 
 ## Contents
 
@@ -27,7 +27,7 @@ This project ships a subscribe-first **Model Context Protocol (MCP) server** tha
 
 This server enables any MCP host (Claude Desktop, Claude Code, Cline, IDE plugins, mcp-inspector, custom agents) to interact with SSH targets through automation. [MCP](https://modelcontextprotocol.io/) is a standardized protocol for communication between AI systems and external tools or data sources.
 
-The server provides tools to open persistent SSH sessions, run async commands, drive interactive PTYs, transfer files via SFTP (with resume + verify), mirror directory trees through a built-in rsync wire-protocol v31 client (byte-identical against `rsync 3.2.7`), bind local TCP forwards, and talk to local serial ports — all streamed back to the model as MCP `notifications/resources/updated` push events the moment bytes arrive. No polling loops, no empty payloads, no wasted tokens.
+The server provides tools to open persistent SSH sessions, run async commands, drive interactive PTYs, transfer files via SFTP (with resume + verify), mirror directory trees through a built-in rsync wire-protocol v32 client (downgrades to v31 against legacy servers via negotiation) (byte-identical against `rsync 3.2.7`), bind local TCP forwards, and talk to local serial ports — all streamed back to the model as MCP `notifications/resources/updated` push events the moment bytes arrive. No polling loops, no empty payloads, no wasted tokens.
 
 Architecture is **hexagonal** ([ADR 0002](docs/adr/0002-adopt-hexagonal-architecture.md)) with **lock-free hot paths** (`DashMap`, `ArcSwap`, `Atomic*`, `tokio::sync::broadcast`, `mpsc` — zero `Mutex` on `RunningCommand` / `RunningShell` / `RunningTransfer` / `SessionRef` / `ForwardHandle` / lane state). Every long-lived resource carries a CAS state machine (`Owned → Observed → Releasing → Closed`) plus per-session refcount cascade ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). Each `resources/subscribe` mints a `SubId` (UUIDv7) with its own `mpsc::channel`, lag policy, filter pipeline, replay buffer, and stats ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)).
 
@@ -105,7 +105,7 @@ Scheme | Channel | Producer
 
 This server is tested using a layered local + CI gate. To learn more about testing, refer to [CI.md](CI.md).
 
-Quick numbers — **1966 lib tests** + **134 integration tests** across 9 binaries + **27 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **21 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
+Quick numbers — **1986 lib tests** + **134 integration tests** across 9 binaries + **27 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **21 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
 
 ## Installation
 
