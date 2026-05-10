@@ -1,9 +1,9 @@
 """Adversarial integration tests for ssh-mcp v5 (Phase 1-7 surfaces).
 
-This suite exercises the **30 MCP tools** end-to-end against the real
-``ssh-mcp-stdio`` binary along three axes:
+This suite exercises the **39 MCP tools** (v7.0.1 surface) end-to-end
+against the real ``ssh-mcp-stdio`` binary along three axes:
 
-1. **Force errors** — every code in the 38-code taxonomy that's
+1. **Force errors** — every code in the 46-code taxonomy that's
    reachable from the wire surface fires at least once.
 2. **Test locks / concurrency** — adversarial races against the
    lock-free invariants (concurrent connect / subscribe / pause /
