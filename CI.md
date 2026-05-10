@@ -11,7 +11,7 @@ Local + GitHub Actions gates run the same canonical command set. The gates that 
 | Build | `cargo build --release --all-features` | All three binaries (`ssh-mcp`, `ssh-mcp-stdio`, `ssh-mcp-tail`) compile clean with `port_forward` enabled |
 | Format | `cargo fmt --all -- --check` | Source tree matches `rustfmt` (Rust 2024 edition style) |
 | Lint | `cargo clippy --release --all-features --all-targets --workspace -- -D warnings` | Strict baseline: forbid (`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_*`) + deny (`pedantic`, `nursery`, `cargo`, lock-free invariants `await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_*`) |
-| Lib tests | `cargo test --lib --quiet` | 1966 unit tests against use cases, ports, adapters, domain entities |
+| Lib tests | `cargo test --lib --quiet` | 1986 unit tests against use cases, ports, adapters, domain entities |
 | Integration tests | `cargo test --tests --features test-fixtures --quiet` | 134 integration tests across 9 binaries (see matrix below) |
 
 ### PR Testing Workflows
@@ -24,7 +24,7 @@ The following gates run on every pull request:
 | Build (no-default) | Compiles without `port_forward` (38 tools, smaller binary) | rust 1.95+ | `--no-default-features` |
 | Fmt | `cargo fmt --all -- --check` | rust 1.95+ | n/a |
 | Clippy | Strict lint gate | rust 1.95+ | `--all-features --all-targets` |
-| Lib tests | 1966 unit tests | rust 1.95+ | default |
+| Lib tests | 1986 unit tests | rust 1.95+ | default |
 | Integration tests | 134 integration tests across 9 binaries | rust 1.95+ | `test-fixtures` |
 | Property tests | proptest suites (`property` 32 + `property_rsync` 9) | rust 1.95+ | `test-fixtures` |
 | Chaos tests | Adversarial scheduler suites (`chaos` 41 + `chaos_rsync` 16) | rust 1.95+ | `test-fixtures` |
