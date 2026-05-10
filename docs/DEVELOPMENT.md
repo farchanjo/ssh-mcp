@@ -19,7 +19,7 @@ cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
 cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
 cargo build --release --no-default-features        # No port forwarding
 
-cargo test --lib --quiet                                   # ~1.9k+ lib tests (1979 on v7.0 master)
+cargo test --lib --quiet                                   # 1986 lib tests (1986 on v7.0.1 master)
 cargo test --tests --features test-fixtures --quiet        # 134 integration tests across 9 binaries (v4_smoke 2, v5_smoke 8, v5_daemon_smoke 5, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_rsync 16, property 32, property_rsync 9)
 cargo test --features test-fixtures                # Use cases vs deterministic adapters
 
@@ -62,7 +62,7 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 | Layer | Path | What it covers | Cost |
 |---|---|---|---|
-| Lib unit tests | `src/**/{mod,*}.rs::tests` | ~1.9k+ tests (1979 on v7.0 master) across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
+| Lib unit tests | `src/**/{mod,*}.rs::tests` | 1986 tests (1986 on v7.0.1 master) across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
 | `test-fixtures` | gated by `cargo test --features test-fixtures` | Use cases against deterministic adapters (`FakeClock`, `DeterministicIdGen`) for reproducible bug bisection. | seconds |
 | Integration tests | `tests/*.rs` | 134 active tests across 9 binaries: `v4_smoke` (2, wire-compat snapshot), `v5_smoke` (8), `v5_daemon_smoke` (5, against `ssh-mcp-tail daemon`), `v6_resume_smoke` (12, ADR 0010 SFTP resume), `v7_rsync_smoke` (9, ADR 0011 rsync hybrid), `chaos` (41, ADR-driven failure-mode coverage), `chaos_rsync` (16, ADR 0011 chaos), `property` (32, lifecycle / mux / lane invariants), `property_rsync` (9, ADR 0011 property). Most need `--features test-fixtures`. e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6) are gated `--features e2e-vm`. | tens of seconds |
 | Loom invariants | `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` (both `#[cfg(loom)]`) | 27 interleavings total: 20 in `lockfree_invariants` (v4 baseline + Phase 1 lifecycle + Phase 2 mux) + 7 in `lockfree_invariants_rsync` (RsyncSession state, rsync lane pause/resume, file-list ordering, sparse-file handling). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
@@ -93,7 +93,7 @@ Full loom mode is currently blocked by upstream tokio/loom incompatibility in ru
 
 | Feature | Default | Effect |
 |---|---|---|
-| `port_forward` | on | Includes the `forward://` resource scheme and the `ssh_forward` tool surface (catalog grows from 35 to 36 tools). |
+| `port_forward` | on | Includes the `forward://` resource scheme and the `ssh_forward` tool surface (catalog grows from 38 to 39 tools). |
 | `test-fixtures` | off | Wires deterministic adapters (`FakeClock`, `DeterministicIdGen`). For tests; never enable in production builds. |
 
 ---
