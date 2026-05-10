@@ -1066,7 +1066,7 @@ Cancel is a CAS to the `Cancelled` terminal status plus a `RsyncTransportPort::c
 
 - **Operator does not control the remote** (managed services, vendor systems, locked-down hosts): `transport=Sftp` works against any host with a functional SFTP subsystem — i.e. any host where `ssh_upload` already works. Slower than the Wire path because every block crosses the wire, but universal.
 - **Hardlinks / delta-sync needed**: `transport=Sftp` returns `SFTP_FEATURE_MISSING` for `opts.preserve.hardlinks=true` and `opts.verify_checksum=true`. Switch to `transport=Wire` (requires rsync >= 3.2.0 on the remote) or drop the offending option.
-- **Wire transport surfaces `RSYNC_VERSION_TOO_OLD`**: install rsync >= 3.2.0 on the remote (the wire-compat client speaks protocol v31 only), or fall back to `transport=Sftp`.
+- **Wire transport surfaces `RSYNC_VERSION_TOO_OLD`**: install rsync >= 3.2.0 on the remote (the wire-compat client advertises protocol v32 (negotiates to v31 against rsync 3.x servers); remote must report >= 31), or fall back to `transport=Sftp`.
 
 ---
 
@@ -1785,7 +1785,7 @@ Six new codes covering the wire-compat probe, the SFTP capability gates, and the
 - **Category:** POLICY
 - **Retryable:** conditional (only after upgrading the remote)
 - **When:** `transport=Wire` was forced and the rsync probe returned a binary older than 3.2.0 (or no binary at all).
-- **Why:** The wire-compat client speaks rsync protocol v31 only — older protocols are not supported.
+- **Why:** The wire-compat client advertises rsync protocol v32 (negotiates to v31 against rsync 3.x); remote must be >= 31.
 - **Cure:** Upgrade rsync on the remote to >= 3.2.0, OR re-issue with `transport=Sftp` to take the universal SFTP fallback path.
 - **Prevention:** Default to `transport=Auto`; the host falls back to the SFTP transport automatically when rsync is missing or older than v31.
 - **Related:** [RSYNC_NOT_FOUND], [SFTP_FEATURE_MISSING].
