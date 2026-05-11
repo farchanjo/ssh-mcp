@@ -866,7 +866,7 @@ Operational follow-on:
 
 ## v7.0 → v7.1 (ADR 0012)
 
-For **MCP host operators, contributors, and downstream automations** moving from v7.0.x to v7.1.0-rc1+. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped. The only opt-in surface is a single new `inline_push: bool` field on `sub_open` plus the matching `experimental.ssh_inline_push` capability handshake. Hosts that ignore both keep the v7.0.x wire identical.
+For **MCP host operators, contributors, and downstream automations** moving from v7.0.x to v7.1.0. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped. The only opt-in surface is a single new `inline_push: bool` field on `sub_open` plus the matching `experimental.ssh_inline_push` capability handshake. Hosts that ignore both keep the v7.0.x wire identical.
 
 Reference: [ADR 0012 — inline push notifications](./adr/0012-inline-push-notifications.md).
 

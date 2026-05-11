@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.0] — 2026-05-11
+
+Minor release stacking [ADR 0012](docs/adr/0012-inline-push-notifications.md) (inline-push notifications for `shell://*`, `command://*`, and `serial://*` lanes) on top of the v7.0.x hexagonal core. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped, no structured-content key was renamed. The only opt-in surfaces are a single new `inline_push: bool` field on `sub_open`, a matching `experimental.ssh_inline_push` capability handshake at `initialize`, and one `notifications/ssh/output` custom notification carrying base64-encoded byte payloads. Hosts that ignore all three keep the v7.0.x wire identical. The `[Cargo.toml]` package version is bumped from `7.0.2` to `7.1.0`; `[Cargo.lock]` is refreshed in lockstep.
+
+### Added
+
+- **`sub_open inline_push: bool` argument** ([ADR 0012](docs/adr/0012-inline-push-notifications.md)). Optional, defaults to `false`. When `true` AND the host advertised `experimental.ssh_inline_push: true` at `initialize`, the lane's data fanout switches from `notifications/resources/updated` (cursor-bookmark, requires a follow-up `resources/read`) to inline `notifications/ssh/output` carrying base64-encoded byte deltas — eliminating the round-trip on the hot path for `shell://*`, `command://*`, and `serial://*` URIs.
+- **`INLINE_PUSH` / `INLINE_PUSH_HONORED` wire lines** on `sub_open` responses. `INLINE_PUSH: yes|no` echoes the requested mode; `INLINE_PUSH_HONORED: yes|no|capability_missing` reports whether the server granted it. Lanes that requested inline but were denied (capability not advertised by the client) fall back transparently to the v7.0.x cursor-bookmark path with `INLINE_PUSH_HONORED: capability_missing`.
+- **`notifications/ssh/output` custom MCP notification** — JSON-RPC `method: "notifications/ssh/output"`, `params: { sub_id, uri, byte_offset, byte_count, payload_b64, is_truncated }`. Emitted only on lanes with `INLINE_PUSH_HONORED: yes`. Single payload bounded by `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (default 32768 B); larger frames split into multiple notifications with monotonically increasing `byte_offset` and an optional `is_truncated: true` sentinel on the final segment when a producer flush exceeded the per-tick budget.
+- **`sub_stats` inline counters** — `INLINE_EVENTS_SENT: <u64>` and `INLINE_BYTES_SENT: <u64>` on lanes that opted in; matching `inline_events_sent` / `inline_bytes_sent` fields on the structured-content payload. Lanes on the cursor path keep emitting only the v7.0.x `EVENTS_SENT` / `BYTES_SENT` pair.
+- **`Event::InlinePush` variant** on the NDJSON daemon (`ssh-mcp-tail daemon`), gated by `SSH_INLINE_PUSH_DAEMON_RELAY` (default `false`). When enabled, the daemon translates upstream `notifications/ssh/output` frames into NDJSON `{"event": "inline_push", "sub_id": "...", "uri": "...", "byte_offset": N, "payload_b64": "..."}` lines. The default-off gate keeps every existing daemon consumer byte-identical with v7.0.x — see [docs/CONFIGURATION.md → `SSH_INLINE_PUSH_DAEMON_RELAY`](docs/CONFIGURATION.md).
+- **2 new error codes** ([ADR 0007](docs/adr/0007-error-taxonomy.md)) — total taxonomy size grows from 44 to 46:
+  - `INLINE_PUSH_OVERSIZE` (`POLICY`, non-retryable). Emitted when a single producer flush exceeds `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` and the lane policy is `Drop` rather than the default `Split`. DETAIL line spells the cap: "lower the producer cadence or raise SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY".
+  - `INLINE_PUSH_BAD_PARAMS` (`POLICY`, non-retryable). Emitted on `sub_open` when `inline_push=true` is paired with a URI scheme that does not support inline delivery (`transfer://*`, `rsync://*`, `session://*`, `forward://*` today). DETAIL line names the supported schemes.
+- **2 new env vars** ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)):
+  - `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (default `32768`). Hard cap per `notifications/ssh/output` payload; larger producer flushes split into multiple notifications.
+  - `SSH_INLINE_PUSH_DAEMON_RELAY` (default `false`). Gates the NDJSON daemon `Event::InlinePush` relay.
+- **1 reserved env var** (forward-compat, **NOT honoured** by the v7.1 server) — `SSH_INLINE_PUSH_DEFAULT`. Documented as the v7.2+ knob that will flip whether the server advertises `experimental.ssh_inline_push` by default. The v7.1 server hard-wires the advertisement on; operators wanting paranoid opt-out should deploy `7.0.2` until v7.2 ships.
+
+### Changed
+
+- **No defaults flipped.** Every existing v7.0.x consumer sees the v7.0.2 wire on every existing tool. Inline-push is purely an additive opt-in surface — `sub_open` without `inline_push` (or with `inline_push=false`) keeps the cursor-bookmark fanout untouched; `initialize` without `experimental.ssh_inline_push` (or with `false`) sees the server advertise the capability but does not honour any later `inline_push=true` on `sub_open`. See [docs/MIGRATION.md → v7.0 → v7.1 → byte-identical recipe](docs/MIGRATION.md#v70--v71).
+
+### Verified
+
+- `cargo clippy --release --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo test --lib --quiet`: **2057 passed** (was 1987 in `[7.0.2]`; +70 inline-push regression guards across lifecycle, capability gating, fanout selection, oversize splitting, daemon relay, sub_stats counter accounting).
+- `cargo test --tests --features test-fixtures --quiet --no-fail-fast`: green across the 9 integration binaries — chaos 41 + chaos_rsync 16 + **chaos_inline_push 9** + property 32 + property_rsync 9 + **property_inline_push 11** + v4_smoke 2 + v5_smoke 12 + v5_daemon_smoke 7 + v6_resume_smoke 12 + v7_rsync_smoke 9.
+- 5 loom invariants gated `#[cfg(loom)]` covering the inline-fanout cursor race against the cursor-path drain.
+- v4_smoke + v5_smoke snapshot tests pass byte-for-byte on the opt-out path (`inline_push` absent, capability not advertised) — confirms wire-additive vs v7.0.x.
+
 ## [7.0.2] — 2026-05-10
 
 Patch release on top of `[7.0.1]`. One real product fix (idempotent unsubscribe lifecycle bug, surfaced via cross-LLM consensus pass post `[7.0.1]`) plus accumulated test/doc drift refresh from the v5/v6/v7 surface migration. No wire format or env-var default changes; fully backwards compatible with `[7.0.1]` clients. The `[Cargo.toml]` package version is bumped from `7.0.1` to `7.0.2`; `[Cargo.lock]` is refreshed in lockstep.
