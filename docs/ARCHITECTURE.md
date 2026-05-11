@@ -693,6 +693,54 @@ flowchart TB
     style P5 fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
 ```
 
+### v7.1 — inline push (ADR 0012)
+
+Phase 9 of [ADR 0012](./adr/0012-inline-push-notifications.md) layers a synchronous producer-side branch on the legacy debouncer-driven path. Producers that already hold the raw byte tail in scope (shell PTY recv, command stdout/stderr publish, serial reader) call `SUBSCRIPTION_REGISTRY.record_bytes_with_tail(kind, id, &bytes)` instead of `record_bytes(kind, id, len)`. The registry:
+
+1. Hands the raw tail to the installed [`LaneFanoutBridge`] via `notify_lanes_inline`, which fans out only to opt-in lanes via `notify_ssh_output`. Opt-out lanes are skipped entirely on this leg.
+2. Falls through to the existing `record_bytes(kind, id, len)` byte-counter pipeline so the debouncer cadence keeps firing `notifications/resources/updated` for every subscriber, opt-in or not.
+
+Result: opt-in lanes receive byte-accurate `notifications/ssh/output` immediately AND the legacy `notifications/resources/updated` on the debouncer cadence (1 s / 5 s force-flush). Opt-out subscribers see a byte-identical wire compared to v7.0.x.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
+flowchart LR
+    Producer["Producer<br/>shell/command/serial<br/>writes raw bytes"]
+    Tail["record_bytes_with_tail<br/>kind + id + &amp;[u8]"]
+    Bridge["LaneFanoutBridge::<br/>notify_lanes_inline"]
+    Compose["compose_inline_payload<br/>bumps inline_seq +<br/>cursor atomically"]
+    Split["InlinePayload::split<br/>cap = SSH_INLINE_PUSH_<br/>MAX_BYTES_PER_NOTIFY"]
+    SshOut["NotifierPort::<br/>notify_ssh_output<br/>(per fragment)"]
+    Counter["record_bytes<br/>(byte counter +<br/>debouncer poke)"]
+    Legacy["notifications/<br/>resources/updated<br/>(opt-out + opt-in)"]
+
+    Producer --> Tail
+    Tail --> Bridge
+    Tail --> Counter
+    Bridge --> Compose
+    Compose --> Split
+    Split --> SshOut
+    Counter --> Legacy
+
+    style Producer fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Tail fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Bridge fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Compose fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style Split fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
+    style SshOut fill:#238636,color:#f0f6fc,stroke:#2ea043
+    style Counter fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+    style Legacy fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
+```
+
+Per-lane atomics dedicated to the inline path live alongside the v5 stats counters in `LaneState`:
+
+- `inline_push: AtomicBool` — opt-in gate flipped by `sub_open` after the capability negotiation.
+- `inline_seq: AtomicU64` — per-lane monotonic sequence shipped on every `notifications/ssh/output`.
+- `inline_events_sent: AtomicU64` — total inline fragments shipped on the lane.
+- `inline_bytes_sent: AtomicU64` — total inline bytes shipped on the lane (sums fragment lengths).
+
+`sub_stats` exposes the inline counters as `inline_events_sent` / `inline_bytes_sent`; `sub_stats_all` rolls them into the per-process total. The bridge cap `inline_max_bytes` is resolved at composition time via [`resolve_inline_push_max_bytes_per_notify`] (env var `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`, default 32 KiB, range `[1k, 1m]`).
+
 ## Lock-free invariants summary
 
 The full table — every atomic, every channel, every guard — lives in [DEVELOPMENT.md](./DEVELOPMENT.md#lock-free-invariants). v5 adds three new categories:

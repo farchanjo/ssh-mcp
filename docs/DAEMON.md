@@ -398,6 +398,27 @@ Long-running resource (shell / command / transfer) released. The `reason` field 
 
 Possible reasons: `unsubscribe_grace_elapsed`, `manual_close`, `cascade_disconnect`, `inactivity_ttl_fired`, `lifetime_lease_expired`.
 
+### `inline_push`
+
+**v7.1 / ADR 0012 — opt-in relay.** Emitted only when `SSH_INLINE_PUSH_DAEMON_RELAY=true` AND the lane opted into inline push via `sub_open inline_push=true`. Default is OFF so v7.0.x NDJSON consumers see a byte-identical stream until an operator flips the gate. Mirrors the MCP-side `notifications/ssh/output` notification one-for-one.
+
+```json
+{"ev":"inline_push","sub_id":"<uuidv7>","uri":"shell://<id>/output","seq":0,"cursor_after":4096,"len":1024,"bytes_b64":"<base64>","truncated":false}
+```
+
+Fields (8 total including `ev`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ev` | `string` | Literal `inline_push`. |
+| `sub_id` | `string` | UUIDv7 of the opt-in lane. |
+| `uri` | `string` | Producer URI (`shell://<id>/output`, `command://<id>/output`, or `serial://<id>/output`). |
+| `seq` | `u64` | Monotonic per-lane sequence. |
+| `cursor_after` | `u64` | Byte cursor AFTER the fragment was appended. Mirrors `resources/read?cursor=auto`. |
+| `len` | `u64` | Number of bytes in this fragment (pre-base64). |
+| `bytes_b64` | `string` | Base64-encoded raw byte tail. |
+| `truncated` | `bool` | `true` when the fragment is part of a multi-fragment split; the last fragment carries `false`. |
+
 ### `heartbeat`
 
 Periodic liveness signal. Emit cadence: `SSH_HEARTBEAT_INTERVAL_S` (default 30 s). Carries the protocol version (so consumers can pin compatibility — see [Versioning](#versioning)).

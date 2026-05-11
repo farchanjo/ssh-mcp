@@ -19,15 +19,15 @@ The `list_changed` advertisement is reserved for tool-driven lifecycle events. T
 
 ## URI schemes
 
-| Scheme                              | Resource                          | Mime               | Cursor support           |
-| ----------------------------------- | --------------------------------- | ------------------ | ------------------------ |
-| `shell://<id>/output`               | PTY output buffer                 | `text/plain`       | yes (`?cursor=auto\|<N>\|0`) |
-| `command://<id>/output`             | Async command stdout/stderr       | `text/plain`       | yes                      |
-| `transfer://<id>/progress`          | SFTP progress (point-in-time)     | `application/json` | no                       |
-| `session://<id>/health`             | Session health snapshot           | `application/json` | no                       |
-| `forward://<id>/events`             | Port-forward event log            | `application/json` | yes                      |
-| `serial://<id>/output`              | UART / TTY / COM byte stream (v5.2 — ADR 0009) | `text/plain`       | yes                      |
-| `rsync://<id>/progress`             | Rsync per-file + aggregate progress events (v7.0 — ADR 0011) | `application/json` | no                       |
+| Scheme                              | Resource                          | Mime               | Cursor support           | Inline push (v7.1 — ADR 0012) |
+| ----------------------------------- | --------------------------------- | ------------------ | ------------------------ | ------------------------------ |
+| `shell://<id>/output`               | PTY output buffer                 | `text/plain`       | yes (`?cursor=auto\|<N>\|0`) | opt-in via `sub_open inline_push=true` |
+| `command://<id>/output`             | Async command stdout/stderr       | `text/plain`       | yes                      | opt-in via `sub_open inline_push=true` |
+| `transfer://<id>/progress`          | SFTP progress (point-in-time)     | `application/json` | no                       | not eligible (binary scheme)   |
+| `session://<id>/health`             | Session health snapshot           | `application/json` | no                       | not eligible (binary scheme)   |
+| `forward://<id>/events`             | Port-forward event log            | `application/json` | yes                      | not eligible (binary scheme)   |
+| `serial://<id>/output`              | UART / TTY / COM byte stream (v5.2 — ADR 0009) | `text/plain`       | yes                      | opt-in via `sub_open inline_push=true` |
+| `rsync://<id>/progress`             | Rsync per-file + aggregate progress events (v7.0 — ADR 0011) | `application/json` | no                       | not eligible (binary scheme)   |
 
 Reference implementation: `src/application/{list_resources,read_resource,subscribe_resource,unsubscribe_resource}.rs` (use cases), `src/infra/mcp/resource_handlers.rs` (rmcp wiring + URI parser), and `src/adapters/subscription/memory_registry.rs` (registry + per-resource debouncer + per-peer cursor).
 
