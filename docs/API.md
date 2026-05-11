@@ -56,6 +56,8 @@ Complete API reference for the **39 MCP tools** (or 38 without `port_forward`) s
 
 `McpSshServer::get_info()` advertises tools (`listChanged: true`), resources (`subscribe: true`, `listChanged: true`), protocol `V_2025_06_18`, and the v4.5 `Implementation` identity (title / description / website_url) — plus the v4.6 `icons` entry — and a few-shot `instructions` block. See [Capability handshake (full payload)](#capability-handshake-1) below for the wire shape.
 
+**v7.1 / ADR 0012** also advertises `experimental.ssh_inline_push: true`. Clients that echo the same flag in their `initialize` response opt into the `notifications/ssh/output` push surface; clients that omit or set it to `false` keep the v7.0.x byte-identical wire on every existing tool. See [docs/LLM_GUIDE.md → Inline push delivery](LLM_GUIDE.md#inline-push-delivery).
+
 ---
 
 ## Tools (39 with `port_forward`, 38 without)
@@ -1085,6 +1087,7 @@ Open a Channel Mux lane for a resource URI. Returns `SUB_ID` (UUIDv7) + the boun
 | `ttl_secs` | `u32?` | — | Honoured only when `lifetime=lease`. Hard TTL on the lane regardless of activity. |
 | `lag_policy` | enum (`block_slow` / `drop_oldest` / `drop_newest` / `snapshot`) | env `SSH_LAG_POLICY_DEFAULT` (`snapshot`) | Lane backpressure policy. |
 | `filter` | string? | `null` | Optional regex string compiled at subscribe time; empty / absent means no filter. Char cap: `SSH_FILTER_REGEX_MAX` (default 1024). |
+| `inline_push` | `bool?` | `false` | **v7.1 / ADR 0012** opt-in for the inline-push delivery path. When `true` AND the peer echoed `experimental.ssh_inline_push: true` during `initialize`, the lane receives `notifications/ssh/output` with the raw byte tail inline (per-notification cap from `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`, default 32 KiB) IN ADDITION to the legacy `notifications/resources/updated` cadence. Honoured only for `shell://`, `command://`, and `serial://` URIs; ignored on binary schemes. The response carries `INLINE_PUSH_HONORED: yes\|no`. |
 
 **Response**:
 ```
@@ -1093,11 +1096,14 @@ SUB_ID: <uuidv7>
 URI: <uri>
 LIFETIME: manual|auto_close|lease
 LAG_POLICY: block_slow|drop_oldest|drop_newest|snapshot
+INLINE_PUSH_HONORED: yes|no
 HINT: REQUIRED: track this SUB_ID; sub_close when done.
 NEXT: sub_close sub_id=<uuidv7> | sub_stats sub_id=<uuidv7>
 ```
 
-**Errors**: `RESOURCE_GONE`, `LANE_LIMIT_PER_URI`, `LANE_LIMIT_TOTAL`, `FILTER_INVALID`, `INVALID_ARGUMENT`.
+`INLINE_PUSH_HONORED: no` means the request was either off (`inline_push=false`), the peer never advertised the experimental capability, or the URI is on a binary scheme (`transfer://`, `session://`, `forward://`, `rsync://`).
+
+**Errors**: `RESOURCE_GONE`, `LANE_LIMIT_PER_URI`, `LANE_LIMIT_TOTAL`, `FILTER_INVALID`, `INLINE_PUSH_BAD_PARAMS`, `INVALID_ARGUMENT`.
 
 **Cost**: O(1) lane open + per-event mpsc thereafter. **Idempotency**: `_meta.idempotency_key` supported.
 
@@ -1176,7 +1182,7 @@ Per-lane atomic counter snapshot.
 |-------|------|-------------|
 | `sub_id` | string | Target lane. |
 
-**Response**: `SUB_STATS: OK` with `events_sent`, `bytes_sent`, `lag_drops`, `queue_depth`, `last_event_at`. **Errors**: `SUB_NOT_FOUND`.
+**Response**: `SUB_STATS: OK` with `events_sent`, `bytes_sent`, `lag_drops`, `queue_depth`, `last_event_at`, plus the **v7.1 / ADR 0012** inline-push counters `inline_events_sent` and `inline_bytes_sent` (both `u64`; counters increment only on opt-in lanes that received `notifications/ssh/output` fragments). **Errors**: `SUB_NOT_FOUND`.
 
 ### sub_stats_all
 
@@ -1294,6 +1300,38 @@ The build without `port_forward` advertises `38 tools, 6 push streams (shell://,
 Each of the 39 tools (or 38 without `port_forward`) carries a `Tool.title` plus `ToolAnnotations.{read_only_hint, destructive_hint, idempotent_hint}`. See [LLM_GUIDE.md section C](./LLM_GUIDE.md#c-server-identity-for-the-host-v45-icon-wired-in-v46) for the matrix. v4.7 also advertises `prompts/list` (10 entries — 5 v4 carry-overs + 5 v5 push-first per ADR 0005) and `resources/templates/list` (5 / 6 entries depending on `port_forward`; the `rsync://` lane is short-lived and is not advertised through the templates list — subscribe directly via the `RSYNC_ID` returned by `ssh_rsync`).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md#subscribe-pipeline-v5-layered-view) for the producer → debouncer → notification pipeline and [DEVELOPMENT.md → Hot-path sequence diagrams](./DEVELOPMENT.md#hot-path-sequence-diagrams) for end-to-end sequence diagrams.
+
+---
+
+## notifications/ssh/output (v7.1 — ADR 0012, opt-in)
+
+Outbound JSON-RPC notification emitted to any `sub_open` lane that opted into the inline-push path via `inline_push: true` AND whose peer echoed `experimental.ssh_inline_push: true` during `initialize`. Fires synchronously from the producer site BEFORE the legacy `notifications/resources/updated` cadence so hosts receive byte-accurate streaming for `shell://`, `command://`, and `serial://` URIs without round-tripping through `resources/read`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/ssh/output",
+  "params": {
+    "sub_id": "<uuidv7>",
+    "uri": "shell://<id>/output",
+    "seq": 0,
+    "cursor_after": 4096,
+    "bytes_b64": "<base64 of the raw byte tail>",
+    "truncated": false
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub_id` | `string` | The lane that received the fragment (UUIDv7 from `sub_open`). |
+| `uri` | `string` | URI the producer wrote to (matches the lane binding). |
+| `seq` | `u64` | Monotonic per-lane sequence (starts at `0`). Use to detect drops. |
+| `cursor_after` | `u64` | Byte cursor AFTER the fragment was appended. Reuse this in `resources/read?cursor=<u64>` for the pull-mode fallback path — both delivery modes converge on the same byte anchor. |
+| `bytes_b64` | `string` | Base64-encoded raw byte tail. Cap from `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (default 32 KiB). |
+| `truncated` | `bool` | `true` when the fragment is part of a multi-fragment split (oversize window); the last fragment carries `truncated: false`. |
+
+The legacy `notifications/resources/updated` continues to fire on the existing debouncer cadence so opt-out subscribers see byte-identical traffic to v7.0.x. See [ADR 0012](./adr/0012-inline-push-notifications.md) and [LLM_GUIDE.md → Inline push delivery](./LLM_GUIDE.md#inline-push-delivery).
 
 ---
 

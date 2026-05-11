@@ -155,6 +155,16 @@ Per-`SubId` lane / `ChannelMux` / backpressure / replay tunables. Wired by the `
 | `SSH_SUB_LEAK_RISK_WARN_S` | `u32` (s) | `2` | `1` | `3600` | Background scan period for the `SUB_LEAK_RISK` watcher (seconds). |
 | `SSH_SUB_LEAK_RISK_KILL_S` | `u32` (s) | `0` | `0` | `86400` | Auto-kill threshold (seconds) for resources that stay subscriber-less longer than this. `0` disables auto-kill (warning-only). |
 
+### Inline push (v7.1 — ADR 0012)
+
+Opt-in `notifications/ssh/output` delivery surface. The fan-out runs synchronously from the producer site, so a lane that opted in receives the raw byte tail BEFORE the legacy debouncer fires `notifications/resources/updated`. See [ADR 0012](./adr/0012-inline-push-notifications.md) and [LLM_GUIDE.md → Inline push delivery](./LLM_GUIDE.md#inline-push-delivery).
+
+| Variable | Type | Default | Floor | Cap | Description |
+|----------|------|---------|-------|-----|-------------|
+| `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` | `usize` (bytes) or bytesize string (`b` / `k` / `m` / `kib` / `mib`) | `32k` (`32_768`) | `1024` (`1k`) | `1_048_576` (`1m`) | Per-notification byte ceiling. Oversize windows split into N fragments — every fragment except the last carries `truncated: true`. Values outside `[1k, 1m]` are logged and clamped. |
+| `SSH_INLINE_PUSH_DAEMON_RELAY` | `bool` (`true` / `1` / `yes` / `on`) | `false` | — | — | NDJSON daemon relay gate. When `true`, `ssh-mcp-tail` emits a new `ev=inline_push` event for every inline notification. Default `false` so existing v7.0.x NDJSON consumers keep a byte-identical stream. The phase 9 implementation intentionally diverges from ADR 0012 line 624's earlier "default true" sketch; the conservative default below is the wire-additive choice. |
+| `SSH_INLINE_PUSH_DEFAULT` | `bool` | reserved for v7.2 | — | — | **Reserved for v7.2.** The current implementation pins `sub_open.inline_push` to a plain `bool` with `serde(default = false)`. Flipping the global default would require a `bool` → `Option<bool>` wire migration, which is deferred. The variable name is documented here for forward-compat declaration; the v7.1 server ignores it. |
+
 ## Daemon (`ssh-mcp-tail`, v5 Phase 4 — ADR 0008)
 
 Resolvers consumed only by the `ssh-mcp-tail` binary; the HTTP and stdio binaries never read these.

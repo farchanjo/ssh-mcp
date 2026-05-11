@@ -864,6 +864,108 @@ Operational follow-on:
 - [RESOURCES.md](./RESOURCES.md) — resource scheme contract.
 - [CONFIGURATION.md](./CONFIGURATION.md) — full env var table.
 
+## v7.0 → v7.1 (ADR 0012)
+
+For **MCP host operators, contributors, and downstream automations** moving from v7.0.x to v7.1.0-rc1+. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped. The only opt-in surface is a single new `inline_push: bool` field on `sub_open` plus the matching `experimental.ssh_inline_push` capability handshake. Hosts that ignore both keep the v7.0.x wire identical.
+
+Reference: [ADR 0012 — inline push notifications](./adr/0012-inline-push-notifications.md).
+
+### What's new
+
+- **`sub_open inline_push: bool?` (default `false`).** Lanes on `shell://`, `command://`, and `serial://` URIs may opt into synchronous `notifications/ssh/output` delivery. The response carries `INLINE_PUSH_HONORED: yes|no` to flag whether the request actually took effect (capability handshake + URI scheme + flag all line up). See [API.md → sub_open](./API.md#sub_open).
+- **Capability handshake adds `experimental.ssh_inline_push`.** Server advertises `true` in its `initialize`; clients must echo `true` to unlock the path. Clients that omit / set `false` keep the legacy notify cadence on every URI — no error, no degraded delivery. See [API.md → Capability handshake](./API.md#capability-handshake).
+- **New JSON-RPC notification `notifications/ssh/output`.** One JSON-RPC notification per inline fragment, carrying `sub_id`, `uri`, `seq`, `cursor_after`, `bytes_b64`, `truncated`. The `cursor_after` field mirrors the legacy `resources/read?cursor=auto` anchor so inline and pull modes converge on a single byte cursor. See [API.md → notifications/ssh/output](./API.md#notificationssshoutput-v71--adr-0012-opt-in).
+- **NDJSON daemon `inline_push` event (gated).** `ssh-mcp-tail` ships a new `ev=inline_push` event mirroring the MCP notification one-for-one, gated by `SSH_INLINE_PUSH_DAEMON_RELAY` (default `false`). The default-off shape keeps v7.0.x daemon consumers byte-identical. See [DAEMON.md → inline_push](./DAEMON.md#inline_push).
+- **2 new error codes.** `INLINE_PUSH_BAD_PARAMS` (POLICY, non-retryable) when `inline_push=true` is paired with a binary URI scheme; `INLINE_PUSH_OVERSIZE` (POLICY, non-retryable) when a single payload exceeds `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`. Total error-taxonomy size grows from 46 to 48. See [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
+- **2 new env vars.** `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (per-notification byte ceiling, default 32 KiB, range `[1k, 1m]`); `SSH_INLINE_PUSH_DAEMON_RELAY` (daemon relay gate, default `false`). A third name (`SSH_INLINE_PUSH_DEFAULT`) is **reserved** for v7.2 — v7.1 documents the name for forward-compat declaration but does not honour it. See [CONFIGURATION.md → Inline push](./CONFIGURATION.md#inline-push-v71--adr-0012).
+- **4 new per-lane atomic counters.** `inline_push` (`AtomicBool`), `inline_seq` (`AtomicU64`), `inline_events_sent` (`AtomicU64`), `inline_bytes_sent` (`AtomicU64`). The two `_sent` counters surface through `sub_stats` and `sub_stats_all`. See [ARCHITECTURE.md → v7.1 inline push](./ARCHITECTURE.md#v71--inline-push-adr-0012).
+
+### What stayed identical
+
+- All 39 v7.0.x tool names, response shapes, env vars, error codes, and the 7-scheme resource catalogue.
+- The byte cursor on `shell://` / `command://` / `serial://` (`resources/read?cursor=auto` still works on every lane, opt-in or not).
+- Lifecycle states, refcount cascade, grace windows, lag policies.
+- NDJSON daemon command schema (stdin) — unchanged. `ev=inline_push` is the only net-new event, off by default.
+- ssh-mcp-tail / ssh-mcp-stdio / ssh-mcp HTTP binaries — all three carry the new feature; no new binary, no new transport.
+
+### Recommended workflow for a v7.0.x host
+
+1. **Do nothing.** v7.1 ships fully wire-additive. Existing tests, automations, and consumers keep passing without any code change.
+2. **Opt in selectively.** Once the host's transport supports the new notification method, echo `experimental.ssh_inline_push: true` during `initialize` and start passing `inline_push: true` on `sub_open` for `shell://` / `command://` / `serial://` lanes you want byte-streamed.
+3. **Watch the response line.** `INLINE_PUSH_HONORED: no` means the request was either off, the capability handshake did not echo, or the URI is on a binary scheme — none of those are errors; the lane stays open with legacy notify cadence.
+4. **Tune the cap.** If lanes carry large bursts and the consumer can drain them, raise `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (up to `1m`). Watch `inline_bytes_sent` and `inline_events_sent` on `sub_stats` to size correctly.
+5. **(NDJSON daemon only.)** When ready to consume `inline_push` events on `ssh-mcp-tail`, set `SSH_INLINE_PUSH_DAEMON_RELAY=true`. Existing v7.0.x consumers that don't recognise the new event type should keep the gate off.
+
+### Wire-additivity guarantees
+
+- v7.0.x clients running `sub_open` WITHOUT `inline_push` → wire-identical to v7.0.x server.
+- v7.0.x clients running `sub_open` WITH `inline_push: true` but NO capability echo → `INLINE_PUSH_HONORED: no`, wire-identical to v7.0.x server.
+- v7.0.x clients running `sub_open` on a binary URI scheme with `inline_push: true` → `INLINE_PUSH_HONORED: no`, wire-identical to v7.0.x server.
+- NDJSON daemon with `SSH_INLINE_PUSH_DAEMON_RELAY` unset / `false` → stdout stream byte-identical to v7.0.x daemon.
+
+### Downgrade path (v7.1.x → v7.0.x)
+
+The on-disk and wire state v7.1 introduces is intentionally minimal so a roll-back to v7.0.x is a binary swap with zero data migration:
+
+- **No persistent state.** v7.1 stores nothing on disk that v7.0.x does not already understand. Sessions, lifecycles, lane snapshots, ring buffers, and ID caches all live in process memory; restarting on a v7.0.x binary starts fresh as it always has.
+- **No DTO / arg surface changes that break v7.0.x.** The new `inline_push` field on `sub_open` is `#[serde(default)]` — clients that omit it are byte-identical to v7.0.x. Roll-back: stop the v7.1 binary, swap the artefact, start the v7.0.x binary. Clients that were sending `inline_push=true` keep working; the v7.0.x server simply ignores the unknown field (rmcp / `serde(deny_unknown_fields)` is OFF on `SubOpenArgs`, per the v5 contract).
+- **No env-var lock-in.** `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` and `SSH_INLINE_PUSH_DAEMON_RELAY` are read-only on the v7.1 server. v7.0.x ignores both. Leave them set across the roll-back boundary.
+- **NDJSON daemon consumers.** If you had `SSH_INLINE_PUSH_DAEMON_RELAY=true` enabled, the v7.0.x daemon will simply never emit `ev=inline_push` events. Existing `ev=*` event consumers stay byte-identical.
+- **Capability handshake.** v7.0.x does not advertise `experimental.ssh_inline_push` at `initialize`. Clients that were relying on `INLINE_PUSH_HONORED: yes` will see `INLINE_PUSH_HONORED: no` on the response line after roll-back — the lane stays open, push delivery falls back to the legacy `resources/updated` cadence. No client code change is required.
+
+### Monitoring (capacity planning + diagnostics)
+
+The inline-push path adds two per-lane atomic counters that surface through `sub_stats` (single lane) and `sub_stats_all` (process-wide). Both are `AtomicU64` updated with `Ordering::Relaxed` — no happens-before with any reader, so the values are eventually-consistent snapshots safe to scrape at 1 Hz from observability harnesses.
+
+- **`INLINE_EVENTS_SENT`** — count of `notifications/ssh/output` notifications shipped from this lane. Increments once per fragment (one inline window may produce N fragments if `bytes.len() > SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`).
+- **`INLINE_BYTES_SENT`** — cumulative byte count of inline payloads shipped (the `bytes.len()` of every fragment, NOT the base64-inflated wire size). Multiply by ~1.33 to estimate post-base64 transport bandwidth.
+- **Hot-path indicator.** `INLINE_EVENTS_SENT / EVENTS_SENT` over a window approximates the fraction of events delivered inline vs through the legacy `resources/updated` notify cadence. A value near 1.0 means the lane is fully inline-driven; near 0 means the lane opted out or the URI failed the capability handshake.
+- **Sizing the cap.** Plot `INLINE_BYTES_SENT / INLINE_EVENTS_SENT` to derive the average per-fragment size. If it equals `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` for sustained periods, the producer is saturating the cap and the consumer may benefit from a higher ceiling (raise `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` up to `1m`).
+- **Drain-rate match.** Compare `INLINE_BYTES_SENT` slope with the host transport's drain rate (rmcp peer mpsc throughput for stdio / HTTP, NDJSON line cap for `ssh-mcp-tail`). If the slope exceeds drain rate, the rmcp peer `mpsc::Sender::send` starts to await — observable as transport latency creeping up at the host side. Reduce the cap or instruct producers to opt-out (`inline_push=false`) for high-volume lanes.
+
+### Capacity planning
+
+Per-lane peak memory footprint with `inline_push=true`:
+
+| Component | Formula |
+|---|---|
+| Producer ring buffer | unchanged from v7.0.x (`SSH_SHELL_MAX_BUFFER`, `SSH_COMMAND_MAX_BUFFER_SIZE`) |
+| Per-notification mpsc slot | `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` × 1.33 (base64 inflation) + ~120 B notification envelope |
+| Worst-case in-flight | `mpsc_capacity × per_notification_slot` |
+
+Sample sizing — 32 KiB cap, default rmcp mpsc capacity 256:
+- Per-notification slot: 32 × 1024 × 1.33 + 120 ≈ 43.7 KiB.
+- Worst-case in-flight per lane: 256 × 43.7 KiB ≈ 11.2 MiB.
+- For 100 concurrent inline lanes: ≈ 1.12 GiB peak RAM **per host process**.
+
+If that footprint is unacceptable, tune in this order:
+1. **Lower the cap.** `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY=8k` divides per-notification memory by 4 at the cost of more fragments per window.
+2. **Drop the opt-in on high-volume lanes.** Pass `inline_push=false` to `sub_open` for any lane carrying >100 KiB/s; the legacy notify cadence (1 s debouncer + cursor pull) caps at ~64 KiB/event.
+3. **Disable daemon relay.** `SSH_INLINE_PUSH_DAEMON_RELAY=false` (default) prevents the NDJSON daemon from forwarding inline frames — the daemon's outbound writer is the hottest backpressure point on `ssh-mcp-tail` workloads.
+
+The 1 s debouncer / 5 s force-flush windows on the legacy path are unaffected by inline opt-in — both legs run side-by-side on opted-in lanes. Operators planning the rollout should expect total bytes-shipped to remain unchanged; only the delivery cadence shifts from pull-after-notify to push-with-bytes.
+
+### Opt-out for paranoid operators
+
+Every v7.1 feature is opt-in. To run a v7.1 binary with v7.0.2-byte-identical behaviour:
+
+- **Server side.** No action required. v7.1 advertises `experimental.ssh_inline_push: true` at `initialize`; clients that don't echo back never trip the inline path.
+- **Belt-and-braces server side.** If you do not want even the capability advertised (paranoid mode), the cleanest path today is to deploy the v7.0.2 binary instead — the capability is hard-wired into the v7.1 build. A future minor (v7.2) is reserved for `SSH_INLINE_PUSH_DEFAULT` to flip this advertisement at runtime; the env var name is documented in v7.1 as forward-compat but is **not honoured** by the v7.1 server.
+- **Client side.** Do NOT include `experimental.ssh_inline_push` in your `initialize` capabilities object; OR include it with the value `false`. Equivalent: send `sub_open` calls without `inline_push` (or with `inline_push=false`). All three paths produce `INLINE_PUSH_HONORED: no` and byte-identical wires to v7.0.2.
+- **NDJSON daemon side.** Keep `SSH_INLINE_PUSH_DAEMON_RELAY` unset (or set to any falsy value: `0`, `false`, `no`). The default is already `false`, so an unset env var is the secure default.
+- **Audit.** `sub_stats_all` shows `INLINE_EVENTS_SENT=0, INLINE_BYTES_SENT=0` across every lane on a properly opted-out deployment. Both counters at zero is the canonical "no inline traffic ever shipped" signal.
+
+### Error budget impact
+
+v7.1 introduces 2 new error codes; both are POLICY, both non-retryable. Neither fires on the legacy notify cadence — only on the inline opt-in path.
+
+- **`INLINE_PUSH_BAD_PARAMS`** — fires from `sub_open` validation when `inline_push=true` is paired with a binary URI scheme. Caller bug; non-retryable until corrected. Frequency on a healthy deployment: zero.
+- **`INLINE_PUSH_OVERSIZE`** — defensive port-boundary guard (ADR 0012 phase 10). The production `LaneFanoutBridge` always splits payloads through `InlinePayload::split` before delivery, so this error code is structurally unreachable from the normal fan-out path. It surfaces only when a direct port caller (test harness, future SDK consumer, custom embed adapter) bypasses the splitter. Frequency on a healthy deployment: zero. Treat any non-zero occurrence as an integration bug, not a transient failure.
+
+The `INLINE_PUSH_HONORED: no` response line is NOT an error — it's a hint that the lane opened but inline delivery did not engage (capability missing on the client, URI scheme not supported, or `inline_push` flag was `false`). Existing observability dashboards that alarm on `STATUS: error` need no change.
+
+---
+
 ## v6.1 → v7.0
 
 For **MCP host operators, contributors, and downstream automations** moving from v6.1 to v7.0. **Wire-additive on the MCP surface** — the existing 36 tool catalogue is unchanged. Three new tools (`ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`) and a new `rsync://<id>/progress` resource scheme go live in v7.0. Two integrated transports ship in-process inside the host crate: `WireRsyncTransport` (canonical port of OpenBSD `openrsync` speaking rsync wire protocol v32 against a remote `rsync --server`; advertises v32, negotiates to v31 against rsync 3.x) and `SftpRsyncTransport` (universal SFTP fallback). Both are live for the supported feature set; push and pull both byte-identical against `rsync 3.2.7` on a real Linux VM. Reference: [ADR 0011 — rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).

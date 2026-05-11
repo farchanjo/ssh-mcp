@@ -488,6 +488,50 @@ Some hosts do not consume MCP notifications. Fallback paths:
 
 Even on the fallback path, prefer the long-poll `wait=true` variants over a tight loop of `wait=false` polls — long-poll wakes immediately on real activity and idles cheaply otherwise.
 
+## Inline push delivery
+
+**v7.1 / ADR 0012** — opt-in push surface that delivers the raw byte tail INLINE on `notifications/ssh/output` instead of forcing every consumer to round-trip through `resources/read` after a `notifications/resources/updated` poke. Designed for interactive PTY workflows, real-time monitoring, and any 27B-class host that cannot afford the extra read latency.
+
+### When to opt in
+
+Set `inline_push: true` on `sub_open` when ALL of these are true:
+
+- The lane is on a **text URI**: `shell://`, `command://`, or `serial://` (binary schemes ignore the flag).
+- You want **byte-level latency** rather than the debouncer cadence (default 1 s flush, 5 s force-flush).
+- Your transport supports the experimental capability — see the next section.
+
+Opt-OUT (omit `inline_push` or set `false`) when:
+
+- The host cannot parse `notifications/ssh/output` (every v7.0.x consumer falls here automatically).
+- The lane is on a binary scheme (`transfer://`, `forward://`, `rsync://`, `session://`) — those keep the legacy notify cadence regardless.
+- You are happy with the debouncer cadence and want to keep bytes off the wire until you `resources/read`.
+
+### Capability handshake
+
+The server advertises `experimental.ssh_inline_push: true` in its `initialize` response. To unlock the path, the client MUST echo the same flag back in ITS `initialize` payload. Servers that see `experimental.ssh_inline_push != true` from the client honour `inline_push=true` requests with `INLINE_PUSH_HONORED: no` and the legacy notify cadence — no error, no degraded delivery, just a polite "client did not opt in".
+
+### Wire shape
+
+See [API.md → notifications/ssh/output](./API.md#notificationssshoutput-v71--adr-0012-opt-in) for the full notification schema. TL;DR — one JSON-RPC notification per fragment, base64-encoded bytes (raw byte tail capped by `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`, default 32 KiB; oversize windows split into N fragments with `truncated: true` on every fragment except the last).
+
+### Cursor semantics
+
+`cursor_after` on each `notifications/ssh/output` event is the post-append byte cursor — the SAME anchor that the legacy `resources/read?cursor=auto` returns. Inline mode and pull mode converge on a single byte cursor, so a host can mix both delivery legs on the same lane without drift:
+
+- Read the inline payload directly when you receive `notifications/ssh/output`.
+- Fall back to `resources/read?cursor=<cursor_after>` if you missed a notification (queue overflow, transport reconnect).
+- The next inline event's `cursor_after` picks up exactly where the read left off.
+
+### `INLINE_PUSH_HONORED: no` fallback
+
+`sub_open` always responds with an `INLINE_PUSH_HONORED: yes|no` line. When `no`:
+
+- Cause #1 — `inline_push: false` (or omitted; default is `false`).
+- Cause #2 — client never echoed `experimental.ssh_inline_push: true`.
+- Cause #3 — URI is on a binary scheme.
+
+In every case the lane stays open with full legacy notify delivery; no retry or feature flag flip is needed.
+
 ## Connection lifecycle and recycling
 
 Three signals that small LLMs can use to keep a session pool tidy without leaking handles.
@@ -1571,6 +1615,26 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 - **Cure:** Subscribe immediately, OR recreate the resource with `release_when_no_subs=true`.
 - **Prevention:** Apply Rule 1 (golden rules).
 - **Related:** [RESOURCE_GONE], [GRACE_TIMER_EXPIRED].
+
+#### [INLINE_PUSH_BAD_PARAMS] `sub_open inline_push` request failed validation
+
+- **Category:** POLICY
+- **Retryable:** no
+- **When:** `sub_open inline_push=true` was paired with a URI on a binary scheme (`transfer://`, `forward://`, `rsync://`, `session://`) or with an obvious wire malformation (e.g. lifetime + inline-push combination disallowed by the schema).
+- **Why:** ADR 0012 phase 5 binds inline-push delivery to the three text URI schemes (`shell://`, `command://`, `serial://`). Other schemes carry binary frames that the inline payload format cannot encode safely.
+- **Cure:** Drop `inline_push` from the request, or move the subscription to a text URI.
+- **Prevention:** Reserve `inline_push=true` for `shell://`, `command://`, and `serial://` lanes.
+- **Related:** [INLINE_PUSH_OVERSIZE].
+
+#### [INLINE_PUSH_OVERSIZE] Single inline payload exceeded the server cap
+
+- **Category:** POLICY
+- **Retryable:** no
+- **When:** A direct caller invoked `NotifierPort::notify_ssh_output` with an `InlinePayload` whose `bytes.len()` exceeds `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (default 32 KiB, range `[1k, 1m]`). The production fan-out path through `LaneFanoutBridge::ship_inline_fragments` ALWAYS splits oversize windows through `InlinePayload::split` before delivery — this error never fires on the production splitter path; it surfaces only when a direct port caller (test harnesses, future SDK consumers, custom embed adapters) bypasses the splitter and hands a too-large payload to the notifier.
+- **Why:** ADR 0012 phase 10 added a defensive guard at the `NotifierPort` boundary so misuse from new direct callers gets clean error feedback instead of silently inflating the rmcp peer's mpsc / NDJSON line cap.
+- **Cure:** Split the window through `InlinePayload::split(SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY, is_text)` before calling `notify_ssh_output` — that is exactly what `LaneFanoutBridge` does on every production producer event. Alternatively, raise `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` (up to 1 MiB), but the cap exists to bound peak per-notification memory; raising it across the board has process-wide footprint impact.
+- **Prevention:** Always route inline payloads through `LaneFanoutBridge` rather than calling the port directly. Watch `inline_bytes_sent` in `sub_stats` to size the cap correctly relative to the consumer's drain rate.
+- **Related:** [INLINE_PUSH_BAD_PARAMS], [LANE_BUFFER_FULL].
 
 ---
 
