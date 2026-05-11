@@ -13,7 +13,10 @@
 use std::sync::Arc;
 
 use rmcp::ServiceExt as _;
-use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+use rmcp::model::{
+    ClientCapabilities, ClientInfo, ExperimentalCapabilities, Implementation, JsonObject,
+    ProtocolVersion,
+};
 use rmcp::service::{RoleClient, RunningService, Service};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use thiserror::Error;
@@ -96,6 +99,16 @@ where
     }
 }
 
+/// Experimental capability key advertised by the daemon client.
+///
+/// Echoed on `initialize` so the server-side ADR 0012 recorder activates
+/// inline push for the in-process peer. Must match the key advertised by
+/// the server side in
+/// `crate::infra::mcp::tool_router::EXPERIMENTAL_INLINE_PUSH_KEY` so the
+/// per-process registry observes the daemon as a capability-granting
+/// peer.
+pub const EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH: &str = "ssh_inline_push";
+
 /// Build the standard `ClientInfo` advertised by the embedded daemon
 /// client.
 ///
@@ -106,11 +119,27 @@ where
 /// `#[non_exhaustive]`, so the builder goes through the public
 /// `::new` constructors and `with_protocol_version` chained setter
 /// rather than struct literals.
+///
+/// ADR 0012 Phase 7 — the advertised capability map carries
+/// `experimental.ssh_inline_push = {}` so the server-side recorder
+/// installed at composition time flips the per-peer
+/// `CapabilityRegistry::InlinePush` bit on the daemon's own internal
+/// peer. With the bit set, `sub_open inline_push=true` lanes opened
+/// through the daemon's NDJSON surface deliver
+/// `notifications/ssh/output` events that the embedded client then
+/// translates into NDJSON `inline_push` events (env-gated by
+/// `SSH_INLINE_PUSH_DAEMON_RELAY`).
 #[must_use]
 pub fn embed_client_info() -> ClientInfo {
     let implementation = Implementation::new("ssh-mcp-tail (embed)", env!("CARGO_PKG_VERSION"));
-    ClientInfo::new(ClientCapabilities::default(), implementation)
-        .with_protocol_version(ProtocolVersion::default())
+    let mut capabilities = ClientCapabilities::default();
+    let mut experimental = ExperimentalCapabilities::new();
+    experimental.insert(
+        EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH.to_string(),
+        JsonObject::new(),
+    );
+    capabilities.experimental = Some(experimental);
+    ClientInfo::new(capabilities, implementation).with_protocol_version(ProtocolVersion::default())
 }
 
 /// Wire one half of a `tokio::io::duplex` pair as the rmcp server side
@@ -210,6 +239,20 @@ mod tests {
         let info = embed_client_info();
         assert_eq!(info.client_info.name, "ssh-mcp-tail (embed)");
         assert!(!info.client_info.version.is_empty());
+    }
+
+    #[test]
+    fn client_capabilities_advertise_ssh_inline_push() {
+        let info = embed_client_info();
+        let experimental = info
+            .capabilities
+            .experimental
+            .as_ref()
+            .expect("daemon client must advertise an experimental map (ADR 0012 phase 7)");
+        assert!(
+            experimental.contains_key(EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH),
+            "experimental map must include ssh_inline_push so the in-process recorder activates"
+        );
     }
 
     #[test]

@@ -107,6 +107,7 @@ trait-variant = "0.1"   # AFIT pattern for ports/adapters (v3 `async-trait` dire
 
 # Lock-free primitives
 arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>
+base64 = "0.22"             # ADR 0012 v7.1 inline-push — wire encoding for `notifications/ssh/output` `bytes_b64` field
 bytes = "1.10"              # COW byte slices for broadcast / history
 
 # Serialization and data handling

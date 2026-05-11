@@ -16,13 +16,15 @@
 
 use std::sync::Arc;
 
+use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
+use crate::domain::ids::PeerId;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
 use crate::ports::notifier::{DebouncerActivator, PeerHandle};
-use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy, SubSummary};
+use crate::ports::subscriber_lane::{InlineLaneCounters, LaneAdmin, LanePolicy, SubSummary};
 use crate::ports::subscriber_registry::ResourceKind;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +46,11 @@ pub struct SubscribeRequest {
     /// events. `None` for transports without a peer concept (NDJSON
     /// daemon).
     pub peer: Option<Arc<dyn PeerHandle>>,
+    /// ADR 0012 phase 5 -- client requested inline-push delivery.
+    /// Honoured only when the peer advertised the
+    /// `experimental.ssh_inline_push` capability at `initialize`;
+    /// silently downgrades otherwise.
+    pub inline_push: bool,
 }
 
 /// Outbound DTO for `sub_open`.
@@ -59,6 +66,14 @@ pub struct SubscribeOutcome {
     pub lag_policy: LagPolicy,
     /// Resolved grace window in ms (0 when not applicable).
     pub grace_ms: u32,
+    /// ADR 0012 phase 5 -- whether the caller requested inline-push
+    /// delivery. Echoes the wire flag verbatim regardless of the
+    /// capability-handshake outcome.
+    pub inline_push_requested: bool,
+    /// ADR 0012 phase 5 -- whether the server honoured the request
+    /// after the capability check. `false` when the request was
+    /// silently downgraded.
+    pub inline_push_honored: bool,
 }
 
 /// `sub_open` use case.
@@ -66,17 +81,20 @@ pub struct SubscribeOutcome {
 pub struct SubscribeUseCase {
     lane: Arc<dyn LaneAdmin>,
     activator: Option<Arc<dyn DebouncerActivator>>,
+    capabilities: Option<Arc<CapabilityRegistry>>,
 }
 
 impl SubscribeUseCase {
     /// Build the use case with the supplied lane handle. No debouncer
-    /// activator — used by tests / fixtures that bypass the full
-    /// production wiring.
+    /// activator, no capability registry -- used by tests / fixtures
+    /// that bypass the full production wiring. `inline_push=true`
+    /// requests are silently downgraded in this mode.
     #[must_use]
     pub const fn new(lane: Arc<dyn LaneAdmin>) -> Self {
         Self {
             lane,
             activator: None,
+            capabilities: None,
         }
     }
 
@@ -92,28 +110,37 @@ impl SubscribeUseCase {
         Self {
             lane,
             activator: Some(activator),
+            capabilities: None,
         }
+    }
+
+    /// ADR 0012 phase 5 -- attach the capability registry so the use
+    /// case can honour `inline_push=true` requests when the peer
+    /// echoed the capability at initialize time. Returns `self` for
+    /// builder-style chaining.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Arc<CapabilityRegistry>) -> Self {
+        self.capabilities = Some(capabilities);
+        self
     }
 
     /// Drive the orchestration.
     ///
     /// # Errors
     ///
-    /// - [`DomainError::InvalidArgument`] — URI fails to parse.
+    /// - [`DomainError::InvalidArgument`] -- URI fails to parse.
     /// - [`DomainError::MaxSubsPerUriExceeded`] / [`DomainError::MaxSubsTotalExceeded`]
-    ///   — caps reached.
-    /// - [`DomainError::InvalidArgument`] — regex fails to compile.
+    ///   -- caps reached.
+    /// - [`DomainError::InvalidArgument`] -- regex fails to compile.
     pub async fn execute(&self, req: SubscribeRequest) -> Result<SubscribeOutcome, DomainError> {
         let parsed =
             parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
-        let policy = LanePolicy {
-            lag_policy: req.lag_policy,
-            lifetime: req.lifetime,
-            filter: req.filter,
-            buffer_size: 0,
-            peer: req.peer,
-        };
+        let lifetime = req.lifetime;
+        let lag_policy = req.lag_policy;
+        let inline_push_requested = req.inline_push;
+        let peer_id = req.peer.as_ref().map(|p| p.id());
+        let policy = lane_policy_from(&req);
         let sub_id = self
             .lane
             .open(canonical.clone(), parsed.kind, parsed.id, policy)
@@ -121,13 +148,38 @@ impl SubscribeUseCase {
         if let Some(activator) = self.activator.as_ref() {
             activator.ensure_for_uri(&canonical);
         }
+        let inline_push_honored =
+            self.honor_inline_push(&sub_id, inline_push_requested, peer_id.as_ref());
         Ok(SubscribeOutcome {
             sub_id,
             uri: canonical,
-            lifetime: req.lifetime,
-            lag_policy: req.lag_policy,
-            grace_ms: grace_ms_from(req.lifetime),
+            lifetime,
+            lag_policy,
+            grace_ms: grace_ms_from(lifetime),
+            inline_push_requested,
+            inline_push_honored,
         })
+    }
+
+    fn honor_inline_push(&self, sub_id: &SubId, requested: bool, peer_id: Option<&PeerId>) -> bool {
+        let honored = self.resolve_inline_honored(requested, peer_id);
+        if honored {
+            self.lane.set_inline_push(sub_id, true);
+        }
+        honored
+    }
+
+    fn resolve_inline_honored(&self, requested: bool, peer_id: Option<&PeerId>) -> bool {
+        if !requested {
+            return false;
+        }
+        let Some(caps) = self.capabilities.as_ref() else {
+            return false;
+        };
+        let Some(peer_id) = peer_id else {
+            return false;
+        };
+        caps.peer_has_capability(peer_id, CapabilityFlag::InlinePush)
     }
 }
 
@@ -135,6 +187,19 @@ const fn grace_ms_from(lifetime: SubscriptionLifetime) -> u32 {
     match lifetime {
         SubscriptionLifetime::AutoClose { grace_ms } => grace_ms,
         SubscriptionLifetime::Manual | SubscriptionLifetime::Lease { .. } => 0,
+    }
+}
+
+/// ADR 0012 phase 5 -- extracted lane-policy builder. Consumes the
+/// non-`Copy` fields of the incoming `SubscribeRequest` so the caller
+/// keeps the inexpensive `Copy` knobs in scope.
+fn lane_policy_from(req: &SubscribeRequest) -> LanePolicy {
+    LanePolicy {
+        lag_policy: req.lag_policy,
+        lifetime: req.lifetime,
+        filter: req.filter.clone(),
+        buffer_size: 0,
+        peer: req.peer.clone(),
     }
 }
 
@@ -456,6 +521,11 @@ pub struct SubStatsOutcome {
     pub sub_id: SubId,
     /// Stats snapshot.
     pub stats: SubscriberStats,
+    /// ADR 0012 phase 5 -- inline-push counters bundle. `None` when
+    /// the lane was already gone by the time we sampled the inline
+    /// atomics; the primary stats path already returned `Ok`, so we
+    /// surface what we have and skip the inline lines on render.
+    pub inline: Option<InlineLaneCounters>,
 }
 
 /// `sub_stats` use case.
@@ -480,9 +550,11 @@ impl SubStatsUseCase {
         self.lane.stats(&req.sub_id).map_or_else(
             || Err(DomainError::SubNotFound(req.sub_id.clone())),
             |stats| {
+                let inline = self.lane.inline_stats(&req.sub_id);
                 Ok(SubStatsOutcome {
                     sub_id: req.sub_id.clone(),
                     stats,
+                    inline,
                 })
             },
         )
@@ -616,6 +688,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -636,6 +709,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -652,6 +726,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap_err();
@@ -668,6 +743,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::Regex("([".to_string()),
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap_err();
@@ -996,6 +1072,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1012,6 +1089,7 @@ mod tests {
                 lag_policy: LagPolicy::DropOldest,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1028,6 +1106,7 @@ mod tests {
                 lag_policy: LagPolicy::BlockSlow,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1044,6 +1123,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1060,6 +1140,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1076,6 +1157,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1092,6 +1174,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1108,6 +1191,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1127,6 +1211,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1137,6 +1222,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1147,6 +1233,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap_err();
@@ -1165,6 +1252,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap();
@@ -1175,6 +1263,7 @@ mod tests {
                 lag_policy: LagPolicy::Snapshot,
                 filter: FilterRule::None,
                 peer: None,
+                inline_push: false,
             })
             .await
             .unwrap_err();
@@ -1363,5 +1452,108 @@ mod tests {
             };
             assert_eq!(summary_kind_str(&s), expected);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ADR 0012 phase 5 -- SubscribeUseCase inline-push capability gate
+    // ------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+    use crate::domain::ids::PeerId;
+    use crate::ports::notifier::PeerHandle;
+
+    #[derive(Debug)]
+    struct PhaseFivePeer {
+        id: PeerId,
+        closed: AtomicBool,
+    }
+
+    impl PhaseFivePeer {
+        fn new(id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: PeerId::new(id.to_string()),
+                closed: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl PeerHandle for PhaseFivePeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+
+    fn phase5_subscribe(peer: Option<Arc<dyn PeerHandle>>, inline_push: bool) -> SubscribeRequest {
+        SubscribeRequest {
+            uri: "shell://phase5/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer,
+            inline_push,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_push_false_default_keeps_lane_opt_out() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let caps = Arc::new(CapabilityRegistry::new());
+        let uc = SubscribeUseCase::new(Arc::clone(&lane)).with_capabilities(caps);
+        let peer: Arc<dyn PeerHandle> = PhaseFivePeer::new("p1");
+        let outcome = uc
+            .execute(phase5_subscribe(Some(peer), false))
+            .await
+            .unwrap();
+        assert!(!outcome.inline_push_requested);
+        assert!(!outcome.inline_push_honored);
+        let counters = adapter.inline_stats(&outcome.sub_id).expect("lane present");
+        assert!(!counters.inline_push, "lane gate must stay opt-out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_push_true_with_capability_sets_lane_gate() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let caps = Arc::new(CapabilityRegistry::new());
+        let peer = PhaseFivePeer::new("p-honored");
+        caps.record_capability(peer.id(), CapabilityFlag::InlinePush, true);
+        let uc = SubscribeUseCase::new(Arc::clone(&lane)).with_capabilities(Arc::clone(&caps));
+        let peer_handle: Arc<dyn PeerHandle> = peer;
+        let outcome = uc
+            .execute(phase5_subscribe(Some(peer_handle), true))
+            .await
+            .unwrap();
+        assert!(outcome.inline_push_requested);
+        assert!(outcome.inline_push_honored);
+        let counters = adapter.inline_stats(&outcome.sub_id).expect("lane present");
+        assert!(counters.inline_push, "lane gate must be honoured");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_push_true_without_capability_silently_falls_back() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let caps = Arc::new(CapabilityRegistry::new());
+        // No record_capability call -- the peer never advertised the flag.
+        let peer: Arc<dyn PeerHandle> = PhaseFivePeer::new("p-cold");
+        let uc = SubscribeUseCase::new(Arc::clone(&lane)).with_capabilities(caps);
+        let outcome = uc
+            .execute(phase5_subscribe(Some(peer), true))
+            .await
+            .unwrap();
+        assert!(outcome.inline_push_requested);
+        assert!(
+            !outcome.inline_push_honored,
+            "capability missing -- must silently downgrade"
+        );
+        let counters = adapter.inline_stats(&outcome.sub_id).expect("lane present");
+        assert!(!counters.inline_push, "lane gate must stay opt-out");
     }
 }

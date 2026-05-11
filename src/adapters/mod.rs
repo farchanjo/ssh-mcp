@@ -12,6 +12,7 @@
 //! just `pub mod` declarations.
 
 pub mod auth;
+pub mod capability;
 pub mod clock;
 pub mod config;
 pub mod id_generator;

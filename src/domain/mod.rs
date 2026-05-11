@@ -12,6 +12,7 @@ pub mod events;
 pub mod forward;
 pub mod identity;
 pub mod ids;
+pub mod inline_payload;
 pub mod keys;
 pub mod lifecycle;
 pub mod policy;

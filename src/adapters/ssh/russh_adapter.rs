@@ -1379,7 +1379,10 @@ async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellR
         }
     }
     if !local.is_empty() {
-        let chunk_len = local.len();
+        // ADR 0012 phase 9 — clone the tail before flush_shell_buffer
+        // clears `local`; the inline-push lane receives the raw bytes
+        // synchronously below.
+        let tail = local.clone();
         flush_shell_buffer(
             &handles.history,
             &handles.output_tx,
@@ -1387,14 +1390,17 @@ async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellR
             &mut local,
             &handles.max_buffer_size,
         );
-        notify_shell_resource(handles.shell_id.as_str(), chunk_len);
+        notify_shell_resource(handles.shell_id.as_str(), &tail);
     }
 }
 
-fn notify_shell_resource(shell_id: &str, bytes_added: usize) {
+fn notify_shell_resource(shell_id: &str, bytes_added: &[u8]) {
     use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
     SUBSCRIPTION_REGISTRY.poke(ResourceKind::Shell, shell_id);
-    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Shell, shell_id, bytes_added);
+    // ADR 0012 phase 9 — raw tail feeds inline-push lanes; the
+    // production registry falls through to `record_bytes(.., len)`
+    // to drive the debouncer cadence for legacy subscribers.
+    SUBSCRIPTION_REGISTRY.record_bytes_with_tail(ResourceKind::Shell, shell_id, bytes_added);
 }
 
 /// Handle a single russh frame. Returns `true` to continue the reader
@@ -1410,7 +1416,8 @@ fn handle_reader_msg(
             local.extend_from_slice(&data);
             handles.last_activity_ms.store(now_ms(), Ordering::Relaxed);
             if local.len() >= SHELL_FLUSH_THRESHOLD {
-                let chunk_len = local.len();
+                // ADR 0012 phase 9 — clone before flush clears `local`.
+                let tail = local.clone();
                 flush_shell_buffer(
                     &handles.history,
                     &handles.output_tx,
@@ -1418,7 +1425,7 @@ fn handle_reader_msg(
                     local,
                     &handles.max_buffer_size,
                 );
-                notify_shell_resource(handles.shell_id.as_str(), chunk_len);
+                notify_shell_resource(handles.shell_id.as_str(), &tail);
             }
             true
         }

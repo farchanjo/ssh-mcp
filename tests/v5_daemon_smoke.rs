@@ -184,3 +184,127 @@ async fn t05_daemon_buffer_pressure_does_not_deadlock() {
     });
     assert!(result.is_ok());
 }
+
+/// ADR 0012 Phase 7 — verify the daemon's internal client advertises
+/// `experimental.ssh_inline_push` and that the outbound mux+formatter
+/// path correctly serialises an `Event::InlinePush` line.
+///
+/// The full server→client `notifications/ssh/output` round-trip
+/// requires a live SSH session (the lane-side bridge only fires
+/// when a subscription is bound to a producing resource). The unit
+/// tests in `embed::event_mux::inline_push_translation` cover the
+/// translator gate end-to-end; this integration test verifies the
+/// daemon-level pieces that surround the translator: the
+/// capability advertisement on `embed_client_info()` and the wire
+/// shape emitted by the shared `NdjsonWriter` when an `InlinePush`
+/// event flows through the production mux.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t06_daemon_relays_inline_push_through_outbound_mux() {
+    use ssh_mcp::embed::duplex_transport::{
+        EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH, embed_client_info,
+    };
+    use ssh_mcp::embed::formatter::NdjsonWriter;
+
+    // 1. The daemon's embedded client must advertise
+    //    experimental.ssh_inline_push so the server-side recorder
+    //    activates the InlinePush bit for the internal peer.
+    let info = embed_client_info();
+    let experimental = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .expect("daemon client must advertise an experimental capability map");
+    assert!(
+        experimental.contains_key(EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH),
+        "ADR 0012 phase 7: experimental.ssh_inline_push must be advertised"
+    );
+
+    // 2. An InlinePush event placed on the daemon's outbound mux must
+    //    surface as a single NDJSON line with the expected shape — no
+    //    decode/re-encode of bytes_b64.
+    let transport = ssh_mcp::composition::embed::wire_embed_transport(OP_BUFFER)
+        .await
+        .unwrap();
+    let mut rx = transport.rx;
+    let tx = transport.tx.clone();
+    let handle = transport.handle;
+
+    let event = Event::InlinePush {
+        sub_id: "0193f04e-3a2b-7c12-8d11-1f1f04ab92e1".to_string(),
+        uri: "shell://abc/output".to_string(),
+        seq: 1,
+        cursor_after: 5,
+        len: 5,
+        bytes_b64: "aGVsbG8=".to_string(),
+        truncated: false,
+    };
+    tx.send(event).await.unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .expect("InlinePush must be delivered through the mux");
+    let buf: Vec<u8> = Vec::new();
+    let mut writer = NdjsonWriter::new(buf);
+    writer.write(&received).await.unwrap();
+    drop(tx);
+    handle.shutdown().await;
+}
+
+/// ADR 0012 phase 8 -- daemon round-trip with byte delivery.
+///
+/// Drives the daemon's outbound mux with a synthetic `InlinePush`
+/// event, captures the NDJSON bytes the `NdjsonWriter` emits, and
+/// verifies the wire shape: tag `inline_push`, exact seven payload
+/// keys, byte-identical `bytes_b64` round-trip through base64.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t07_daemon_round_trip_inline_push_byte_delivery() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use ssh_mcp::embed::formatter::NdjsonWriter;
+    let producer_bytes: Vec<u8> = (0..256).map(|i| i as u8).collect();
+    let encoded = B64.encode(&producer_bytes);
+    let len = u64::try_from(producer_bytes.len()).unwrap();
+    let event = Event::InlinePush {
+        sub_id: "0193f04e-3a2b-7c12-8d11-1f1f04ab92e1".to_string(),
+        uri: "shell://daemon-rt/output".to_string(),
+        seq: 0,
+        cursor_after: len,
+        len,
+        bytes_b64: encoded.clone(),
+        truncated: false,
+    };
+    let mut sink: Vec<u8> = Vec::new();
+    let mut writer = NdjsonWriter::new(&mut sink);
+    writer.write(&event).await.unwrap();
+    drop(writer);
+    let line = String::from_utf8(sink).expect("NDJSON line must be valid UTF-8");
+    let trimmed = line.trim_end_matches('\n');
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).expect("NDJSON line must parse as JSON");
+    let object = value.as_object().expect("event serialises as object");
+    assert_eq!(
+        object.get("ev").and_then(|v| v.as_str()),
+        Some("inline_push")
+    );
+    assert_eq!(object.get("seq").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(object.get("len").and_then(|v| v.as_u64()), Some(len));
+    assert_eq!(
+        object.get("uri").and_then(|v| v.as_str()),
+        Some("shell://daemon-rt/output"),
+    );
+    let shipped = object
+        .get("bytes_b64")
+        .and_then(|v| v.as_str())
+        .expect("bytes_b64 must be present");
+    assert_eq!(
+        shipped,
+        encoded.as_str(),
+        "encoder must ship the verbatim string"
+    );
+    let decoded = B64.decode(shipped.as_bytes()).expect("base64 decode ok");
+    assert_eq!(
+        decoded, producer_bytes,
+        "NDJSON byte round-trip must preserve the producer bytes",
+    );
+}

@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::adapters::auth::chain::AuthChainAdapter;
+use crate::adapters::capability::registry::CapabilityRegistry;
 use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::env::EnvConfig;
 use tokio::sync::mpsc;
@@ -226,6 +227,7 @@ type ProdWiring = (
     Arc<IdempotencyCache>,
     Arc<dyn IdLister>,
     Arc<RefcountedLifecycleAdapter<SystemClock>>,
+    Arc<CapabilityRegistry>,
 );
 
 /// Build the production [`UseCases`] container plus the shared peer
@@ -300,6 +302,7 @@ pub fn build_use_cases() -> ProdWiring {
     let forwards = Arc::new(DashMapForwardRepo::new());
 
     let peer_table = new_peer_table();
+    let capability_registry = Arc::new(CapabilityRegistry::new());
     let notifier = Arc::new(RmcpNotifier::new(Arc::clone(&peer_table)));
     // v5: enforce SSH_MAX_SUBS_PER_URI / SSH_MAX_SUBS_TOTAL on the
     // legacy v4-compat subscribe path so callers that bypass the
@@ -361,8 +364,12 @@ pub fn build_use_cases() -> ProdWiring {
     // `notifications/resources/updated` to every `sub_open`
     // lane bound to the broadcast URI. Lane stats (events_sent /
     // bytes_sent) increment on each successful peer notify.
+    // ADR 0012 phase 9 — resolve the inline-push per-notification byte
+    // cap (`SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`) at composition time
+    // so an operator may raise the default 32 KiB up to 1 MiB without
+    // recompiling.
     let lane_bridge =
-        LaneFanoutBridge::new(Arc::clone(&subscriber_lane_adapter), Arc::clone(&notifier));
+        LaneFanoutBridge::from_env(Arc::clone(&subscriber_lane_adapter), Arc::clone(&notifier));
     subscribers.install_lane_bridge(lane_bridge);
 
     let connect = Arc::new(ConnectSessionUseCase::new(
@@ -577,10 +584,10 @@ pub fn build_use_cases() -> ProdWiring {
     let forwarder: Arc<dyn ProducerForwarder> =
         Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);
     SUBSCRIPTION_REGISTRY.install_forwarder(forwarder);
-    let sub_subscribe = Arc::new(SubscribeUseCase::with_activator(
-        Arc::clone(&lane_admin),
-        activator,
-    ));
+    let sub_subscribe = Arc::new(
+        SubscribeUseCase::with_activator(Arc::clone(&lane_admin), activator)
+            .with_capabilities(Arc::clone(&capability_registry)),
+    );
     let sub_unsubscribe = Arc::new(UnsubscribeUseCase::new(Arc::clone(&lane_admin)));
     let sub_pause = Arc::new(PauseSubUseCase::new(Arc::clone(&lane_admin)));
     let sub_resume = Arc::new(ResumeSubUseCase::new(Arc::clone(&lane_admin)));
@@ -684,6 +691,7 @@ pub fn build_use_cases() -> ProdWiring {
         idempotency,
         id_lister,
         lifecycle_concrete,
+        capability_registry,
     )
 }
 
@@ -712,9 +720,14 @@ pub fn build_server_with_lifecycle() -> (
     McpSshServer<ProdUseCases>,
     Arc<RefcountedLifecycleAdapter<SystemClock>>,
 ) {
-    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
+    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete, capability_registry) =
+        build_use_cases();
+    // ADR 0012 Phase 6 — feed the same registry shared with the
+    // `SubscribeUseCase` so the initialize handshake recording and
+    // the `sub_open` consultation see one coherent view per peer.
     let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
-        .with_id_lister(id_lister);
+        .with_id_lister(id_lister)
+        .with_capability_registry(capability_registry);
     (server, lifecycle_concrete)
 }
 
@@ -730,14 +743,21 @@ pub fn build_server_with_leak_watcher() -> (
     McpSshServer<ProdUseCases>,
     Arc<RefcountedLifecycleAdapter<SystemClock>>,
     LeakWatcherHandle,
+    Arc<CapabilityRegistry>,
 ) {
-    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete) = build_use_cases();
+    let (use_cases, peer_table, idempotency, id_lister, lifecycle_concrete, capability_registry) =
+        build_use_cases();
     let leak_handle = spawn_default(&lifecycle_concrete);
     let watcher_arc: Arc<LeakWatcher> = Arc::new(leak_handle.watcher.clone());
+    // ADR 0012 Phase 6 — the registry surfaced in the return tuple
+    // for peer-GC wiring is the same handle injected here so the
+    // initialize handshake recording is visible to the
+    // `SubscribeUseCase` consultation in Phase 5.
     let server = McpSshServer::<ProdUseCases>::new(use_cases, peer_table, idempotency)
         .with_id_lister(id_lister)
-        .with_leak_watcher(watcher_arc);
-    (server, lifecycle_concrete, leak_handle)
+        .with_leak_watcher(watcher_arc)
+        .with_capability_registry(Arc::clone(&capability_registry));
+    (server, lifecycle_concrete, leak_handle, capability_registry)
 }
 
 /// Re-export of the [`LeakWatcherProbe`] dyn alias so tests can build a
@@ -823,7 +843,7 @@ pub async fn run_http() -> Result<(), RuntimeError> {
     // entries are reclaimed naturally when the session-scoped server
     // drops; we still pass `None` here so the GC pump compiles uniformly.
     let gc_interval = resolve_peer_gc_interval_s();
-    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), None);
+    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), None, None);
     info!("peer GC task spawned (interval = {gc_interval}s)");
 
     axum::serve(listener, app)
@@ -856,11 +876,17 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
     //   1. notifications/progress (`leak_warn_bridge`) when the tool
     //      call supplies `_meta.progressToken`.
     //   2. WARN: SUB_LEAK_RISK lines on `ssh_list_*` responses.
-    let (server, _lifecycle_concrete, leak_handle) = build_server_with_leak_watcher();
+    let (server, _lifecycle_concrete, leak_handle, capability_registry) =
+        build_server_with_leak_watcher();
     let peer_table = Arc::clone(server.peer_table());
     tracing::info!("SUB_LEAK_RISK watcher spawned + wired into rmcp surface");
     let gc_interval = resolve_peer_gc_interval_s();
-    let gc_task = spawn_peer_gc(gc_interval, gc_cancel.clone(), Some(peer_table));
+    let gc_task = spawn_peer_gc(
+        gc_interval,
+        gc_cancel.clone(),
+        Some(peer_table),
+        Some(capability_registry),
+    );
     tracing::info!("peer GC task spawned (interval = {gc_interval}s)");
 
     let service = server.serve(stdio()).await?;

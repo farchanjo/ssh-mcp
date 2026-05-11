@@ -947,6 +947,36 @@ pub const DEFAULT_NDJSON_PRETTY: bool = false;
 /// Environment variable for the pretty-print flag.
 pub const NDJSON_PRETTY_ENV_VAR: &str = "SSH_NDJSON_PRETTY";
 
+/// Default for the ADR 0012 Phase 7 daemon inline-push relay gate.
+///
+/// v7.1.0 ships with relay OFF so existing v7.0.x NDJSON consumers see
+/// a byte-identical stream — no new `inline_push` events are emitted
+/// until an operator sets the matching env var.
+pub const DEFAULT_INLINE_PUSH_DAEMON_RELAY: bool = false;
+/// Environment variable for the ADR 0012 Phase 7 daemon relay gate
+/// (`SSH_INLINE_PUSH_DAEMON_RELAY`). Truthy values
+/// (`true` / `1` / `yes` / `on`, case-insensitive) enable the relay.
+pub const INLINE_PUSH_DAEMON_RELAY_ENV_VAR: &str = "SSH_INLINE_PUSH_DAEMON_RELAY";
+
+/// Default per-notification byte ceiling for ADR 0012 inline-push
+/// fragments. Mirrors the negotiated default in the ADR (32 KiB).
+///
+/// Composition wires this through
+/// [`resolve_inline_push_max_bytes_per_notify`] so an operator can
+/// raise the cap up to 1 MiB or drop it down to 1 KiB without
+/// touching the binary.
+pub const DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY: usize = 32 * 1024;
+/// Floor for the inline-push per-notification byte cap (1 KiB).
+pub const INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN: usize = 1_024;
+/// Cap for the inline-push per-notification byte cap (1 MiB).
+pub const INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX: usize = 1_048_576;
+/// Environment variable for the inline-push per-notification byte cap.
+///
+/// Reads `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`; accepts bare bytes
+/// or a `bytesize` suffix (`b`, `k`, `m`, `kib`, `mib`); values
+/// outside `[1k, 1m]` are logged and clamped to the nearest bound.
+pub const INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR: &str = "SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY";
+
 /// Resolve the per-line NDJSON byte cap (`SSH_NDJSON_LINE_MAX`).
 #[must_use]
 pub fn resolve_ndjson_line_max() -> usize {
@@ -996,6 +1026,90 @@ pub fn resolve_ndjson_pretty() -> bool {
         .map_or(DEFAULT_NDJSON_PRETTY, |v| {
             matches!(v.as_str(), "true" | "1" | "yes")
         })
+}
+
+/// Resolve the ADR 0012 Phase 7 daemon inline-push relay gate
+/// (`SSH_INLINE_PUSH_DAEMON_RELAY`).
+///
+/// The function is called at notification-handle time (not at startup),
+/// so an operator who flips the env var must restart the daemon for the
+/// new value to take effect. Truthy values (`true` / `1` / `yes` / `on`,
+/// case-insensitive) enable the relay; every other value — including
+/// unset — leaves it disabled so v7.0.x NDJSON consumers see a
+/// byte-identical stream.
+#[must_use]
+pub fn resolve_inline_push_daemon_relay() -> bool {
+    env::var(INLINE_PUSH_DAEMON_RELAY_ENV_VAR)
+        .ok()
+        .as_deref()
+        .is_some_and(is_inline_push_relay_truthy)
+}
+
+/// Pure parser for the `SSH_INLINE_PUSH_DAEMON_RELAY` env var value.
+///
+/// Truthy set (case-insensitive): `true`, `1`, `yes`, `on`. Every
+/// other value (including the empty string and parse errors) is
+/// treated as falsy, matching the conservative default in
+/// [`DEFAULT_INLINE_PUSH_DAEMON_RELAY`].
+#[must_use]
+pub fn is_inline_push_relay_truthy(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("true")
+        || raw == "1"
+        || raw.eq_ignore_ascii_case("yes")
+        || raw.eq_ignore_ascii_case("on")
+}
+
+/// Resolve the inline-push per-notification byte cap.
+///
+/// Reads `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY` at composition time;
+/// accepts the same `bytesize` suffix grammar as
+/// [`resolve_notify_flush_bytes`]. Values outside
+/// `[INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN,
+/// INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX]` are logged at `warn` and
+/// clamped to the nearest bound. Missing / empty / unparseable values
+/// fall back to [`DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`] (32 KiB).
+#[must_use]
+pub fn resolve_inline_push_max_bytes_per_notify() -> usize {
+    let Ok(raw) = env::var(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) else {
+        return DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY;
+    }
+    let Some(parsed) = parse_bytesize(trimmed) else {
+        tracing::warn!(
+            env = INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR,
+            value = trimmed,
+            "unparseable bytesize; falling back to default"
+        );
+        return DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY;
+    };
+    clamp_inline_push_max_bytes(parsed)
+}
+
+/// Clamp helper extracted to keep [`resolve_inline_push_max_bytes_per_notify`]
+/// under the 30-line method ceiling.
+fn clamp_inline_push_max_bytes(parsed: usize) -> usize {
+    if parsed < INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN {
+        tracing::warn!(
+            env = INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR,
+            value = parsed,
+            min = INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN,
+            "value below minimum; clamping"
+        );
+        return INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN;
+    }
+    if parsed > INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX {
+        tracing::warn!(
+            env = INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR,
+            value = parsed,
+            max = INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX,
+            "value above maximum; clamping"
+        );
+        return INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX;
+    }
+    parsed
 }
 
 #[cfg(test)]
@@ -2459,6 +2573,118 @@ mod tests {
                 // SAFETY: Holding ENV_TEST_MUTEX, no concurrent env access
                 unsafe { remove_env(PEER_GC_INTERVAL_S_ENV_VAR) };
                 assert_eq!(result, DEFAULT_PEER_GC_INTERVAL_S);
+            }
+        }
+
+        mod inline_push_daemon_relay {
+            use super::*;
+
+            #[test]
+            fn defaults_to_false_when_unset() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_DAEMON_RELAY_ENV_VAR) };
+                assert!(!resolve_inline_push_daemon_relay());
+            }
+
+            #[test]
+            fn truthy_values_enable_relay() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                for raw in ["true", "TRUE", "True", "1", "yes", "YES", "on", "ON"] {
+                    // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                    unsafe { set_env(INLINE_PUSH_DAEMON_RELAY_ENV_VAR, raw) };
+                    assert!(
+                        resolve_inline_push_daemon_relay(),
+                        "raw={raw} should enable relay",
+                    );
+                }
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_DAEMON_RELAY_ENV_VAR) };
+            }
+
+            #[test]
+            fn falsy_values_leave_relay_disabled() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                for raw in ["false", "FALSE", "0", "no", "off", "", "garbage", "  "] {
+                    // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                    unsafe { set_env(INLINE_PUSH_DAEMON_RELAY_ENV_VAR, raw) };
+                    assert!(
+                        !resolve_inline_push_daemon_relay(),
+                        "raw={raw:?} must keep relay disabled",
+                    );
+                }
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_DAEMON_RELAY_ENV_VAR) };
+            }
+
+            #[test]
+            fn is_inline_push_relay_truthy_matches_existing_convention() {
+                for raw in ["true", "TRUE", "1", "yes", "YES", "on", "On"] {
+                    assert!(is_inline_push_relay_truthy(raw), "{raw} must be truthy",);
+                }
+                for raw in ["false", "0", "no", "off", "", "garbage"] {
+                    assert!(!is_inline_push_relay_truthy(raw), "{raw:?} must be falsy",);
+                }
+            }
+        }
+
+        mod inline_push_max_bytes_per_notify {
+            use super::*;
+
+            #[test]
+            fn defaults_to_32k_when_unset() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) };
+                assert_eq!(
+                    resolve_inline_push_max_bytes_per_notify(),
+                    DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY,
+                );
+            }
+
+            #[test]
+            fn parses_valid_bytesize_64k() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { set_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR, "64k") };
+                let resolved = resolve_inline_push_max_bytes_per_notify();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) };
+                // `parse_bytesize` treats `k` as decimal (1000); accept that.
+                assert_eq!(resolved, 64_000);
+            }
+
+            #[test]
+            fn clamps_low_value_to_floor() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { set_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR, "256") };
+                let resolved = resolve_inline_push_max_bytes_per_notify();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) };
+                assert_eq!(resolved, INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MIN);
+            }
+
+            #[test]
+            fn clamps_high_value_to_ceiling() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { set_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR, "16m") };
+                let resolved = resolve_inline_push_max_bytes_per_notify();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) };
+                assert_eq!(resolved, INLINE_PUSH_MAX_BYTES_PER_NOTIFY_MAX);
+            }
+
+            #[test]
+            fn unparseable_falls_back_to_default() {
+                let _g = ENV_TEST_MUTEX.lock().unwrap();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { set_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR, "garbage") };
+                let resolved = resolve_inline_push_max_bytes_per_notify();
+                // SAFETY: holding ENV_TEST_MUTEX, no concurrent env access.
+                unsafe { remove_env(INLINE_PUSH_MAX_BYTES_PER_NOTIFY_ENV_VAR) };
+                assert_eq!(resolved, DEFAULT_INLINE_PUSH_MAX_BYTES_PER_NOTIFY);
             }
         }
     }

@@ -361,9 +361,15 @@ mod tests {
         // Effective floor is max(RSYNC_PROTOCOL_MIN, lver - 4).
         // With lver=32: max(27, 28) = 28. proto 28+ must be accepted.
         let effective_floor = RSYNC_PROTOCOL_MIN.max(lver - 4);
-        assert!(protocol_supported(lver, effective_floor), "effective floor {effective_floor} must be accepted");
+        assert!(
+            protocol_supported(lver, effective_floor),
+            "effective floor {effective_floor} must be accepted"
+        );
         // One below effective floor is rejected.
-        assert!(!protocol_supported(lver, effective_floor - 1), "below effective floor must be rejected");
+        assert!(
+            !protocol_supported(lver, effective_floor - 1),
+            "below effective floor must be rejected"
+        );
         // Higher remote protocol is fine — `rver < lver` would only
         // be rejected if rver is below `lver - 4` per openrsync.
         assert!(protocol_supported(lver, lver + 5));
@@ -481,7 +487,10 @@ mod tests {
         sess.lver = RSYNC_PROTOCOL;
         sess.rver = 32;
         sess.negotiated = sess.rver.min(sess.lver);
-        assert_eq!(sess.negotiated, 32, "lver=32 + rver=32 must negotiate to 32");
+        assert_eq!(
+            sess.negotiated, 32,
+            "lver=32 + rver=32 must negotiate to 32"
+        );
         assert!(
             sess.negotiated >= MPLEX_FRAMING_MIN_PROTOCOL,
             "proto 32 must enable mplex framing (min {MPLEX_FRAMING_MIN_PROTOCOL})"
@@ -496,6 +505,9 @@ mod tests {
         sess.lver = RSYNC_PROTOCOL;
         sess.rver = 31;
         sess.negotiated = sess.rver.min(sess.lver);
-        assert_eq!(sess.negotiated, 31, "lver=32 + rver=31 must downgrade to 31");
+        assert_eq!(
+            sess.negotiated, 31,
+            "lver=32 + rver=31 must downgrade to 31"
+        );
     }
 }

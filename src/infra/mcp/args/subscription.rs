@@ -89,6 +89,21 @@ pub struct SubOpenArgs {
     /// Optional regex filter compiled at subscribe time. Empty / absent
     /// means no filter.
     pub filter: Option<String>,
+
+    /// ADR 0012 phase 5 -- request inline-push delivery.
+    ///
+    /// When `true` AND the client advertised the
+    /// `experimental.ssh_inline_push` capability at `initialize`, the
+    /// server delivers coalesced bytes inline via the custom
+    /// `notifications/ssh/output` method ON TOP OF the legacy
+    /// `notifications/resources/updated` debouncer cadence.
+    ///
+    /// Default `false` -- every v7.0.x host sees byte-identical wires.
+    /// When `true` but the capability was not echoed, the server
+    /// downgrades the lane silently and emits a
+    /// `HINT: RECOMMENDED:` line on the `sub_open` response.
+    #[serde(default)]
+    pub inline_push: bool,
 }
 
 /// Arguments for the `sub_close` MCP tool.

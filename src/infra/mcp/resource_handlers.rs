@@ -135,7 +135,12 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         | DomainError::RsyncProtocolError(_)
         | DomainError::RsyncFileListTooLarge { .. }
         | DomainError::RsyncPartialTransfer(_)
-        | DomainError::SftpFeatureMissing(_) => ResourceErrorCategory::Internal,
+        | DomainError::SftpFeatureMissing(_)
+        // ADR 0012 phase 10 — port-boundary oversize guard; mapped
+        // onto the `Internal` resource category for the resource read
+        // path (resources/read never produces this error today; the
+        // mapping exists for exhaustiveness only).
+        | DomainError::InlinePushOversize { .. } => ResourceErrorCategory::Internal,
     }
 }
 

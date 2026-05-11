@@ -22,15 +22,19 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, GetPromptRequestParams, GetPromptResult, Icon, Implementation,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
+    CallToolResult, ExperimentalCapabilities, GetPromptRequestParams, GetPromptResult, Icon,
+    Implementation, InitializeRequestParams, InitializeResult, JsonObject, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
+use serde_json::Value as JsonValue;
+
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
 use crate::adapters::lifecycle::leak_watcher::LeakWatcher;
 use crate::application::cancel_command::CancelCommandRequest;
 use crate::application::close_shell::CloseShellRequest;
@@ -71,7 +75,7 @@ use crate::composition::UseCases;
 use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{Address, Credentials};
-use crate::domain::ids::{AgentId, CommandId, SessionId, ShellId, TransferId};
+use crate::domain::ids::{AgentId, CommandId, PeerId, SessionId, ShellId, TransferId};
 use crate::domain::keys::KeyModifiers;
 use crate::domain::lifecycle::LifecyclePolicy;
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
@@ -295,7 +299,11 @@ fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
         | DomainError::RsyncProtocolError(_)
         | DomainError::RsyncFileListTooLarge { .. }
         | DomainError::RsyncPartialTransfer(_)
-        | DomainError::SftpFeatureMissing(_) => None,
+        | DomainError::SftpFeatureMissing(_)
+        // ADR 0012 phase 10 — port-boundary oversize guard; no
+        // closest-match surface (the error carries byte counts, not
+        // ids).
+        | DomainError::InlinePushOversize { .. } => None,
     }
 }
 
@@ -879,6 +887,17 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "remote SFTP server does not support required operation; this transport=Sftp request cannot proceed".to_string(),
             Some(reason.clone()),
         ),
+        // ADR 0012 phase 10 — defensive guard at the notifier port
+        // boundary. Production splitter never raises this; only
+        // direct port callers (test harnesses, future SDK consumers).
+        DomainError::InlinePushOversize {
+            payload_bytes,
+            cap_bytes,
+        } => (
+            "INLINE_PUSH_OVERSIZE",
+            "inline-push payload exceeds the server cap; raise SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY or split the window through LaneFanoutBridge".to_string(),
+            Some(format!("payload_bytes={payload_bytes},cap_bytes={cap_bytes}")),
+        ),
     }
 }
 
@@ -1230,6 +1249,7 @@ async fn run_sub_subscribe(
         lag_policy: args.lag_policy.unwrap_or(LagPolicy::Snapshot),
         filter: filter_from_str(args.filter.as_deref()),
         peer,
+        inline_push: args.inline_push,
     };
     match use_case.execute(req).await {
         Ok(outcome) => {
@@ -5026,6 +5046,7 @@ fn build_implementation() -> Implementation {
 /// catalogue and instructions differ.
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities::builder()
+        .enable_experimental_with(build_experimental_capabilities())
         .enable_tools()
         .enable_tool_list_changed()
         .enable_resources()
@@ -5033,6 +5054,78 @@ fn server_capabilities() -> ServerCapabilities {
         .enable_resources_list_changed()
         .enable_prompts()
         .build()
+}
+
+/// ADR 0012 Phase 6 — populate `Implementation.capabilities.experimental`
+/// with the `ssh_inline_push` opt-in advertisement.
+///
+/// Spec-only MCP clients see the entry as an opaque experimental flag
+/// and ignore it; clients that understand the contract echo
+/// `experimental.ssh_inline_push` back on their `initialize` request,
+/// at which point the [`ServerHandler::initialize`] override records
+/// the opt-in in the per-peer
+/// [`CapabilityRegistry`]. Carrying the
+/// `{ "version": 1 }` value keeps future capability revisions (v7.2+)
+/// trivially distinguishable on the wire.
+fn build_experimental_capabilities() -> ExperimentalCapabilities {
+    let mut entry = JsonObject::new();
+    entry.insert("version".to_string(), JsonValue::from(1_u32));
+    let mut map = ExperimentalCapabilities::new();
+    map.insert("ssh_inline_push".to_string(), entry);
+    map
+}
+
+/// ADR 0012 Phase 6 — experimental capability identifier shared by the
+/// server advertisement, the recording helper, and the integration
+/// tests. Single source of truth so the wire key never drifts between
+/// sites.
+pub(crate) const EXPERIMENTAL_INLINE_PUSH_KEY: &str = "ssh_inline_push";
+
+/// ADR 0012 Phase 6 — record `experimental.ssh_inline_push` for the
+/// peer behind `context` when the client echoed the capability on its
+/// `initialize` request.
+///
+/// Splits into two layers so the unit tests can exercise the pure
+/// recording predicate without constructing a live rmcp transport:
+///
+/// - [`record_inline_push_capability`] — adapter entry consumed by
+///   the [`ServerHandler::initialize`] override; resolves the
+///   [`crate::domain::ids::PeerId`] through the shared
+///   [`PeerTable`] and delegates.
+/// - [`record_inline_push_for_peer`] — pure side-effect on the
+///   capability registry. Tests instantiate a stand-alone registry,
+///   call this helper directly with a synthetic peer id and request
+///   shape, then assert via [`CapabilityRegistry::peer_has_capability`].
+///
+/// Idempotent: repeat handshakes from the same peer overwrite
+/// consistently.
+pub(crate) fn record_inline_push_capability(
+    registry: &Arc<CapabilityRegistry>,
+    peer_table: &Arc<PeerTable>,
+    context: &RequestContext<RoleServer>,
+    request: &InitializeRequestParams,
+) {
+    let handle = RmcpPeerHandle::resolve(context, peer_table);
+    record_inline_push_for_peer(registry, &handle.id(), request);
+}
+
+/// Pure helper — record `experimental.ssh_inline_push` for the given
+/// `peer_id` when `request` advertises the capability.
+///
+/// Pre-resolves the peer-id so unit tests can exercise the predicate
+/// without a live rmcp [`RequestContext`].
+pub(crate) fn record_inline_push_for_peer(
+    registry: &Arc<CapabilityRegistry>,
+    peer_id: &PeerId,
+    request: &InitializeRequestParams,
+) {
+    let Some(experimental) = request.capabilities.experimental.as_ref() else {
+        return;
+    };
+    if !experimental.contains_key(EXPERIMENTAL_INLINE_PUSH_KEY) {
+        return;
+    }
+    registry.record_capability(peer_id.clone(), CapabilityFlag::InlinePush, true);
 }
 
 /// Few-shot bootstrap text for the `port_forward` build (36 tools across
@@ -5147,6 +5240,22 @@ where
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(build_implementation())
             .with_instructions(INSTRUCTIONS_WITH_FORWARD)
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        // rmcp's default `initialize` stashes the peer info on
+        // first arrival — preserve that contract before recording.
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request.clone());
+        }
+        if let Some(registry) = self.capability_registry.as_ref() {
+            record_inline_push_capability(registry, &self.peer_table, &context, &request);
+        }
+        Ok(self.get_info())
     }
 
     async fn list_resources(
@@ -5274,6 +5383,22 @@ where
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(build_implementation())
             .with_instructions(INSTRUCTIONS_WITHOUT_FORWARD)
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        // rmcp's default `initialize` stashes the peer info on
+        // first arrival — preserve that contract before recording.
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request.clone());
+        }
+        if let Some(registry) = self.capability_registry.as_ref() {
+            record_inline_push_capability(registry, &self.peer_table, &context, &request);
+        }
+        Ok(self.get_info())
     }
 
     async fn list_resources(
@@ -6094,6 +6219,149 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "error responses must NOT be cached — both calls must run f"
+        );
+    }
+    // ---- ADR 0012 Phase 6 — initialize handshake unit tests ----
+
+    #[test]
+    fn initialize_advertises_experimental_ssh_inline_push() {
+        use super::{EXPERIMENTAL_INLINE_PUSH_KEY, server_capabilities};
+        let caps = server_capabilities();
+        let experimental = caps
+            .experimental
+            .as_ref()
+            .expect("ADR 0012 Phase 6 must populate experimental capabilities");
+        let entry = experimental
+            .get(EXPERIMENTAL_INLINE_PUSH_KEY)
+            .expect("experimental.ssh_inline_push must be advertised");
+        let version = entry
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .expect("ssh_inline_push entry must carry `version`");
+        assert_eq!(version, 1, "Phase 6 ships version 1");
+    }
+
+    #[test]
+    fn experimental_capabilities_carry_version_field() {
+        use super::build_experimental_capabilities;
+        let map = build_experimental_capabilities();
+        assert_eq!(map.len(), 1, "exactly one experimental entry");
+        let entry = map
+            .get("ssh_inline_push")
+            .expect("ssh_inline_push entry must exist");
+        let version = entry
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .expect("version key must be present");
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn server_capabilities_still_advertises_tools_and_resources() {
+        use super::server_capabilities;
+        let caps = server_capabilities();
+        assert!(caps.tools.is_some(), "tools capability must remain");
+        assert!(caps.resources.is_some(), "resources capability must remain");
+    }
+
+    #[test]
+    fn server_capabilities_keeps_prompts_capability() {
+        use super::server_capabilities;
+        let caps = server_capabilities();
+        assert!(caps.prompts.is_some(), "prompts capability must remain");
+    }
+
+    #[test]
+    fn initialize_with_client_echo_records_capability() {
+        use super::record_inline_push_for_peer;
+        use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+        use crate::domain::ids::PeerId;
+        use rmcp::model::{
+            ClientCapabilities, ExperimentalCapabilities, Implementation, InitializeRequestParams,
+            JsonObject,
+        };
+        use std::sync::Arc;
+
+        let registry = Arc::new(CapabilityRegistry::new());
+        let peer = PeerId::new("peer-echoes-flag".to_string());
+        let mut experimental = ExperimentalCapabilities::new();
+        experimental.insert("ssh_inline_push".to_string(), JsonObject::new());
+        let mut caps = ClientCapabilities::default();
+        caps.experimental = Some(experimental);
+        let request =
+            InitializeRequestParams::new(caps, Implementation::new("client-under-test", "0.0.0"));
+
+        record_inline_push_for_peer(&registry, &peer, &request);
+        assert!(
+            registry.peer_has_capability(&peer, CapabilityFlag::InlinePush),
+            "client echoing experimental.ssh_inline_push must flip the registry bit"
+        );
+    }
+
+    #[test]
+    fn initialize_without_client_echo_does_not_record() {
+        use super::record_inline_push_for_peer;
+        use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+        use crate::domain::ids::PeerId;
+        use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
+        use std::sync::Arc;
+
+        let registry = Arc::new(CapabilityRegistry::new());
+        let peer = PeerId::new("peer-silent-client".to_string());
+        // ClientCapabilities::default() leaves `experimental` at None.
+        let request = InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new("spec-only-client", "0.0.0"),
+        );
+
+        record_inline_push_for_peer(&registry, &peer, &request);
+        assert!(
+            !registry.peer_has_capability(&peer, CapabilityFlag::InlinePush),
+            "spec-only client must NOT have inline_push recorded"
+        );
+        assert!(
+            registry.is_empty(),
+            "registry must stay empty when client does not echo the flag"
+        );
+    }
+
+    #[test]
+    fn initialize_with_unknown_experimental_keys_ignored() {
+        use super::record_inline_push_for_peer;
+        use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+        use crate::domain::ids::PeerId;
+        use rmcp::model::{
+            ClientCapabilities, ExperimentalCapabilities, Implementation, InitializeRequestParams,
+            JsonObject,
+        };
+        use std::sync::Arc;
+
+        let registry = Arc::new(CapabilityRegistry::new());
+        let peer = PeerId::new("peer-mixed-flags".to_string());
+        let mut experimental = ExperimentalCapabilities::new();
+        experimental.insert("foo".to_string(), JsonObject::new());
+        experimental.insert("ssh_inline_push".to_string(), JsonObject::new());
+        experimental.insert("bar".to_string(), JsonObject::new());
+        let mut caps = ClientCapabilities::default();
+        caps.experimental = Some(experimental);
+        let request = InitializeRequestParams::new(
+            caps,
+            Implementation::new("forward-compat-client", "0.0.0"),
+        );
+
+        record_inline_push_for_peer(&registry, &peer, &request);
+        assert!(
+            registry.peer_has_capability(&peer, CapabilityFlag::InlinePush),
+            "ssh_inline_push present alongside unknown keys must still record"
+        );
+        // Other experimental keys must not have hijacked the slot —
+        // CapabilityRegistry only knows InlinePush today, so a positive
+        // result for `InlinePush` is the strongest assertion we can make
+        // about the side-effects shape.
+        assert_eq!(
+            registry.len(),
+            1,
+            "exactly one peer entry must exist after recording"
         );
     }
 }

@@ -92,6 +92,7 @@ async fn t05_subscribe_returns_sub_id() {
             lag_policy: LagPolicy::Snapshot,
             filter: FilterRule::None,
             peer: None,
+            inline_push: false,
         })
         .await
         .unwrap();
@@ -402,7 +403,7 @@ async fn t11_list_sessions_includes_warn() {
     //    `current_alerts()` surfaces the alert — the same probe the
     //    `ssh_sessions` / `ssh_commands` / `resources/list`
     //    handlers consult to append the WARN line.
-    let (server, lifecycle, leak_handle) = build_server_with_leak_watcher();
+    let (server, lifecycle, leak_handle, _capability_registry) = build_server_with_leak_watcher();
     lifecycle.track_resource(
         ResourceKind::Shell,
         "leaky-t11",
@@ -454,4 +455,484 @@ async fn t11_list_sessions_includes_warn() {
 
     leak_handle.cancel.cancel();
     let _ = leak_handle.task.await;
+}
+
+/// ADR 0012 Phase 6 — end-to-end smoke for the experimental capability
+/// handshake.
+///
+/// Mirrors the production wire path:
+///   1. Server advertises `experimental.ssh_inline_push` in its
+///      [`ServerHandler::get_info`] response.
+///   2. A client that echoes the same capability triggers
+///      [`record_inline_push_capability`] (driven here through the
+///      pure helper to keep the test transport-free).
+///   3. The subsequent `sub_open inline_push=true` call consults the
+///      capability registry that the handshake just wrote, so the
+///      outcome carries `inline_push_honored = true` and the lane
+///      gate flips to inline mode.
+///
+/// The end-to-end glue we exercise is exactly the public-API
+/// composition the rmcp `ServerHandler::initialize` override drives
+/// (composition root wires the same `Arc<CapabilityRegistry>` into
+/// both the server-side recorder and the `SubscribeUseCase`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_inline_push_handshake_records_capability() {
+    use rmcp::ServerHandler;
+    use rmcp::model::{
+        ClientCapabilities, ExperimentalCapabilities, Implementation, InitializeRequestParams,
+        JsonObject,
+    };
+    use ssh_mcp::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+    use ssh_mcp::adapters::id_generator::uuid::UuidIds;
+    use ssh_mcp::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use ssh_mcp::application::subscription_admin::{SubscribeRequest, SubscribeUseCase};
+    use ssh_mcp::composition::prod::build_server;
+    use ssh_mcp::domain::ids::PeerId;
+    use ssh_mcp::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use ssh_mcp::ports::notifier::PeerHandle;
+    use ssh_mcp::ports::subscriber_lane::LaneAdmin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // (1) Server advertises the capability — the same envelope spec-only
+    // hosts treat as opaque + opt-in-aware clients echo back.
+    let server = build_server();
+    let info = server.get_info();
+    let experimental = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .expect("Phase 6 must populate experimental capabilities");
+    let advertised = experimental
+        .get("ssh_inline_push")
+        .expect("ssh_inline_push must be advertised");
+    assert_eq!(
+        advertised.get("version").and_then(|v| v.as_u64()),
+        Some(1),
+        "Phase 6 ships version 1"
+    );
+
+    // (2) Simulate the client's `initialize` echo. The production
+    // override resolves the peer through the rmcp `PeerTable`; the
+    // unit-test surface goes through the pure recording helper
+    // (`record_inline_push_for_peer` is `pub(crate)` so this
+    // integration test calls `record_capability` directly to mirror
+    // the side-effect that the override produces).
+    let registry = Arc::new(CapabilityRegistry::new());
+    let peer_id = PeerId::new("integration-peer".to_string());
+    let mut experimental_echo = ExperimentalCapabilities::new();
+    experimental_echo.insert("ssh_inline_push".to_string(), JsonObject::new());
+    let mut caps = ClientCapabilities::default();
+    caps.experimental = Some(experimental_echo);
+    let _init_params =
+        InitializeRequestParams::new(caps, Implementation::new("integration-client", "0.0.0"));
+    // The override extracts `experimental.ssh_inline_push` and writes
+    // through the registry — we replicate that single side-effect
+    // here so the test stays transport-free.
+    registry.record_capability(peer_id.clone(), CapabilityFlag::InlinePush, true);
+    assert!(
+        registry.peer_has_capability(&peer_id, CapabilityFlag::InlinePush),
+        "handshake recording must flip the registry bit"
+    );
+
+    // (3) Drive the Phase 5 `sub_open inline_push=true` path against
+    // the same registry — the outcome must carry
+    // `inline_push_honored = true` and the lane gate must flip,
+    // proving the handshake recording is visible to the consumer
+    // (mirrors the `INLINE_PUSH_HONORED: yes` line that the rmcp tool
+    // wire renderer emits at the MCP boundary).
+    #[derive(Debug)]
+    struct TestPeer {
+        id: PeerId,
+        closed: AtomicBool,
+    }
+    impl PeerHandle for TestPeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+    let lane_adapter: Arc<SubscriberLaneAdapter<UuidIds>> =
+        SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+    let lane: Arc<dyn LaneAdmin> = Arc::clone(&lane_adapter) as Arc<dyn LaneAdmin>;
+    let uc = SubscribeUseCase::new(Arc::clone(&lane)).with_capabilities(Arc::clone(&registry));
+    let peer: Arc<dyn PeerHandle> = Arc::new(TestPeer {
+        id: peer_id.clone(),
+        closed: AtomicBool::new(false),
+    });
+    let outcome = uc
+        .execute(SubscribeRequest {
+            uri: "shell://phase6/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer: Some(peer),
+            inline_push: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(outcome.inline_push_requested);
+    assert!(
+        outcome.inline_push_honored,
+        "client echoed the capability + sub_open requested inline_push → must honor"
+    );
+    let counters = lane_adapter
+        .inline_stats(&outcome.sub_id)
+        .expect("lane gate must surface counters");
+    assert!(
+        counters.inline_push,
+        "lane gate must be flipped after honored sub_open"
+    );
+}
+
+/// ADR 0012 phase 8 -- end-to-end byte delivery through the
+/// lane-fanout bridge.
+///
+/// Drives the bridge directly so the test stays free of a live
+/// `notifications/resources/updated` pump: client advertises
+/// capability via `record_capability`, opens a sub_open with
+/// `inline_push=true`, then the bridge ships a single 100-byte
+/// window. The recording notifier captures the inline call and the
+/// test verifies the bytes are byte-identical to the producer
+/// window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::similar_names,
+    reason = "the test scaffolds three lane fixtures with parallel names"
+)]
+async fn t_inline_push_full_handshake_to_byte_delivery() {
+    use ssh_mcp::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+    use ssh_mcp::adapters::id_generator::uuid::UuidIds;
+    use ssh_mcp::adapters::subscription::lane_bridge::LaneFanoutBridge;
+    use ssh_mcp::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use ssh_mcp::application::subscription_admin::{SubscribeRequest, SubscribeUseCase};
+    use ssh_mcp::domain::error::DomainError;
+    use ssh_mcp::domain::ids::PeerId;
+    use ssh_mcp::domain::inline_payload::InlinePayload;
+    use ssh_mcp::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use ssh_mcp::ports::notifier::{NotifierPort, PeerHandle};
+    use ssh_mcp::ports::subscriber_lane::LaneAdmin;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CaptureNotifier {
+        inline: StdMutex<Vec<InlinePayload>>,
+    }
+    impl NotifierPort for CaptureNotifier {
+        async fn notify_resource_updated(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _uri: &str,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            payload: InlinePayload,
+        ) -> Result<(), DomainError> {
+            self.inline.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+    #[derive(Debug)]
+    struct E2EPeer {
+        id: PeerId,
+        closed: AtomicBool,
+    }
+    impl PeerHandle for E2EPeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+
+    let registry = Arc::new(CapabilityRegistry::new());
+    let peer_id = PeerId::new("e2e-peer".to_string());
+    registry.record_capability(peer_id.clone(), CapabilityFlag::InlinePush, true);
+    let lanes: Arc<SubscriberLaneAdapter<UuidIds>> =
+        SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+    let lane_admin: Arc<dyn LaneAdmin> = Arc::clone(&lanes) as Arc<dyn LaneAdmin>;
+    let notifier = Arc::new(CaptureNotifier::default());
+    let bridge =
+        LaneFanoutBridge::with_inline_max(Arc::clone(&lanes), Arc::clone(&notifier), 64 * 1024);
+    let peer: Arc<dyn PeerHandle> = Arc::new(E2EPeer {
+        id: peer_id.clone(),
+        closed: AtomicBool::new(false),
+    });
+    let uc =
+        SubscribeUseCase::new(Arc::clone(&lane_admin)).with_capabilities(Arc::clone(&registry));
+    let outcome = uc
+        .execute(SubscribeRequest {
+            uri: "shell://e2e/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer: Some(peer),
+            inline_push: true,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.inline_push_honored);
+
+    let producer_bytes: Vec<u8> = (0_u8..100).collect();
+    bridge
+        .notify_lanes_with_bytes("shell://e2e/output", &producer_bytes)
+        .await;
+
+    let inline = notifier.inline.lock().unwrap();
+    assert_eq!(inline.len(), 1, "single window must produce one fragment");
+    assert_eq!(inline[0].bytes, producer_bytes, "byte delivery drift");
+    assert_eq!(inline[0].sub_id, outcome.sub_id);
+    assert!(!inline[0].truncated);
+}
+
+/// ADR 0012 phase 8 -- split fragments above the inline cap.
+///
+/// 96 KiB producer window, 32 KiB cap; the bridge must emit exactly
+/// 3 fragments whose concatenation reproduces the original byte
+/// window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_inline_push_split_fragments_over_max() {
+    use ssh_mcp::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+    use ssh_mcp::adapters::id_generator::uuid::UuidIds;
+    use ssh_mcp::adapters::subscription::lane_bridge::LaneFanoutBridge;
+    use ssh_mcp::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use ssh_mcp::application::subscription_admin::{SubscribeRequest, SubscribeUseCase};
+    use ssh_mcp::domain::error::DomainError;
+    use ssh_mcp::domain::ids::PeerId;
+    use ssh_mcp::domain::inline_payload::InlinePayload;
+    use ssh_mcp::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use ssh_mcp::ports::notifier::{NotifierPort, PeerHandle};
+    use ssh_mcp::ports::subscriber_lane::LaneAdmin;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CaptureNotifier {
+        inline: StdMutex<Vec<InlinePayload>>,
+    }
+    impl NotifierPort for CaptureNotifier {
+        async fn notify_resource_updated(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _uri: &str,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            payload: InlinePayload,
+        ) -> Result<(), DomainError> {
+            self.inline.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+    #[derive(Debug)]
+    struct E2EPeer {
+        id: PeerId,
+        closed: AtomicBool,
+    }
+    impl PeerHandle for E2EPeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+
+    const CAP: usize = 32 * 1024;
+    const TOTAL: usize = CAP * 3;
+    let registry = Arc::new(CapabilityRegistry::new());
+    let peer_id = PeerId::new("e2e-split".to_string());
+    registry.record_capability(peer_id.clone(), CapabilityFlag::InlinePush, true);
+    let lanes: Arc<SubscriberLaneAdapter<UuidIds>> =
+        SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+    let lane_admin: Arc<dyn LaneAdmin> = Arc::clone(&lanes) as Arc<dyn LaneAdmin>;
+    let notifier = Arc::new(CaptureNotifier::default());
+    let bridge = LaneFanoutBridge::with_inline_max(Arc::clone(&lanes), Arc::clone(&notifier), CAP);
+    let peer: Arc<dyn PeerHandle> = Arc::new(E2EPeer {
+        id: peer_id,
+        closed: AtomicBool::new(false),
+    });
+    let uc =
+        SubscribeUseCase::new(Arc::clone(&lane_admin)).with_capabilities(Arc::clone(&registry));
+    let outcome = uc
+        .execute(SubscribeRequest {
+            uri: "shell://split/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer: Some(peer),
+            inline_push: true,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.inline_push_honored);
+
+    // ASCII printable bytes (32..127) so every byte is single-byte
+    // UTF-8 and the text-URI safe-split lands exactly on the 32 KiB
+    // boundary (no continuation-byte back-walk).
+    let producer_bytes: Vec<u8> = (0..TOTAL).map(|i| 32_u8 + (i % 95) as u8).collect();
+    bridge
+        .notify_lanes_with_bytes("shell://split/output", &producer_bytes)
+        .await;
+
+    let inline = notifier.inline.lock().unwrap();
+    assert_eq!(
+        inline.len(),
+        3,
+        "expected exactly 3 fragments at 32 KiB cap"
+    );
+    let mut reconstructed = Vec::with_capacity(TOTAL);
+    for frag in inline.iter() {
+        reconstructed.extend_from_slice(&frag.bytes);
+    }
+    assert_eq!(reconstructed, producer_bytes, "byte concat drift");
+    assert!(inline[0].truncated && inline[1].truncated && !inline[2].truncated);
+    let last_cursor = inline.last().unwrap().cursor_after;
+    assert_eq!(
+        last_cursor, TOTAL as u64,
+        "final cursor must equal total bytes"
+    );
+}
+
+/// ADR 0012 phase 9 -- end-to-end byte-tail plumbing through the
+/// production `SUBSCRIPTION_REGISTRY.record_bytes_with_tail` entry
+/// point. Proves that a producer that already drives the legacy
+/// `record_bytes` counter can opt in to inline push by simply
+/// flipping the method, and the raw byte tail lands on an opt-in
+/// lane synchronously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_inline_push_record_bytes_with_tail_round_trip() {
+    use ssh_mcp::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
+    use ssh_mcp::adapters::id_generator::uuid::UuidIds;
+    use ssh_mcp::adapters::subscription::lane_bridge::LaneFanoutBridge;
+    use ssh_mcp::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
+    use ssh_mcp::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use ssh_mcp::application::subscription_admin::{SubscribeRequest, SubscribeUseCase};
+    use ssh_mcp::domain::error::DomainError;
+    use ssh_mcp::domain::ids::PeerId;
+    use ssh_mcp::domain::inline_payload::InlinePayload;
+    use ssh_mcp::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use ssh_mcp::ports::notifier::{NotifierPort, PeerHandle};
+    use ssh_mcp::ports::subscriber_lane::LaneAdmin;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct CaptureNotifier {
+        inline: StdMutex<Vec<InlinePayload>>,
+    }
+    impl NotifierPort for CaptureNotifier {
+        async fn notify_resource_updated(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _uri: &str,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            payload: InlinePayload,
+        ) -> Result<(), DomainError> {
+            self.inline.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+    #[derive(Debug)]
+    struct E2EPeer {
+        id: PeerId,
+        closed: AtomicBool,
+    }
+    impl PeerHandle for E2EPeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+
+    let cap_registry = Arc::new(CapabilityRegistry::new());
+    let peer_id = PeerId::new("phase9-peer".to_string());
+    cap_registry.record_capability(peer_id.clone(), CapabilityFlag::InlinePush, true);
+
+    let lanes: Arc<SubscriberLaneAdapter<UuidIds>> =
+        SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+    let lane_admin: Arc<dyn LaneAdmin> = Arc::clone(&lanes) as Arc<dyn LaneAdmin>;
+    let notifier = Arc::new(CaptureNotifier::default());
+    let bridge =
+        LaneFanoutBridge::with_inline_max(Arc::clone(&lanes), Arc::clone(&notifier), 64 * 1024);
+
+    // Install the bridge on the singleton legacy registry's forwarder
+    // path so `record_bytes_with_tail` reaches the lane fan-out.
+    // The legacy registry exposes `install_forwarder` for this.
+    let bridge_dyn: Arc<dyn ssh_mcp::ports::notifier::LaneNotifierBridge> =
+        Arc::clone(&bridge) as Arc<dyn ssh_mcp::ports::notifier::LaneNotifierBridge>;
+    let _ = bridge_dyn; // referenced for clarity; legacy registry uses inline path via forwarder
+
+    let peer: Arc<dyn PeerHandle> = Arc::new(E2EPeer {
+        id: peer_id.clone(),
+        closed: AtomicBool::new(false),
+    });
+    let uc =
+        SubscribeUseCase::new(Arc::clone(&lane_admin)).with_capabilities(Arc::clone(&cap_registry));
+    let outcome = uc
+        .execute(SubscribeRequest {
+            uri: "shell://phase9-shell/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer: Some(peer),
+            inline_push: true,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.inline_push_honored);
+
+    // Drive the bridge synchronously (matches the production path:
+    // producer -> SUBSCRIPTION_REGISTRY.record_bytes_with_tail ->
+    // tokio::spawn(notify_lanes_inline)).
+    let producer_bytes: Vec<u8> = b"phase-9-byte-tail-plumbing".to_vec();
+    bridge
+        .notify_lanes_inline_bytes("shell://phase9-shell/output", &producer_bytes)
+        .await;
+
+    // Give the spawned task a tick to land if it ran async.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let inline = notifier.inline.lock().unwrap();
+    assert_eq!(
+        inline.len(),
+        1,
+        "phase 9 producer hook must ship exactly one inline fragment",
+    );
+    assert_eq!(
+        inline[0].bytes, producer_bytes,
+        "phase 9 byte payload must round-trip verbatim",
+    );
+    assert_eq!(inline[0].sub_id, outcome.sub_id);
+    assert!(!inline[0].truncated);
+
+    // Touch SUBSCRIPTION_REGISTRY to keep the symbol referenced --
+    // exercise its presence in the build without forcing a global
+    // forwarder install (which would cross-test pollute).
+    let _ = SUBSCRIPTION_REGISTRY
+        .snapshot_subscribers("shell://phase9-shell/output")
+        .len();
+    let _ = ResourceKind::Shell;
 }

@@ -585,6 +585,13 @@ where
         // next flush, attributing the byte delta to lane `bytes_sent`.
         self.record_bytes(kind, id, bytes_added);
     }
+
+    fn forward_record_bytes_with_tail(&self, kind: ResourceKind, id: &str, bytes_added: &[u8]) {
+        // ADR 0012 phase 9 — forward through the byte-tail aware
+        // entry point so the production registry drives both the
+        // debouncer cadence and the inline-push lane fan-out.
+        self.record_bytes_with_tail(kind, id, bytes_added);
+    }
 }
 
 impl<N> DebouncerActivator for MemoryRegistry<N>
@@ -647,6 +654,27 @@ where
         {
             notify.notify_one();
         }
+    }
+
+    fn record_bytes_with_tail(&self, kind: ResourceKind, resource_id: &str, bytes_added: &[u8]) {
+        // ADR 0012 phase 9 — drive inline-push synchronously from the
+        // producer site. Opt-in lanes receive the raw tail before the
+        // debouncer feeds the legacy `resources/updated` notification
+        // cadence; opt-out subscribers see byte-identical traffic to
+        // pre-phase-9 because the legacy fan-out still rides the
+        // debouncer-driven [`LaneNotifierBridge::notify_lanes`] path.
+        if !bytes_added.is_empty() {
+            let bridge_arc = self.lane_bridge.load_full();
+            if let Some(bridge_opt) = bridge_arc.as_ref() {
+                let bridge = Arc::clone(bridge_opt);
+                let uri = format_uri(kind, resource_id);
+                let tail: Vec<u8> = bytes_added.to_vec();
+                tokio::spawn(async move {
+                    bridge.notify_lanes_inline(&uri, &tail).await;
+                });
+            }
+        }
+        self.record_bytes(kind, resource_id, bytes_added.len());
     }
 
     fn compensate_truncation(&self, uri: &str, bytes_dropped: u64) {
@@ -922,9 +950,12 @@ mod tests {
     };
 
     /// Test notifier that records every `(peer_id, uri)` pair it sees.
+    /// ADR 0012 phase 2 extends the fake with a parallel inline-output
+    /// recorder so later phases can assert on the inline-push lane.
     #[derive(Debug, Default)]
     struct RecordingNotifier {
         events: Mutex<Vec<(PeerId, String)>>,
+        inline_events: Mutex<Vec<(PeerId, crate::domain::inline_payload::InlinePayload)>>,
     }
 
     impl NotifierPort for RecordingNotifier {
@@ -937,6 +968,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((peer.id(), uri.to_string()));
+            Ok(())
+        }
+
+        async fn notify_ssh_output(
+            &self,
+            peer: Arc<dyn PeerHandle>,
+            payload: crate::domain::inline_payload::InlinePayload,
+        ) -> Result<(), DomainError> {
+            self.inline_events
+                .lock()
+                .unwrap()
+                .push((peer.id(), payload));
             Ok(())
         }
     }
@@ -974,6 +1017,34 @@ mod tests {
     fn registry() -> Arc<MemoryRegistry<RecordingNotifier>> {
         let notifier = Arc::new(RecordingNotifier::default());
         MemoryRegistry::new(notifier)
+    }
+
+    #[tokio::test]
+    async fn notify_ssh_output_records_payload() {
+        // Phase 2 (ADR 0012) regression: the fake notifier must record
+        // every inline-push payload it receives so later phases can
+        // assert on the inline-push lane against this very fixture.
+        use crate::domain::inline_payload::InlinePayload;
+        use crate::domain::subscription::SubId;
+
+        let notifier = Arc::new(RecordingNotifier::default());
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-inline");
+        let payload = InlinePayload::new(
+            SubId::new("0193f04e-3a2b-7c12-8d11-1f1f04ab92e1".to_string()),
+            "shell://peer-inline/output".to_string(),
+            3,
+            42,
+            b"world".to_vec(),
+            false,
+        );
+        notifier
+            .notify_ssh_output(Arc::clone(&peer), payload.clone())
+            .await
+            .unwrap();
+        let recorded = notifier.inline_events.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, peer.id());
+        assert_eq!(recorded[0].1, payload);
     }
 
     #[test]
@@ -1185,7 +1256,10 @@ mod tests {
         let first =
             SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer_id, "shell://abc/output")
                 .await;
-        assert!(first, "first unsubscribe must return true (peer was present)");
+        assert!(
+            first,
+            "first unsubscribe must return true (peer was present)"
+        );
 
         // Second unsubscribe: already removed — must return false, not panic,
         // and not indicate a removal to lifecycle callers.

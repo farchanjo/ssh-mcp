@@ -39,6 +39,14 @@ impl NotifierPort for NoopNotifier {
     ) -> Result<(), DomainError> {
         Ok(())
     }
+
+    async fn notify_ssh_output(
+        &self,
+        _peer: Arc<dyn PeerHandle>,
+        _payload: ssh_mcp::domain::inline_payload::InlinePayload,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

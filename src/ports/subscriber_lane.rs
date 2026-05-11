@@ -66,6 +66,23 @@ pub struct SubSummary {
     pub stats: SubscriberStats,
 }
 
+/// ADR 0012 phase 5 -- inline-push counters bundle returned by
+/// [`LaneAdmin::inline_stats`].
+///
+/// Surfaces the lane opt-in flag together with the matching atomic
+/// counters so `sub_stats` can render the v7.1 inline lines (and
+/// keep the structured-content twin in sync) without exposing the
+/// underlying `LaneState` to higher layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineLaneCounters {
+    /// Whether the lane has the inline-push gate flipped on.
+    pub inline_push: bool,
+    /// Cumulative inline notifications delivered to this lane.
+    pub inline_events_sent: u64,
+    /// Cumulative raw inline bytes delivered, pre-base64.
+    pub inline_bytes_sent: u64,
+}
+
 /// Sync slice of the per-`SubId` lane registry.
 pub trait SubscriberLanePort: Send + Sync + 'static {
     /// Read-only stats snapshot for `sub_id`. `None` when the lane
@@ -135,6 +152,20 @@ pub trait LaneAdmin: fmt::Debug + Send + Sync + 'static {
 
     /// Read-only summary list for `sub_list`.
     fn list(&self) -> Vec<SubSummary>;
+
+    /// ADR 0012 phase 5 -- toggle the inline-push opt-in gate on the
+    /// lane identified by `sub_id`. Returns `false` when the lane is
+    /// unknown (silent no-op); `true` when the gate was flipped.
+    /// Cold-path -- runs once per `sub_open`, never on the producer
+    /// path. Sync because the underlying atomic store needs no
+    /// `.await`.
+    fn set_inline_push(&self, sub_id: &SubId, enabled: bool) -> bool;
+
+    /// ADR 0012 phase 5 -- read the inline counters bundle for
+    /// `sub_id`. Returns `None` for unknown lanes. The `inline_push`
+    /// flag is `true` iff the lane opted in AND the capability was
+    /// honoured at `sub_open` time.
+    fn inline_stats(&self, sub_id: &SubId) -> Option<InlineLaneCounters>;
 }
 
 /// Async slice of the per-`SubId` lane registry.

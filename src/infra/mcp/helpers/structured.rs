@@ -64,9 +64,8 @@ fn parse_structured_env(value: Option<&str>) -> bool {
 /// Resolve the gate once per process via `OnceLock`. Subsequent calls
 /// are an atomic load + branch.
 fn structured_enabled() -> bool {
-    *STRUCTURED_GATE.get_or_init(|| {
-        parse_structured_env(env::var(STRUCTURED_CONTENT_ENV_VAR).ok().as_deref())
-    })
+    *STRUCTURED_GATE
+        .get_or_init(|| parse_structured_env(env::var(STRUCTURED_CONTENT_ENV_VAR).ok().as_deref()))
 }
 
 /// Build a successful tool result.

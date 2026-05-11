@@ -60,8 +60,16 @@ pub type EmbedRunError = Box<dyn Error + Send + Sync>;
 /// Surfaces [`crate::embed::duplex_transport::EmbedError`] when the
 /// rmcp handshake fails on either side of the duplex.
 pub async fn wire_embed_transport(mux_buffer: usize) -> Result<EmbedTransport, EmbedRunError> {
-    let (use_cases, peer_table, idempotency, id_lister, _lifecycle_concrete) = build_use_cases();
-    let server = McpSshServer::new(use_cases, peer_table, idempotency).with_id_lister(id_lister);
+    let (use_cases, peer_table, idempotency, id_lister, _lifecycle_concrete, capability_registry) =
+        build_use_cases();
+    // ADR 0012 Phase 6 — share the per-process registry with the
+    // server so the daemon's internal `initialize` handshake records
+    // `experimental.ssh_inline_push` for whichever client echoes the
+    // capability. Phase 7 will flip the embedded `EmbedClient` to
+    // advertise the same flag so the daemon round-trips inline events.
+    let server = McpSshServer::new(use_cases, peer_table, idempotency)
+        .with_id_lister(id_lister)
+        .with_capability_registry(capability_registry);
 
     let (server_stream, client_stream) = duplex_pair();
     let server_task = spawn_server_side(server, server_stream);

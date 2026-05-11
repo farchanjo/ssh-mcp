@@ -97,6 +97,14 @@ mod tests {
         ) -> Result<(), DomainError> {
             Ok(())
         }
+
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _payload: crate::domain::inline_payload::InlinePayload,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
     }
 
     #[derive(Debug)]
