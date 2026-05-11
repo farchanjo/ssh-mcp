@@ -38,7 +38,8 @@ use crate::domain::subscription::{
 use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::PeerHandle;
 use crate::ports::subscriber_lane::{
-    LaneAdmin, LaneFuture, LanePolicy, SubSummary, SubscriberLaneAsync, SubscriberLanePort,
+    InlineLaneCounters, LaneAdmin, LaneFuture, LanePolicy, SubSummary, SubscriberLaneAsync,
+    SubscriberLanePort,
 };
 use crate::ports::subscriber_registry::ResourceKind;
 
@@ -159,6 +160,38 @@ pub struct LaneState {
     pub paused: AtomicBool,
     /// Live byte cursor for replay anchoring.
     pub cursor: AtomicU64,
+    /// ADR 0012 phase 4 -- opt-in gate for inline-push delivery.
+    ///
+    /// Defaults to `false` so the legacy resources-updated fan-out
+    /// stays byte-identical on existing lanes. The `sub_open` use case
+    /// flips this to `true` later when the client requested inline
+    /// push AND the peer `CapabilityRegistry` entry advertises the
+    /// `InlinePush` flag. Loads use `Acquire` so they pair with the
+    /// `Release` store on the opt-in path; the gate is a hot-path
+    /// atomic, never a lock, per ADR 0012 lock-free invariants.
+    pub inline_push: AtomicBool,
+    /// ADR 0012 phase 4 -- monotonic per-lane `seq` counter for inline
+    /// payloads.
+    ///
+    /// Allocated by the lane-fanout bridge when a fan-out tick produces
+    /// an inline payload. Each successful `compose_inline_payload`
+    /// consumes one slot via `fetch_add 1 Release`.
+    pub inline_seq: AtomicU64,
+    /// ADR 0012 phase 5 D2 fix -- cumulative inline notifications
+    /// delivered to this lane.
+    ///
+    /// Pure observability counter, separate from the legacy
+    /// `events_sent` so `sub_stats` can differentiate inline vs
+    /// pull-mode delivery. Incremented per fragment inside the bridge
+    /// `ship_inline_fragments` path. `Relaxed` ordering -- no
+    /// read-side happens-before dependency.
+    pub inline_events_sent: AtomicU64,
+    /// ADR 0012 phase 5 D2 fix -- cumulative raw inline bytes
+    /// delivered, pre-base64.
+    ///
+    /// Mirrors `bytes_sent` but only for the inline-push leg. Folded
+    /// per fragment via `fetch_add Relaxed`.
+    pub inline_bytes_sent: AtomicU64,
     /// Live stats mirror.
     atomics: LaneAtomics,
     /// Capacity used to size the mpsc.
@@ -214,6 +247,10 @@ impl LaneState {
             filter,
             paused: AtomicBool::new(false),
             cursor: AtomicU64::new(0),
+            inline_push: AtomicBool::new(false),
+            inline_seq: AtomicU64::new(0),
+            inline_events_sent: AtomicU64::new(0),
+            inline_bytes_sent: AtomicU64::new(0),
             atomics: LaneAtomics::default(),
             capacity,
             fallback_rx: AsyncMutex::new(Some(rx)),
@@ -233,6 +270,16 @@ impl LaneState {
     /// observable on stdio/HTTP transports.
     pub fn record_notify(&self, bytes_added: usize) {
         self.atomics.record_send(bytes_added);
+    }
+
+    /// ADR 0012 phase 4 -- flip the inline-push gate.
+    ///
+    /// Called by the `sub_open` use case once the capability handshake
+    /// confirms the peer advertised `ssh_inline_push`. Uses `Release`
+    /// ordering so the bridge's `Acquire` load on `inline_push`
+    /// happens-after this store. Idempotent; safe to call repeatedly.
+    pub fn set_inline_push(&self, enabled: bool) {
+        self.inline_push.store(enabled, Ordering::Release);
     }
 
     /// Borrow the live policy without cloning the inner `Arc`.
@@ -639,6 +686,24 @@ impl<I: IdGeneratorPort + fmt::Debug> LaneAdmin for SubscriberLaneAdapter<I> {
 
     fn list(&self) -> Vec<SubSummary> {
         <Self as SubscriberLanePort>::list_subs(self)
+    }
+
+    fn set_inline_push(&self, sub_id: &SubId, enabled: bool) -> bool {
+        self.lanes.get(sub_id).is_some_and(|entry| {
+            entry.value().set_inline_push(enabled);
+            true
+        })
+    }
+
+    fn inline_stats(&self, sub_id: &SubId) -> Option<InlineLaneCounters> {
+        self.lanes.get(sub_id).map(|entry| {
+            let lane = entry.value();
+            InlineLaneCounters {
+                inline_push: lane.inline_push.load(Ordering::Acquire),
+                inline_events_sent: lane.inline_events_sent.load(Ordering::Relaxed),
+                inline_bytes_sent: lane.inline_bytes_sent.load(Ordering::Relaxed),
+            }
+        })
     }
 }
 

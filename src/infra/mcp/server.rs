@@ -32,6 +32,7 @@
 use core::fmt;
 use std::sync::Arc;
 
+use crate::adapters::capability::registry::CapabilityRegistry;
 use crate::adapters::lifecycle::leak_watcher::{LeakWatcher, LeakWatcherProbe};
 
 use super::idempotency::IdempotencyCache;
@@ -76,6 +77,16 @@ where
     /// touching the watcher; production wiring shares the
     /// [`LeakWatcher`] handle behind both this and `leak_watcher`.
     pub(super) leak_probe: Option<Arc<dyn LeakWatcherProbe>>,
+    /// ADR 0012 Phase 6 — per-process registry that records
+    /// `experimental.ssh_inline_push` opt-in per peer at
+    /// `initialize` handshake time. `None` when the transport does
+    /// not wire the registry (e.g. unit tests that build the server
+    /// without composition root). When present, the
+    /// [`ServerHandler::initialize`] override consults
+    /// `request.capabilities.experimental` and writes through
+    /// [`CapabilityRegistry::record_capability`] for the resolved
+    /// peer id.
+    pub(super) capability_registry: Option<Arc<CapabilityRegistry>>,
 }
 
 impl<UC> McpSshServer<UC>
@@ -99,6 +110,7 @@ where
             id_lister: noop_id_lister(),
             leak_watcher: None,
             leak_probe: None,
+            capability_registry: None,
         }
     }
 
@@ -144,6 +156,18 @@ where
         self
     }
 
+    /// ADR 0012 Phase 6 — plug the shared
+    /// [`CapabilityRegistry`] so the [`ServerHandler::initialize`]
+    /// override can record `experimental.ssh_inline_push` opt-in
+    /// per peer. The same registry handle is shared with the
+    /// `SubscribeUseCase` (Phase 5) which consults it on
+    /// `sub_open inline_push=true`.
+    #[must_use]
+    pub fn with_capability_registry(mut self, registry: Arc<CapabilityRegistry>) -> Self {
+        self.capability_registry = Some(registry);
+        self
+    }
+
     /// Borrow the underlying use case container. Test/observability helper.
     #[must_use]
     pub const fn use_cases(&self) -> &Arc<UC> {
@@ -184,6 +208,14 @@ where
     pub const fn leak_probe(&self) -> Option<&Arc<dyn LeakWatcherProbe>> {
         self.leak_probe.as_ref()
     }
+
+    /// Borrow the optional capability registry (ADR 0012 Phase 6).
+    /// Used by the `ServerHandler::initialize` override to record
+    /// experimental client capabilities.
+    #[must_use]
+    pub const fn capability_registry(&self) -> Option<&Arc<CapabilityRegistry>> {
+        self.capability_registry.as_ref()
+    }
 }
 
 impl<UC> fmt::Debug for McpSshServer<UC>
@@ -203,6 +235,13 @@ where
             .field(
                 "leak_probe",
                 &self.leak_probe.as_ref().map_or("<unset>", |_| "<wired>"),
+            )
+            .field(
+                "capability_registry",
+                &self
+                    .capability_registry
+                    .as_ref()
+                    .map_or("<unset>", |_| "<wired>"),
             )
             .finish()
     }

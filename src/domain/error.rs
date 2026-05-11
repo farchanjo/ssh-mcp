@@ -232,6 +232,29 @@ pub enum DomainError {
     /// dropping the request feature or switching to `transport=Wire`).
     #[error("sftp feature missing: {0}")]
     SftpFeatureMissing(String),
+
+    // ----- ADR 0012 (inline push notifications) -------------------
+    /// Caller invoked `NotifierPort::notify_ssh_output` with an
+    /// `InlinePayload` whose `bytes.len()` exceeds the server cap
+    /// (resolved from `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`,
+    /// default 32 KiB). Wire code: `INLINE_PUSH_OVERSIZE` (POLICY —
+    /// non-retryable).
+    ///
+    /// Defensive guard at the port boundary per ADR 0012 phase 10.
+    /// The production splitter in
+    /// `LaneFanoutBridge::ship_inline_fragments` always passes
+    /// under-cap fragments, so this variant never fires on the
+    /// production fan-out path; it surfaces only for direct port
+    /// callers (test harnesses, future SDK consumers, NDJSON daemon
+    /// outbound paths that bypass the splitter).
+    #[error("inline push payload of {payload_bytes} bytes exceeds server cap of {cap_bytes} bytes")]
+    InlinePushOversize {
+        /// Byte length of the `InlinePayload` that exceeded the cap.
+        payload_bytes: usize,
+        /// Configured per-notification ceiling (default 32 KiB,
+        /// resolved from `SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY`).
+        cap_bytes: usize,
+    },
 }
 
 #[cfg(test)]

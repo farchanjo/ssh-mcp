@@ -219,15 +219,11 @@ mod tests {
         assert_eq!(cfg.forward_broadcast_cap(), 256);
         assert_eq!(
             cfg.notify_debounce(),
-            Duration::from_millis(
-                crate::adapters::config::internal::DEFAULT_NOTIFY_DEBOUNCE_MS
-            )
+            Duration::from_millis(crate::adapters::config::internal::DEFAULT_NOTIFY_DEBOUNCE_MS)
         );
         assert_eq!(
             cfg.notify_force_flush(),
-            Duration::from_millis(
-                crate::adapters::config::internal::DEFAULT_NOTIFY_FORCE_FLUSH_MS
-            )
+            Duration::from_millis(crate::adapters::config::internal::DEFAULT_NOTIFY_FORCE_FLUSH_MS)
         );
         assert_eq!(cfg.notify_keepalive(), Duration::from_secs(30));
         assert_eq!(cfg.peer_gc_interval(), Duration::from_secs(30));

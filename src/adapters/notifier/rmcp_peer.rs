@@ -140,6 +140,18 @@ impl PeerTable {
     /// peer disconnect.
     #[must_use]
     pub fn gc_closed_peers(&self) -> usize {
+        self.gc_closed_peers_with(|_id| {})
+    }
+
+    /// Walk the reverse map and drop every entry whose underlying rmcp
+    /// transport has closed. Fires `on_drop` once per evicted [`PeerId`]
+    /// (used by ADR 0012 Phase 3 to plug
+    /// [`crate::adapters::capability::CapabilityRegistry::forget_peer`]
+    /// into the GC pump). Returns the number of peers dropped.
+    pub fn gc_closed_peers_with<F>(&self, mut on_drop: F) -> usize
+    where
+        F: FnMut(&PeerId),
+    {
         // Snapshot ids before mutating to avoid `await_holding_lock`-style
         // shard contention; `Peer::is_transport_closed` is sync but we
         // still don't want to hold a shard guard across the prune.
@@ -151,6 +163,7 @@ impl PeerTable {
             .collect();
         let dropped = to_drop.len();
         for id in to_drop {
+            on_drop(&id);
             self.drop_by_id(&id);
         }
         dropped

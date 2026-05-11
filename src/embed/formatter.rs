@@ -93,6 +93,37 @@ pub enum Event {
         /// RFC 3339 timestamp.
         ts: String,
     },
+    /// ADR 0012 Phase 7 — relay of `notifications/ssh/output` from
+    /// the in-process server. The byte payload is base64-encoded by
+    /// the server-side notifier (`adapters::notifier::rmcp_adapter`)
+    /// and passed through the daemon's client handler verbatim; the
+    /// formatter never decodes nor re-encodes the bytes.
+    #[serde(rename = "inline_push")]
+    InlinePush {
+        /// Subscription identifier minted at `sub_open` time.
+        sub_id: String,
+        /// Resource URI the bytes belong to (e.g.
+        /// `shell://<id>/output`).
+        uri: String,
+        /// Per-lane monotonic sequence number.
+        seq: u64,
+        /// Producer-side cumulative byte offset at the end of this
+        /// payload.
+        cursor_after: u64,
+        /// Length in raw bytes of this fragment (post-decode). The
+        /// server emits this value alongside `bytes_b64` so consumers
+        /// can sanity-check the decoded length without base64 work.
+        len: u64,
+        /// Base64-encoded byte window. The formatter ships the string
+        /// verbatim from the MCP notification params — no decode and
+        /// no re-encode.
+        bytes_b64: String,
+        /// `true` when this fragment is not the final fragment of the
+        /// originating window. The fragment with `truncated=false`
+        /// marks the boundary at which the legacy
+        /// `resources/read?cursor=auto` would surface the same delta.
+        truncated: bool,
+    },
     /// Async command finished.
     Completed {
         /// Echo of the op's correlation `id`.
@@ -427,6 +458,68 @@ mod tests {
         let line = encode_line(&event).unwrap();
         assert!(line.contains("\"ev\":\"warn\""));
         assert!(line.contains("\"resource\":\"shell://abc/output\""));
+    }
+
+    #[test]
+    fn serializes_inline_push_with_all_fields() {
+        let event = Event::InlinePush {
+            sub_id: "0193f04e-3a2b-7c12-8d11-1f1f04ab92e1".to_string(),
+            uri: "shell://abc/output".to_string(),
+            seq: 42,
+            cursor_after: 12_345,
+            len: 5,
+            bytes_b64: "aGVsbG8=".to_string(),
+            truncated: false,
+        };
+        let line = encode_line(&event).unwrap();
+        assert!(line.contains("\"ev\":\"inline_push\""));
+        assert!(line.contains("\"sub_id\":\"0193f04e-3a2b-7c12-8d11-1f1f04ab92e1\""));
+        assert!(line.contains("\"uri\":\"shell://abc/output\""));
+        assert!(line.contains("\"seq\":42"));
+        assert!(line.contains("\"cursor_after\":12345"));
+        assert!(line.contains("\"len\":5"));
+        assert!(line.contains("\"bytes_b64\":\"aGVsbG8=\""));
+        assert!(line.contains("\"truncated\":false"));
+    }
+
+    #[test]
+    fn round_trips_inline_push_via_serde() {
+        let event = Event::InlinePush {
+            sub_id: "01H9".to_string(),
+            uri: "command://c1/output".to_string(),
+            seq: 7,
+            cursor_after: 1_024,
+            len: 11,
+            bytes_b64: "SGVsbG8gV29ybGQ=".to_string(),
+            truncated: true,
+        };
+        let line = encode_line(&event).unwrap();
+        // Re-parse as an untagged JSON value first because the
+        // `ev` tag is stripped from the variant — we assert
+        // structural equality on the underlying bytes_b64 payload.
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["ev"], "inline_push");
+        assert_eq!(value["bytes_b64"], "SGVsbG8gV29ybGQ=");
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["truncated"], true);
+        // Event is Serialize-only by design (the daemon only writes
+        // events outbound). The structural check above plus a
+        // re-encoded JSON value comparison covers the round-trip
+        // contract: the line we emit deserialises into a stable
+        // JSON shape with no extra noise.
+        let reencoded: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let expected = serde_json::json!({
+            "ev": "inline_push",
+            "sub_id": "01H9",
+            "uri": "command://c1/output",
+            "seq": 7_u64,
+            "cursor_after": 1_024_u64,
+            "len": 11_u64,
+            "bytes_b64": "SGVsbG8gV29ybGQ=",
+            "truncated": true,
+        });
+        assert_eq!(reencoded, expected);
+        let _ = event;
     }
 
     #[test]

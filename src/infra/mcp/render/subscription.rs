@@ -93,13 +93,14 @@ pub fn append_hygiene(
 pub fn subscribe_render(outcome: &SubscribeOutcome) -> String {
     let mut out = String::with_capacity(256);
     append_subscribe_header(&mut out, outcome);
+    append_subscribe_inline_flags(&mut out, outcome);
     append_subscribe_advisories(&mut out, outcome);
     append_hygiene(
         &mut out,
         Some("sub_close"),
         Some("O(1) lane open + per-event mpsc"),
         Some("Pass _meta.idempotency_key to dedup retries"),
-        Some("Hold the SUB_ID; never re-open the same URI without first unsubscribing"),
+        Some(hygiene_line_for(outcome)),
     );
     out
 }
@@ -115,6 +116,23 @@ fn append_subscribe_header(out: &mut String, outcome: &SubscribeOutcome) {
     out.push_str(outcome.lag_policy.as_str());
     out.push_str("\nGRACE_MS: ");
     out.push_str(&outcome.grace_ms.to_string());
+}
+
+/// ADR 0012 phase 5 -- emit the inline-push wire lines AFTER the
+/// existing header but BEFORE any NEXT / HINT lines. Both lines are
+/// gated on `inline_push_requested` so v7.0.x callers that omit the
+/// arg keep byte-identical wires.
+fn append_subscribe_inline_flags(out: &mut String, outcome: &SubscribeOutcome) {
+    if !outcome.inline_push_requested {
+        return;
+    }
+    out.push_str("\nINLINE_PUSH: yes");
+    out.push_str("\nINLINE_PUSH_HONORED: ");
+    out.push_str(if outcome.inline_push_honored {
+        "yes"
+    } else {
+        "no"
+    });
 }
 
 fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
@@ -133,6 +151,13 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
             outcome.sub_id
         ),
     );
+    if outcome.inline_push_requested && !outcome.inline_push_honored {
+        append_hint(
+            out,
+            HintStrength::Recommended,
+            "client did not advertise ssh_inline_push capability; falling back to pull-mode",
+        );
+    }
     append_hint(
         out,
         HintStrength::Recommended,
@@ -140,10 +165,23 @@ fn append_subscribe_advisories(out: &mut String, outcome: &SubscribeOutcome) {
     );
 }
 
+/// ADR 0012 phase 5 (line 259) -- when inline-push was honoured, the
+/// Hygiene line steers the LLM to drain bytes from
+/// `notifications/ssh/output` instead of chaining
+/// `resources/read?cursor=auto` calls. The pull-mode read stays
+/// available as a verification path.
+const fn hygiene_line_for(outcome: &SubscribeOutcome) -> &'static str {
+    if outcome.inline_push_requested && outcome.inline_push_honored {
+        "When inline_push=true, bytes arrive in notifications/ssh/output; you do not need to read resources/read?cursor=auto separately. Pull-mode resources/read?cursor=... is still available as a verification path. Hold the SUB_ID; never re-open the same URI without first unsubscribing."
+    } else {
+        "Hold the SUB_ID; never re-open the same URI without first unsubscribing"
+    }
+}
+
 /// Render the structured JSON twin for `sub_open`.
 #[must_use]
 pub fn subscribe_structured(outcome: &SubscribeOutcome) -> Value {
-    json!({
+    let mut value = json!({
         "tool": "sub_open",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
@@ -151,7 +189,17 @@ pub fn subscribe_structured(outcome: &SubscribeOutcome) -> Value {
         "lifetime": lifetime_label(outcome.lifetime),
         "lag_policy": outcome.lag_policy.as_str(),
         "grace_ms": outcome.grace_ms,
-    })
+        "inline_push": outcome.inline_push_requested,
+    });
+    if outcome.inline_push_requested
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert(
+            "inline_push_honored".to_string(),
+            Value::Bool(outcome.inline_push_honored),
+        );
+    }
+    value
 }
 
 const fn lifetime_label(lifetime: SubscriptionLifetime) -> &'static str {
@@ -382,14 +430,31 @@ pub fn sub_stats_render(outcome: &SubStatsOutcome) -> String {
     out.push_str(&outcome.stats.queue_high_watermark.to_string());
     out.push_str("\nBLOCK_TOTAL_MS: ");
     out.push_str(&outcome.stats.block_total_ms.to_string());
+    append_sub_stats_inline_lines(&mut out, outcome);
     append_next(&mut out, "sub_filter | sub_replay | sub_close");
     out
+}
+
+/// ADR 0012 phase 5 -- emit the inline counters after the existing
+/// per-lane stat lines, gated on lane opt-in. Opt-out lanes keep the
+/// stats wire byte-identical to v7.0.x.
+fn append_sub_stats_inline_lines(out: &mut String, outcome: &SubStatsOutcome) {
+    let Some(inline) = outcome.inline else {
+        return;
+    };
+    if !inline.inline_push {
+        return;
+    }
+    out.push_str("\nINLINE_EVENTS_SENT: ");
+    out.push_str(&inline.inline_events_sent.to_string());
+    out.push_str("\nINLINE_BYTES_SENT: ");
+    out.push_str(&inline.inline_bytes_sent.to_string());
 }
 
 /// Render the structured JSON twin for `sub_stats`.
 #[must_use]
 pub fn sub_stats_structured(outcome: &SubStatsOutcome) -> Value {
-    json!({
+    let mut value = json!({
         "tool": "sub_stats",
         "status": "ok",
         "sub_id": outcome.sub_id.as_str(),
@@ -400,7 +465,21 @@ pub fn sub_stats_structured(outcome: &SubStatsOutcome) -> Value {
         "queue_depth": outcome.stats.queue_depth,
         "queue_high_watermark": outcome.stats.queue_high_watermark,
         "block_total_ms": outcome.stats.block_total_ms,
-    })
+    });
+    if let Some(inline) = outcome.inline
+        && inline.inline_push
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert(
+            "inline_events_sent".to_string(),
+            Value::from(inline.inline_events_sent),
+        );
+        map.insert(
+            "inline_bytes_sent".to_string(),
+            Value::from(inline.inline_bytes_sent),
+        );
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +585,8 @@ mod tests {
             lifetime: SubscriptionLifetime::AutoClose { grace_ms: 2_000 },
             lag_policy: LagPolicy::Snapshot,
             grace_ms: 2_000,
+            inline_push_requested: false,
+            inline_push_honored: false,
         };
         let body = subscribe_render(&outcome);
         assert!(body.starts_with("SUB_OPEN: OK"));
@@ -538,6 +619,8 @@ mod tests {
             lifetime: SubscriptionLifetime::Lease { ttl_secs: 60 },
             lag_policy: LagPolicy::DropOldest,
             grace_ms: 0,
+            inline_push_requested: false,
+            inline_push_honored: false,
         };
         let json = subscribe_structured(&outcome);
         assert_eq!(json["tool"], "sub_open");
@@ -663,6 +746,7 @@ mod tests {
         let outcome = SubStatsOutcome {
             sub_id: sub_id("s"),
             stats,
+            inline: None,
         };
         let body = sub_stats_render(&outcome);
         assert!(body.contains("EVENTS_SENT: 10"));
@@ -766,6 +850,8 @@ mod tests {
                 lifetime: SubscriptionLifetime::Manual,
                 lag_policy: variant,
                 grace_ms: 0,
+                inline_push_requested: false,
+                inline_push_honored: false,
             };
             let body = subscribe_render(&outcome);
             assert!(
@@ -813,6 +899,8 @@ mod tests {
             lifetime: SubscriptionLifetime::Manual,
             lag_policy: LagPolicy::Snapshot,
             grace_ms: 0,
+            inline_push_requested: false,
+            inline_push_honored: false,
         };
         let body = subscribe_render(&outcome);
         // The HINT line's REQUIRED tag steers the LLM straight at the
@@ -821,5 +909,139 @@ mod tests {
         let next_idx = body.find("NEXT: ").expect("next present");
         // NEXT precedes HINT in this render; both must exist.
         assert!(next_idx < hint_idx, "expected NEXT before HINT");
+    }
+
+    // ------------------------------------------------------------------
+    // ADR 0012 phase 5 -- inline-push wire-line renderers.
+    // ------------------------------------------------------------------
+
+    fn outcome_with_inline(requested: bool, honored: bool) -> SubscribeOutcome {
+        SubscribeOutcome {
+            sub_id: sub_id("019phase5"),
+            uri: "shell://phase5/output".to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            grace_ms: 0,
+            inline_push_requested: requested,
+            inline_push_honored: honored,
+        }
+    }
+
+    fn sub_stats_outcome(
+        inline_push: bool,
+        inline_events_sent: u64,
+        inline_bytes_sent: u64,
+    ) -> SubStatsOutcome {
+        let inline = Some(crate::ports::subscriber_lane::InlineLaneCounters {
+            inline_push,
+            inline_events_sent,
+            inline_bytes_sent,
+        });
+        SubStatsOutcome {
+            sub_id: sub_id("019stats"),
+            stats: SubscriberStats {
+                events_sent: 1,
+                bytes_sent: 32,
+                lagged_drops: 0,
+                lagged_recoveries: 0,
+                queue_depth: 0,
+                queue_high_watermark: 0,
+                block_total_ms: 0,
+                byte_triggered_flushes: 0,
+            },
+            inline,
+        }
+    }
+
+    #[test]
+    fn renders_inline_push_yes_with_honored_no_and_hint() {
+        let outcome = outcome_with_inline(true, false);
+        let body = subscribe_render(&outcome);
+        assert!(body.contains("INLINE_PUSH: yes"));
+        assert!(body.contains("INLINE_PUSH_HONORED: no"));
+        assert!(
+            body.contains("HINT: RECOMMENDED: client did not advertise ssh_inline_push capability"),
+            "fallback hint missing: {body}"
+        );
+        let json = subscribe_structured(&outcome);
+        assert_eq!(json["inline_push"], true);
+        assert_eq!(json["inline_push_honored"], false);
+    }
+
+    #[test]
+    fn renders_inline_push_yes_with_honored_yes_and_hygiene_line() {
+        let outcome = outcome_with_inline(true, true);
+        let body = subscribe_render(&outcome);
+        assert!(body.contains("INLINE_PUSH: yes"));
+        assert!(body.contains("INLINE_PUSH_HONORED: yes"));
+        assert!(
+            body.contains("When inline_push=true, bytes arrive in notifications/ssh/output"),
+            "hygiene line missing inline guidance: {body}"
+        );
+        // Fallback hint must NOT fire when the capability was honoured.
+        assert!(
+            !body
+                .contains("HINT: RECOMMENDED: client did not advertise ssh_inline_push capability"),
+            "fallback hint must not fire when honoured: {body}"
+        );
+        let json = subscribe_structured(&outcome);
+        assert_eq!(json["inline_push"], true);
+        assert_eq!(json["inline_push_honored"], true);
+    }
+
+    #[test]
+    fn renders_no_inline_lines_when_inline_push_false() {
+        let outcome = outcome_with_inline(false, false);
+        let body = subscribe_render(&outcome);
+        assert!(
+            !body.contains("INLINE_PUSH:"),
+            "v7.0.x-compatible wire must not carry INLINE_PUSH line: {body}"
+        );
+        assert!(
+            !body.contains("INLINE_PUSH_HONORED:"),
+            "wire-additive: honored line gated on opt-in: {body}"
+        );
+        let json = subscribe_structured(&outcome);
+        // Structured-content still carries the boolean for parsers that
+        // want to read it; just defaults to false.
+        assert_eq!(json["inline_push"], false);
+        assert!(
+            json.get("inline_push_honored").is_none(),
+            "honored field omitted when opt-out"
+        );
+    }
+
+    #[test]
+    fn emits_inline_counters_when_inline_enabled() {
+        let outcome = sub_stats_outcome(true, 12, 8_743);
+        let body = sub_stats_render(&outcome);
+        assert!(body.contains("INLINE_EVENTS_SENT: 12"));
+        assert!(body.contains("INLINE_BYTES_SENT: 8743"));
+        let json = sub_stats_structured(&outcome);
+        assert_eq!(json["inline_events_sent"], 12);
+        assert_eq!(json["inline_bytes_sent"], 8_743);
+    }
+
+    #[test]
+    fn omits_inline_counters_when_inline_disabled() {
+        let outcome = sub_stats_outcome(false, 0, 0);
+        let body = sub_stats_render(&outcome);
+        assert!(
+            !body.contains("INLINE_EVENTS_SENT:"),
+            "opt-out lane must keep wire byte-identical to v7.0.x"
+        );
+        assert!(
+            !body.contains("INLINE_BYTES_SENT:"),
+            "opt-out lane must keep wire byte-identical to v7.0.x"
+        );
+        let json = sub_stats_structured(&outcome);
+        assert!(
+            json.get("inline_events_sent").is_none(),
+            "structured twin must omit inline field on opt-out lane"
+        );
+        assert!(
+            json.get("inline_bytes_sent").is_none(),
+            "structured twin must omit inline field on opt-out lane"
+        );
     }
 }

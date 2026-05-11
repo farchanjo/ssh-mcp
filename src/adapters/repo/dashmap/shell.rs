@@ -274,7 +274,10 @@ mod tests {
             | DomainError::RsyncPartialTransfer(_)
             | DomainError::SftpFeatureMissing(_)
             | DomainError::InvalidLagPolicy(_)
-            | DomainError::InvalidLifetime(_) => {
+            | DomainError::InvalidLifetime(_)
+            // ADR 0012 phase 10 — port-boundary oversize guard not
+            // produced by repos; included for exhaustiveness only.
+            | DomainError::InlinePushOversize { .. } => {
                 panic!("unexpected error variant: {err:?}")
             }
         }

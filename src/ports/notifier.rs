@@ -2,8 +2,10 @@
 //!
 //! `PeerHandle` is the sync, dyn-safe handle the registry stores per
 //! connected MCP peer. `NotifierPort` is the async port use cases call to
-//! deliver `notifications/resources/updated`. `PeerHandle` is intentionally
-//! sync (no AFIT methods) so it remains erasable behind `Arc<dyn PeerHandle>`.
+//! deliver `notifications/resources/updated` and (since ADR 0012, v7.1)
+//! `notifications/ssh/output` for inline-push delivery. `PeerHandle` is
+//! intentionally sync (no AFIT methods) so it remains erasable behind
+//! `Arc<dyn PeerHandle>`.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
+use crate::domain::inline_payload::InlinePayload;
 
 /// Stable, dyn-safe handle to a connected MCP peer.
 ///
@@ -39,6 +42,37 @@ pub trait LocalNotifierPort: Sync {
         &self,
         peer: Arc<dyn PeerHandle>,
         uri: &str,
+    ) -> Result<(), DomainError>;
+
+    /// Deliver an inline-push fragment to the originating peer as a
+    /// `notifications/ssh/output` MCP notification.
+    ///
+    /// Called by the lane-side bridge for subscriptions that negotiated
+    /// inline push at `sub_open` time and that the v7.1 capability
+    /// handshake authorised (see ADR 0012). The lane composes the
+    /// [`InlinePayload`] from its producer ring buffer; this port is
+    /// the pure-delivery boundary — payload composition, splitting, and
+    /// per-lane stats live on the lane side.
+    ///
+    /// `peer` mirrors the `notify_resource_updated` shape so adapters
+    /// share a single `PeerHandle`-to-transport resolver. The payload is
+    /// moved (not borrowed) so adapters take ownership of `bytes`
+    /// without an intermediate copy. Implementations MUST NOT hold any
+    /// lock across the underlying `.await`; the production rmcp adapter
+    /// snapshots the cheap-to-clone [`rmcp::Peer`] out of its lookup
+    /// table before awaiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::Transport` when the underlying transport
+    /// rejects the notification (closed channel, IO failure, ...). The
+    /// production rmcp adapter treats a missing peer (already GC'd
+    /// because the transport closed) as at-most-once delivery and
+    /// returns `Ok(())`.
+    async fn notify_ssh_output(
+        &self,
+        peer: Arc<dyn PeerHandle>,
+        payload: InlinePayload,
     ) -> Result<(), DomainError>;
 }
 
@@ -75,6 +109,20 @@ pub trait ProducerForwarder: Send + Sync + Debug + 'static {
         id: &str,
         bytes_added: usize,
     );
+
+    /// ADR 0012 phase 9 — byte-tail variant. Default impl forwards
+    /// to [`Self::forward_record_bytes`] with the byte count, so
+    /// implementations that only care about the legacy debouncer
+    /// remain unchanged. The composition root forwarder overrides to
+    /// also drive the inline-push lane fan-out.
+    fn forward_record_bytes_with_tail(
+        &self,
+        kind: super::subscriber_registry::ResourceKind,
+        id: &str,
+        bytes_added: &[u8],
+    ) {
+        self.forward_record_bytes(kind, id, bytes_added.len());
+    }
 }
 
 /// URI-keyed bridge for the legacy broadcast pipeline.
@@ -96,6 +144,23 @@ pub trait LaneNotifierBridge: Send + Sync + Debug + 'static {
         uri: &'a str,
         bytes_added: usize,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// ADR 0012 phase 9 — synchronous producer-side hook for the
+    /// inline-push path. The producer calls this with the actual byte
+    /// tail it just appended; the bridge fans out only to opt-in
+    /// inline lanes (legacy `resources/updated` notifications are
+    /// still delivered by the debouncer-driven [`Self::notify_lanes`]
+    /// at the regular cadence).
+    ///
+    /// Default impl is a no-op so test bridges that do not care about
+    /// the inline path compile without change.
+    fn notify_lanes_inline<'a>(
+        &'a self,
+        _uri: &'a str,
+        _bytes_added: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 #[cfg(test)]

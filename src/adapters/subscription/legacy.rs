@@ -51,6 +51,7 @@ use tokio::time::{self, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::adapters::capability::registry::CapabilityRegistry;
 use crate::adapters::config::internal::{
     resolve_notify_debounce_ms, resolve_notify_flush_bytes, resolve_notify_force_flush_ms,
     resolve_notify_keepalive_s,
@@ -446,6 +447,25 @@ impl SubscriptionRegistry {
         if let Some(forwarder) = fwd.as_ref() {
             forwarder.forward_record_bytes(legacy_kind_to_port(kind), id, bytes_added);
         }
+        self.maybe_flush_local_counter(kind, id, bytes_added);
+    }
+
+    /// ADR 0012 phase 9 — byte-tail variant. Forwards the raw bytes
+    /// through to the hexagonal forwarder so the production
+    /// `MemoryRegistry` can drive inline-push lanes, then runs the
+    /// legacy local counter for `SSH_NOTIFY_FLUSH_BYTES` debouncing
+    /// exactly as `record_bytes` does.
+    pub fn record_bytes_with_tail(&self, kind: ResourceKind, id: &str, bytes_added: &[u8]) {
+        let fwd = self.forwarder.load_full();
+        if let Some(forwarder) = fwd.as_ref() {
+            forwarder.forward_record_bytes_with_tail(legacy_kind_to_port(kind), id, bytes_added);
+        }
+        self.maybe_flush_local_counter(kind, id, bytes_added.len());
+    }
+
+    /// Shared byte-counter pipeline used by both [`Self::record_bytes`]
+    /// and [`Self::record_bytes_with_tail`].
+    fn maybe_flush_local_counter(&self, kind: ResourceKind, id: &str, bytes_added: usize) {
         if self.flush_bytes_threshold == 0 || bytes_added == 0 {
             return;
         }
@@ -607,11 +627,18 @@ async fn broadcast_resource_updated(uri: &str) {
 /// supplied the GC pass also prunes its closed peers so the v4 side
 /// table stays in sync with the legacy [`SUBSCRIPTION_REGISTRY`] ahead
 /// of the runtime migration.
+///
+/// `capabilities` is the ADR 0012 Phase 3
+/// [`CapabilityRegistry`] holding per-peer experimental client
+/// capability flags (`experimental.ssh_inline_push`, ...). When supplied
+/// the GC pass calls `forget_peer` for every evicted [`PeerId`] so the
+/// capability registry never out-lives the peer's transport.
 #[must_use]
 pub fn spawn_peer_gc(
     interval_secs: u64,
     cancel: CancellationToken,
     peer_table: Option<Arc<PeerTable>>,
+    capabilities: Option<Arc<CapabilityRegistry>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(interval_secs.max(1)));
@@ -626,19 +653,27 @@ pub fn spawn_peer_gc(
                     return;
                 }
                 _ = ticker.tick() => {
-                    let dropped = SUBSCRIPTION_REGISTRY.gc_closed_peers();
-                    let table_dropped = peer_table
-                        .as_deref()
-                        .map_or(0, PeerTable::gc_closed_peers);
-                    if dropped > 0 || table_dropped > 0 {
-                        debug!(
-                            "peer GC: dropped {dropped} legacy peers, {table_dropped} v4 peers"
-                        );
-                    }
+                    run_peer_gc_tick(peer_table.as_deref(), capabilities.as_deref());
                 }
             }
         }
     })
+}
+
+/// Single peer-GC tick. Extracted from [`spawn_peer_gc`] to keep the
+/// loop body under the crate-wide method-length budget.
+fn run_peer_gc_tick(peer_table: Option<&PeerTable>, capabilities: Option<&CapabilityRegistry>) {
+    let dropped = SUBSCRIPTION_REGISTRY.gc_closed_peers();
+    let table_dropped = peer_table.map_or(0, |table| {
+        table.gc_closed_peers_with(|id| {
+            if let Some(reg) = capabilities {
+                reg.forget_peer(id);
+            }
+        })
+    });
+    if dropped > 0 || table_dropped > 0 {
+        debug!("peer GC: dropped {dropped} legacy peers, {table_dropped} v4 peers");
+    }
 }
 
 #[cfg(test)]

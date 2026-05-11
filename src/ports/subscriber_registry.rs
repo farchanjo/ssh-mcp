@@ -89,6 +89,19 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
         // semantics.
     }
 
+    /// ADR 0012 phase 9 — byte-tail variant. Producers that hold the
+    /// real bytes in scope (shell PTY, command stdout/stderr, serial
+    /// reader) call this so the registry can fan the raw tail out to
+    /// every opt-in inline lane before feeding the debouncer.
+    ///
+    /// Default impl forwards to [`Self::record_bytes`] with the byte
+    /// count only, preserving the v4 / Phase 4 semantics for stubs and
+    /// the legacy adapter. The production `MemoryRegistry` overrides
+    /// to also call the installed `LaneNotifierBridge`.
+    fn record_bytes_with_tail(&self, kind: ResourceKind, resource_id: &str, bytes_added: &[u8]) {
+        self.record_bytes(kind, resource_id, bytes_added.len());
+    }
+
     /// Decrement every peer cursor on `uri` by `bytes_dropped` (saturating).
     /// Called when the underlying ring buffer drops bytes from the head.
     fn compensate_truncation(&self, uri: &str, bytes_dropped: u64);

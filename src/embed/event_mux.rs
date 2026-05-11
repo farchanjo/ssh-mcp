@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientCapabilities, ClientInfo, Implementation,
+    CancelledNotificationParam, ClientCapabilities, ClientInfo, CustomNotification, Implementation,
     ProgressNotificationParam, ProtocolVersion, ResourceUpdatedNotificationParam,
 };
 use rmcp::service::{NotificationContext, RoleClient};
@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval as tokio_interval};
 use tokio_util::sync::CancellationToken;
 
+use crate::adapters::config::internal::resolve_inline_push_daemon_relay;
 use crate::embed::duplex_transport::embed_client_info;
 use crate::embed::formatter::{Event, NdjsonWriter, PROTOCOL_VERSION};
 
@@ -271,6 +272,136 @@ impl ClientHandler for EmbedClient {
             tracing::trace!("cancelled forward dropped: {err}");
         }
     }
+
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _ctx: NotificationContext<RoleClient>,
+    ) {
+        if notification.method.as_str() != NOTIFICATIONS_SSH_OUTPUT {
+            tracing::trace!(
+                "custom notification ignored (method={})",
+                notification.method
+            );
+            return;
+        }
+        translate_inline_push(&self.tx, &notification);
+    }
+}
+
+/// MCP notification method advertised by ADR 0012 for inline-push
+/// delivery. Matches the constant on the server-side notifier
+/// adapter — the wire key must never drift across sites.
+const NOTIFICATIONS_SSH_OUTPUT: &str = "notifications/ssh/output";
+
+/// ADR 0012 Phase 7 wire-error code carried by the daemon's
+/// `INLINE_PUSH_BAD_PARAMS` synthetic `Event::Err`. Keeps the
+/// wire-resilience contract auditable from a single name.
+pub const INLINE_PUSH_BAD_PARAMS_CODE: &str = "INLINE_PUSH_BAD_PARAMS";
+
+/// Translate a `notifications/ssh/output` custom notification into a
+/// [`Event::InlinePush`] NDJSON line and push it onto the outbound
+/// mux.
+///
+/// Gated by [`resolve_inline_push_daemon_relay`]: when the env var
+/// is not truthy the function returns silently so v7.0.x NDJSON
+/// consumers see no behavioural change.
+///
+/// Parses the JSON-RPC params object without decoding the
+/// `bytes_b64` string — ADR 0012 mandates verbatim pass-through so
+/// the daemon never round-trips through base64. Missing or mistyped
+/// params surface as an `Event::Err{code: INLINE_PUSH_BAD_PARAMS}`
+/// so the daemon stays resilient (no panic, no abort).
+fn translate_inline_push(tx: &EventTx, notification: &CustomNotification) {
+    if !resolve_inline_push_daemon_relay() {
+        tracing::trace!("inline-push relay disabled; dropping notifications/ssh/output silently");
+        return;
+    }
+    let event = build_inline_push_event(notification.params.as_ref());
+    if let Err(err) = tx.try_send(event) {
+        tracing::trace!("inline_push forward dropped: {err}");
+    }
+}
+
+/// Pure helper — convert the JSON-RPC params blob carried by a
+/// `notifications/ssh/output` notification into either an
+/// [`Event::InlinePush`] or an [`Event::Err`] when the params are
+/// missing / mistyped. Split off the async path so unit tests can
+/// drive the translation with a synthetic params blob.
+fn build_inline_push_event(params: Option<&serde_json::Value>) -> Event {
+    params.map_or_else(missing_params_event, |value| {
+        parse_inline_push_params(value).unwrap_or_else(malformed_params_event)
+    })
+}
+
+fn missing_params_event() -> Event {
+    Event::Err {
+        id: None,
+        code: INLINE_PUSH_BAD_PARAMS_CODE.to_string(),
+        reason: "notifications/ssh/output missing params".to_string(),
+        detail: Some(
+            "Server must send a JSON object carrying sub_id/uri/seq/cursor_after/len/bytes_b64/truncated."
+                .to_string(),
+        ),
+    }
+}
+
+fn malformed_params_event(missing: &'static str) -> Event {
+    Event::Err {
+        id: None,
+        code: INLINE_PUSH_BAD_PARAMS_CODE.to_string(),
+        reason: "notifications/ssh/output params malformed".to_string(),
+        detail: Some(format!(
+            "Missing or mistyped param: {missing}. Expected sub_id/uri/seq/cursor_after/len/bytes_b64/truncated."
+        )),
+    }
+}
+
+/// Decode the `notifications/ssh/output` params object into an
+/// [`Event::InlinePush`]. Returns the missing / mistyped field name
+/// on failure so the caller can surface a precise error event.
+fn parse_inline_push_params(value: &serde_json::Value) -> Result<Event, &'static str> {
+    let obj = value.as_object().ok_or("<root-not-object>")?;
+    let sub_id = take_string(obj, "sub_id")?;
+    let uri = take_string(obj, "uri")?;
+    let seq = take_u64(obj, "seq")?;
+    let cursor_after = take_u64(obj, "cursor_after")?;
+    let len = take_u64(obj, "len")?;
+    let bytes_b64 = take_string(obj, "bytes_b64")?;
+    let truncated = take_bool(obj, "truncated")?;
+    Ok(Event::InlinePush {
+        sub_id,
+        uri,
+        seq,
+        cursor_after,
+        len,
+        bytes_b64,
+        truncated,
+    })
+}
+
+fn take_string(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<String, &'static str> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(key)
+}
+
+fn take_u64(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<u64, &'static str> {
+    obj.get(key).and_then(serde_json::Value::as_u64).ok_or(key)
+}
+
+fn take_bool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<bool, &'static str> {
+    obj.get(key).and_then(serde_json::Value::as_bool).ok_or(key)
 }
 
 /// Wrap the [`EmbedClient`] handler in `Arc` so the dispatcher and the
@@ -386,5 +517,174 @@ mod tests {
         let client = EmbedClient::default();
         let info = client.get_info();
         assert!(info.client_info.name.contains("default"));
+    }
+
+    // ADR 0012 Phase 7 — daemon inline-push relay.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 requires unsafe for env::set_var; tests serialize via ENV_GUARD"
+    )]
+    mod inline_push_translation {
+        use super::*;
+        use crate::adapters::config::internal::INLINE_PUSH_DAEMON_RELAY_ENV_VAR;
+        use serde_json::json;
+        use std::sync::{LazyLock, Mutex as StdMutex};
+
+        /// Serialise env-mutating tests so the shared `SSH_INLINE_PUSH_DAEMON_RELAY`
+        /// variable cannot race across `cargo test` worker threads. Mirrors the
+        /// `ENV_TEST_MUTEX` pattern used in `adapters::config::internal`.
+        static ENV_GUARD: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+        fn sample_params() -> serde_json::Value {
+            json!({
+                "sub_id": "0193f04e-3a2b-7c12-8d11-1f1f04ab92e1",
+                "uri": "shell://abc/output",
+                "seq": 7_u64,
+                "cursor_after": 42_u64,
+                "len": 5_u64,
+                "bytes_b64": "aGVsbG8=",
+                "truncated": false,
+            })
+        }
+
+        fn sample_notification() -> CustomNotification {
+            CustomNotification::new(NOTIFICATIONS_SSH_OUTPUT, Some(sample_params()))
+        }
+
+        fn unset_relay() {
+            // SAFETY: ENV_GUARD held by every caller of this helper.
+            unsafe { std::env::remove_var(INLINE_PUSH_DAEMON_RELAY_ENV_VAR) };
+        }
+
+        fn set_relay(value: &str) {
+            // SAFETY: ENV_GUARD held by every caller of this helper.
+            unsafe { std::env::set_var(INLINE_PUSH_DAEMON_RELAY_ENV_VAR, value) };
+        }
+
+        #[test]
+        fn build_inline_push_event_parses_valid_params() {
+            let event = build_inline_push_event(Some(&sample_params()));
+            match event {
+                Event::InlinePush {
+                    sub_id,
+                    uri,
+                    seq,
+                    cursor_after,
+                    len,
+                    bytes_b64,
+                    truncated,
+                } => {
+                    assert_eq!(sub_id, "0193f04e-3a2b-7c12-8d11-1f1f04ab92e1");
+                    assert_eq!(uri, "shell://abc/output");
+                    assert_eq!(seq, 7);
+                    assert_eq!(cursor_after, 42);
+                    assert_eq!(len, 5);
+                    assert_eq!(bytes_b64, "aGVsbG8=");
+                    assert!(!truncated);
+                }
+                other => panic!("expected Event::InlinePush, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn build_inline_push_event_emits_err_on_missing_param() {
+            let mut params = sample_params();
+            let obj = params.as_object_mut().unwrap();
+            obj.remove("bytes_b64");
+            let event = build_inline_push_event(Some(&params));
+            match event {
+                Event::Err { code, detail, .. } => {
+                    assert_eq!(code, INLINE_PUSH_BAD_PARAMS_CODE);
+                    let detail = detail.unwrap_or_default();
+                    assert!(
+                        detail.contains("bytes_b64"),
+                        "detail must surface the missing field; got {detail}"
+                    );
+                }
+                other => panic!("expected Event::Err on missing param, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn build_inline_push_event_emits_err_when_params_absent() {
+            let event = build_inline_push_event(None);
+            match event {
+                Event::Err { code, .. } => {
+                    assert_eq!(code, INLINE_PUSH_BAD_PARAMS_CODE);
+                }
+                other => panic!("expected Event::Err when params absent, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn translates_ssh_output_to_inline_push_event_when_relay_enabled() {
+            let _g = ENV_GUARD.lock().unwrap();
+            set_relay("1");
+            let (tx, mut rx) = make_pair();
+            translate_inline_push(&tx, &sample_notification());
+            unset_relay();
+            let event = rx.try_recv().expect("relay must emit an event");
+            match event {
+                Event::InlinePush { seq, len, .. } => {
+                    assert_eq!(seq, 7);
+                    assert_eq!(len, 5);
+                }
+                other => panic!("expected InlinePush, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn drops_ssh_output_silently_when_relay_disabled() {
+            let _g = ENV_GUARD.lock().unwrap();
+            unset_relay();
+            let (tx, mut rx) = make_pair();
+            translate_inline_push(&tx, &sample_notification());
+            assert!(
+                rx.try_recv().is_err(),
+                "relay disabled: no event must be queued"
+            );
+        }
+
+        #[tokio::test]
+        async fn emits_error_event_on_missing_param_via_translate() {
+            let _g = ENV_GUARD.lock().unwrap();
+            set_relay("yes");
+            let (tx, mut rx) = make_pair();
+            let mut bad_params = sample_params();
+            bad_params.as_object_mut().unwrap().remove("bytes_b64");
+            let bad_notification =
+                CustomNotification::new(NOTIFICATIONS_SSH_OUTPUT, Some(bad_params));
+            translate_inline_push(&tx, &bad_notification);
+            unset_relay();
+            let event = rx.try_recv().expect("error event must be queued");
+            match event {
+                Event::Err { code, .. } => assert_eq!(code, INLINE_PUSH_BAD_PARAMS_CODE),
+                other => panic!("expected Event::Err, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn env_truthy_parsing_matches_existing_convention() {
+            let _g = ENV_GUARD.lock().unwrap();
+            for raw in ["true", "TRUE", "1", "yes", "Yes", "on", "ON"] {
+                set_relay(raw);
+                let (tx, mut rx) = make_pair();
+                translate_inline_push(&tx, &sample_notification());
+                assert!(
+                    rx.try_recv().is_ok(),
+                    "relay must be ENABLED for env value {raw:?}"
+                );
+            }
+            for raw in ["false", "FALSE", "0", "no", "off", "", "garbage"] {
+                set_relay(raw);
+                let (tx, mut rx) = make_pair();
+                translate_inline_push(&tx, &sample_notification());
+                assert!(
+                    rx.try_recv().is_err(),
+                    "relay must be DISABLED for env value {raw:?}"
+                );
+            }
+            unset_relay();
+        }
     }
 }

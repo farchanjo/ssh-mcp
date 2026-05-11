@@ -567,7 +567,14 @@ fn flush_serial_buffer(state: &Arc<SerialPortState>, local: &mut Vec<u8>) {
     });
     let _ = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Serial, state.id.as_str());
     SUBSCRIPTION_REGISTRY.poke(ResourceKind::Serial, state.id.as_str());
-    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Serial, state.id.as_str(), chunk.len());
+    // ADR 0012 phase 9 — raw tail feeds inline-push lanes; the
+    // production registry forwards `chunk.len()` to `record_bytes`
+    // internally for the debouncer cadence.
+    SUBSCRIPTION_REGISTRY.record_bytes_with_tail(
+        ResourceKind::Serial,
+        state.id.as_str(),
+        chunk.as_ref(),
+    );
     state.data_notify.notify_waiters();
 }
 
