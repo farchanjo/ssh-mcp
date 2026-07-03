@@ -100,13 +100,12 @@ mod tests {
 
     #[tokio::test]
     async fn valid_ed25519_pem_authenticates() -> Result<(), Box<dyn std::error::Error>> {
-        use russh::keys::ssh_key::rand_core::OsRng;
         use russh::keys::ssh_key::{Algorithm, LineEnding, PrivateKey};
 
         // Generate a fresh Ed25519 key in-memory and round-trip through
         // the OpenSSH PEM serialiser so we feed a structurally valid PEM
         // to the adapter without committing private material to the repo.
-        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         let pem = key.to_openssh(LineEnding::LF)?;
 
         let creds = Credentials::PrivateKey {

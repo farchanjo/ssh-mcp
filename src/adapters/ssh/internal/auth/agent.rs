@@ -54,7 +54,7 @@ impl AuthStrategy for AgentAuth {
 async fn try_identities(
     handle: &mut client::Handle<SshClientHandler>,
     username: &str,
-    identities: &[keys::PublicKey],
+    identities: &[keys::agent::AgentIdentity],
     agent: &mut keys::agent::client::AgentClient<UnixStream>,
 ) -> Result<bool, String> {
     for identity in identities {
@@ -68,8 +68,9 @@ async fn try_identities(
             .flatten();
         debug!("Using RSA hash algorithm: {:?}", hash_alg);
 
+        let public_key = identity.public_key().into_owned();
         match handle
-            .authenticate_publickey_with(username, identity.clone(), hash_alg, agent)
+            .authenticate_publickey_with(username, public_key, hash_alg, agent)
             .await
         {
             Ok(result) if result.success() => {
