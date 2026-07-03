@@ -94,7 +94,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use russh::ChannelMsg;
 use russh::client::{self, Msg};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -121,6 +121,15 @@ use crate::ports::rsync_transport::{
 
 /// Default lane capacity for the per-session progress mpsc.
 const DEFAULT_LANE_CAPACITY: usize = 256;
+
+/// Read-side prefetch capacity for the mplex reader's `BufReader`
+/// wrapper. Perf-only: the russh channel reader otherwise takes bare
+/// 1..4-byte `read_exact` calls per varint/header decode (see
+/// [`io::MplexReader`]); batching the underlying reads into 64 KiB
+/// chunks cuts channel-read syscall/poll overhead without changing a
+/// single decoded byte — the decoder still consumes the exact same
+/// byte stream, just from a buffered front.
+const WIRE_READ_BUFFER_CAPACITY: usize = 65536;
 
 /// Stub-transport detail for the un-registry-wired path. The transport
 /// only matters when a russh channel registry is plugged in via
@@ -436,7 +445,8 @@ async fn drive_post_handshake_push(
 ) -> Result<RsyncStats, DomainError> {
     let (mut read_half, write_half) = channel.split();
     let mut writer = MplexWriter::new(write_half.make_writer());
-    let chained = AsyncReadExt::chain(Cursor::new(leftover), read_half.make_reader());
+    let buffered = BufReader::with_capacity(WIRE_READ_BUFFER_CAPACITY, read_half.make_reader());
+    let chained = AsyncReadExt::chain(Cursor::new(leftover), buffered);
     let mut reader = MplexReader::new(chained);
     // We are the client/sender — write raw, read framed. `mplex_writes`
     // stays false; `mplex_reads` was set during handshake.
@@ -498,7 +508,8 @@ async fn drive_post_handshake_pull(
 ) -> Result<RsyncStats, DomainError> {
     let (mut read_half, write_half) = channel.split();
     let mut writer = MplexWriter::new(write_half.make_writer());
-    let chained = AsyncReadExt::chain(Cursor::new(leftover), read_half.make_reader());
+    let buffered = BufReader::with_capacity(WIRE_READ_BUFFER_CAPACITY, read_half.make_reader());
+    let chained = AsyncReadExt::chain(Cursor::new(leftover), buffered);
     let mut reader = MplexReader::new(chained);
     // At protocol >= 30 upstream rsync `compat.c::setup_protocol`
     // (line 776) unconditionally sets `need_messages_from_generator =

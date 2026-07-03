@@ -1060,11 +1060,15 @@ where
 {
     let mut hasher = FileHasher::for_protocol(sess.seed, sess.negotiated);
     let mut total = 0_u64;
+    // Reused across every literal token in this file's stream instead
+    // of a fresh `Vec` allocation per token (up to 32 KiB each) — see
+    // `drain_literal`. Bytes read/written/hashed are unaffected.
+    let mut scratch: Vec<u8> = Vec::new();
     loop {
         match next_token(reader, sess).await? {
             Token::Literal { len } => {
-                let (n, chunk) = drain_literal(reader, sess, len, out, sparse).await?;
-                hasher.update(&chunk);
+                let n = drain_literal(reader, sess, len, out, sparse, &mut scratch).await?;
+                hasher.update(&scratch);
                 total = total.saturating_add(n);
             }
             Token::Match { idx } => return Err(reject_unexpected_match(idx)),
@@ -1140,38 +1144,45 @@ where
 }
 
 /// Drain `len` literal bytes off the wire into `out`. Returns
-/// `(bytes_written, chunk_for_digest)` so the caller can fold the bytes
-/// into the running per-file digest.
+/// `bytes_written`; the caller folds `buf` (left holding the drained
+/// chunk) into the running per-file digest.
+///
+/// `buf` is a scratch buffer reused across every literal token in the
+/// enclosing file's token stream (see `consume_token_stream`) — it is
+/// cleared and resized to `len` here instead of a fresh per-token
+/// `Vec` allocation. Bytes read/written/hashed are identical either
+/// way.
 ///
 /// Slice 10 — when `sparse` is set, runs of zero bytes longer than
 /// [`SPARSE_RUN_THRESHOLD`] are turned into filesystem holes via `seek`
 /// instead of writing zeros. The non-zero head + tail are still written
-/// verbatim. The returned `chunk_for_digest` always carries the
-/// original wire bytes (zeros included) — sparse is a write-path
-/// optimisation only.
+/// verbatim. `buf` always carries the original wire bytes (zeros
+/// included) after this call — sparse is a write-path optimisation only.
 async fn drain_literal<R>(
     reader: &mut MplexReader<R>,
     sess: &mut WireSession,
     len: u32,
     out: &mut fs::File,
     sparse: bool,
-) -> Result<(u64, Vec<u8>), DomainError>
+    buf: &mut Vec<u8>,
+) -> Result<u64, DomainError>
 where
     R: AsyncRead + Unpin + Send,
 {
     let len_usize = usize::try_from(len).unwrap_or(0);
-    let mut buf = vec![0_u8; len_usize];
+    buf.clear();
+    buf.resize(len_usize, 0_u8);
     if !buf.is_empty() {
-        reader.read_buf(sess, &mut buf).await?;
+        reader.read_buf(sess, buf).await?;
         if sparse {
-            write_literal_sparse(out, &buf).await?;
+            write_literal_sparse(out, buf).await?;
         } else {
-            out.write_all(&buf).await.map_err(|e| {
+            out.write_all(buf).await.map_err(|e| {
                 DomainError::RsyncProtocolError(format!("receiver: tempfile write_all: {e}"))
             })?;
         }
     }
-    Ok((u64::from(len), buf))
+    Ok(u64::from(len))
 }
 
 /// Write `buf` to `out` while collapsing zero-runs of at least
