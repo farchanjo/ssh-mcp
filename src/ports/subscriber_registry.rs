@@ -102,6 +102,26 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
         self.record_bytes(kind, resource_id, bytes_added.len());
     }
 
+    /// Read back the accumulated raw tail recorded via
+    /// [`Self::record_bytes_with_tail`] for `(kind, resource_id)`.
+    ///
+    /// Resource kinds that already serve their bytes through a
+    /// dedicated [`crate::ports::output_stream::OutputStreamPort`]
+    /// snapshot (shell, command) or a point-in-time entity snapshot
+    /// with no byte stream (transfer, session) never call this.
+    /// `forward://` events have neither — they are only ever fed
+    /// through `record_bytes_with_tail` — so `resources/read` reads
+    /// them back from here instead of only rendering a static entity
+    /// snapshot (see BUG #3 / ADR 0012 phase 9 follow-up).
+    ///
+    /// Default impl returns an empty buffer so every existing test
+    /// stub and the legacy (Phase 1) adapter keep compiling unchanged;
+    /// the production `MemoryRegistry` overrides this to serve the
+    /// accumulated `forward://` event tail.
+    fn tail_snapshot(&self, _kind: ResourceKind, _resource_id: &str) -> bytes::Bytes {
+        bytes::Bytes::new()
+    }
+
     /// Decrement every peer cursor on `uri` by `bytes_dropped` (saturating).
     /// Called when the underlying ring buffer drops bytes from the head.
     fn compensate_truncation(&self, uri: &str, bytes_dropped: u64);

@@ -399,14 +399,22 @@ where
         &self,
         parsed: &ParsedUri,
         canonical: &str,
+        peer_id: &PeerId,
     ) -> Result<ReadResourceOutcome, DomainError> {
         #[cfg(feature = "port_forward")]
         {
-            read_forward(&*self.forwards, &*self.subscribers, parsed, canonical).await
+            read_forward(
+                &*self.forwards,
+                &*self.subscribers,
+                parsed,
+                canonical,
+                peer_id,
+            )
+            .await
         }
         #[cfg(not(feature = "port_forward"))]
         {
-            forward_read_disabled(&self.forwards, parsed, canonical)
+            forward_read_disabled(&self.forwards, parsed, canonical, peer_id)
         }
     }
 
@@ -457,7 +465,10 @@ where
             ResourceKind::Session => {
                 read_session(&*self.sessions, &*self.subscribers, &parsed, &canonical).await
             }
-            ResourceKind::Forward => self.dispatch_forward(&parsed, &canonical).await,
+            ResourceKind::Forward => {
+                self.dispatch_forward(&parsed, &canonical, &req.peer_id)
+                    .await
+            }
             ResourceKind::Serial => Err(DomainError::InvalidArgument(
                 "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
                     .to_string(),
@@ -648,6 +659,7 @@ async fn read_forward<FR, Sub>(
     subscribers: &Sub,
     parsed: &ParsedUri,
     canonical: &str,
+    peer_id: &PeerId,
 ) -> Result<ReadResourceOutcome, DomainError>
 where
     FR: ForwardRepository + Send + Sync,
@@ -659,6 +671,8 @@ where
         .await?
         .ok_or_else(|| DomainError::ForwardNotFound(id.clone()))?;
     let last_seq = subscribers.current_seq(parsed.kind, &parsed.id);
+    let (events, events_cursor, events_buffer_size) =
+        forward_events_tail(subscribers, parsed, canonical, peer_id);
     let payload = json!({
         "forward_id": entity.id.as_str(),
         "session_id": entity.session_id.as_str(),
@@ -668,6 +682,9 @@ where
         "started_at": entity.started_at,
         "status": entity.status.to_string(),
         "last_seq": last_seq,
+        "events": events,
+        "events_cursor": events_cursor,
+        "events_buffer_size": events_buffer_size,
     });
     Ok(ReadResourceOutcome::Forward {
         uri: canonical.to_string(),
@@ -675,6 +692,41 @@ where
         last_seq,
         status: entity.status.to_string(),
     })
+}
+
+/// Slice the fresh event tail for a `forward://` resource read and advance
+/// the per-peer byte cursor. Returns `(events, events_cursor,
+/// events_buffer_size)`.
+///
+/// BUG #3 fix — `forward://` events are recorded only into the
+/// subscription registry's tail accumulator (there is no dedicated
+/// `OutputStreamPort` for lifecycle events), so this slices the same way
+/// `read_shell` slices its PTY buffer: resolve the start offset from
+/// `?cursor=`, take the fresh tail, then advance the per-peer cursor.
+#[cfg(feature = "port_forward")]
+fn forward_events_tail<Sub>(
+    subscribers: &Sub,
+    parsed: &ParsedUri,
+    canonical: &str,
+    peer_id: &PeerId,
+) -> (String, u64, u64)
+where
+    Sub: SubscriberRegistryPort,
+{
+    let tail = subscribers.tail_snapshot(parsed.kind, &parsed.id);
+    let events_buffer_size = u64_from_usize(tail.len());
+    let start = resolve_start_offset(
+        parsed.cursor,
+        subscribers,
+        peer_id,
+        canonical,
+        events_buffer_size,
+    );
+    let slice = slice_from(&tail, start);
+    let events_cursor = start.saturating_add(u64_from_usize(slice.len()));
+    let _new_cursor = subscribers.advance_peer_byte_cursor(peer_id, canonical, events_cursor);
+    let events = String::from_utf8_lossy(slice).into_owned();
+    (events, events_cursor, events_buffer_size)
 }
 
 /// Reject a `forward://` read when the `port_forward` feature is disabled.
@@ -689,6 +741,7 @@ fn forward_read_disabled<FR>(
     _forwards: &Arc<FR>,
     _parsed: &ParsedUri,
     _canonical: &str,
+    _peer_id: &PeerId,
 ) -> Result<ReadResourceOutcome, DomainError>
 where
     FR: ForwardRepository + Send + Sync,

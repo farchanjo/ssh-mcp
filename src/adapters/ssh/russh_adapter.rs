@@ -928,6 +928,10 @@ fn notify_forward_resource(forward_id: &str, event: &str) {
     use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
     let mut line = event.to_string();
     line.push('\n');
+    // Mirror the shell/command/serial producers: bump `current_seq`
+    // before poking/recording so `read_forward`'s `last_seq` reflects
+    // event count instead of staying stuck at 0 forever (BUG #4).
+    let _ = SUBSCRIPTION_REGISTRY.next_seq(ResourceKind::Forward, forward_id);
     SUBSCRIPTION_REGISTRY.poke(ResourceKind::Forward, forward_id);
     SUBSCRIPTION_REGISTRY.record_bytes_with_tail(
         ResourceKind::Forward,
