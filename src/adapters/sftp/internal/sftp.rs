@@ -316,10 +316,13 @@ fn upload_verify_command(remote_path: &str) -> String {
 ///
 /// We hash only the first `offset` bytes of the remote source because
 /// the remote file is normally larger than the local prefix; piping
-/// `dd` into `sha256sum` keeps the hash bounded.
+/// `dd` into `sha256sum` keeps the hash bounded. `bs=1M iflag=count_bytes`
+/// reads in 1 MiB blocks while still counting `count=` in exact bytes
+/// (a GNU `dd` extension), so a large resume offset hashes in a handful
+/// of syscalls instead of one `read(2)` per byte (`bs=1`).
 fn download_verify_command(remote_path: &str, offset: u64) -> String {
     let escaped = shell_single_quote(remote_path);
-    format!("dd if={escaped} bs=1 count={offset} 2>/dev/null | sha256sum")
+    format!("dd if={escaped} bs=1M iflag=count_bytes count={offset} 2>/dev/null | sha256sum")
 }
 
 /// Quote a path for safe inclusion in a remote shell command using
@@ -1463,7 +1466,7 @@ mod tests {
         #[test]
         fn download_verify_command_uses_dd_pipe_sha256sum() {
             let cmd = download_verify_command("/srv/data.bin", 1024);
-            assert!(cmd.contains("dd if='/srv/data.bin' bs=1 count=1024"));
+            assert!(cmd.contains("dd if='/srv/data.bin' bs=1M iflag=count_bytes count=1024"));
             assert!(cmd.contains("sha256sum"));
         }
 
