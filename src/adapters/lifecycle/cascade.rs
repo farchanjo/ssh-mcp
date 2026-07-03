@@ -114,10 +114,12 @@ impl CascadeCoordinator {
             .sessions
             .entry(session_id.clone())
             .or_insert_with(SessionEntry::new);
-        // Reset the reaped flag on a fresh increment so a session that
-        // was previously reaped can be re-bound to a new resource.
-        entry.state.store(SESSION_ACTIVE, Ordering::Release);
         entry.active_refs.fetch_add(1, Ordering::AcqRel);
+        // Reset the reaped flag AFTER the increment (B3 TOCTOU twin) so a
+        // fresh resource re-binds a previously-reaped session, and a
+        // concurrent last-close that reaped between here and the
+        // `fetch_add` cannot leave a live-ref session flagged reaped.
+        entry.state.store(SESSION_ACTIVE, Ordering::Release);
     }
 
     /// Notify the coordinator that a tracked resource transitioned to
@@ -192,6 +194,14 @@ impl CascadeCoordinator {
             )
             .is_err()
         {
+            return;
+        }
+        // Compound-atomicity guard (B3 TOCTOU twin): a concurrent
+        // `inc_session` may have added a ref AFTER our `fetch_sub` but
+        // BEFORE this CAS. Re-read now that we own `Reaped`; if a resource
+        // raced in, revert to `Active` and do NOT fire the disconnect hook.
+        if entry.active_refs.load(Ordering::Acquire) > 0 {
+            entry.state.store(SESSION_ACTIVE, Ordering::Release);
             return;
         }
         // Snapshot the hook then fire outside the entry borrow scope.
