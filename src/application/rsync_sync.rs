@@ -382,14 +382,25 @@ where
     /// Run the SFTP capability probe for the given session, caching the
     /// result so subsequent `execute` calls against the same session
     /// reuse it.
+    ///
+    /// Only a genuine capability result (`ProbeOutcome::Ran`) is
+    /// cached. An infrastructure failure to even run the probe (the
+    /// scratch-dir `mkdir` itself failing) must never poison the cache
+    /// with a false `nothing_supported` verdict — that would wrongly
+    /// reject every later `ssh_rsync` call on the session with
+    /// `SFTP_FEATURE_MISSING`. On infra failure this call still returns
+    /// the pessimistic default for its own caller, but leaves the cache
+    /// empty so the next call gets a fresh retry.
     async fn probe_sftp_features(&self, session_id: &SessionId) -> SftpFeatures {
         if let Some(cached) = self.sftp_features_cache.get(session_id) {
             return *cached.value();
         }
-        let features = probe_sftp_features(&*self.sftp_fs, session_id).await;
-        self.sftp_features_cache
-            .insert(session_id.clone(), features);
-        features
+        let outcome = probe_sftp_features(&*self.sftp_fs, session_id).await;
+        if outcome.should_cache() {
+            self.sftp_features_cache
+                .insert(session_id.clone(), outcome.features());
+        }
+        outcome.features()
     }
 
     async fn start_transport(

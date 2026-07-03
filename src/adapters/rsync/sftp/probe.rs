@@ -73,15 +73,65 @@ impl Default for SftpFeatures {
     }
 }
 
+/// Outcome of attempting to run the capability probe.
+///
+/// The probe's own scratch-directory `mkdir` can fail for reasons that
+/// have nothing to do with the server's SFTP capabilities — a
+/// permission-denied home directory, a `chroot`ed `internal-sftp` jail,
+/// or (before the scratch path was made unique per call) a race between
+/// two concurrent probes on the same session. That is an
+/// **infrastructure failure to run the probe**, not a genuine "this
+/// server refuses `setstat`/`symlink`" result, and it must never be
+/// cached as one: caching it would permanently wedge every later
+/// `ssh_rsync` call on the session behind a stale `nothing_supported`
+/// verdict. [`ProbeOutcome`] lets the caller tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The scratch directory was created and both capability checks ran
+    /// to completion; the wrapped [`SftpFeatures`] is a genuine result
+    /// safe to cache for the rest of the session.
+    Ran(SftpFeatures),
+    /// The probe's scratch-directory `mkdir` failed before any
+    /// capability check could run. Callers must fall back to the
+    /// pessimistic [`SftpFeatures::nothing_supported`] for *this* call
+    /// only, and must NOT cache it — the next call gets a fresh
+    /// (unique-path) retry.
+    InfraFailure,
+}
+
+impl ProbeOutcome {
+    /// Features to use for the call that produced this outcome,
+    /// regardless of whether the probe genuinely ran. Check
+    /// [`Self::should_cache`] before persisting this into a
+    /// session-keyed cache.
+    #[must_use]
+    pub const fn features(self) -> SftpFeatures {
+        match self {
+            Self::Ran(features) => features,
+            Self::InfraFailure => SftpFeatures::nothing_supported(),
+        }
+    }
+
+    /// `true` when this outcome reflects a genuine capability probe
+    /// that ran to completion, i.e. it is safe to cache.
+    #[must_use]
+    pub const fn should_cache(self) -> bool {
+        matches!(self, Self::Ran(_))
+    }
+}
+
 /// Run the SFTP capability probe against `fs` on `session`.
 ///
 /// Allocates a scratch directory under
-/// `<scratch_root>/.ssh-mcp-probe-<session-id>` (default
-/// `scratch_root = "/tmp"`), exercises each capability, then tears the
-/// directory down. The probe never propagates errors — every probe
-/// step's failure flips its corresponding flag to `false` and the next
-/// step still runs.
-pub async fn probe<F>(fs: &F, session: &SessionId) -> SftpFeatures
+/// `<scratch_root>/.ssh-mcp-probe-<session-id>-<nonce>` (default
+/// `scratch_root = "/tmp"`) — the trailing `UUIDv7` nonce guarantees two
+/// probes on the same session (concurrent calls, or a retry after a
+/// prior probe was cancelled before its cleanup ran) never target the
+/// same path — exercises each capability, then tears the directory
+/// down. The probe never propagates errors — every probe step's
+/// failure flips its corresponding flag to `false` and the next step
+/// still runs.
+pub async fn probe<F>(fs: &F, session: &SessionId) -> ProbeOutcome
 where
     F: RsyncSftpFsPort,
 {
@@ -95,13 +145,19 @@ pub async fn probe_with_scratch_root<F>(
     fs: &F,
     session: &SessionId,
     scratch_root: &str,
-) -> SftpFeatures
+) -> ProbeOutcome
 where
     F: RsyncSftpFsPort,
 {
-    let scratch_dir = format!("{}/.ssh-mcp-probe-{}", scratch_root, session.as_str());
+    let nonce = uuid::Uuid::now_v7().simple();
+    let scratch_dir = format!(
+        "{}/.ssh-mcp-probe-{}-{}",
+        scratch_root,
+        session.as_str(),
+        nonce
+    );
     if fs.mkdir(session, &scratch_dir, 0o755).await.is_err() {
-        return SftpFeatures::nothing_supported();
+        return ProbeOutcome::InfraFailure;
     }
 
     let setstat_supported = probe_setstat(fs, session, &scratch_dir).await;
@@ -113,11 +169,11 @@ where
 
     let _ = fs.rmdir(session, &scratch_dir).await;
 
-    SftpFeatures {
+    ProbeOutcome::Ran(SftpFeatures {
         setstat_supported,
         symlink_supported,
         posix_rename_supported,
-    }
+    })
 }
 
 async fn probe_setstat<F>(fs: &F, session: &SessionId, scratch_dir: &str) -> bool
@@ -152,12 +208,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{SftpFeatures, probe_with_scratch_root};
+    use super::{ProbeOutcome, SftpFeatures, probe_with_scratch_root};
     use crate::adapters::rsync::sftp::fake::FakeRsyncSftpFs;
     use crate::domain::ids::SessionId;
 
     fn s() -> SessionId {
         SessionId::new("probe-test".to_string())
+    }
+
+    fn ran_features(outcome: ProbeOutcome) -> SftpFeatures {
+        match outcome {
+            ProbeOutcome::Ran(features) => features,
+            ProbeOutcome::InfraFailure => panic!("expected ProbeOutcome::Ran"),
+        }
     }
 
     #[test]
@@ -180,27 +243,53 @@ mod tests {
     async fn fake_fs_probe_reports_full_capabilities() {
         let fs = FakeRsyncSftpFs::new();
         // Pre-create the scratch root parent so mkdir against
-        // /tmp/.ssh-mcp-probe-<id> succeeds.
+        // /tmp/.ssh-mcp-probe-<id>-<nonce> succeeds.
         fs.put_dir("/tmp", 0o755);
-        let features = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let outcome = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let features = ran_features(outcome);
         assert!(features.setstat_supported);
         assert!(features.symlink_supported);
         assert!(features.posix_rename_supported);
     }
 
     #[tokio::test]
-    async fn mkdir_failure_collapses_to_nothing_supported() {
-        // FakeRsyncSftpFs returns `Sftp("path exists")` when mkdir
-        // targets an existing path. Pre-seeding the scratch dir
-        // therefore forces the probe's initial mkdir to fail and the
-        // probe returns the pessimistic default.
+    async fn mkdir_infra_failure_yields_infra_failure_outcome() {
+        // A genuine infrastructure failure (permission denied, no
+        // writable home dir, ...) must surface as `InfraFailure` — a
+        // distinct variant from a real "server refuses everything"
+        // capability result — so the caller knows not to cache it.
         let fs = FakeRsyncSftpFs::new();
         fs.put_dir("/tmp", 0o755);
-        fs.put_dir(&format!("/tmp/.ssh-mcp-probe-{}", s().as_str()), 0o755);
-        let features = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        fs.fail_mkdir();
+        let outcome = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        assert_eq!(outcome, ProbeOutcome::InfraFailure);
+        // `.features()` still degrades to the pessimistic default for
+        // the caller that needs an answer for *this* call.
+        let features = outcome.features();
         assert!(!features.setstat_supported);
         assert!(!features.symlink_supported);
         assert!(!features.posix_rename_supported);
+        assert!(!outcome.should_cache());
+    }
+
+    #[tokio::test]
+    async fn concurrent_probes_on_same_session_never_collide() {
+        // Regression for BUG #2: two `ssh_rsync` calls racing on a
+        // fresh session used to target the exact same fixed scratch
+        // path (`/tmp/.ssh-mcp-probe-<session-id>`), so one probe's
+        // `mkdir` would fail against the other's still-live directory
+        // and wrongly report `nothing_supported`. The per-call UUIDv7
+        // nonce gives each probe its own path, so both run to
+        // completion independently.
+        let fs = FakeRsyncSftpFs::new();
+        fs.put_dir("/tmp", 0o755);
+        let session = s();
+        let (first, second) = tokio::join!(
+            probe_with_scratch_root(&fs, &session, "/tmp"),
+            probe_with_scratch_root(&fs, &session, "/tmp"),
+        );
+        assert!(matches!(first, ProbeOutcome::Ran(_)));
+        assert!(matches!(second, ProbeOutcome::Ran(_)));
     }
 
     #[tokio::test]
@@ -208,7 +297,8 @@ mod tests {
         let fs = FakeRsyncSftpFs::new();
         fs.put_dir("/tmp", 0o755);
         fs.fail_setstat();
-        let features = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let outcome = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let features = ran_features(outcome);
         assert!(!features.setstat_supported);
         assert!(features.symlink_supported);
     }
@@ -218,7 +308,8 @@ mod tests {
         let fs = FakeRsyncSftpFs::new();
         fs.put_dir("/tmp", 0o755);
         fs.fail_symlink();
-        let features = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let outcome = probe_with_scratch_root(&fs, &s(), "/tmp").await;
+        let features = ran_features(outcome);
         assert!(features.setstat_supported);
         assert!(!features.symlink_supported);
     }

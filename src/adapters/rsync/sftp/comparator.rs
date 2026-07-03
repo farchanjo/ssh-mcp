@@ -160,13 +160,25 @@ fn push_delete_actions(
     dst: &[RsyncEntry],
     src_by_path: &HashMap<&str, &RsyncEntry>,
 ) {
-    for entry in dst {
-        if !src_by_path.contains_key(entry.rel_path.as_str()) {
-            actions.push(SyncAction::Delete {
-                rel_path: entry.rel_path.clone(),
-                is_dir: matches!(entry.kind, FileKind::Directory),
-            });
-        }
+    let mut extraneous: Vec<&RsyncEntry> = dst
+        .iter()
+        .filter(|entry| !src_by_path.contains_key(entry.rel_path.as_str()))
+        .collect();
+    // Deepest-first: the walker lists a directory before its children, so
+    // deleting in that order would run a non-recursive rmdir on a
+    // still-non-empty directory. Sorting by descending depth (with a
+    // lexicographic tie-break for determinism) guarantees every child —
+    // file or directory — is removed before its parent's rmdir runs.
+    extraneous.sort_by(|a, b| {
+        depth(&b.rel_path)
+            .cmp(&depth(&a.rel_path))
+            .then_with(|| b.rel_path.cmp(&a.rel_path))
+    });
+    for entry in extraneous {
+        actions.push(SyncAction::Delete {
+            rel_path: entry.rel_path.clone(),
+            is_dir: matches!(entry.kind, FileKind::Directory),
+        });
     }
 }
 
@@ -388,6 +400,101 @@ mod tests {
             actions[1],
             SyncAction::Setstat { mode: 0o600, .. }
         ));
+    }
+
+    #[test]
+    fn delete_actions_order_children_before_nested_parent_dir() {
+        // Mirrors the walker's own emission order: a directory is listed
+        // before its children (BFS worklist push-then-pop). Feeding that
+        // order straight into the delete pass without re-sorting would
+        // schedule `Delete { rel_path: "sub" }` before
+        // `Delete { rel_path: "sub/leaf.txt" }`, which fails a
+        // non-recursive `rmdir` on a still-non-empty directory.
+        let dst = vec![
+            entry_dir("sub"),
+            entry_file("sub/leaf.txt", 4, 100),
+            entry_dir("sub/nested"),
+            entry_file("sub/nested/deep.txt", 4, 100),
+        ];
+        let mut o = opts_default();
+        o.delete = true;
+        let actions = compare_trees(&[], &dst, Direction::Push, o);
+        assert_eq!(actions.len(), 4);
+        let pos = |needle: &str| {
+            actions
+                .iter()
+                .position(
+                    |a| matches!(a, SyncAction::Delete { rel_path, .. } if rel_path == needle),
+                )
+                .unwrap_or_else(|| panic!("missing delete action for {needle}"))
+        };
+        let sub = pos("sub");
+        let sub_leaf = pos("sub/leaf.txt");
+        let sub_nested = pos("sub/nested");
+        let sub_nested_deep = pos("sub/nested/deep.txt");
+        assert!(sub_nested_deep < sub_nested, "deepest file before its dir");
+        assert!(sub_leaf < sub, "leaf file before its parent dir");
+        assert!(sub_nested < sub, "nested dir before its parent dir");
+    }
+
+    #[tokio::test]
+    async fn delete_actions_execute_deepest_first_for_nested_dirs() {
+        // End-to-end repro of BUG #1: walk a real nested tree with the
+        // FakeRsyncSftpFs (whose `rmdir` refuses non-empty directories,
+        // exactly like a real SFTP server), derive delete actions, and
+        // run them through the executor. Before the deepest-first sort
+        // this failed with `files_failed > 0` and a stray "sub" dir left
+        // behind because the walker lists parents before children.
+        use crate::adapters::rsync::sftp::executor::SftpExecutor;
+        use crate::adapters::rsync::sftp::fake::FakeRsyncSftpFs;
+        use crate::adapters::rsync::sftp::walker::{SftpWalker, build_globset};
+        use crate::domain::ids::SessionId;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let fs = FakeRsyncSftpFs::new();
+        fs.put_dir("/dst", 0o755);
+        fs.put_dir("/dst/sub", 0o755);
+        fs.put_file("/dst/sub/leaf.txt", b"gone", 0o644, 0);
+        let fs = Arc::new(fs);
+
+        let session = SessionId::new("del-nested".to_string());
+        let empty: Vec<String> = Vec::new();
+        let walker = SftpWalker::new(
+            Arc::clone(&fs),
+            build_globset(&empty).expect("empty globset"),
+            build_globset(&empty).expect("empty globset"),
+            1_000,
+        );
+        let dst_entries = walker.walk(&session, "/dst").await.expect("walk dst");
+        // Sanity: confirm the walker really does list the parent before
+        // the child, which is the precondition for the bug.
+        assert_eq!(dst_entries[0].rel_path, "sub");
+        assert_eq!(dst_entries[1].rel_path, "sub/leaf.txt");
+
+        let mut opts = opts_default();
+        opts.delete = true;
+        let actions = compare_trees(&[], &dst_entries, Direction::Push, opts);
+
+        let (tx, _rx) = mpsc::channel(8);
+        let exec = SftpExecutor::new(
+            Arc::clone(&fs),
+            None,
+            false,
+            tx,
+            CancellationToken::new(),
+            "/src".to_string(),
+            "/dst".to_string(),
+        );
+        let stats = exec.execute(&session, &actions).await.expect("execute");
+        assert_eq!(
+            stats.files_failed, 0,
+            "rmdir must never hit a non-empty dir"
+        );
+        assert_eq!(stats.files_deleted, 2);
+        assert!(!fs.exists("/dst/sub/leaf.txt"));
+        assert!(!fs.exists("/dst/sub"));
     }
 
     #[test]

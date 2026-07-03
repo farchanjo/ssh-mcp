@@ -106,6 +106,10 @@ struct Knobs {
     /// When set, every `set_metadata` call fails with
     /// [`DomainError::Sftp`].
     setstat_unsupported: AtomicBool,
+    /// When set, every `mkdir` call fails with [`DomainError::Sftp`],
+    /// simulating an infrastructure failure (permission denied, no
+    /// writable home dir) unrelated to the path already existing.
+    mkdir_unsupported: AtomicBool,
     /// Counter incremented on every `write_chunk` call (debugging).
     write_calls: AtomicU32,
 }
@@ -168,6 +172,15 @@ impl FakeRsyncSftpFs {
         self.inner
             .knobs
             .setstat_unsupported
+            .store(true, Ordering::Release);
+    }
+
+    /// Inject failure on every future `mkdir` call, regardless of
+    /// whether the target path already exists.
+    pub fn fail_mkdir(&self) {
+        self.inner
+            .knobs
+            .mkdir_unsupported
             .store(true, Ordering::Release);
     }
 
@@ -304,6 +317,9 @@ impl RsyncSftpFsPort for FakeRsyncSftpFs {
         path: &str,
         mode: u32,
     ) -> Result<(), DomainError> {
+        if self.inner.knobs.mkdir_unsupported.load(Ordering::Acquire) {
+            return Err(DomainError::Sftp("mkdir unsupported".to_string()));
+        }
         if self.inner.nodes.contains_key(path) {
             return Err(DomainError::Sftp(format!("path exists: {path}")));
         }
