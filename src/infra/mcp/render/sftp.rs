@@ -12,6 +12,7 @@ use crate::application::upload_file::UploadOutcome;
 use crate::domain::ids::AgentId;
 use crate::domain::transfer::{TransferDirection, TransferStatus};
 use crate::infra::mcp::helpers::output::{format_bytes_human, sanitize_value};
+use crate::infra::mcp::render::{append_next_line, append_subscribe_hint};
 
 /// Render an [`UploadOutcome`] as the v3 `SSH_UPLOAD: STARTED` block.
 #[must_use]
@@ -169,21 +170,6 @@ fn next_hint_for_transfer(transfer_id: &str) -> String {
         "sub_open uri=transfer://{transfer_id}/progress | \
          ssh_transfer_progress(transfer_id={transfer_id}, wait=true) (poll fallback)"
     )
-}
-
-/// Append a single `NEXT: <hint>` advisory line listing concrete tool
-/// calls a smaller LLM can chain without consulting the cookbook.
-fn append_next_line(out: &mut String, hint: &str) {
-    out.push_str("\nNEXT: ");
-    out.push_str(hint);
-}
-
-/// Append a `HINT:` line steering 27B-class models toward the
-/// subscribe-first resource pattern (push notifications) instead of
-/// hot-polling tool calls.
-fn append_subscribe_hint(out: &mut String, hint: &str) {
-    out.push_str("\nHINT: ");
-    out.push_str(hint);
 }
 
 /// Render a [`GetTransferProgressResult`] as the v3

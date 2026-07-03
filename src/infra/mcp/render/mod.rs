@@ -19,3 +19,15 @@ pub mod serial;
 pub mod sftp;
 pub mod shell;
 pub mod subscription;
+
+/// Appends a `\nNEXT: <hint>` line to the wire response body.
+pub(crate) fn append_next_line(out: &mut String, hint: &str) {
+    out.push_str("\nNEXT: ");
+    out.push_str(hint);
+}
+
+/// Appends a `\nHINT: <hint>` line to the wire response body.
+pub(crate) fn append_subscribe_hint(out: &mut String, hint: &str) {
+    out.push_str("\nHINT: ");
+    out.push_str(hint);
+}

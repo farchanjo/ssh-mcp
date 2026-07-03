@@ -21,6 +21,7 @@ use crate::application::list_sessions::ListSessionsOutcome;
 use crate::domain::ids::AgentId;
 use crate::domain::session::SessionEntity;
 use crate::infra::mcp::helpers::output::sanitize_value;
+use crate::infra::mcp::render::append_next_line;
 use crate::ports::subscriber_registry::ResourceKind;
 
 /// Threshold (per-agent session count) above which the list-sessions
@@ -110,13 +111,6 @@ fn render_reused(
     );
     append_next_line(&mut out, &next_hint_for_session(session.id.as_str()));
     out
-}
-
-/// Append a single `NEXT: <hint>` advisory line listing concrete tool
-/// calls a smaller LLM can chain without consulting the cookbook.
-fn append_next_line(out: &mut String, hint: &str) {
-    out.push_str("\nNEXT: ");
-    out.push_str(hint);
 }
 
 /// Successor tools after a connect-style response — execute / shell-open
