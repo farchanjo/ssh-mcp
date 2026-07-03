@@ -453,9 +453,19 @@ where
             "flist: varlong min_bytes {min_bytes} out of range"
         )));
     }
-    let mut head = vec![0_u8; min_bytes];
-    reader.read_buf(sess, &mut head).await?;
-    let prefix = *head
+    // Stack buffers instead of per-call heap `Vec`s — mirrors the
+    // sibling `read_varint`'s `[0u8; 4]` tail buffer above. `min_bytes`
+    // is bounds-checked to 1..=8 and `extra` to fit `min_bytes + extra
+    // <= 9`, so both fit comfortably in 8-byte stack arrays; unused
+    // tail positions stay zero and are never read by
+    // `assemble_varlong_bytes` (it only consults `..min_bytes` /
+    // `..extra` of what we pass it).
+    let mut head_arr = [0_u8; 8];
+    let head_slice = head_arr
+        .get_mut(..min_bytes)
+        .ok_or_else(|| DomainError::RsyncProtocolError("flist: varlong head OOB".to_string()))?;
+    reader.read_buf(sess, head_slice).await?;
+    let prefix = *head_arr
         .first()
         .ok_or_else(|| DomainError::RsyncProtocolError("flist: varlong empty".to_string()))?;
     let extra = usize::from(INT_BYTE_EXTRA[usize::from(prefix / 4)]);
@@ -464,11 +474,14 @@ where
             "flist: varlong overflow (min_bytes={min_bytes}, extra={extra})"
         )));
     }
-    let mut tail_buf = vec![0_u8; extra];
+    let mut tail_arr = [0_u8; 8];
     if extra > 0 {
-        reader.read_buf(sess, &mut tail_buf).await?;
+        let tail_slice = tail_arr.get_mut(..extra).ok_or_else(|| {
+            DomainError::RsyncProtocolError("flist: varlong tail OOB".to_string())
+        })?;
+        reader.read_buf(sess, tail_slice).await?;
     }
-    let bytes = assemble_varlong_bytes(prefix, &head, &tail_buf, min_bytes, extra);
+    let bytes = assemble_varlong_bytes(prefix, &head_arr, &tail_arr, min_bytes, extra);
     Ok(i64::from_le_bytes(bytes))
 }
 
