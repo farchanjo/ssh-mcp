@@ -40,6 +40,7 @@
 //! alongside whatever the caller already pinned — always per-task.
 
 use tokio::io::AsyncWrite;
+use tokio::task::yield_now;
 
 use crate::adapters::rsync::wire::blocks::{BlockSet, MAX_CHUNK};
 use crate::adapters::rsync::wire::hash::{
@@ -55,6 +56,14 @@ use crate::domain::error::DomainError;
 /// — same trade-off the C source makes ("Use the same that GPL rsync
 /// uses").
 const BLKTAB_SZ: usize = 65_536;
+
+/// Slide-loop yield cadence for [`drive_match_loop`]. Every this-many
+/// non-matching slide steps, the loop yields to the tokio scheduler via
+/// `tokio::task::yield_now().await` so a long non-matching stretch of a
+/// large file cannot starve co-scheduled tasks on the same worker
+/// thread. Purely a scheduling nicety — it changes neither the emitted
+/// tokens nor the byte offsets the matcher visits.
+const MATCH_LOOP_YIELD_INTERVAL: u32 = 65_536;
 
 /// Block hashtable keyed by Adler32 rolling-hash modulo
 /// [`BLKTAB_SZ`].
@@ -85,15 +94,54 @@ impl BlockHashtable {
     /// upstream is no-op so we mirror that).
     #[must_use]
     pub fn build(blockset: &BlockSet) -> Self {
-        let mut buckets: Vec<Vec<u32>> = Vec::with_capacity(BLKTAB_SZ);
-        buckets.resize_with(BLKTAB_SZ, Vec::new);
+        let mut table = Self::empty();
+        table.reset_for(blockset);
+        table
+    }
+
+    /// Create a hashtable with no buckets allocated yet. The outer
+    /// `Vec<Vec<u32>>` is only materialised on the first
+    /// [`Self::reset_for`] call — cheap to construct up front so a
+    /// caller driving multiple files in one session can allocate the
+    /// pool once (see [`Self::reset_for`]).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            buckets: Vec::new(),
+        }
+    }
+
+    /// (Re)populate the hashtable from `blockset`, reusing the
+    /// previously allocated buckets when this is not the first call.
+    ///
+    /// First call: allocates the [`BLKTAB_SZ`]-bucket outer `Vec`
+    /// (mirrors [`Self::build`]'s one-shot allocation). Subsequent
+    /// calls: instead of reallocating the ~1.5 MiB outer `Vec` of
+    /// bucket headers per file, `clear()`s every bucket that was
+    /// populated by the previous file (leaving its heap capacity
+    /// intact for reuse) and then re-populates from `blockset`. A
+    /// cleared bucket is fully equivalent to a fresh `Vec::new()`
+    /// bucket for matching purposes — `Vec::clear` drops every
+    /// element and sets `len == 0`, so no stale index from a prior
+    /// file can leak into this file's candidate list. The bucket
+    /// selection (mask), chaining, and lookup semantics are unchanged
+    /// from [`Self::build`].
+    pub fn reset_for(&mut self, blockset: &BlockSet) {
+        if self.buckets.is_empty() {
+            self.buckets.resize_with(BLKTAB_SZ, Vec::new);
+        } else {
+            for bucket in &mut self.buckets {
+                if !bucket.is_empty() {
+                    bucket.clear();
+                }
+            }
+        }
         for sig in &blockset.blocks {
             let bucket_idx = bucket_for(sig.rolling);
-            if let Some(bucket) = buckets.get_mut(bucket_idx) {
+            if let Some(bucket) = self.buckets.get_mut(bucket_idx) {
                 bucket.push(sig.idx);
             }
         }
-        Self { buckets }
     }
 
     /// Return the indices stored for `rolling`'s bucket. Empty slice
@@ -141,6 +189,13 @@ const fn bucket_for(rolling: u32) -> usize {
 /// selects the per-file trailer digest (MD5 at proto >= 30 / MD4 at
 /// proto < 30 — see [`FileHasher::for_protocol`]).
 ///
+/// `table` is the caller-owned [`BlockHashtable`] pool for this
+/// session — reset in place via [`BlockHashtable::reset_for`] instead
+/// of allocating a fresh 65536-bucket table per file. Passing the
+/// same `table` across every file in a session's `send_files` loop
+/// avoids a per-file ~1.5 MiB allocation without changing which
+/// candidate blocks are found or which tokens are emitted.
+///
 /// # Errors
 ///
 /// - [`DomainError::RsyncProtocolError`] when the underlying writer
@@ -152,6 +207,7 @@ pub async fn emit_block_match_tokens<W>(
     bytes: &[u8],
     seed: i32,
     negotiated: i32,
+    table: &mut BlockHashtable,
 ) -> Result<[u8; 16], DomainError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -165,7 +221,7 @@ where
         return emit_single_literal_tail(writer, sess, bytes, seed, negotiated).await;
     }
 
-    let table = BlockHashtable::build(blockset);
+    table.reset_for(blockset);
     let mut hasher = FileHasher::for_protocol(seed, negotiated);
     let mut state = MatchState::new(blockset, bytes);
     drive_match_loop(
@@ -173,7 +229,7 @@ where
         sess,
         blockset,
         bytes,
-        &table,
+        table,
         &mut hasher,
         &mut state,
     )
@@ -292,6 +348,14 @@ impl MatchState {
 /// Drive the slide-and-match loop until `state.offs >= state.end`.
 /// Each iteration either emits a match (recomputing the window from
 /// scratch on the new offset) or rolls the window one byte forward.
+///
+/// Every [`MATCH_LOOP_YIELD_INTERVAL`] non-matching slide steps the
+/// loop calls `tokio::task::yield_now().await` so a long
+/// non-matching stretch (a large file with few matching blocks)
+/// cannot monopolise its worker thread and starve co-scheduled tasks.
+/// This is a scheduling-only change: it neither reorders nor skips
+/// any byte the matcher visits, and emits the exact same token
+/// stream as running the loop with no yield points at all.
 async fn drive_match_loop<W>(
     writer: &mut MplexWriter<W>,
     sess: &mut WireSession,
@@ -306,6 +370,7 @@ where
 {
     // Seed the initial (s1, s2) over bytes[0..block_len].
     state.recompute_window(bytes);
+    let mut steps_since_yield: u32 = 0;
     while state.offs < state.end {
         let rolling = combine_s1_s2(state.s1, state.s2);
         tracing::trace!(
@@ -327,6 +392,11 @@ where
         // outgoing byte (at offs) and the incoming byte (at offs +
         // block_len) when available.
         slide_window_one_byte(bytes, state);
+        steps_since_yield = steps_since_yield.saturating_add(1);
+        if steps_since_yield >= MATCH_LOOP_YIELD_INTERVAL {
+            steps_since_yield = 0;
+            yield_now().await;
+        }
     }
     Ok(())
 }
@@ -764,10 +834,18 @@ mod tests {
         // for strong-block checksums). Pin it to the same seed the
         // blockset was hashed under.
         sess_w.seed = seed;
-        let _expected_digest =
-            emit_block_match_tokens(&mut writer, &mut sess_w, blockset, bytes, seed, negotiated)
-                .await
-                .expect("emit");
+        let mut table = BlockHashtable::empty();
+        let _expected_digest = emit_block_match_tokens(
+            &mut writer,
+            &mut sess_w,
+            blockset,
+            bytes,
+            seed,
+            negotiated,
+            &mut table,
+        )
+        .await
+        .expect("emit");
         drop(writer);
 
         let mut reader = MplexReader::new(rr);
@@ -928,9 +1006,11 @@ mod tests {
         drop(lr);
         let mut writer = MplexWriter::new(lw);
         let mut sess = WireSession::new();
-        let err = emit_block_match_tokens(&mut writer, &mut sess, &blockset, bytes, 0, 31)
-            .await
-            .expect_err("must err");
+        let mut table = BlockHashtable::empty();
+        let err =
+            emit_block_match_tokens(&mut writer, &mut sess, &blockset, bytes, 0, 31, &mut table)
+                .await
+                .expect_err("must err");
         assert!(format!("{err}").contains("whole-file"));
     }
 

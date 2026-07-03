@@ -33,7 +33,7 @@ use tokio::io::AsyncWrite;
 use crate::adapters::rsync::wire::blocks::{BlockSet, MAX_CHUNK};
 use crate::adapters::rsync::wire::hash::FileHasher;
 use crate::adapters::rsync::wire::io::MplexWriter;
-use crate::adapters::rsync::wire::match_path::emit_block_match_tokens;
+use crate::adapters::rsync::wire::match_path::{BlockHashtable, emit_block_match_tokens};
 use crate::adapters::rsync::wire::session::WireSession;
 use crate::domain::error::DomainError;
 
@@ -53,6 +53,11 @@ use crate::domain::error::DomainError;
 /// algorithm (MD5 at proto >= 30 / MD4-with-seed at proto < 30 — see
 /// [`FileHasher::for_protocol`]).
 ///
+/// `table` is the caller-owned block-match hashtable pool for this
+/// session (see [`BlockHashtable::reset_for`]) — only consulted on
+/// the [`emit_block_match_tokens`] branch; the whole-file branch
+/// ignores it.
+///
 /// # Errors
 ///
 /// - [`DomainError::RsyncProtocolError`] when the underlying writer
@@ -64,6 +69,7 @@ pub async fn emit_token_stream<W>(
     bytes: &[u8],
     seed: i32,
     negotiated: i32,
+    table: &mut BlockHashtable,
 ) -> Result<[u8; 16], DomainError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -71,7 +77,7 @@ where
     if blockset.is_whole_file() {
         emit_whole_file_tokens(writer, sess, blockset, bytes, seed, negotiated).await
     } else {
-        emit_block_match_tokens(writer, sess, blockset, bytes, seed, negotiated).await
+        emit_block_match_tokens(writer, sess, blockset, bytes, seed, negotiated, table).await
     }
 }
 
