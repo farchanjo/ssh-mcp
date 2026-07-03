@@ -39,6 +39,8 @@
 //! Authentication failures are never retried to avoid account lockouts.
 
 use std::env;
+use std::fmt;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -60,6 +62,7 @@ use crate::adapters::ssh::internal::error::is_retryable_error;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::ssh::internal::types::{AsyncCommandStatus, SshCommandResponse};
 use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
+use crate::domain::error::DomainError;
 
 /// Build russh client configuration with the specified settings.
 ///
@@ -752,10 +755,33 @@ async fn handle_timeout(
     let _ = command.status_tx.send(AsyncCommandStatus::Completed);
 }
 
+/// Run one PTY-setup step (`channel_open_session` / `request_pty` /
+/// `request_shell`) bounded by `dur`. Elapsed maps to
+/// [`DomainError::Timeout`] so a stalled remote sshd fails the caller fast
+/// instead of hanging the `ssh_shell_open` request indefinitely; a russh-level
+/// error maps to [`DomainError::Transport`] as before.
+async fn timeout_step<T, E, F>(dur: Duration, fut: F, step_name: &str) -> Result<T, DomainError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: fmt::Display,
+{
+    time::timeout(dur, fut)
+        .await
+        .map_err(|_elapsed| {
+            DomainError::Timeout(format!("PTY {step_name} timed out after {dur:?}"))
+        })?
+        .map_err(|e| DomainError::Transport(format!("Failed to {step_name}: {e}")))
+}
+
 /// Open a PTY channel with an interactive shell.
 ///
 /// Allocates a pseudo-terminal and starts a shell on the remote server.
 /// Returns a pair of channels: one for reading output, one for writing input.
+///
+/// Each of the three sequential steps (channel open, PTY request, shell
+/// request) is bounded by `channel_open_timeout` — a stalled remote sshd
+/// hangs no longer than that, surfacing [`DomainError::Timeout`] instead of
+/// blocking the caller forever.
 ///
 /// # Arguments
 ///
@@ -763,31 +789,42 @@ async fn handle_timeout(
 /// * `term` - Terminal type (e.g., "xterm", "vt100", "ansi")
 /// * `cols` - Terminal width in columns
 /// * `rows` - Terminal height in rows
+/// * `channel_open_timeout` - Per-step bound applied to each of the three
+///   sequential awaits below
 ///
 /// # Returns
 ///
 /// * `Ok(channel)` - The SSH channel with PTY and shell allocated
-/// * `Err(message)` - Error if PTY or shell request fails
+/// * `Err(DomainError::Timeout)` - A step did not complete within
+///   `channel_open_timeout`
+/// * `Err(DomainError::Transport)` - PTY or shell request failed
 pub async fn open_pty_shell(
     handle: &Arc<client::Handle<SshClientHandler>>,
     term: &str,
     cols: u32,
     rows: u32,
-) -> Result<Channel<client::Msg>, String> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Failed to open channel: {e}"))?;
+    channel_open_timeout: Duration,
+) -> Result<Channel<client::Msg>, DomainError> {
+    let channel = timeout_step(
+        channel_open_timeout,
+        handle.channel_open_session(),
+        "open channel",
+    )
+    .await?;
 
-    channel
-        .request_pty(true, term, cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| format!("Failed to request PTY: {e}"))?;
+    timeout_step(
+        channel_open_timeout,
+        channel.request_pty(true, term, cols, rows, 0, 0, &[]),
+        "request PTY",
+    )
+    .await?;
 
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|e| format!("Failed to request shell: {e}"))?;
+    timeout_step(
+        channel_open_timeout,
+        channel.request_shell(true),
+        "request shell",
+    )
+    .await?;
 
     Ok(channel)
 }

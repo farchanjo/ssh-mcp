@@ -56,6 +56,7 @@ use dashmap::mapref::entry::Entry;
 use russh::Disconnect;
 use russh::client::{self, Msg};
 use russh::{Channel, ChannelMsg};
+use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
@@ -121,6 +122,12 @@ pub struct RusshAdapterConfig {
     pub persistent: bool,
     /// Health-probe timeout used by [`SshClientPort::health_check`].
     pub health_probe_timeout: Duration,
+    /// Bound applied to every remote channel-open step: the
+    /// `forward_one_connection` direct-tcpip open and each sequential step
+    /// of [`open_pty_shell`] (`channel_open_session` / `request_pty` /
+    /// `request_shell`). Prevents a stalled remote sshd from hanging a
+    /// per-connection forward task or an `ssh_shell_open` call indefinitely.
+    pub channel_open_timeout: Duration,
 }
 
 impl Default for RusshAdapterConfig {
@@ -133,6 +140,7 @@ impl Default for RusshAdapterConfig {
             compression_enabled: true,
             persistent: false,
             health_probe_timeout: Duration::from_secs(10),
+            channel_open_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -853,6 +861,7 @@ impl SshClientPort for RusshAdapter {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task_handle = handle;
+        let channel_open_timeout = self.config.channel_open_timeout;
         let task = tokio::spawn(async move {
             run_forward_accept_loop(
                 listener,
@@ -860,6 +869,7 @@ impl SshClientPort for RusshAdapter {
                 remote_address,
                 remote_port,
                 task_cancel,
+                channel_open_timeout,
             )
             .await;
         });
@@ -893,6 +903,14 @@ struct ForwardRecord {
     session_id: SessionId,
 }
 
+/// Starting delay for the accept-loop error backoff (see
+/// [`handle_accept_error`]).
+const ACCEPT_ERROR_BACKOFF_BASE: Duration = Duration::from_millis(50);
+/// Ceiling for the accept-loop error backoff so a sustained failure mode
+/// (e.g. fd exhaustion) degrades to a slow poll instead of growing without
+/// bound.
+const ACCEPT_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
 /// Listener loop that accepts local TCP connections and spawns a
 /// per-connection direct-tcpip pump for each. Stops on `cancel`.
 async fn run_forward_accept_loop(
@@ -901,13 +919,24 @@ async fn run_forward_accept_loop(
     remote_address: String,
     remote_port: u16,
     cancel: CancellationToken,
+    channel_open_timeout: Duration,
 ) {
+    let mut backoff = ACCEPT_ERROR_BACKOFF_BASE;
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             accepted = listener.accept() => {
-                handle_accept(accepted, &ssh_handle, &remote_address, remote_port, &cancel).await;
+                handle_accept(
+                    accepted,
+                    &ssh_handle,
+                    &remote_address,
+                    remote_port,
+                    &cancel,
+                    channel_open_timeout,
+                    &mut backoff,
+                )
+                .await;
             }
         }
     }
@@ -921,33 +950,77 @@ async fn handle_accept(
     remote_address: &str,
     remote_port: u16,
     cancel: &CancellationToken,
+    channel_open_timeout: Duration,
+    backoff: &mut Duration,
 ) {
     match accepted {
         Ok((stream, peer_addr)) => {
-            let conn_handle = Arc::clone(ssh_handle);
-            let remote_host = remote_address.to_string();
-            let conn_cancel = cancel.clone();
-            tokio::spawn(async move {
-                forward_one_connection(
-                    stream,
-                    peer_addr.to_string(),
-                    conn_handle,
-                    remote_host,
-                    remote_port,
-                    conn_cancel,
-                )
-                .await;
-            });
+            *backoff = ACCEPT_ERROR_BACKOFF_BASE;
+            spawn_forward_connection(
+                stream,
+                peer_addr,
+                ssh_handle,
+                remote_address,
+                remote_port,
+                cancel,
+                channel_open_timeout,
+            );
         }
-        Err(err) => {
-            debug!("forward accept error: {err}");
-            time::sleep(Duration::from_millis(50)).await;
-        }
+        Err(err) => handle_accept_error(err, backoff).await,
     }
 }
 
+/// Spawn the per-connection direct-tcpip pump for one accepted TCP
+/// connection. Split out of [`handle_accept`] so the dispatch branch stays
+/// short and the `async move` capture list is easy to audit.
+fn spawn_forward_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    ssh_handle: &SshHandle,
+    remote_address: &str,
+    remote_port: u16,
+    cancel: &CancellationToken,
+    channel_open_timeout: Duration,
+) {
+    let conn_handle = Arc::clone(ssh_handle);
+    let remote_host = remote_address.to_string();
+    let conn_cancel = cancel.clone();
+    tokio::spawn(async move {
+        forward_one_connection(
+            stream,
+            peer_addr.to_string(),
+            conn_handle,
+            remote_host,
+            remote_port,
+            conn_cancel,
+            channel_open_timeout,
+        )
+        .await;
+    });
+}
+
+/// Handle one `listener.accept()` failure.
+///
+/// `WouldBlock` is a transient condition tokio's readiness-driven accept can
+/// still surface in rare cases and retries immediately with no delay.
+/// Everything else — including fd exhaustion (EMFILE/ENFILE), which std's
+/// `ErrorKind` does not distinguish from other OS errors on stable Rust — is
+/// treated as persistent and backed off exponentially (doubling from
+/// [`ACCEPT_ERROR_BACKOFF_BASE`], capped at [`ACCEPT_ERROR_BACKOFF_CAP`]) so
+/// a sustained failure degrades to a slow poll instead of a busy-loop.
+async fn handle_accept_error(err: IoError, backoff: &mut Duration) {
+    debug!("forward accept error: {err}");
+    if err.kind() == IoErrorKind::WouldBlock {
+        return;
+    }
+    time::sleep(*backoff).await;
+    *backoff = (*backoff * 2).min(ACCEPT_ERROR_BACKOFF_CAP);
+}
+
 /// Open a direct-tcpip channel for `tcp_stream` and pump bytes both
-/// ways until either end closes. Cancellation drops both halves.
+/// ways until either end closes. Cancellation drops both halves. The
+/// channel-open step is bounded by `channel_open_timeout` so a stalled
+/// remote sshd cannot hang this per-connection task indefinitely.
 async fn forward_one_connection(
     mut tcp_stream: TcpStream,
     originator: String,
@@ -955,17 +1028,19 @@ async fn forward_one_connection(
     remote_address: String,
     remote_port: u16,
     cancel: CancellationToken,
+    channel_open_timeout: Duration,
 ) {
-    let channel = match ssh_handle
-        .channel_open_direct_tcpip(remote_address, u32::from(remote_port), originator, 0_u32)
-        .await
-    {
-        Ok(ch) => ch,
-        Err(err) => {
-            debug!("forward direct-tcpip open failed: {err}");
-            let _ = tcp_stream.shutdown().await;
-            return;
-        }
+    let Some(channel) = open_forward_channel(
+        &ssh_handle,
+        &remote_address,
+        remote_port,
+        &originator,
+        channel_open_timeout,
+        &mut tcp_stream,
+    )
+    .await
+    else {
+        return;
     };
     let mut channel_stream = channel.into_stream();
     tokio::select! {
@@ -975,6 +1050,39 @@ async fn forward_one_connection(
             if let Err(err) = result {
                 debug!("forward bidirectional copy ended: {err}");
             }
+        }
+    }
+}
+
+/// Open the direct-tcpip channel for one forwarded connection, bounded by
+/// `channel_open_timeout`. On timeout or open failure, shuts the local TCP
+/// stream down and returns `None` so the caller bails instead of pumping
+/// bytes into a channel that never opened.
+async fn open_forward_channel(
+    ssh_handle: &SshHandle,
+    remote_address: &str,
+    remote_port: u16,
+    originator: &str,
+    channel_open_timeout: Duration,
+    tcp_stream: &mut TcpStream,
+) -> Option<Channel<Msg>> {
+    let open = ssh_handle.channel_open_direct_tcpip(
+        remote_address.to_string(),
+        u32::from(remote_port),
+        originator.to_string(),
+        0_u32,
+    );
+    match time::timeout(channel_open_timeout, open).await {
+        Ok(Ok(channel)) => Some(channel),
+        Ok(Err(err)) => {
+            debug!("forward direct-tcpip open failed: {err}");
+            let _ = tcp_stream.shutdown().await;
+            None
+        }
+        Err(_) => {
+            debug!("forward direct-tcpip open timed out after {channel_open_timeout:?}");
+            let _ = tcp_stream.shutdown().await;
+            None
         }
     }
 }
@@ -1163,9 +1271,9 @@ impl RusshAdapter {
             terminal.term_type.as_str(),
             terminal.cols,
             terminal.rows,
+            self.config.channel_open_timeout,
         )
-        .await
-        .map_err(|e| DomainError::Transport(format!("CHANNEL_FAILED: {e}")))?;
+        .await?;
         let shell_id = Self::mint_shell_id(session_id);
         // v4.7.1 fix (BUG #1): honour the per-call buffer-size override on
         // both the persisted entity AND the runtime ring buffer. The
