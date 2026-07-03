@@ -345,11 +345,11 @@ async fn apply_post_phase(
 /// extended path. Slice 9 will swap this for the full directory-aware
 /// comparator.
 fn sort_entries_for_request_index(entries: &mut [Flist]) {
-    entries.sort_by(|a, b| {
-        let a_bytes = path_to_sort_bytes(&a.path);
-        let b_bytes = path_to_sort_bytes(&b.path);
-        a_bytes.cmp(&b_bytes)
-    });
+    // `sort_by_cached_key` computes `path_to_sort_bytes` once per
+    // element instead of once per comparison — identical `Ord` on
+    // `Vec<u8>` keys, so the resulting order is byte-for-byte
+    // unchanged.
+    entries.sort_by_cached_key(|entry| path_to_sort_bytes(&entry.path));
 }
 
 /// Convert a [`Path`] to bytes for the sort comparator. Mirrors the
