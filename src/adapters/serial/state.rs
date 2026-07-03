@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_serial::{
     DataBits as SerialDataBits, FlowControl as TokioFlowControl, Parity as TokioParity, SerialPort,
     SerialPortBuilderExt, SerialStream, StopBits as TokioStopBits,
@@ -51,6 +52,13 @@ const DEFAULT_MAX_BUFFER_SIZE: u64 = 1_048_576;
 
 /// Reader I/O buffer (bytes). Pulled in one syscall per loop turn.
 const READ_BUF_LEN: usize = 4 * 1024;
+
+/// Periodic force-flush cadence for the reader's local staging buffer.
+/// Mirrors the default `SSH_NOTIFY_DEBOUNCE_MS` cadence so a device with
+/// short, infrequent output (GPS NMEA sentences, modem `OK` replies)
+/// still surfaces to `serial://<id>/output` subscribers well under the
+/// 4 KiB size-based threshold.
+const SERIAL_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -515,32 +523,48 @@ fn spawn_reader_task(reader: ReadHalf<SerialStream>, state: Arc<SerialPortState>
 async fn run_reader_loop(mut reader: ReadHalf<SerialStream>, state: Arc<SerialPortState>) {
     let mut local = Vec::with_capacity(SERIAL_FLUSH_THRESHOLD);
     let mut buf = [0_u8; READ_BUF_LEN];
+    let mut flush_tick = interval(SERIAL_FLUSH_INTERVAL);
+    flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-        biased;
-        () = state.cancel_token.cancelled() => break,
-        read_result = reader.read(&mut buf) => match read_result {
-            Ok(0) => break,
-            Ok(n) => {
-                local.extend_from_slice(&buf[..n]);
-                state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-                if local.len() >= SERIAL_FLUSH_THRESHOLD {
-                    flush_serial_buffer(&state, &mut local);
-                }
-            }
-            Err(err) => {
-                debug!("serial reader error for {}: {err}", state.config.path);
-                break;
+            biased;
+            () = state.cancel_token.cancelled() => break,
+            read_result = reader.read(&mut buf) => match read_result {
+                Ok(0) => break,
+                Ok(n) => on_read_chunk(&buf[..n], &state, &mut local),
+                Err(err) => {
+                    debug!("serial reader error for {}: {err}", state.config.path);
+                    break;
                 }
             },
+            _ = flush_tick.tick() => flush_if_pending(&state, &mut local),
         }
     }
-    if !local.is_empty() {
-        flush_serial_buffer(&state, &mut local);
+    flush_if_pending(&state, &mut local);
+    deregister_reader(&state);
+}
+
+/// Fold one non-empty read chunk into the local staging buffer, bump the
+/// activity clock, and flush eagerly once the byte-count threshold is hit.
+fn on_read_chunk(data: &[u8], state: &Arc<SerialPortState>, local: &mut Vec<u8>) {
+    local.extend_from_slice(data);
+    state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    if local.len() >= SERIAL_FLUSH_THRESHOLD {
+        flush_serial_buffer(state, local);
     }
-    // Cleanup: ensure registry entry vanishes once the reader exits
-    // (e.g. unplugged USB). A subsequent `serial_close` call is a
-    // no-op via the idempotent contract.
+}
+
+/// Flush the local staging buffer iff it holds unflushed bytes.
+fn flush_if_pending(state: &Arc<SerialPortState>, local: &mut Vec<u8>) {
+    if !local.is_empty() {
+        flush_serial_buffer(state, local);
+    }
+}
+
+/// Cleanup: ensure registry entry vanishes once the reader exits
+/// (e.g. unplugged USB). A subsequent `serial_close` call is a
+/// no-op via the idempotent contract.
+fn deregister_reader(state: &Arc<SerialPortState>) {
     SERIAL_REGISTRY.ports.remove(&state.id);
 }
 

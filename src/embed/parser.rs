@@ -13,7 +13,9 @@
 //! [`crate::embed::formatter::Event`] (`ack`, `err`, `started`, ...).
 
 use schemars::JsonSchema;
+use std::io;
 use std::io::ErrorKind;
+use std::str;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -314,7 +316,22 @@ pub enum ParseOutcome {
 pub struct NdjsonReader<R> {
     inner: R,
     line_max: usize,
-    buf: String,
+    buf: Vec<u8>,
+}
+
+/// Outcome of draining bytes for one physical line from the underlying
+/// reader, bounded by `line_max`. See [`NdjsonReader::fill_bounded_line`].
+enum LineStatus {
+    /// Stdin reached EOF with nothing pending.
+    Eof,
+    /// A full line landed entirely within `line_max` bytes; `NdjsonReader::buf`
+    /// holds its content (delimiter included).
+    Line,
+    /// The physical line exceeded `line_max` bytes. The reader still drained
+    /// through the terminating newline (or EOF) so the stream stays
+    /// correctly positioned for the next call; `usize` is the total byte
+    /// length observed (not the truncated buffer length).
+    TooLong(usize),
 }
 
 impl<R> NdjsonReader<R>
@@ -327,7 +344,7 @@ where
         Self {
             inner,
             line_max,
-            buf: String::new(),
+            buf: Vec::new(),
         }
     }
 
@@ -341,23 +358,23 @@ where
     /// closure and [`ParseOutcome::Invalid`] on a single malformed line.
     pub async fn next(&mut self) -> ParseOutcome {
         self.buf.clear();
-        match self.inner.read_line(&mut self.buf).await {
-            Ok(0) => ParseOutcome::Eof,
-            Ok(_) => {
-                if self.buf.len() > self.line_max {
-                    let len = self.buf.len();
-                    return ParseOutcome::Invalid(ParseError::LineTooLong(len));
+        match self.fill_bounded_line().await {
+            Ok(LineStatus::Eof) => ParseOutcome::Eof,
+            Ok(LineStatus::TooLong(len)) => ParseOutcome::Invalid(ParseError::LineTooLong(len)),
+            Ok(LineStatus::Line) => match str::from_utf8(&self.buf) {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        // Empty / whitespace-only line — treat as a benign skip.
+                        return Box::pin(self.next()).await;
+                    }
+                    match serde_json::from_str::<Op>(trimmed) {
+                        Ok(op) => ParseOutcome::Op(op),
+                        Err(err) => ParseOutcome::Invalid(ParseError::InvalidJson(err.to_string())),
+                    }
                 }
-                let trimmed = self.buf.trim();
-                if trimmed.is_empty() {
-                    // Empty / whitespace-only line — treat as a benign skip.
-                    return Box::pin(self.next()).await;
-                }
-                match serde_json::from_str::<Op>(trimmed) {
-                    Ok(op) => ParseOutcome::Op(op),
-                    Err(err) => ParseOutcome::Invalid(ParseError::InvalidJson(err.to_string())),
-                }
-            }
+                Err(err) => ParseOutcome::Invalid(ParseError::InvalidUtf8(err.to_string())),
+            },
             Err(err) => {
                 let kind = err.kind();
                 if matches!(kind, ErrorKind::InvalidData) {
@@ -366,6 +383,52 @@ where
                     ParseOutcome::Invalid(ParseError::Io(err.to_string()))
                 }
             }
+        }
+    }
+
+    /// Drain one physical line from `inner` into `self.buf`, bounded by
+    /// `self.line_max` bytes. Unlike a plain `read_line`, this never
+    /// buffers more than `line_max` bytes in memory even when the
+    /// physical line is far longer — once the running total crosses the
+    /// cap, further bytes are counted but discarded as they arrive
+    /// (never appended to `self.buf`); the reader keeps draining until
+    /// the terminating newline (or EOF) so the underlying stream stays
+    /// correctly positioned for the caller's next line.
+    async fn fill_bounded_line(&mut self) -> io::Result<LineStatus> {
+        let mut total_len = 0_usize;
+        let mut overflowed = false;
+        loop {
+            let available = self.inner.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(if total_len == 0 {
+                    LineStatus::Eof
+                } else {
+                    Self::line_status(total_len, overflowed)
+                });
+            }
+            let newline_at = available.iter().position(|&byte| byte == b'\n');
+            let consumed = newline_at.map_or(available.len(), |pos| pos + 1);
+            total_len += consumed;
+            if overflowed || total_len > self.line_max {
+                overflowed = true;
+            } else {
+                self.buf.extend_from_slice(&available[..consumed]);
+            }
+            self.inner.consume(consumed);
+            if newline_at.is_some() {
+                return Ok(Self::line_status(total_len, overflowed));
+            }
+        }
+    }
+
+    /// Resolve the terminal [`LineStatus`] for a physical line that has
+    /// just been fully consumed (newline found, or EOF with a non-empty
+    /// line already buffered).
+    const fn line_status(total_len: usize, overflowed: bool) -> LineStatus {
+        if overflowed {
+            LineStatus::TooLong(total_len)
+        } else {
+            LineStatus::Line
         }
     }
 }
