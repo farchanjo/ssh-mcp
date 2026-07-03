@@ -364,7 +364,20 @@ impl<C: ClockPort> RefcountedLifecycleAdapter<C> {
         }
         if entry.cas_state(LifecycleState::Observed, LifecycleState::Releasing) {
             entry.grace_until_ms.store(deadline_ms, Ordering::Release);
-            // Fall through to spawn the timer task in the async slice.
+            // Compound-atomicity guard (B3 TOCTOU): a concurrent
+            // `on_subscribe` may have taken the `Observed` fast path and
+            // `fetch_add`ed AFTER our `fetch_sub` but BEFORE this CAS,
+            // leaving `Releasing` with a live subscriber the grace timer
+            // would wrongly close. Re-read the count now that we own
+            // `Releasing`; if a subscriber raced in, revert to `Observed`
+            // and clear the deadline so the timer never fires.
+            if entry.sub_count.load(Ordering::Acquire) > 0
+                && entry.cas_state(LifecycleState::Releasing, LifecycleState::Observed)
+            {
+                entry.grace_until_ms.store(0, Ordering::Release);
+                entry.waker.notify_one();
+            }
+            // Otherwise fall through to spawn the timer task in the async slice.
         }
         entry.current_state()
     }
@@ -405,6 +418,17 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
         };
         Self::promote_to_observed(&entry)?;
         entry.sub_count.fetch_add(1, Ordering::AcqRel);
+        // Compound-atomicity guard (B3 TOCTOU): if a concurrent
+        // last-`on_unsubscribe` armed `Releasing` between our
+        // `promote_to_observed` and this `fetch_add`, our subscription
+        // would be lost to the grace timer. Re-check and revert so a
+        // live subscriber is honored (symmetric with `maybe_arm_release`).
+        if matches!(entry.current_state(), LifecycleState::Releasing)
+            && entry.cas_state(LifecycleState::Releasing, LifecycleState::Observed)
+        {
+            entry.grace_until_ms.store(0, Ordering::Release);
+            entry.waker.notify_one();
+        }
         Ok(())
     }
 
@@ -516,6 +540,38 @@ mod tests {
 
     fn sess(id: &str) -> SessionId {
         SessionId::new(id.to_string())
+    }
+
+    // --- B3 TOCTOU compensate --------------------------------------
+
+    #[test]
+    fn maybe_arm_release_reverts_when_subscriber_present_b3() {
+        // B3 TOCTOU compensate: if a subscriber is present when the
+        // Observed->Releasing CAS fires (an on_subscribe that raced in
+        // before the CAS), maybe_arm_release must revert to Observed and
+        // clear the grace deadline so the timer never closes a live one.
+        let (a, _c, _) = build();
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &sess("s-1"),
+            LifecyclePolicy::release_with_default_grace(),
+        );
+        a.on_subscribe(ResourceKind::Shell, "sh-1").expect("sub");
+        let entry = a.get(ResourceKind::Shell, "sh-1").expect("entry");
+        assert_eq!(entry.current_state(), LifecycleState::Observed);
+        assert_eq!(entry.sub_count(), 1);
+        // Simulate the race outcome: arm release while the subscriber is
+        // still counted.
+        let deadline = a.now_ms().saturating_add(1_000);
+        let state = RefcountedLifecycleAdapter::<FakeClock>::maybe_arm_release(
+            &entry,
+            entry.policy(),
+            deadline,
+        );
+        assert_eq!(state, LifecycleState::Observed, "compensate must revert");
+        assert_eq!(entry.current_state(), LifecycleState::Observed);
+        assert_eq!(entry.grace_until_ms(), 0, "deadline cleared on revert");
     }
 
     // --- Tracking and initial state --------------------------------
