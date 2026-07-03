@@ -1849,7 +1849,10 @@ const fn walk_mode_default(is_directory: bool) -> u32 {
 /// Sort entries lexicographically by their wire-relative path. Mirrors
 /// `flist.c::flist_cmp` (line 67) which uses `strcmp` on `wpath`.
 fn sort_entries(entries: &mut [Flist]) {
-    entries.sort_by_key(Flist::path_bytes);
+    // `sort_by_cached_key` computes `path_bytes()` once per element
+    // instead of once per comparison — identical `Ord` on `Vec<u8>`
+    // keys, so the resulting order is byte-for-byte unchanged.
+    entries.sort_by_cached_key(Flist::path_bytes);
 }
 
 // =====================================================================

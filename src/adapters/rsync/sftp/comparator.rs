@@ -111,7 +111,11 @@ pub fn compare_trees(
 
     let mut actions = Vec::with_capacity(src.len());
     let mut src_sorted: Vec<&RsyncEntry> = src.iter().collect();
-    src_sorted.sort_by_key(|e| (depth(&e.rel_path), e.rel_path.clone()));
+    // Borrowed-key sort: `(depth, &str)` avoids the `String` clone the
+    // old owned-key `sort_by_key` paid per element while keeping the
+    // exact same `Ord` — depth first, then lexicographic path — so the
+    // resulting order is unchanged.
+    src_sorted.sort_by_cached_key(|e| (depth(&e.rel_path), e.rel_path.as_str()));
 
     for entry in &src_sorted {
         let dst_match = dst_by_path.get(entry.rel_path.as_str()).copied();

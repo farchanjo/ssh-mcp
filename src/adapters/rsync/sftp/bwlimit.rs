@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep};
 
+use crate::adapters::rsync::sftp::executor::CHUNK_BYTES;
+
 /// Token-bucket rate limiter sized in bytes.
 #[derive(Debug)]
 pub struct TokenBucket {
@@ -33,11 +35,19 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     /// Build a fresh bucket with capacity `rate_bps` (one second's
-    /// worth of bytes — the ADR 0011 default).
+    /// worth of bytes — the ADR 0011 default), floored at
+    /// [`CHUNK_BYTES`] so the largest single [`TokenBucket::take`]
+    /// request the SFTP executor ever issues can always be admitted
+    /// once the bucket refills. Without this floor a `bwlimit_bps`
+    /// below the chunk size (e.g. a sub-256 kbit/s throttle) would
+    /// cap `capacity` under `want`, and `take` would sleep-and-retry
+    /// forever because `balance >= want` could never become true.
     #[must_use]
     pub fn new(rate_bps: u64) -> Self {
+        let chunk_bytes = u64::try_from(CHUNK_BYTES).unwrap_or(u64::MAX);
+        let capacity = rate_bps.max(chunk_bytes);
         Self {
-            capacity: rate_bps,
+            capacity,
             rate_bps,
             tokens: AtomicU64::new(rate_bps),
             last_refill_ms: AtomicU64::new(0),
@@ -126,7 +136,11 @@ impl TokenBucket {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenBucket;
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::{CHUNK_BYTES, TokenBucket};
 
     #[tokio::test]
     async fn take_returns_immediately_when_under_capacity() {
@@ -154,5 +168,24 @@ mod tests {
     async fn rate_zero_is_disabled() {
         let bucket = TokenBucket::new(0);
         bucket.take(usize::MAX as u64).await;
+    }
+
+    #[tokio::test]
+    async fn take_with_bwlimit_below_chunk_size_does_not_hang() {
+        // Regression test: a sub-256 kbit/s bwlimit (16 KiB/s) used to
+        // wedge the SFTP executor forever. `capacity` saturated at
+        // `rate_bps` (16 KiB), which is below the 32 KiB `CHUNK_BYTES`
+        // request the executor issues per `write_one_chunk` call, so
+        // `balance >= want` could never become true and `take` slept
+        // in an infinite retry loop. `TokenBucket::new` now floors
+        // `capacity` at `CHUNK_BYTES`, so the request drains once the
+        // bucket refills to the floor.
+        let bucket = TokenBucket::new(16 * 1024);
+        let want = u64::try_from(CHUNK_BYTES).unwrap_or(u64::MAX);
+        let outcome = timeout(Duration::from_secs(5), bucket.take(want)).await;
+        assert!(
+            outcome.is_ok(),
+            "take(CHUNK_BYTES) hung under a sub-chunk-size bwlimit"
+        );
     }
 }
