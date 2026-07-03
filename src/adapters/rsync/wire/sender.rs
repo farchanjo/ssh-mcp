@@ -58,6 +58,7 @@ use crate::adapters::rsync::types::{RsyncProgressEvent, SkipReason};
 use crate::adapters::rsync::wire::blocks::{read_blockset, write_blockset_header};
 use crate::adapters::rsync::wire::flist::Flist;
 use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
+use crate::adapters::rsync::wire::match_path::BlockHashtable;
 use crate::adapters::rsync::wire::ndx::{NDX_DONE, NdxState, read_ndx, write_ndx};
 use crate::adapters::rsync::wire::session::WireSession;
 use crate::adapters::rsync::wire::tokens::emit_token_stream;
@@ -86,6 +87,13 @@ where
     ndx_in: &'a mut NdxState,
     /// Codec state for `write_ndx`. See [`Self::ndx_in`] for invariants.
     ndx_out: &'a mut NdxState,
+    /// Block-match hashtable pool, reused across every file processed
+    /// by this session instead of allocating a fresh 65536-bucket
+    /// table per file. Reset in place by
+    /// [`crate::adapters::rsync::wire::match_path::BlockHashtable::reset_for`]
+    /// on every block-match dispatch; untouched (and irrelevant) on
+    /// the whole-file fast path.
+    table: &'a mut BlockHashtable,
     /// `--dry-run` mode flag. When set, the sender mirrors upstream
     /// rsync 3.2.7's `sender.c::send_files` lines 343..347 dry-run
     /// branch: per-file `ITEM_TRANSFER` frames echo `ndx + iflags` only
@@ -138,6 +146,9 @@ where
     let mut stats = ZeroStats::new(flist);
     let mut ndx_in = NdxState::new();
     let mut ndx_out = NdxState::new();
+    // Pooled across every file this session sends — see the `table`
+    // field doc on `SenderCtx`.
+    let mut table = BlockHashtable::empty();
     let mut ctx = SenderCtx {
         reader,
         writer,
@@ -148,6 +159,7 @@ where
         cancel,
         ndx_in: &mut ndx_in,
         ndx_out: &mut ndx_out,
+        table: &mut table,
         dry_run,
     };
     drive_send_files_loop(&mut ctx, &mut stats).await?;
@@ -422,8 +434,10 @@ where
     // >= 30, default for stock rsync 3.x) vs the legacy MD4 + seed
     // shape (proto < 30). See `FileHasher::for_protocol` and upstream
     // rsync 3.2.7 `checksum.c::parse_csum_name` lines 109..143.
-    let _digest =
-        emit_token_stream(ctx.writer, ctx.sess, &blockset, &bytes, seed, negotiated).await?;
+    let _digest = emit_token_stream(
+        ctx.writer, ctx.sess, &blockset, &bytes, seed, negotiated, ctx.table,
+    )
+    .await?;
     emit_file_completed(ctx.progress_tx, entry, bytes_len).await;
     stats.note_file_completed(bytes_len);
     Ok(())
