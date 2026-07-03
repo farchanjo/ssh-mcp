@@ -149,6 +149,11 @@ pub trait LocalSshClientPort: Sync {
     /// for every accepted connection. Returns once the listener is
     /// bound and accepting; per-connection lifetimes are independent.
     ///
+    /// `forward_id` is the already-minted [`crate::domain::ids::ForwardId`]
+    /// (as a plain `String` to keep this port free of the domain-id
+    /// newtype) so the adapter can drive `forward://<id>/events` push
+    /// notifications for accept / channel-open / close lifecycle events.
+    ///
     /// # Errors
     ///
     /// - [`DomainError::SessionNotFound`] when the session is unknown.
@@ -161,6 +166,7 @@ pub trait LocalSshClientPort: Sync {
         local_port: u16,
         remote_address: String,
         remote_port: u16,
+        forward_id: String,
     ) -> Result<ForwardHandle, DomainError>;
 
     /// Stop the listener + cancel every in-flight forwarded connection

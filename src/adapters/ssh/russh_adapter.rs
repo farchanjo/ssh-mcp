@@ -842,6 +842,7 @@ impl SshClientPort for RusshAdapter {
         local_port: u16,
         remote_address: String,
         remote_port: u16,
+        forward_id: String,
     ) -> Result<ForwardHandle, DomainError> {
         let handle = self.lookup_handle(session_id)?;
         let listener = TcpListener::bind(("0.0.0.0", local_port))
@@ -861,17 +862,14 @@ impl SshClientPort for RusshAdapter {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task_handle = handle;
-        let channel_open_timeout = self.config.channel_open_timeout;
+        let route = ForwardRoute {
+            remote_address: Arc::from(remote_address),
+            remote_port,
+            channel_open_timeout: self.config.channel_open_timeout,
+            forward_id: Arc::from(forward_id),
+        };
         let task = tokio::spawn(async move {
-            run_forward_accept_loop(
-                listener,
-                task_handle,
-                remote_address,
-                remote_port,
-                task_cancel,
-                channel_open_timeout,
-            )
-            .await;
+            run_forward_accept_loop(listener, task_handle, route, task_cancel).await;
         });
         self.forwards.insert(
             local_port,
@@ -903,6 +901,41 @@ struct ForwardRecord {
     session_id: SessionId,
 }
 
+/// Per-forward routing + identity bundle threaded through the accept-loop
+/// pipeline (`run_forward_accept_loop` → `handle_accept` →
+/// `spawn_forward_connection` → `forward_one_connection` →
+/// `open_forward_channel`).
+///
+/// Bundled into one struct — rather than passed as four discrete
+/// parameters — so none of those functions crosses the project's
+/// max-7-argument clippy threshold now that `forward_id` rides along for
+/// `forward://<id>/events` push-lane observability (ADR 0012). `Arc<str>`
+/// keeps the per-connection clone cheap (one atomic bump, no allocation).
+#[derive(Debug, Clone)]
+struct ForwardRoute {
+    remote_address: Arc<str>,
+    remote_port: u16,
+    channel_open_timeout: Duration,
+    forward_id: Arc<str>,
+}
+
+/// Emit one newline-terminated lifecycle event onto the
+/// `forward://<id>/events` push lane and wake any long-polling
+/// `resources/read` caller. Mirrors the shell-side `notify_shell_resource`
+/// idiom (ADR 0012 phase 9) so the accept-loop pipeline drives the same
+/// debounce + inline-push path as every other resource kind.
+fn notify_forward_resource(forward_id: &str, event: &str) {
+    use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
+    let mut line = event.to_string();
+    line.push('\n');
+    SUBSCRIPTION_REGISTRY.poke(ResourceKind::Forward, forward_id);
+    SUBSCRIPTION_REGISTRY.record_bytes_with_tail(
+        ResourceKind::Forward,
+        forward_id,
+        line.as_bytes(),
+    );
+}
+
 /// Starting delay for the accept-loop error backoff (see
 /// [`handle_accept_error`]).
 const ACCEPT_ERROR_BACKOFF_BASE: Duration = Duration::from_millis(50);
@@ -916,10 +949,8 @@ const ACCEPT_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(5);
 async fn run_forward_accept_loop(
     listener: TcpListener,
     ssh_handle: SshHandle,
-    remote_address: String,
-    remote_port: u16,
+    route: ForwardRoute,
     cancel: CancellationToken,
-    channel_open_timeout: Duration,
 ) {
     let mut backoff = ACCEPT_ERROR_BACKOFF_BASE;
     loop {
@@ -927,16 +958,7 @@ async fn run_forward_accept_loop(
             biased;
             () = cancel.cancelled() => return,
             accepted = listener.accept() => {
-                handle_accept(
-                    accepted,
-                    &ssh_handle,
-                    &remote_address,
-                    remote_port,
-                    &cancel,
-                    channel_open_timeout,
-                    &mut backoff,
-                )
-                .await;
+                handle_accept(accepted, &ssh_handle, &route, &cancel, &mut backoff).await;
             }
         }
     }
@@ -947,24 +969,15 @@ async fn run_forward_accept_loop(
 async fn handle_accept(
     accepted: IoResult<(TcpStream, SocketAddr)>,
     ssh_handle: &SshHandle,
-    remote_address: &str,
-    remote_port: u16,
+    route: &ForwardRoute,
     cancel: &CancellationToken,
-    channel_open_timeout: Duration,
     backoff: &mut Duration,
 ) {
     match accepted {
         Ok((stream, peer_addr)) => {
             *backoff = ACCEPT_ERROR_BACKOFF_BASE;
-            spawn_forward_connection(
-                stream,
-                peer_addr,
-                ssh_handle,
-                remote_address,
-                remote_port,
-                cancel,
-                channel_open_timeout,
-            );
+            notify_forward_resource(&route.forward_id, &format!("accepted {peer_addr}"));
+            spawn_forward_connection(stream, peer_addr, ssh_handle, route, cancel);
         }
         Err(err) => handle_accept_error(err, backoff).await,
     }
@@ -977,23 +990,19 @@ fn spawn_forward_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     ssh_handle: &SshHandle,
-    remote_address: &str,
-    remote_port: u16,
+    route: &ForwardRoute,
     cancel: &CancellationToken,
-    channel_open_timeout: Duration,
 ) {
     let conn_handle = Arc::clone(ssh_handle);
-    let remote_host = remote_address.to_string();
+    let conn_route = route.clone();
     let conn_cancel = cancel.clone();
     tokio::spawn(async move {
         forward_one_connection(
             stream,
             peer_addr.to_string(),
             conn_handle,
-            remote_host,
-            remote_port,
+            conn_route,
             conn_cancel,
-            channel_open_timeout,
         )
         .await;
     });
@@ -1019,29 +1028,24 @@ async fn handle_accept_error(err: IoError, backoff: &mut Duration) {
 
 /// Open a direct-tcpip channel for `tcp_stream` and pump bytes both
 /// ways until either end closes. Cancellation drops both halves. The
-/// channel-open step is bounded by `channel_open_timeout` so a stalled
-/// remote sshd cannot hang this per-connection task indefinitely.
+/// channel-open step is bounded by `route.channel_open_timeout` so a
+/// stalled remote sshd cannot hang this per-connection task indefinitely.
 async fn forward_one_connection(
     mut tcp_stream: TcpStream,
     originator: String,
     ssh_handle: SshHandle,
-    remote_address: String,
-    remote_port: u16,
+    route: ForwardRoute,
     cancel: CancellationToken,
-    channel_open_timeout: Duration,
 ) {
-    let Some(channel) = open_forward_channel(
-        &ssh_handle,
-        &remote_address,
-        remote_port,
-        &originator,
-        channel_open_timeout,
-        &mut tcp_stream,
-    )
-    .await
+    let Some(channel) =
+        open_forward_channel(&ssh_handle, &route, &originator, &mut tcp_stream).await
     else {
         return;
     };
+    notify_forward_resource(
+        &route.forward_id,
+        &format!("channel-open ok originator={originator}"),
+    );
     let mut channel_stream = channel.into_stream();
     tokio::select! {
         biased;
@@ -1052,35 +1056,41 @@ async fn forward_one_connection(
             }
         }
     }
+    notify_forward_resource(
+        &route.forward_id,
+        &format!("closed originator={originator}"),
+    );
 }
 
 /// Open the direct-tcpip channel for one forwarded connection, bounded by
-/// `channel_open_timeout`. On timeout or open failure, shuts the local TCP
-/// stream down and returns `None` so the caller bails instead of pumping
-/// bytes into a channel that never opened.
+/// `route.channel_open_timeout`. On timeout or open failure, shuts the
+/// local TCP stream down, emits a `forward://<id>/events` failure event,
+/// and returns `None` so the caller bails instead of pumping bytes into a
+/// channel that never opened.
 async fn open_forward_channel(
     ssh_handle: &SshHandle,
-    remote_address: &str,
-    remote_port: u16,
+    route: &ForwardRoute,
     originator: &str,
-    channel_open_timeout: Duration,
     tcp_stream: &mut TcpStream,
 ) -> Option<Channel<Msg>> {
     let open = ssh_handle.channel_open_direct_tcpip(
-        remote_address.to_string(),
-        u32::from(remote_port),
+        route.remote_address.to_string(),
+        u32::from(route.remote_port),
         originator.to_string(),
         0_u32,
     );
-    match time::timeout(channel_open_timeout, open).await {
+    match time::timeout(route.channel_open_timeout, open).await {
         Ok(Ok(channel)) => Some(channel),
         Ok(Err(err)) => {
             debug!("forward direct-tcpip open failed: {err}");
+            notify_forward_resource(&route.forward_id, &format!("channel-open failed: {err}"));
             let _ = tcp_stream.shutdown().await;
             None
         }
         Err(_) => {
-            debug!("forward direct-tcpip open timed out after {channel_open_timeout:?}");
+            let timeout = route.channel_open_timeout;
+            debug!("forward direct-tcpip open timed out after {timeout:?}");
+            notify_forward_resource(&route.forward_id, "channel-open timed out");
             let _ = tcp_stream.shutdown().await;
             None
         }

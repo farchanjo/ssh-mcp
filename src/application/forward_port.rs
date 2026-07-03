@@ -171,6 +171,12 @@ where
             return Err(DomainError::SessionNotFound(req.session_id));
         }
 
+        // Mint the forward id up front (rather than after `open_forward`)
+        // so the adapter can drive `forward://<id>/events` push
+        // notifications — accept / channel-open / close lifecycle events —
+        // from inside the accept-loop pipeline it owns.
+        let forward_id = self.ids.new_forward_id();
+
         // Hand off to the SSH adapter — the adapter binds the listener,
         // spawns the accept loop, and pumps bytes both ways for every
         // accepted connection. The use case keeps ownership of the
@@ -181,10 +187,10 @@ where
                 req.local_port,
                 req.remote_address.clone(),
                 req.remote_port,
+                forward_id.as_str().to_string(),
             )
             .await?;
 
-        let forward_id = self.ids.new_forward_id();
         let started_at = self.clock.utc_now();
         let entity = ForwardEntity::new(
             forward_id.clone(),
