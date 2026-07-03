@@ -10,7 +10,6 @@
 //! submodules behind this same module path.
 
 pub mod command;
-#[cfg(feature = "port_forward")]
 pub mod forward;
 pub mod rsync;
 pub mod session;

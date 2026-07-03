@@ -1,9 +1,13 @@
 //! Forward repository port.
 //!
-//! Feature-gated to mirror the v3 `port_forward` Cargo feature. The trait
-//! itself is small and dyn-safe via `trait_variant`.
-
-#![cfg(feature = "port_forward")]
+//! Always compiled. The forwarding *tool* surface (`ssh_forward`) and the
+//! russh forwarding adapters remain gated behind the `port_forward` Cargo
+//! feature, but the repository port itself is always present so the
+//! [`crate::composition::UseCases`] container can carry a single,
+//! feature-independent forward-repository type parameter. When
+//! `port_forward` is disabled nothing ever inserts into the repository, so
+//! the always-on wiring is inert. The trait is small and dyn-safe via
+//! `trait_variant`.
 
 use crate::domain::error::DomainError;
 use crate::domain::forward::ForwardEntity;

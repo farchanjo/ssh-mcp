@@ -46,7 +46,6 @@ use crate::domain::error::DomainError;
 use crate::domain::rsync_ids::RsyncId;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::config::ConfigPort;
-#[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::PeerHandle;
@@ -151,33 +150,6 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
 ///
 /// Propagates any port-level error from the underlying use case via
 /// [`map_resource_error`].
-#[cfg(not(feature = "port_forward"))]
-pub async fn list_resources_impl<SR, CR, ShR, TR>(
-    use_case: &ListResourcesUseCase<SR, CR, ShR, TR>,
-    leak_probe: Option<&Arc<dyn LeakWatcherProbe>>,
-) -> Result<ListResourcesResult, McpError>
-where
-    SR: SessionRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    ShR: ShellRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-{
-    let outcome = use_case
-        .execute(ListResourcesRequest)
-        .await
-        .map_err(|e| map_resource_error(&e))?;
-    Ok(attach_leak_warnings(
-        ListResourcesResult::with_all_items(outcome.resources.iter().map(make_resource).collect()),
-        leak_probe,
-    ))
-}
-
-/// Handle `resources/list` for the v4 server (with `port_forward`).
-///
-/// # Errors
-///
-/// Propagates any port-level error via [`map_resource_error`].
-#[cfg(feature = "port_forward")]
 pub async fn list_resources_impl<SR, CR, ShR, TR, FR>(
     use_case: &ListResourcesUseCase<SR, CR, ShR, TR, FR>,
     leak_probe: Option<&Arc<dyn LeakWatcherProbe>>,
@@ -360,7 +332,6 @@ fn describe_listing(entry: &ResourceListing) -> (String, String, String, &'stati
             ),
             "application/json",
         ),
-        #[cfg(feature = "port_forward")]
         ResourceListing::Forward {
             uri,
             forward_id,
@@ -388,42 +359,6 @@ fn describe_listing(entry: &ResourceListing) -> (String, String, String, &'stati
 /// # Errors
 ///
 /// Propagates the use case error via [`map_resource_error`].
-#[cfg(not(feature = "port_forward"))]
-pub async fn read_resource_impl<ShR, CR, TR, SR, OS, Sub>(
-    use_case: &ReadResourceUseCase<ShR, CR, TR, SR, OS, Sub>,
-    request: ReadResourceRequestParams,
-    ctx: &RequestContext<RoleServer>,
-    peer_table: &Arc<PeerTable>,
-) -> Result<ReadResourceResult, McpError>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    OS: OutputStreamPort + Send + Sync,
-    Sub: SubscriberRegistryPort,
-{
-    if let Some(content) = try_serial_read(&request.uri) {
-        return Ok(ReadResourceResult::new(vec![content]));
-    }
-    let handle = RmcpPeerHandle::resolve(ctx, peer_table);
-    let req = ReadResourceRequest {
-        uri: request.uri,
-        peer_id: handle.id(),
-    };
-    let outcome = use_case
-        .execute(req)
-        .await
-        .map_err(|e| map_resource_error(&e))?;
-    Ok(ReadResourceResult::new(vec![render_outcome(outcome)]))
-}
-
-/// Handle `resources/read` for the v4 server (with `port_forward`).
-///
-/// # Errors
-///
-/// Propagates the use case error via [`map_resource_error`].
-#[cfg(feature = "port_forward")]
 pub async fn read_resource_impl<ShR, CR, TR, SR, FR, OS, Sub>(
     use_case: &ReadResourceUseCase<ShR, CR, TR, SR, FR, OS, Sub>,
     request: ReadResourceRequestParams,
@@ -706,7 +641,6 @@ fn render_outcome(outcome: ReadResourceOutcome) -> ResourceContents {
             last_seq,
             status,
         } => render_snapshot_outcome("session", uri, json_payload, last_seq, &status),
-        #[cfg(feature = "port_forward")]
         ReadResourceOutcome::Forward {
             uri,
             json_payload,
@@ -815,12 +749,11 @@ fn build_snapshot_meta(kind: &str, last_seq: u64, status: &str) -> Meta {
     Meta(map)
 }
 
-/// Handle `resources/subscribe` for the v4 server (no `port_forward`).
+/// Handle `resources/subscribe` for the v4 server.
 ///
 /// # Errors
 ///
 /// Propagates the use case error via [`map_resource_error`].
-#[cfg(not(feature = "port_forward"))]
 pub async fn subscribe_impl<ShR, CR, TR, SR, Sub>(
     use_case: &SubscribeResourceUseCase<ShR, CR, TR, SR, Sub>,
     request: SubscribeRequestParams,
@@ -832,38 +765,6 @@ where
     CR: CommandRepository + Send + Sync,
     TR: TransferRepository + Send + Sync,
     SR: SessionRepository + Send + Sync,
-    Sub: SubscriberRegistryAsync + Send + Sync,
-{
-    let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    let outcome = use_case
-        .execute(SubscribeResourceRequest {
-            uri: request.uri,
-            peer: handle,
-        })
-        .await
-        .map_err(|e| map_resource_error(&e))?;
-    log_subscribe_outcome(&outcome);
-    Ok(())
-}
-
-/// Handle `resources/subscribe` for the v4 server (with `port_forward`).
-///
-/// # Errors
-///
-/// Propagates the use case error via [`map_resource_error`].
-#[cfg(feature = "port_forward")]
-pub async fn subscribe_impl<ShR, CR, TR, SR, FR, Sub>(
-    use_case: &SubscribeResourceUseCase<ShR, CR, TR, SR, FR, Sub>,
-    request: SubscribeRequestParams,
-    ctx: &RequestContext<RoleServer>,
-    peer_table: &Arc<PeerTable>,
-) -> Result<(), McpError>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    FR: ForwardRepository + Send + Sync,
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
