@@ -37,6 +37,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -103,6 +104,14 @@ type ResourceKey = (ResourceKind, String);
 type PeerUriKey = (PeerId, String);
 type SubUriKey = (SubId, String);
 
+/// Ceiling on the accumulated `forward://<id>/events` tail buffer
+/// (BUG #3 fix). Oldest events are head-truncated once the cap is
+/// crossed, mirroring the shell/serial ring-buffer truncation idiom.
+/// Forward lifecycle events are short text lines (`"accepted 1.2.3.4:5555"`
+/// etc.) emitted at connection cadence, not bulk byte-stream throughput,
+/// so this ceiling is generous without risking unbounded growth.
+const FORWARD_EVENT_TAIL_CAP: usize = 64 * 1024;
+
 /// In-process [`SubscriberRegistryPort`] +
 /// [`SubscriberRegistryAsync`] adapter.
 ///
@@ -137,6 +146,13 @@ pub struct MemoryRegistry<N> {
     /// `Relaxed` ordering throughout — this is a coalescing hint, not
     /// a synchronisation primitive. See ADR 0006 Amendment 1.
     bytes_since_flush: DashMap<ResourceKey, Arc<AtomicUsize>>,
+    /// `(kind, resource_id)` -> accumulated raw event tail (BUG #3 fix).
+    /// Only populated for [`ResourceKind::Forward`] — shell/command
+    /// already keep their byte history behind [`crate::ports::output_stream::OutputStreamPort`]
+    /// and don't need a second copy here. Capped at
+    /// [`FORWARD_EVENT_TAIL_CAP`]; read back via
+    /// [`SubscriberRegistryPort::tail_snapshot`].
+    event_tails: DashMap<ResourceKey, Arc<ArcSwap<Bytes>>>,
     /// Cached byte-threshold (`SSH_NOTIFY_FLUSH_BYTES`). Resolved
     /// once at construction so the per-`record_bytes` path stays
     /// lock-free. `0` disables byte-threshold entirely.
@@ -227,6 +243,7 @@ where
             wakers: DashMap::new(),
             flush_now: DashMap::new(),
             bytes_since_flush: DashMap::new(),
+            event_tails: DashMap::new(),
             flush_bytes_threshold,
             byte_triggered_flushes: AtomicU64::new(0),
             notifier,
@@ -307,6 +324,30 @@ where
             .entry(key)
             .or_insert_with(|| Arc::clone(&progress));
         progress
+    }
+
+    /// Append `bytes_added` to the `(Forward, resource_id)` event-tail
+    /// accumulator, head-truncating once [`FORWARD_EVENT_TAIL_CAP`] is
+    /// crossed (BUG #3 fix — mirrors the shell/serial ring-buffer
+    /// truncation idiom via `ArcSwap::rcu`).
+    fn append_event_tail(&self, resource_id: &str, bytes_added: &[u8]) {
+        let key: ResourceKey = (ResourceKind::Forward, resource_id.to_string());
+        let entry = self
+            .event_tails
+            .entry(key)
+            .or_insert_with(|| Arc::new(ArcSwap::from_pointee(Bytes::new())));
+        let slot = Arc::clone(entry.value());
+        drop(entry);
+        slot.rcu(|current| {
+            let mut combined = Vec::with_capacity(current.len() + bytes_added.len());
+            combined.extend_from_slice(current);
+            combined.extend_from_slice(bytes_added);
+            if combined.len() > FORWARD_EVENT_TAIL_CAP {
+                let excess = combined.len() - FORWARD_EVENT_TAIL_CAP;
+                combined.drain(..excess);
+            }
+            Bytes::from(combined)
+        });
     }
 
     fn sequence_counter(&self, kind: ResourceKind, id: &str) -> Arc<AtomicU64> {
@@ -676,8 +717,23 @@ where
                 let uri = format_uri(kind, resource_id);
                 bridge.notify_lanes_inline(&uri, bytes_added);
             }
+            // BUG #3 fix — `forward://` has no `OutputStreamPort` backing
+            // its bytes (unlike shell/command), so a default `sub_open`
+            // (inline_push unset) or legacy `resources/subscribe`
+            // consumer would otherwise get woken with nothing new to
+            // read. Accumulate the raw tail here so `read_forward` can
+            // serve it back.
+            if kind == ResourceKind::Forward {
+                self.append_event_tail(resource_id, bytes_added);
+            }
         }
         self.record_bytes(kind, resource_id, bytes_added.len());
+    }
+
+    fn tail_snapshot(&self, kind: ResourceKind, resource_id: &str) -> Bytes {
+        self.event_tails
+            .get(&(kind, resource_id.to_string()))
+            .map_or_else(Bytes::new, |entry| (*entry.value().load_full()).clone())
     }
 
     fn compensate_truncation(&self, uri: &str, bytes_dropped: u64) {
