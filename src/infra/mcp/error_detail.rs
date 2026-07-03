@@ -29,6 +29,10 @@ pub fn detail_for(code: &str) -> Option<&'static str> {
         .or_else(|| detail_for_policy(code))
         .or_else(|| detail_for_state(code))
         .or_else(|| detail_for_internal(code))
+        .or_else(|| detail_for_resume(code))
+        .or_else(|| detail_for_rsync(code))
+        .or_else(|| detail_for_serial(code))
+        .or_else(|| detail_for_inline_push(code))
 }
 
 const fn detail_for_auth(code: &str) -> Option<&'static str> {
@@ -87,6 +91,9 @@ const fn detail_for_resource(code: &str) -> Option<&'static str> {
         }
         b"FORWARD_NOT_FOUND" => {
             "Re-issue ssh_forward; verify the binary was built with the port_forward feature."
+        }
+        b"FORWARD_PORT_NOT_FOUND" => {
+            "No forwarder is bound to that local_port; verify it against the ssh_forward response before closing."
         }
         b"RESOURCE_GONE" => {
             "Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_exec / ssh_upload."
@@ -189,6 +196,74 @@ const fn detail_for_internal(code: &str) -> Option<&'static str> {
     })
 }
 
+/// ADR 0010 (v6.1) SFTP resume preflight/verify codes. `STATE` category,
+/// neither retryable.
+const fn detail_for_resume(code: &str) -> Option<&'static str> {
+    Some(match code.as_bytes() {
+        b"RESUME_OVERSHOOT" => {
+            "Re-run with resume=false to overwrite the destination, or repoint remote_path / local_path at the correct partial file."
+        }
+        b"RESUME_MISMATCH" => {
+            "Re-run with resume=false to overwrite the destination, or fix (truncate/repair) the partial file before retrying with verify=true."
+        }
+        _ => return None,
+    })
+}
+
+/// ADR 0011 (v7.0) rsync hybrid transport codes: `RSYNC_NOT_FOUND`
+/// (RESOURCE), `RSYNC_VERSION_TOO_OLD` / `RSYNC_FILE_LIST_TOO_LARGE` /
+/// `SFTP_FEATURE_MISSING` (POLICY, conditional retry), and
+/// `RSYNC_PROTOCOL_ERROR` / `RSYNC_PARTIAL_TRANSFER` (TRANSPORT, retryable).
+const fn detail_for_rsync(code: &str) -> Option<&'static str> {
+    Some(match code.as_bytes() {
+        b"RSYNC_NOT_FOUND" => {
+            "Install rsync >= 3.2.0 on the remote, or re-issue with transport=sftp for the universal fallback."
+        }
+        b"RSYNC_VERSION_TOO_OLD" => {
+            "Upgrade rsync on the remote to >= 3.2.0, or re-issue with transport=sftp; transport=auto picks this automatically."
+        }
+        b"RSYNC_PROTOCOL_ERROR" => {
+            "Auto-retry on the same channel; if persistent, switch transports (transport=wire <-> transport=sftp)."
+        }
+        b"RSYNC_FILE_LIST_TOO_LARGE" => {
+            "Tighten opts.exclude (node_modules/, target/, .git/) or raise SSH_RSYNC_FILE_LIST_LIMIT."
+        }
+        b"RSYNC_PARTIAL_TRANSFER" => {
+            "Re-run with opts.partial=true so the transport resumes from the first non-overlapping block per file."
+        }
+        b"SFTP_FEATURE_MISSING" => {
+            "Drop the unsupported preserve/checksum flag, or re-issue with transport=wire (needs rsync >= 3.2.0 on the remote)."
+        }
+        _ => return None,
+    })
+}
+
+/// ADR 0009 (v5.2) serial transport codes. `SERIAL_NOT_FOUND` is
+/// RESOURCE (never retry without recreating); `SERIAL_ERROR` covers
+/// open/read/write/close adapter failures.
+const fn detail_for_serial(code: &str) -> Option<&'static str> {
+    Some(match code.as_bytes() {
+        b"SERIAL_NOT_FOUND" => {
+            "Recreate via serial_open; use serial_active to confirm the port is still tracked before serial_write/serial_press."
+        }
+        b"SERIAL_ERROR" => {
+            "Inspect the underlying message; check device permissions/availability and retry serial_open."
+        }
+        _ => return None,
+    })
+}
+
+/// ADR 0012 (v7.1) inline-push notification codes. `POLICY` category,
+/// non-retryable.
+const fn detail_for_inline_push(code: &str) -> Option<&'static str> {
+    Some(match code.as_bytes() {
+        b"INLINE_PUSH_OVERSIZE" => {
+            "Split the payload via InlinePayload::split before calling notify_ssh_output, or raise SSH_INLINE_PUSH_MAX_BYTES_PER_NOTIFY."
+        }
+        _ => return None,
+    })
+}
+
 /// Merge the static cure with a per-call dynamic detail.
 ///
 /// Returns the static cure when `dynamic` is `None`/empty, the
@@ -246,6 +321,7 @@ mod tests {
             "COMMAND_NOT_FOUND",
             "TRANSFER_NOT_FOUND",
             "FORWARD_NOT_FOUND",
+            "FORWARD_PORT_NOT_FOUND",
             "RESOURCE_GONE",
             "SUB_NOT_FOUND",
             "GRACE_TIMER_EXPIRED",
@@ -327,6 +403,39 @@ mod tests {
     }
 
     #[test]
+    fn resume_codes_have_pedagogy() {
+        for code in ["RESUME_OVERSHOOT", "RESUME_MISMATCH"] {
+            assert!(detail_for(code).is_some(), "missing DETAIL for {code}");
+        }
+    }
+
+    #[test]
+    fn rsync_codes_have_pedagogy() {
+        for code in [
+            "RSYNC_NOT_FOUND",
+            "RSYNC_VERSION_TOO_OLD",
+            "RSYNC_PROTOCOL_ERROR",
+            "RSYNC_FILE_LIST_TOO_LARGE",
+            "RSYNC_PARTIAL_TRANSFER",
+            "SFTP_FEATURE_MISSING",
+        ] {
+            assert!(detail_for(code).is_some(), "missing DETAIL for {code}");
+        }
+    }
+
+    #[test]
+    fn serial_codes_have_pedagogy() {
+        for code in ["SERIAL_NOT_FOUND", "SERIAL_ERROR"] {
+            assert!(detail_for(code).is_some(), "missing DETAIL for {code}");
+        }
+    }
+
+    #[test]
+    fn inline_push_codes_have_pedagogy() {
+        assert!(detail_for("INLINE_PUSH_OVERSIZE").is_some());
+    }
+
+    #[test]
     fn taxonomy_covers_38_codes_minimum() {
         // Every code documented in docs/LLM_GUIDE.md (Error handbook) must
         // resolve. This is the canonical list from ADR 0007 §"38-code
@@ -344,6 +453,9 @@ mod tests {
             "COMMAND_NOT_FOUND",
             "TRANSFER_NOT_FOUND",
             "FORWARD_NOT_FOUND",
+            // v7.1.1 — close_forward NotFound fix: local_port has no
+            // matching ForwardId in scope at the adapter boundary.
+            "FORWARD_PORT_NOT_FOUND",
             "RESOURCE_GONE",
             "SUB_NOT_FOUND",
             "GRACE_TIMER_EXPIRED",
@@ -369,13 +481,28 @@ mod tests {
             "INTERNAL_ERROR",
             "LIFECYCLE_STATE_CONFLICT",
             "SESSION_REFCOUNT_UNDERFLOW",
+            // v6.1 (ADR 0010) resume codes.
+            "RESUME_OVERSHOOT",
+            "RESUME_MISMATCH",
+            // v7.0 (ADR 0011) rsync hybrid transport codes.
+            "RSYNC_NOT_FOUND",
+            "RSYNC_VERSION_TOO_OLD",
+            "RSYNC_PROTOCOL_ERROR",
+            "RSYNC_FILE_LIST_TOO_LARGE",
+            "RSYNC_PARTIAL_TRANSFER",
+            "SFTP_FEATURE_MISSING",
+            // v5.2 (ADR 0009) serial transport codes.
+            "SERIAL_NOT_FOUND",
+            "SERIAL_ERROR",
+            // v7.1 (ADR 0012) inline-push notification codes.
+            "INLINE_PUSH_OVERSIZE",
         ];
         for code in codes {
             assert!(detail_for(code).is_some(), "missing DETAIL for {code}");
         }
         assert!(
-            codes.len() >= 37,
-            "expected >=37 entries, got {}",
+            codes.len() >= 48,
+            "expected >=48 entries, got {}",
             codes.len()
         );
     }
