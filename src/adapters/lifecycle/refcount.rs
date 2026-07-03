@@ -381,6 +381,38 @@ impl<C: ClockPort> RefcountedLifecycleAdapter<C> {
         }
         entry.current_state()
     }
+
+    /// B3 TOCTOU compensate applied right after the `on_subscribe`
+    /// increment. The resource may have changed state between
+    /// [`Self::promote_to_observed`] and the `fetch_add`; reconcile so a
+    /// live subscriber is honored and a subscriber attached to a
+    /// meanwhile-closed resource is undone.
+    fn compensate_after_subscribe(entry: &Arc<ResourceLifecycle>) -> Result<(), DomainError> {
+        match entry.current_state() {
+            // A concurrent last-`on_unsubscribe` armed `Releasing`; our
+            // subscription would otherwise be lost to the grace timer.
+            // Revert so a live subscriber is honored (symmetric with
+            // `maybe_arm_release`).
+            LifecycleState::Releasing => {
+                if entry.cas_state(LifecycleState::Releasing, LifecycleState::Observed) {
+                    entry.grace_until_ms.store(0, Ordering::Release);
+                    entry.waker.notify_one();
+                }
+                Ok(())
+            }
+            // A concurrent `force_close` / grace-timer fire closed the
+            // resource under us. Undo the increment so a dead resource
+            // never retains a phantom subscriber, and report it gone.
+            LifecycleState::Closed => {
+                entry.sub_count.fetch_sub(1, Ordering::AcqRel);
+                Err(DomainError::ResourceGone(format!(
+                    "resource already closed: {:?}",
+                    entry.session_id
+                )))
+            }
+            LifecycleState::Owned | LifecycleState::Observed => Ok(()),
+        }
+    }
 }
 
 impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
@@ -418,18 +450,11 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
         };
         Self::promote_to_observed(&entry)?;
         entry.sub_count.fetch_add(1, Ordering::AcqRel);
-        // Compound-atomicity guard (B3 TOCTOU): if a concurrent
-        // last-`on_unsubscribe` armed `Releasing` between our
-        // `promote_to_observed` and this `fetch_add`, our subscription
-        // would be lost to the grace timer. Re-check and revert so a
-        // live subscriber is honored (symmetric with `maybe_arm_release`).
-        if matches!(entry.current_state(), LifecycleState::Releasing)
-            && entry.cas_state(LifecycleState::Releasing, LifecycleState::Observed)
-        {
-            entry.grace_until_ms.store(0, Ordering::Release);
-            entry.waker.notify_one();
-        }
-        Ok(())
+        // Compound-atomicity guard (B3 TOCTOU): the resource may have
+        // changed state between `promote_to_observed` and this
+        // `fetch_add`. Reconcile Releasing (revert) and Closed (undo +
+        // report gone) so no phantom subscriber survives.
+        Self::compensate_after_subscribe(&entry)
     }
 
     fn on_unsubscribe(&self, kind: ResourceKind, resource_id: &str) -> Result<(), DomainError> {
@@ -484,6 +509,28 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
             grace_remaining_ms,
             policy,
         })
+    }
+
+    fn arm_release_timer(&self, kind: ResourceKind, resource_id: &str) {
+        let Some(entry) = self.get(kind, resource_id) else {
+            return;
+        };
+        // Only arm when the last unsubscribe actually drove the resource
+        // into `Releasing` with a live deadline. A concurrent resubscribe
+        // may have reverted it to `Observed` and cleared the deadline.
+        // Spawning a second timer against the same resource is safe — the
+        // `Releasing -> Closed` CAS in `grace_timer::fire_close` fires the
+        // cascade at most once.
+        if entry.current_state() != LifecycleState::Releasing || entry.grace_until_ms() == 0 {
+            return;
+        }
+        spawn_grace_timer(
+            kind,
+            resource_id.to_string(),
+            entry,
+            Arc::clone(&self.cascade),
+            Arc::clone(&self.clock),
+        );
     }
 }
 
@@ -572,6 +619,37 @@ mod tests {
         assert_eq!(state, LifecycleState::Observed, "compensate must revert");
         assert_eq!(entry.current_state(), LifecycleState::Observed);
         assert_eq!(entry.grace_until_ms(), 0, "deadline cleared on revert");
+    }
+
+    #[test]
+    fn on_subscribe_compensate_undoes_increment_when_resource_closed_b3() {
+        // BUG #10: if the resource reaches Closed between
+        // `promote_to_observed` and the `fetch_add`, the compensate must
+        // undo the increment and report ResourceGone rather than leaving a
+        // phantom subscriber counted on a dead resource.
+        use std::sync::atomic::Ordering;
+
+        let (a, _c, _) = build();
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &sess("s-1"),
+            LifecyclePolicy::default(),
+        );
+        let entry = a.entry(ResourceKind::Shell, "sh-1").expect("entry");
+        // Reproduce the post-`fetch_add` TOCTOU window: the subscriber is
+        // already counted, but the resource was force-closed under us.
+        entry.sub_count.fetch_add(1, Ordering::AcqRel);
+        entry
+            .state_atomic()
+            .store(LifecycleState::Closed.as_u8(), Ordering::Release);
+        let err = RefcountedLifecycleAdapter::<FakeClock>::compensate_after_subscribe(&entry)
+            .expect_err("closed resource must report gone");
+        match err {
+            DomainError::ResourceGone(msg) => assert!(msg.contains("s-1"), "msg: {msg}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(entry.sub_count(), 0, "phantom subscriber must be undone");
     }
 
     // --- Tracking and initial state --------------------------------

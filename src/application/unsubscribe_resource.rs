@@ -121,6 +121,14 @@ where
         // internal-error RPC failure to the caller.
         if was_subscribed {
             self.lifecycle.on_unsubscribe(parsed.kind, &parsed.id)?;
+            // The sync `on_unsubscribe` only stamps the grace deadline
+            // when the last subscriber leaves a `release_when_no_subs`
+            // resource. Spawn the grace timer here so the resource
+            // actually advances `Releasing -> Closed`, firing the cascade
+            // that debits the owning session's refcount. No-op unless the
+            // resource is in `Releasing` (a concurrent resubscribe may
+            // have already reverted it to `Observed`).
+            self.lifecycle.arm_release_timer(parsed.kind, &parsed.id);
         }
         Ok(UnsubscribeResourceOutcome { uri: canonical })
     }
@@ -383,5 +391,80 @@ mod tests {
             .await
             .expect("execute should tolerate unknown sub_id");
         assert_eq!(outcome.uri, "shell://x/output");
+    }
+
+    // --- BUG #5: grace timer armed on the production unsubscribe path ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_resource_reaches_closed_via_production_unsubscribe_path() {
+        // A `release_when_no_subs` resource whose last subscriber leaves
+        // via the production `execute` path must actually advance to
+        // Closed: the use case has to spawn the grace timer (the sync
+        // `on_unsubscribe` only stamps the deadline). Before the fix the
+        // resource stayed stuck in Releasing forever (session-refcount
+        // leak).
+        use std::time::Duration;
+
+        use crate::adapters::clock::fake::FakeClock;
+        use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+        use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
+        use crate::domain::ids::SessionId;
+        use crate::domain::lifecycle::{LifecyclePolicy, LifecycleState};
+        use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+        use crate::ports::subscriber_registry::ResourceKind;
+
+        let registry = Arc::new(RecordingRegistry::default());
+        let cascade = CascadeCoordinator::new();
+        let clock = Arc::new(FakeClock::new(1_000_000));
+        let lifecycle_concrete =
+            RefcountedLifecycleAdapter::new(Arc::clone(&cascade), Arc::clone(&clock));
+
+        // Track + subscribe a release_when_no_subs resource so the last
+        // unsubscribe drives Observed -> Releasing.
+        let mut policy = LifecyclePolicy::release_with_default_grace();
+        policy.grace_ms = 1_000;
+        let session = SessionId::new("s-1".to_string());
+        lifecycle_concrete.track_resource(ResourceKind::Shell, "sh-1", &session, policy);
+        lifecycle_concrete
+            .on_subscribe(ResourceKind::Shell, "sh-1")
+            .expect("sub");
+
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            Arc::<RefcountedLifecycleAdapter<FakeClock>>::clone(&lifecycle_concrete);
+        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle);
+
+        uc.execute(UnsubscribeResourceRequest {
+            uri: "shell://sh-1/output".to_string(),
+            peer_id: PeerId::new("peer-1".to_string()),
+            sub_id: None,
+        })
+        .await
+        .expect("execute");
+
+        // The production path armed the grace timer. Advance the clock past
+        // the deadline and wait for the detached timer to fire the close.
+        clock.advance(Duration::from_millis(5_000));
+        let mut closed = false;
+        for _ in 0_u8..60 {
+            if lifecycle_concrete
+                .snapshot(ResourceKind::Shell, "sh-1")
+                .expect("snap")
+                .state
+                == LifecycleState::Closed
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            closed,
+            "release resource must reach Closed via the production unsubscribe path"
+        );
+        assert_eq!(
+            cascade.session_active_refs(&session),
+            0,
+            "cascade must debit the session refcount once the resource closes"
+        );
     }
 }

@@ -118,6 +118,23 @@ pub trait LifecyclePolicyPort: fmt::Debug + Send + Sync + 'static {
     /// and integration tests. Returns `None` when the resource has
     /// never been tracked.
     fn snapshot(&self, kind: ResourceKind, resource_id: &str) -> Option<LifecycleSnapshot>;
+
+    /// Spawn the grace-timer task when the resource is currently in
+    /// [`crate::domain::lifecycle::LifecycleState::Releasing`].
+    ///
+    /// The sync [`Self::on_unsubscribe`] only stamps the grace deadline;
+    /// this method actually launches the detached task that advances the
+    /// resource to
+    /// [`crate::domain::lifecycle::LifecycleState::Closed`] once the
+    /// deadline elapses. It is exposed on the sync, dyn-safe slice so a
+    /// use case holding an `Arc<dyn LifecyclePolicyPort>` can drive it
+    /// without reaching for the AFIT async slice.
+    ///
+    /// Must be called from within a Tokio runtime context — the
+    /// production unsubscribe path is async. A no-op when the resource is
+    /// untracked or is not `Releasing` (e.g. a concurrent resubscribe
+    /// reverted it to `Observed`).
+    fn arm_release_timer(&self, kind: ResourceKind, resource_id: &str);
 }
 
 /// Async slice of the lifecycle adapter.
@@ -170,6 +187,8 @@ impl LifecyclePolicyPort for NoopLifecycle {
     fn snapshot(&self, _kind: ResourceKind, _resource_id: &str) -> Option<LifecycleSnapshot> {
         None
     }
+
+    fn arm_release_timer(&self, _kind: ResourceKind, _resource_id: &str) {}
 }
 
 #[cfg(test)]
