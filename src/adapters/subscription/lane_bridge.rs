@@ -39,6 +39,20 @@ use crate::ports::notifier::{LaneNotifierBridge, NotifierPort, PeerHandle};
 /// phase 4 ships the constant only.
 pub const DEFAULT_INLINE_MAX_BYTES: usize = 32 * 1024;
 
+/// A pre-composed inline-push work item.
+///
+/// ADR 0012 phase 9 (B2 ordering fix): the `seq`/`cursor_after` inside
+/// `payload` are minted synchronously on the producer thread by
+/// [`LaneFanoutBridge::prepare_inline_dispatch`]; the only work left is
+/// the async notifier send, which a detached task performs. Keeping the
+/// assignment out of the spawned task is what makes ordering
+/// producer-determined for concurrent same-`uri` writes.
+struct InlineDispatch {
+    lane: Arc<LaneState>,
+    peer: Arc<dyn PeerHandle>,
+    payload: InlinePayload,
+}
+
 /// Concrete [`LaneNotifierBridge`] implementation.
 ///
 /// Generic over the id generator and the notifier adapter so the
@@ -178,14 +192,88 @@ where
         }
     }
 
+    /// ADR 0012 phase 9 (B2 ordering fix) — mint the per-lane
+    /// `seq`/`cursor_after` for every opt-in lane bound to `uri`
+    /// SYNCHRONOUSLY, returning ready-to-ship [`InlineDispatch`] work
+    /// items. The `fetch_add`s inside [`Self::compose_inline_payload`]
+    /// run on the caller thread in producer-call order, so the ordering
+    /// of the resulting seq/cursor is producer-determined even when the
+    /// actual `.await` send is deferred to a spawned task. No `.await`,
+    /// no shard guard held.
+    fn prepare_inline_dispatch(&self, uri: &str, bytes_added: &[u8]) -> Vec<InlineDispatch> {
+        if bytes_added.is_empty() {
+            return Vec::new();
+        }
+        let lanes = self.lanes.lanes_for_uri_public(uri);
+        let mut dispatches: Vec<InlineDispatch> = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            let Some(peer) = lane.peer().map(Arc::clone) else {
+                continue;
+            };
+            let Some(payload) = Self::compose_inline_payload(&lane, uri, bytes_added) else {
+                continue;
+            };
+            dispatches.push(InlineDispatch {
+                lane,
+                peer,
+                payload,
+            });
+        }
+        dispatches
+    }
+
+    /// ADR 0012 phase 9 (B2 ordering fix) — synchronous producer entry.
+    /// Assigns each opt-in lane's `seq`/`cursor` in producer-call order
+    /// via [`Self::prepare_inline_dispatch`] (no `.await` before the
+    /// `fetch_add`), then defers ONLY the async notifier send onto a
+    /// detached task carrying the pre-minted payloads. Two back-to-back
+    /// producer writes to the same `uri` therefore observe strictly
+    /// increasing seq/cursor regardless of runtime scheduling.
+    fn dispatch_inline_now(&self, uri: &str, bytes_added: &[u8]) {
+        let dispatches = self.prepare_inline_dispatch(uri, bytes_added);
+        if dispatches.is_empty() {
+            return;
+        }
+        let notifier = Arc::clone(&self.notifier);
+        let inline_max_bytes = self.inline_max_bytes;
+        tokio::spawn(async move {
+            Self::ship_dispatches(&notifier, inline_max_bytes, dispatches).await;
+        });
+    }
+
+    /// Ship a batch of pre-composed dispatches in order. Associated fn
+    /// (no `&self`) so the detached task owns only the notifier `Arc`
+    /// and the byte cap, keeping the spawn `'static` without capturing
+    /// the whole bridge.
+    async fn ship_dispatches(
+        notifier: &Arc<N>,
+        inline_max_bytes: usize,
+        dispatches: Vec<InlineDispatch>,
+    ) {
+        for dispatch in dispatches {
+            let InlineDispatch {
+                lane,
+                peer,
+                payload,
+            } = dispatch;
+            Self::ship_inline_fragments(notifier, inline_max_bytes, &lane, peer, payload).await;
+        }
+    }
+
     async fn notify_one_lane(&self, lane: &LaneState, uri: &str, bytes_added: &[u8]) {
         let Some(peer) = lane.peer().map(Arc::clone) else {
             return;
         };
         let inline_payload = Self::compose_inline_payload(lane, uri, bytes_added);
         if let Some(payload) = inline_payload {
-            self.ship_inline_fragments(lane, Arc::clone(&peer), uri, payload)
-                .await;
+            Self::ship_inline_fragments(
+                &self.notifier,
+                self.inline_max_bytes,
+                lane,
+                Arc::clone(&peer),
+                payload,
+            )
+            .await;
         }
         self.ship_legacy_notify(lane, peer, uri, bytes_added).await;
     }
@@ -197,26 +285,23 @@ where
         let Some(payload) = Self::compose_inline_payload(lane, uri, bytes_added) else {
             return;
         };
-        self.ship_inline_fragments(lane, peer, uri, payload).await;
+        Self::ship_inline_fragments(&self.notifier, self.inline_max_bytes, lane, peer, payload)
+            .await;
     }
 
     async fn ship_inline_fragments(
-        &self,
+        notifier: &Arc<N>,
+        inline_max_bytes: usize,
         lane: &LaneState,
         peer: Arc<dyn PeerHandle>,
-        uri: &str,
         payload: InlinePayload,
     ) {
         let peer_id = peer.id();
-        let is_text = is_text_uri(uri);
-        for fragment in payload.split(self.inline_max_bytes, is_text) {
+        let is_text = is_text_uri(&payload.uri);
+        for fragment in payload.split(inline_max_bytes, is_text) {
             let frag_len = fragment.bytes.len();
             let peer_for_frag = Arc::clone(&peer);
-            if let Err(err) = self
-                .notifier
-                .notify_ssh_output(peer_for_frag, fragment)
-                .await
-            {
+            if let Err(err) = notifier.notify_ssh_output(peer_for_frag, fragment).await {
                 debug!("lane inline notify failed for peer {peer_id}: {err}");
                 return;
             }
@@ -279,12 +364,10 @@ where
         Box::pin(async move { self.notify_lanes_with_bytes(uri, &[]).await })
     }
 
-    fn notify_lanes_inline<'a>(
-        &'a self,
-        uri: &'a str,
-        bytes_added: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move { self.notify_lanes_inline_bytes(uri, bytes_added).await })
+    fn notify_lanes_inline(&self, uri: &str, bytes_added: &[u8]) {
+        // ADR 0012 phase 9 (B2 ordering fix) -- mint seq/cursor
+        // synchronously here (producer-call order), spawn only the send.
+        self.dispatch_inline_now(uri, bytes_added);
     }
 }
 
@@ -497,6 +580,37 @@ mod tests {
         assert_eq!(p0.cursor_after, 10);
         assert_eq!(p1.cursor_after, 30);
         assert_eq!(p2.cursor_after, 35);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_inline_dispatch_mints_seq_and_cursor_in_producer_order() {
+        // ADR 0012 phase 9 (B2 ordering fix) -- two back-to-back
+        // producer writes to the SAME uri must have their seq/cursor
+        // minted synchronously in call order by `prepare_inline_dispatch`
+        // (the fetch_add runs on the caller thread, NOT inside the
+        // spawned send task). This guards against the regression where
+        // the assignment happened at task-execution time and the
+        // multi-thread runtime could reverse the two fragments.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-order"), "shell://x/output").await;
+        lane.set_inline_push(true);
+
+        let first = b.prepare_inline_dispatch("shell://x/output", b"AAAA");
+        let second = b.prepare_inline_dispatch("shell://x/output", b"BBBBBB");
+
+        assert_eq!(first.len(), 1, "one opt-in lane -> one dispatch");
+        assert_eq!(second.len(), 1, "one opt-in lane -> one dispatch");
+        // seq is producer-ordered: first write gets 0, second gets 1.
+        assert_eq!(first[0].payload.seq, 0);
+        assert_eq!(second[0].payload.seq, 1);
+        // cursor accumulates in producer order: 4 then 4 + 6 = 10.
+        assert_eq!(first[0].payload.cursor_after, 4);
+        assert_eq!(second[0].payload.cursor_after, 10);
+        // Payload bytes are preserved verbatim on each write.
+        assert_eq!(first[0].payload.bytes, b"AAAA".to_vec());
+        assert_eq!(second[0].payload.bytes, b"BBBBBB".to_vec());
     }
 
     #[tokio::test(flavor = "multi_thread")]
