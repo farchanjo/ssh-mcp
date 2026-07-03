@@ -23,7 +23,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use dashmap::DashMap;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::timeout;
 use tracing::debug;
 
 use crate::adapters::config::internal::resolve_inline_push_max_bytes_per_notify;
@@ -39,14 +44,35 @@ use crate::ports::notifier::{LaneNotifierBridge, NotifierPort, PeerHandle};
 /// phase 4 ships the constant only.
 pub const DEFAULT_INLINE_MAX_BYTES: usize = 32 * 1024;
 
+/// Bounded capacity of the per-URI inline-dispatch channel.
+///
+/// ADR 0012 phase 9 (BUG #6 fix): the single ordered consumer drains
+/// this channel FIFO. The bound is what turns a fast-producer /
+/// slow-peer pairing into backpressure (drop-newest per the lane
+/// `LagPolicy`) instead of unbounded in-flight task/memory growth.
+const INLINE_DISPATCH_CHANNEL_CAP: usize = 1024;
+
+/// Idle interval after which an inline consumer re-checks whether its
+/// URI still has live lanes. A consumer parked on an empty channel with
+/// no remaining lanes reaps itself and exits, bounding teardown latency
+/// so short-lived resource URIs do not accumulate parked tasks.
+const INLINE_CONSUMER_IDLE_CHECK: Duration = Duration::from_secs(30);
+
+/// Per-URI ordered send side, keyed by canonical URI. Each entry is
+/// drained by exactly one long-lived consumer task spawned on first
+/// inline dispatch for that URI.
+type InlineChannels = DashMap<String, mpsc::Sender<InlineDispatch>>;
+
 /// A pre-composed inline-push work item.
 ///
 /// ADR 0012 phase 9 (B2 ordering fix): the `seq`/`cursor_after` inside
 /// `payload` are minted synchronously on the producer thread by
 /// [`LaneFanoutBridge::prepare_inline_dispatch`]; the only work left is
-/// the async notifier send, which a detached task performs. Keeping the
-/// assignment out of the spawned task is what makes ordering
-/// producer-determined for concurrent same-`uri` writes.
+/// the async notifier send. BUG #6 fix: rather than one detached task
+/// per producer write (whose sends race on the multi-thread runtime and
+/// can reverse seq order), the pre-minted item is pushed into a bounded
+/// per-URI channel and shipped by a single ordered consumer, so items
+/// are also SENT in the producer-determined order.
 struct InlineDispatch {
     lane: Arc<LaneState>,
     peer: Arc<dyn PeerHandle>,
@@ -68,6 +94,13 @@ where
     /// when an opt-in lane composes an inline payload. Plumbed in from
     /// composition; phase 9 wires the env var.
     inline_max_bytes: usize,
+    /// BUG #6 fix: per-URI ordered inline-dispatch channels. Producers
+    /// push pre-minted [`InlineDispatch`] items here; one consumer per
+    /// URI drains FIFO so delivery order matches producer order and the
+    /// bounded channel applies backpressure instead of spawning an
+    /// unbounded number of racing send tasks. `Arc` so the spawned
+    /// consumer can hold a handle to reap its own entry on teardown.
+    inline_channels: Arc<InlineChannels>,
 }
 
 impl<I, N> fmt::Debug for LaneFanoutBridge<I, N>
@@ -78,6 +111,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LaneFanoutBridge")
             .field("inline_max_bytes", &self.inline_max_bytes)
+            .field("inline_channels", &self.inline_channels.len())
             .finish_non_exhaustive()
     }
 }
@@ -116,6 +150,7 @@ where
             lanes,
             notifier,
             inline_max_bytes,
+            inline_channels: Arc::new(DashMap::new()),
         })
     }
 
@@ -222,44 +257,6 @@ where
         dispatches
     }
 
-    /// ADR 0012 phase 9 (B2 ordering fix) — synchronous producer entry.
-    /// Assigns each opt-in lane's `seq`/`cursor` in producer-call order
-    /// via [`Self::prepare_inline_dispatch`] (no `.await` before the
-    /// `fetch_add`), then defers ONLY the async notifier send onto a
-    /// detached task carrying the pre-minted payloads. Two back-to-back
-    /// producer writes to the same `uri` therefore observe strictly
-    /// increasing seq/cursor regardless of runtime scheduling.
-    fn dispatch_inline_now(&self, uri: &str, bytes_added: &[u8]) {
-        let dispatches = self.prepare_inline_dispatch(uri, bytes_added);
-        if dispatches.is_empty() {
-            return;
-        }
-        let notifier = Arc::clone(&self.notifier);
-        let inline_max_bytes = self.inline_max_bytes;
-        tokio::spawn(async move {
-            Self::ship_dispatches(&notifier, inline_max_bytes, dispatches).await;
-        });
-    }
-
-    /// Ship a batch of pre-composed dispatches in order. Associated fn
-    /// (no `&self`) so the detached task owns only the notifier `Arc`
-    /// and the byte cap, keeping the spawn `'static` without capturing
-    /// the whole bridge.
-    async fn ship_dispatches(
-        notifier: &Arc<N>,
-        inline_max_bytes: usize,
-        dispatches: Vec<InlineDispatch>,
-    ) {
-        for dispatch in dispatches {
-            let InlineDispatch {
-                lane,
-                peer,
-                payload,
-            } = dispatch;
-            Self::ship_inline_fragments(notifier, inline_max_bytes, &lane, peer, payload).await;
-        }
-    }
-
     async fn notify_one_lane(&self, lane: &LaneState, uri: &str, bytes_added: &[u8]) {
         let Some(peer) = lane.peer().map(Arc::clone) else {
             return;
@@ -332,6 +329,146 @@ where
     }
 }
 
+/// BUG #6 fix — ordered inline-dispatch delivery.
+///
+/// The producer hook mints `seq`/`cursor` synchronously (see
+/// [`LaneFanoutBridge::prepare_inline_dispatch`]) then hands each item
+/// to a single per-URI FIFO consumer. Because same-URI producer writes
+/// arrive sequentially from one resource reader task, pushing into the
+/// per-URI channel in that order and draining it with one consumer makes
+/// delivery order equal producer order. The bounded channel turns a
+/// slow peer into backpressure rather than unbounded in-flight tasks.
+///
+/// These methods spawn a task that captures `Arc<SubscriberLaneAdapter>`,
+/// so they require the stronger `I: Send + Sync + 'static` bound that the
+/// [`LaneNotifierBridge`] impl already carries.
+impl<I, N> LaneFanoutBridge<I, N>
+where
+    I: IdGeneratorPort + Send + Sync + 'static,
+    N: NotifierPort + Send + Sync + 'static,
+{
+    /// Synchronous producer entry for the inline path. Mints each opt-in
+    /// lane's `seq`/`cursor` in producer-call order via
+    /// [`Self::prepare_inline_dispatch`] (no `.await` before the
+    /// `fetch_add`), then enqueues the pre-minted items onto the per-URI
+    /// ordered channel. The single consumer sends them strictly in
+    /// receive order, so two back-to-back writes to the same `uri` are
+    /// both MINTED and SENT in order.
+    fn dispatch_inline_now(&self, uri: &str, bytes_added: &[u8]) {
+        let dispatches = self.prepare_inline_dispatch(uri, bytes_added);
+        if dispatches.is_empty() {
+            return;
+        }
+        let tx = self.inline_channel_for(uri);
+        for dispatch in dispatches {
+            Self::enqueue_dispatch(&tx, dispatch);
+        }
+    }
+
+    /// Resolve (or lazily create) the ordered channel for `uri`. On a
+    /// cold URI a fresh bounded channel is created and its consumer task
+    /// spawned; on a warm URI the existing sender is cloned. A lost race
+    /// on first creation self-heals: the loser's receiver has no live
+    /// sender left, so its consumer exits immediately.
+    fn inline_channel_for(&self, uri: &str) -> mpsc::Sender<InlineDispatch> {
+        if let Some(tx) = self.inline_channels.get(uri).map(|r| r.value().clone()) {
+            return tx;
+        }
+        let (tx, rx) = mpsc::channel(INLINE_DISPATCH_CHANNEL_CAP);
+        self.spawn_inline_consumer(uri.to_string(), rx);
+        let entry = self.inline_channels.entry(uri.to_string()).or_insert(tx);
+        let stored = entry.value().clone();
+        drop(entry);
+        stored
+    }
+
+    /// Push one pre-minted dispatch onto the ordered channel. `try_send`
+    /// keeps the synchronous producer non-blocking; a full channel is
+    /// backpressure (bounded memory) — the newest fragment is dropped and
+    /// logged with the lane's `LagPolicy`, never silently. A closed
+    /// channel means the consumer already reaped a lane-less URI, so the
+    /// target subscriber is gone and dropping is correct.
+    fn enqueue_dispatch(tx: &mpsc::Sender<InlineDispatch>, dispatch: InlineDispatch) {
+        match tx.try_send(dispatch) {
+            Err(TrySendError::Full(dropped)) => {
+                let policy = **dropped.lane.policy.load();
+                debug!(
+                    "inline backpressure: lane {} channel full (policy {policy:?}, seq {}); dropping newest fragment to bound memory",
+                    dropped.lane.sub_id.as_str(),
+                    dropped.payload.seq
+                );
+            }
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// Spawn the long-lived per-URI consumer. Captures only `Arc` clones
+    /// so the task stays `'static` without borrowing the bridge.
+    fn spawn_inline_consumer(&self, uri: String, rx: mpsc::Receiver<InlineDispatch>) {
+        let notifier = Arc::clone(&self.notifier);
+        let lanes = Arc::clone(&self.lanes);
+        let channels = Arc::clone(&self.inline_channels);
+        let inline_max_bytes = self.inline_max_bytes;
+        tokio::spawn(async move {
+            Self::run_inline_consumer(&notifier, &lanes, &channels, uri, inline_max_bytes, rx)
+                .await;
+        });
+    }
+
+    /// Drain the per-URI channel FIFO, shipping each dispatch in order.
+    ///
+    /// Ordering: producers for a given URI enqueue sequentially, so
+    /// receive order equals producer order; awaiting each send in
+    /// `recv()` order preserves it end-to-end.
+    ///
+    /// Teardown: `recv()` returns `None` once every sender is dropped;
+    /// additionally, after [`INLINE_CONSUMER_IDLE_CHECK`] of idle the
+    /// consumer reaps itself iff the URI has no live lanes. The
+    /// `remove_if` predicate runs under the channels-shard write lock, so
+    /// a concurrent producer's `inline_channel_for` is serialized against
+    /// the removal: a URI with a live lane is never torn down under a
+    /// racing producer.
+    async fn run_inline_consumer(
+        notifier: &Arc<N>,
+        lanes: &Arc<SubscriberLaneAdapter<I>>,
+        channels: &Arc<InlineChannels>,
+        uri: String,
+        inline_max_bytes: usize,
+        mut rx: mpsc::Receiver<InlineDispatch>,
+    ) {
+        loop {
+            match timeout(INLINE_CONSUMER_IDLE_CHECK, rx.recv()).await {
+                Ok(Some(dispatch)) => {
+                    Self::ship_one(notifier, inline_max_bytes, dispatch).await;
+                }
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    let removed = channels
+                        .remove_if(&uri, |_, _| lanes.lanes_for_uri_public(&uri).is_empty());
+                    if removed.is_some() {
+                        // The URI had no lanes; drain any last-moment
+                        // enqueue for safety, then exit.
+                        while let Ok(dispatch) = rx.try_recv() {
+                            Self::ship_one(notifier, inline_max_bytes, dispatch).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ship a single pre-composed dispatch through the fragment splitter.
+    async fn ship_one(notifier: &Arc<N>, inline_max_bytes: usize, dispatch: InlineDispatch) {
+        let InlineDispatch {
+            lane,
+            peer,
+            payload,
+        } = dispatch;
+        Self::ship_inline_fragments(notifier, inline_max_bytes, &lane, peer, payload).await;
+    }
+}
+
 /// Whether a resource URI carries UTF-8 text. ADR 0012 phase 4 limits
 /// inline push to `shell://`, `command://`, and `serial://` URIs; the
 /// binary schemes skip the UTF-8 back-walk so the splitter falls back
@@ -381,6 +518,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use super::{DEFAULT_INLINE_MAX_BYTES, LaneFanoutBridge};
     use crate::adapters::id_generator::uuid::UuidIds;
@@ -389,7 +527,7 @@ mod tests {
     use crate::domain::ids::PeerId;
     use crate::domain::inline_payload::InlinePayload;
     use crate::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
-    use crate::ports::notifier::{NotifierPort, PeerHandle};
+    use crate::ports::notifier::{LaneNotifierBridge, NotifierPort, PeerHandle};
     use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync};
     use crate::ports::subscriber_registry::ResourceKind;
 
@@ -611,6 +749,50 @@ mod tests {
         // Payload bytes are preserved verbatim on each write.
         assert_eq!(first[0].payload.bytes, b"AAAA".to_vec());
         assert_eq!(second[0].payload.bytes, b"BBBBBB".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn back_to_back_inline_writes_delivered_in_seq_order() {
+        // BUG #6 fix -- two back-to-back synchronous producer writes to
+        // the SAME uri must be DELIVERED (not just minted) in seq order.
+        // The old code spawned one detached send task per write, whose
+        // notifier awaits raced on the multi-thread runtime and could put
+        // seq=1 on the wire before seq=0. The single per-URI FIFO consumer
+        // guarantees receive order == producer order == send order.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-fifo"), "shell://x/output").await;
+        lane.set_inline_push(true);
+
+        // Drive the synchronous producer hook twice in a row on this
+        // thread (mirrors one resource reader task's sequential writes).
+        b.notify_lanes_inline("shell://x/output", b"AAAA");
+        b.notify_lanes_inline("shell://x/output", b"BBBBBB");
+
+        // Delivery is via the spawned consumer; wait for both to land.
+        let mut delivered = 0;
+        for _ in 0..400 {
+            delivered = n.inline_events.lock().unwrap().len();
+            if delivered >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            delivered >= 2,
+            "consumer did not deliver both inline events (got {delivered})"
+        );
+
+        let events = n.inline_events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "exactly two inline events delivered");
+        // Delivered in seq order, not just minted in seq order.
+        assert_eq!(events[0].1.seq, 0, "first delivery must be seq 0");
+        assert_eq!(events[0].1.bytes, b"AAAA".to_vec());
+        assert_eq!(events[0].1.cursor_after, 4);
+        assert_eq!(events[1].1.seq, 1, "second delivery must be seq 1");
+        assert_eq!(events[1].1.bytes, b"BBBBBB".to_vec());
+        assert_eq!(events[1].1.cursor_after, 10);
     }
 
     #[tokio::test(flavor = "multi_thread")]
