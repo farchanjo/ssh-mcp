@@ -456,6 +456,7 @@ mod tests {
             _local_port: u16,
             _remote_address: String,
             _remote_port: u16,
+            _forward_id: String,
         ) -> Result<crate::ports::ssh_client::ForwardHandle, DomainError> {
             Err(DomainError::Internal(
                 "CancellingSsh::open_forward unused".to_string(),

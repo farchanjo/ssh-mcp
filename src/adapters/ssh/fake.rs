@@ -700,6 +700,7 @@ impl SshClientPort for FakeSshClient {
         local_port: u16,
         _remote_address: String,
         _remote_port: u16,
+        _forward_id: String,
     ) -> Result<ForwardHandle, DomainError> {
         // Test fake — actually try a bind so unit tests can verify
         // PortInUse semantics. The listener is dropped immediately;
