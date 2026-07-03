@@ -105,6 +105,7 @@ const fn resource_error_category(err: &DomainError) -> ResourceErrorCategory {
         | DomainError::CommandNotFound(_)
         | DomainError::TransferNotFound(_)
         | DomainError::ForwardNotFound(_)
+        | DomainError::ForwardPortNotFound(_)
         | DomainError::SerialNotFound(_)
         | DomainError::ResourceGone(_)
         | DomainError::SubNotFound(_)

@@ -303,7 +303,10 @@ fn lookup_target(err: &DomainError) -> Option<LookupTarget<'_>> {
         // ADR 0012 phase 10 — port-boundary oversize guard; no
         // closest-match surface (the error carries byte counts, not
         // ids).
-        | DomainError::InlinePushOversize { .. } => None,
+        | DomainError::InlinePushOversize { .. }
+        // `close_forward` keys on the raw local port, not a domain id;
+        // no id-based lister to closest-match against.
+        | DomainError::ForwardPortNotFound(_) => None,
     }
 }
 
@@ -754,6 +757,11 @@ fn classify_error(err: &DomainError) -> (&'static str, String, Option<String>) {
             "FORWARD_NOT_FOUND",
             "no forwarder with the given ID".to_string(),
             Some(id.as_str().to_string()),
+        ),
+        DomainError::ForwardPortNotFound(port) => (
+            "FORWARD_PORT_NOT_FOUND",
+            "no forwarder listening on the given local port".to_string(),
+            Some(format!("port={port}")),
         ),
         DomainError::SerialNotFound(id) => (
             "SERIAL_NOT_FOUND",
@@ -2585,8 +2593,16 @@ where
     async fn serial_close(
         &self,
         Parameters(args): Parameters<SerialCloseArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_close(args))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "serial_close",
+            fingerprint_args(&args),
+            || async { Ok(serial_tool_helpers::run_serial_close(args)) },
+        )
+        .await
     }
 
     #[tool(
@@ -2661,13 +2677,23 @@ where
     async fn ssh_rsync(
         &self,
         Parameters(args): Parameters<SshRsyncArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(run_ssh_rsync(
-            self.use_cases.rsync_sync.as_ref(),
-            self.id_lister.as_ref(),
-            args,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_rsync",
+            fingerprint_args(&args),
+            || async {
+                Ok(run_ssh_rsync(
+                    self.use_cases.rsync_sync.as_ref(),
+                    self.id_lister.as_ref(),
+                    args,
+                )
+                .await)
+            },
         )
-        .await)
+        .await
     }
 
     #[tool(
@@ -3804,8 +3830,16 @@ where
     async fn serial_close(
         &self,
         Parameters(args): Parameters<SerialCloseArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_close(args))
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "serial_close",
+            fingerprint_args(&args),
+            || async { Ok(serial_tool_helpers::run_serial_close(args)) },
+        )
+        .await
     }
 
     #[tool(
@@ -3877,13 +3911,23 @@ where
     async fn ssh_rsync(
         &self,
         Parameters(args): Parameters<SshRsyncArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(run_ssh_rsync(
-            self.use_cases.rsync_sync.as_ref(),
-            self.id_lister.as_ref(),
-            args,
+        with_idempotency(
+            &self.idempotency,
+            &ctx,
+            "ssh_rsync",
+            fingerprint_args(&args),
+            || async {
+                Ok(run_ssh_rsync(
+                    self.use_cases.rsync_sync.as_ref(),
+                    self.id_lister.as_ref(),
+                    args,
+                )
+                .await)
+            },
         )
-        .await)
+        .await
     }
 
     #[tool(
