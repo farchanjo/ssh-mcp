@@ -93,7 +93,7 @@ tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 
 # SSH client (async)
-russh = "0.55"
+russh = "0.60"
 russh-sftp = "2"
 
 # Serial / UART / TTY / COM transport (v5.2 — ADR 0009)
@@ -139,6 +139,7 @@ globset = "0.4"             # ADR 0011 SFTP transport — gitignore-style includ
 [dev-dependencies]
 loom = "0.7"                # Concurrent tests for ArcSwap / broadcast invariants
 proptest = "1"              # v5 Phase 5 — property-based tests for state machine, cursor, lag policy invariants
+rand = "0.10"               # test-only RNG for in-memory key generation (rand_core 0.10 line used by russh 0.60 ssh-key)
 tempfile = "3"              # Synthetic local source trees for the ADR 0011 e2e-vm test (gated behind feature = "e2e-vm")
 
 [features]
@@ -228,3 +229,10 @@ unexpected_cfgs            = { level = "warn", check-cfg = ['cfg(loom)'] }
 # Re-enabled in E2 (post-tools-migration) once commands.rs is rebuilt against rmcp:
 #   dead_code, unused_variables, unused_qualifications,
 #   trivial_numeric_casts, trivial_casts, let_underscore_drop
+
+# Build-output tuning for the crypto + byte-pumping (SSH/SFTP/rsync) workload.
+# Thin LTO + single codegen unit trade a slower release build for tighter
+# codegen on hot paths; no runtime/behavioral change.
+[profile.release]
+lto = "thin"
+codegen-units = 1
