@@ -657,21 +657,24 @@ where
     }
 
     fn record_bytes_with_tail(&self, kind: ResourceKind, resource_id: &str, bytes_added: &[u8]) {
-        // ADR 0012 phase 9 — drive inline-push synchronously from the
-        // producer site. Opt-in lanes receive the raw tail before the
-        // debouncer feeds the legacy `resources/updated` notification
-        // cadence; opt-out subscribers see byte-identical traffic to
-        // pre-phase-9 because the legacy fan-out still rides the
+        // ADR 0012 phase 9 (B2 ordering fix) — drive inline-push
+        // synchronously from the producer site. `notify_lanes_inline`
+        // mints each opt-in lane's `seq`/`cursor` on THIS thread, in
+        // producer-call order, before spawning the async send. That is
+        // what guarantees two back-to-back writes to the same `uri`
+        // reconstruct in order on the peer; the previous producer-site
+        // `tokio::spawn` assigned seq/cursor at task-execution time and
+        // could reverse the fragments under the multi-thread runtime.
+        // `bytes_added` is passed by reference (no owned copy here); the
+        // single unavoidable copy lands in the composed `InlinePayload`
+        // the send task owns. Opt-out subscribers see byte-identical
+        // traffic because the legacy fan-out still rides the
         // debouncer-driven [`LaneNotifierBridge::notify_lanes`] path.
         if !bytes_added.is_empty() {
             let bridge_arc = self.lane_bridge.load_full();
-            if let Some(bridge_opt) = bridge_arc.as_ref() {
-                let bridge = Arc::clone(bridge_opt);
+            if let Some(bridge) = bridge_arc.as_ref() {
                 let uri = format_uri(kind, resource_id);
-                let tail: Vec<u8> = bytes_added.to_vec();
-                tokio::spawn(async move {
-                    bridge.notify_lanes_inline(&uri, &tail).await;
-                });
+                bridge.notify_lanes_inline(&uri, bytes_added);
             }
         }
         self.record_bytes(kind, resource_id, bytes_added.len());

@@ -145,22 +145,25 @@ pub trait LaneNotifierBridge: Send + Sync + Debug + 'static {
         bytes_added: usize,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-    /// ADR 0012 phase 9 — synchronous producer-side hook for the
-    /// inline-push path. The producer calls this with the actual byte
-    /// tail it just appended; the bridge fans out only to opt-in
-    /// inline lanes (legacy `resources/updated` notifications are
-    /// still delivered by the debouncer-driven [`Self::notify_lanes`]
+    /// ADR 0012 phase 9 (B2 ordering fix) — synchronous producer-side
+    /// hook for the inline-push path. The producer calls this with the
+    /// actual byte tail it just appended; the bridge fans out only to
+    /// opt-in inline lanes (legacy `resources/updated` notifications
+    /// are still delivered by the debouncer-driven [`Self::notify_lanes`]
     /// at the regular cadence).
+    ///
+    /// This method is intentionally **synchronous** (returns `()`, no
+    /// boxed future). The per-lane `seq`/`cursor_after` MUST be minted
+    /// on the caller thread, in producer-call order, BEFORE any task is
+    /// spawned — otherwise two back-to-back writes to the same `uri`
+    /// could have their sequence numbers assigned in reversed order by
+    /// the multi-thread runtime and the peer would reconstruct the byte
+    /// stream out of order. Implementations do the `fetch_add` here and
+    /// defer only the async notifier send onto a detached task.
     ///
     /// Default impl is a no-op so test bridges that do not care about
     /// the inline path compile without change.
-    fn notify_lanes_inline<'a>(
-        &'a self,
-        _uri: &'a str,
-        _bytes_added: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
-    }
+    fn notify_lanes_inline(&self, _uri: &str, _bytes_added: &[u8]) {}
 }
 
 #[cfg(test)]
