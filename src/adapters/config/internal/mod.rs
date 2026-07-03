@@ -19,8 +19,11 @@
 //! | `SSH_COMMAND_CLEANUP_TTL` | 60s | TTL before unread command output is cleaned up |
 //! | `SSH_SHELL_INACTIVITY_TTL` | 600s | Shell auto-close after inactivity |
 //! | `SSH_SHELL_MAX_BUFFER_SIZE` | 10m | Max shell output buffer (supports b/k/m/g/t) |
+//! | `SSH_MCP_INSECURE_SKIP_HOST_KEY_CHECK` | false | Disable TOFU host-key verification (INSECURE — MITM exposure) |
+//! | `SSH_MCP_KNOWN_HOSTS` | `~/.ssh/known_hosts` | Path to the `known_hosts` file used for TOFU verification |
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::domain::subscription::LagPolicy;
@@ -60,6 +63,19 @@ pub const INACTIVITY_TIMEOUT_ENV_VAR: &str = "SSH_INACTIVITY_TIMEOUT";
 
 /// Environment variable name for SSH compression
 pub const COMPRESSION_ENV_VAR: &str = "SSH_COMPRESSION";
+
+/// Environment variable to opt out of TOFU host-key verification.
+///
+/// SECURE BY DEFAULT: unset (or any non-truthy value) means host keys are
+/// verified against `known_hosts` via trust-on-first-use. Setting this to
+/// a truthy value restores unconditional accept-any behaviour
+/// (`StrictHostKeyChecking=no`), exposing every session to MITM credential
+/// theft — only intended for lab / throwaway environments.
+pub const INSECURE_SKIP_HOST_KEY_CHECK_ENV_VAR: &str = "SSH_MCP_INSECURE_SKIP_HOST_KEY_CHECK";
+
+/// Environment variable overriding the `known_hosts` file path used for
+/// TOFU host-key verification. Defaults to `~/.ssh/known_hosts`.
+pub const KNOWN_HOSTS_PATH_ENV_VAR: &str = "SSH_MCP_KNOWN_HOSTS";
 
 /// Default TTL for completed command cleanup (seconds)
 pub const DEFAULT_COMMAND_CLEANUP_TTL: Duration = Duration::from_mins(1);
@@ -419,6 +435,40 @@ pub fn resolve_compression(compress_param: Option<bool>) -> bool {
 
     // Priority 3: Default value (enabled)
     true
+}
+
+/// Resolve whether TOFU host-key verification should be skipped.
+///
+/// SECURE BY DEFAULT: returns `false` (verify via `known_hosts`) unless the
+/// operator explicitly opts out via `SSH_MCP_INSECURE_SKIP_HOST_KEY_CHECK`
+/// set to a truthy value (`true` / `1` / `yes`, case-insensitive). Missing,
+/// empty, or unparseable values fall back to the secure default.
+#[must_use]
+pub fn resolve_skip_host_key_check() -> bool {
+    env::var(INSECURE_SKIP_HOST_KEY_CHECK_ENV_VAR)
+        .ok()
+        .is_some_and(|v| {
+            v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes")
+        })
+}
+
+/// Resolve the `known_hosts` file path used for TOFU host-key verification.
+///
+/// Priority: `SSH_MCP_KNOWN_HOSTS` env var -> `~/.ssh/known_hosts`. Mirrors
+/// the SSH client's default-key home resolution (`HOME`, then
+/// `USERPROFILE`), falling back to a relative `known_hosts` file only when
+/// neither is set.
+#[must_use]
+pub fn resolve_known_hosts_path() -> PathBuf {
+    if let Ok(path) = env::var(KNOWN_HOSTS_PATH_ENV_VAR) {
+        return PathBuf::from(path);
+    }
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map_or_else(
+            |_| PathBuf::from("known_hosts"),
+            |home| Path::new(&home).join(".ssh").join("known_hosts"),
+        )
 }
 
 /// Resolve the command cleanup TTL with priority: env var -> default (60s)

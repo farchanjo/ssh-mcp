@@ -330,10 +330,10 @@ async fn connect_to_ssh(
     persistent: bool,
 ) -> Result<client::Handle<SshClientHandler>, String> {
     let config = build_client_config(inactivity_timeout, compress, persistent);
-    let handler = SshClientHandler;
 
     // Parse address into host and port
     let (host, port) = parse_address(address)?;
+    let handler = SshClientHandler::new(&host, port);
 
     // Connect with timeout
     let connect_future = client::connect(config, (host.as_str(), port), handler);
