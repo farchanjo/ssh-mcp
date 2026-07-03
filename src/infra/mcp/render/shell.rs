@@ -19,6 +19,7 @@ use crate::infra::mcp::helpers::nonce::generate_nonce;
 use crate::infra::mcp::helpers::output::{
     render_output_block, sanitize_value, truncate_utf8_safe_tail,
 };
+use crate::infra::mcp::render::{append_next_line, append_subscribe_hint};
 
 /// Default byte cap applied to data blocks when the request did not
 /// supply one. Mirrors the v3 `output_default_bytes` config knob (16
@@ -199,21 +200,6 @@ fn shell_drive_await_push_hint(shell_id: &str) -> String {
     format!(
         "RECOMMENDED: response arrives via push on shell://{shell_id}/output. Wait for notifications/resources/updated, then drain with resources/read?cursor=auto. Do NOT call ssh_shell_wait_for unless you need to gate on a specific regex."
     )
-}
-
-/// Append a single `NEXT: <hint>` advisory line listing concrete tool
-/// calls a smaller LLM can chain without consulting the cookbook.
-fn append_next_line(out: &mut String, hint: &str) {
-    out.push_str("\nNEXT: ");
-    out.push_str(hint);
-}
-
-/// Append a `HINT:` line steering 27B-class models toward the
-/// subscribe-first resource pattern (push notifications) instead of
-/// hot-polling tool calls.
-fn append_subscribe_hint(out: &mut String, hint: &str) {
-    out.push_str("\nHINT: ");
-    out.push_str(hint);
 }
 
 /// Render a [`ReadShellOutcome`] as the v3 `SSH_SHELL_READ` block.

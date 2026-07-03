@@ -20,6 +20,7 @@ use crate::infra::mcp::helpers::output::{
     render_output_block, sanitize_value, truncate_utf8_safe_tail,
 };
 use crate::infra::mcp::render::connection::{append_sub_leak_risk_warnings, warnings_value};
+use crate::infra::mcp::render::{append_next_line, append_subscribe_hint};
 
 /// Default byte cap applied to output blocks when the request did not
 /// supply one. Mirrors the v3 `output_default_bytes` config knob (16
@@ -68,21 +69,6 @@ fn next_hint_for_execute(command_id: &str) -> String {
          ssh_exec_cancel(command_id={command_id}) | \
          ssh_exec_output(command_id={command_id}, wait=true) (poll fallback)"
     )
-}
-
-/// Append a single `NEXT: <hint>` advisory line listing concrete tool
-/// calls a smaller LLM can chain without consulting the cookbook.
-fn append_next_line(out: &mut String, hint: &str) {
-    out.push_str("\nNEXT: ");
-    out.push_str(hint);
-}
-
-/// Append a `HINT:` line steering 27B-class models toward the
-/// subscribe-first resource pattern (push notifications) instead of
-/// hot-polling tool calls.
-fn append_subscribe_hint(out: &mut String, hint: &str) {
-    out.push_str("\nHINT: ");
-    out.push_str(hint);
 }
 
 /// Render a [`GetCommandOutputResult`] as the v3

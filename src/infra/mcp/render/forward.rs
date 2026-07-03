@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::application::forward_port::ForwardPortOutcome;
 use crate::infra::mcp::helpers::output::sanitize_value;
+use crate::infra::mcp::render::{append_next_line, append_subscribe_hint};
 
 /// Render a [`ForwardPortOutcome`] as the `SSH_FORWARD: OK` block.
 ///
@@ -61,21 +62,6 @@ fn append_forward_advisories(out: &mut String, forward: &str) {
         ),
     );
     append_next_line(out, &format!("sub_open uri=forward://{forward}/events"));
-}
-
-/// Append a single `NEXT: <hint>` advisory line listing concrete tool
-/// calls a smaller LLM can chain without consulting the cookbook.
-fn append_next_line(out: &mut String, hint: &str) {
-    out.push_str("\nNEXT: ");
-    out.push_str(hint);
-}
-
-/// Append a `HINT:` line steering 27B-class models toward the
-/// subscribe-first resource pattern (push notifications) instead of
-/// hot-polling tool calls.
-fn append_subscribe_hint(out: &mut String, hint: &str) {
-    out.push_str("\nHINT: ");
-    out.push_str(hint);
 }
 
 // ---------------------------------------------------------------------------
