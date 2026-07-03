@@ -608,19 +608,43 @@ where
     let combined_len =
         u64_from_usize(snapshot.stdout.len()).saturating_add(u64_from_usize(snapshot.stderr.len()));
     let start = resolve_start_offset(parsed.cursor, subscribers, peer_id, canonical, combined_len);
-    // Cursor advances over the concatenated stdout+stderr stream.
-    let cursor = start.saturating_add(combined_len.saturating_sub(start));
+    // Cursor advances over the concatenated stdout+stderr stream; slice both
+    // buffers against `start` so re-polling never re-delivers old bytes.
+    let (stdout, stderr, delivered) =
+        split_combined_slice(&snapshot.stdout, &snapshot.stderr, start);
+    let cursor = start.saturating_add(delivered);
     let _new_cursor = subscribers.advance_peer_byte_cursor(peer_id, canonical, cursor);
     let status = entity.status.to_string();
     Ok(ReadResourceOutcome::Command {
         uri: canonical.to_string(),
-        stdout: snapshot.stdout,
-        stderr: snapshot.stderr,
+        stdout,
+        stderr,
         cursor,
         buffer_size: combined_len,
         last_seq: snapshot.last_seq,
         status,
     })
+}
+
+/// Slices the concatenated `stdout + stderr` command stream against a byte
+/// offset `start`, returning the fresh tail of each buffer plus the number of
+/// bytes delivered. `start` is clamped to the combined length so an
+/// out-of-range cursor yields empty/empty rather than panicking.
+fn split_combined_slice(stdout: &Bytes, stderr: &Bytes, start: u64) -> (Bytes, Bytes, u64) {
+    let stdout_len = u64_from_usize(stdout.len());
+    let stderr_len = u64_from_usize(stderr.len());
+    let combined_len = stdout_len.saturating_add(stderr_len);
+    let start = start.min(combined_len);
+    if start <= stdout_len {
+        let stdout_start = usize::try_from(start).unwrap_or(usize::MAX);
+        let delivered = (stdout_len - start).saturating_add(stderr_len);
+        (stdout.slice(stdout_start..), stderr.clone(), delivered)
+    } else {
+        let stderr_offset = start - stdout_len;
+        let stderr_start = usize::try_from(stderr_offset).unwrap_or(usize::MAX);
+        let delivered = stderr_len.saturating_sub(stderr_offset);
+        (Bytes::new(), stderr.slice(stderr_start..), delivered)
+    }
 }
 
 async fn read_transfer<TR, Sub>(
@@ -1265,6 +1289,73 @@ mod tests {
                 assert_eq!(buffer_size, 5);
                 assert_eq!(cursor, 5);
                 assert_eq!(last_seq, 5);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_command_second_auto_poll_with_no_new_bytes_returns_empty() {
+        let h = build_harness();
+        seed_command(&h.commands, "c-1", "s-1", "echo hi").await;
+        h.output.set_command(OutputSnapshot {
+            byte_cursor: 0,
+            last_seq: 5,
+            stdout: Bytes::from_static(b"hi"),
+            stderr: Bytes::from_static(b"err"),
+        });
+        // First poll consumes everything and bumps the cursor to the combined length.
+        let _ =
+            h.uc.execute(req("command://c-1/output?cursor=auto", "peer-1"))
+                .await
+                .expect("first");
+        // No producer activity between polls -> snapshot is unchanged.
+        let outcome =
+            h.uc.execute(req("command://c-1/output?cursor=auto", "peer-1"))
+                .await
+                .expect("second");
+        match outcome {
+            ReadResourceOutcome::Command {
+                stdout,
+                stderr,
+                cursor,
+                ..
+            } => {
+                assert_eq!(stdout.as_ref(), b"");
+                assert_eq!(stderr.as_ref(), b"");
+                assert_eq!(cursor, 5);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_command_cursor_landing_inside_stderr_slices_only_remaining_stderr() {
+        let h = build_harness();
+        seed_command(&h.commands, "c-1", "s-1", "echo hi").await;
+        h.output.set_command(OutputSnapshot {
+            byte_cursor: 0,
+            last_seq: 7,
+            stdout: Bytes::from_static(b"hi"),
+            stderr: Bytes::from_static(b"error!"),
+        });
+        // Explicit cursor=3 lands one byte into stderr (stdout_len == 2).
+        let outcome =
+            h.uc.execute(req("command://c-1/output?cursor=3", "peer-1"))
+                .await
+                .expect("execute");
+        match outcome {
+            ReadResourceOutcome::Command {
+                stdout,
+                stderr,
+                cursor,
+                buffer_size,
+                ..
+            } => {
+                assert_eq!(stdout.as_ref(), b"");
+                assert_eq!(stderr.as_ref(), b"rror!");
+                assert_eq!(buffer_size, 8);
+                assert_eq!(cursor, 8);
             }
             other => panic!("expected Command, got {other:?}"),
         }
