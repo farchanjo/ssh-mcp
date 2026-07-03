@@ -34,9 +34,7 @@ use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
 use crate::ports::transfer_repo::TransferRepository;
 
-#[cfg(feature = "port_forward")]
 use crate::domain::ids::ForwardId;
-#[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 
 /// Inbound DTO. Currently a unit struct — the v3 surface does not
@@ -92,7 +90,10 @@ pub enum ResourceListing {
         healthy: Option<bool>,
     },
     /// `forward://<forward_id>/events` — port-forward event log.
-    #[cfg(feature = "port_forward")]
+    ///
+    /// Always present so the resource enumerator has a single shape. When
+    /// the `port_forward` feature is disabled the forward repository stays
+    /// empty, so this variant is simply never produced.
     Forward {
         /// Canonical URI.
         uri: String,
@@ -117,28 +118,16 @@ pub struct ListResourcesOutcome {
     pub resources: Vec<ResourceListing>,
 }
 
-/// List-resources use case generic over the five repository ports.
+/// List-resources use case generic over every repository port.
+///
+/// The forward repository is always present as a type parameter so the
+/// [`crate::composition::UseCases`] container has a single shape across
+/// both `port_forward` feature configurations. When the feature is
+/// disabled the forward repository stays empty, so
+/// [`collect_forward_resources`] simply yields nothing.
 ///
 /// The composition root pins concrete adapter types per binary; tests
 /// inject fakes via [`crate::adapters`].
-#[cfg(not(feature = "port_forward"))]
-#[derive(Debug)]
-pub struct ListResourcesUseCase<SR, CR, ShR, TR>
-where
-    SR: SessionRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    ShR: ShellRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-{
-    sessions: Arc<SR>,
-    commands: Arc<CR>,
-    shells: Arc<ShR>,
-    transfers: Arc<TR>,
-}
-
-/// List-resources use case generic over every repository port (with the
-/// optional forward repository).
-#[cfg(feature = "port_forward")]
 #[derive(Debug)]
 pub struct ListResourcesUseCase<SR, CR, ShR, TR, FR>
 where
@@ -155,50 +144,6 @@ where
     forwards: Arc<FR>,
 }
 
-#[cfg(not(feature = "port_forward"))]
-impl<SR, CR, ShR, TR> ListResourcesUseCase<SR, CR, ShR, TR>
-where
-    SR: SessionRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    ShR: ShellRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-{
-    /// Wire the use case from already-shared adapter handles.
-    #[must_use]
-    pub const fn new(
-        sessions: Arc<SR>,
-        commands: Arc<CR>,
-        shells: Arc<ShR>,
-        transfers: Arc<TR>,
-    ) -> Self {
-        Self {
-            sessions,
-            commands,
-            shells,
-            transfers,
-        }
-    }
-
-    /// Drive the list-resources orchestration. See module-level docs.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the first repository error encountered; partial results
-    /// are not surfaced to callers.
-    pub async fn execute(
-        &self,
-        _req: ListResourcesRequest,
-    ) -> Result<ListResourcesOutcome, DomainError> {
-        let mut resources = Vec::new();
-        collect_shell_resources(&*self.shells, &mut resources).await?;
-        collect_command_resources(&*self.commands, &mut resources).await?;
-        collect_transfer_resources(&*self.transfers, &mut resources).await?;
-        collect_session_resources(&*self.sessions, &mut resources).await?;
-        Ok(ListResourcesOutcome { resources })
-    }
-}
-
-#[cfg(feature = "port_forward")]
 impl<SR, CR, ShR, TR, FR> ListResourcesUseCase<SR, CR, ShR, TR, FR>
 where
     SR: SessionRepository + Send + Sync,
@@ -309,7 +254,6 @@ async fn collect_session_resources<SR: SessionRepository + Send + Sync>(
     Ok(())
 }
 
-#[cfg(feature = "port_forward")]
 async fn collect_forward_resources<FR: ForwardRepository + Send + Sync>(
     repo: &FR,
     out: &mut Vec<ResourceListing>,
@@ -348,7 +292,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[cfg(feature = "port_forward")]
     use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
     #[cfg(feature = "port_forward")]
     use crate::domain::forward::ForwardEntity;
@@ -357,21 +300,12 @@ mod tests {
     #[cfg(feature = "port_forward")]
     use crate::ports::forward_repo::ForwardRepository;
 
-    #[cfg(feature = "port_forward")]
     type UseCaseUnderTest = ListResourcesUseCase<
         DashMapSessionRepo,
         DashMapCommandRepo,
         DashMapShellRepo,
         DashMapTransferRepo,
         DashMapForwardRepo,
-    >;
-
-    #[cfg(not(feature = "port_forward"))]
-    type UseCaseUnderTest = ListResourcesUseCase<
-        DashMapSessionRepo,
-        DashMapCommandRepo,
-        DashMapShellRepo,
-        DashMapTransferRepo,
     >;
 
     struct Harness {
@@ -389,22 +323,13 @@ mod tests {
         let commands = Arc::new(DashMapCommandRepo::new());
         let shells = Arc::new(DashMapShellRepo::new());
         let transfers = Arc::new(DashMapTransferRepo::new());
-        #[cfg(feature = "port_forward")]
         let forwards = Arc::new(DashMapForwardRepo::new());
-        #[cfg(feature = "port_forward")]
         let uc = ListResourcesUseCase::new(
             Arc::clone(&sessions),
             Arc::clone(&commands),
             Arc::clone(&shells),
             Arc::clone(&transfers),
             Arc::clone(&forwards),
-        );
-        #[cfg(not(feature = "port_forward"))]
-        let uc = ListResourcesUseCase::new(
-            Arc::clone(&sessions),
-            Arc::clone(&commands),
-            Arc::clone(&shells),
-            Arc::clone(&transfers),
         );
         Harness {
             uc,

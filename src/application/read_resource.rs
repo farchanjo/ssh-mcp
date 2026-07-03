@@ -54,7 +54,6 @@ use crate::ports::transfer_repo::TransferRepository;
 
 #[cfg(feature = "port_forward")]
 use crate::domain::ids::ForwardId;
-#[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 
 /// `?cursor=` mode requested by the inbound caller.
@@ -305,8 +304,12 @@ pub enum ReadResourceOutcome {
         /// Lifecycle hint string ("healthy"/"unhealthy"/"unknown").
         status: String,
     },
-    /// Port-forwarder event snapshot. Feature-gated by `port_forward`.
-    #[cfg(feature = "port_forward")]
+    /// Port-forwarder event snapshot.
+    ///
+    /// Always present so the read dispatcher has a single outcome shape.
+    /// Only produced when the `port_forward` feature is enabled; the
+    /// disabled build rejects `forward://` reads with `FEATURE_DISABLED`
+    /// before constructing this variant.
     Forward {
         /// Canonical URI.
         uri: String,
@@ -322,30 +325,11 @@ pub enum ReadResourceOutcome {
 /// Read-resource use case. Sub-registers retain `Arc` handles to every
 /// repository plus the [`OutputStreamPort`] and [`SubscriberRegistryPort`].
 ///
-/// Two flavours are exported, gated by the `port_forward` feature, so
-/// the forward repository slot does not require a stub when the feature
-/// is disabled.
-#[cfg(not(feature = "port_forward"))]
-#[derive(Debug)]
-pub struct ReadResourceUseCase<ShR, CR, TR, SR, OS, Sub>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    OS: OutputStreamPort + Send + Sync,
-    Sub: SubscriberRegistryPort,
-{
-    shells: Arc<ShR>,
-    commands: Arc<CR>,
-    transfers: Arc<TR>,
-    sessions: Arc<SR>,
-    output: Arc<OS>,
-    subscribers: Arc<Sub>,
-}
-
-/// Read-resource use case with the `port_forward` feature enabled.
-#[cfg(feature = "port_forward")]
+/// The forward repository is always present as a type parameter so the
+/// [`crate::composition::UseCases`] container has a single shape across
+/// both `port_forward` feature configurations. When the feature is
+/// disabled the `forward://` dispatch arm short-circuits with
+/// `FEATURE_DISABLED` before touching the (always-empty) repository.
 #[derive(Debug)]
 pub struct ReadResourceUseCase<ShR, CR, TR, SR, FR, OS, Sub>
 where
@@ -366,97 +350,6 @@ where
     subscribers: Arc<Sub>,
 }
 
-#[cfg(not(feature = "port_forward"))]
-impl<ShR, CR, TR, SR, OS, Sub> ReadResourceUseCase<ShR, CR, TR, SR, OS, Sub>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    OS: OutputStreamPort + Send + Sync,
-    Sub: SubscriberRegistryPort,
-{
-    /// Wire the use case from already-shared adapter handles.
-    #[must_use]
-    pub const fn new(
-        shells: Arc<ShR>,
-        commands: Arc<CR>,
-        transfers: Arc<TR>,
-        sessions: Arc<SR>,
-        output: Arc<OS>,
-        subscribers: Arc<Sub>,
-    ) -> Self {
-        Self {
-            shells,
-            commands,
-            transfers,
-            sessions,
-            output,
-            subscribers,
-        }
-    }
-
-    /// Drive the read orchestration. See module-level docs.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomainError::InvalidArgument`] when the URI fails to parse.
-    /// - [`DomainError::ShellNotFound`] / `CommandNotFound` /
-    ///   `TransferNotFound` / `SessionNotFound` when the resource is
-    ///   unknown.
-    pub async fn execute(
-        &self,
-        req: ReadResourceRequest,
-    ) -> Result<ReadResourceOutcome, DomainError> {
-        let parsed =
-            parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
-        let canonical = canonical_uri(parsed.kind, &parsed.id);
-        match parsed.kind {
-            ResourceKind::Shell => {
-                read_shell(
-                    &*self.shells,
-                    &*self.output,
-                    &*self.subscribers,
-                    &parsed,
-                    &canonical,
-                    &req.peer_id,
-                )
-                .await
-            }
-            ResourceKind::Command => {
-                read_command(
-                    &*self.commands,
-                    &*self.output,
-                    &*self.subscribers,
-                    &parsed,
-                    &canonical,
-                    &req.peer_id,
-                )
-                .await
-            }
-            ResourceKind::Transfer => {
-                read_transfer(&*self.transfers, &*self.subscribers, &parsed, &canonical).await
-            }
-            ResourceKind::Session => {
-                read_session(&*self.sessions, &*self.subscribers, &parsed, &canonical).await
-            }
-            ResourceKind::Forward => Err(DomainError::InvalidArgument(
-                "FEATURE_DISABLED: forward:// resources require the port_forward Cargo feature"
-                    .to_string(),
-            )),
-            ResourceKind::Serial => Err(DomainError::InvalidArgument(
-                "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
-                    .to_string(),
-            )),
-            ResourceKind::Rsync => Err(DomainError::InvalidArgument(
-                "rsync:// reads are dispatched at the MCP infra layer (see resource_handlers); the application use case is bypassed — see ADR 0011"
-                    .to_string(),
-            )),
-        }
-    }
-}
-
-#[cfg(feature = "port_forward")]
 impl<ShR, CR, TR, SR, FR, OS, Sub> ReadResourceUseCase<ShR, CR, TR, SR, FR, OS, Sub>
 where
     ShR: ShellRepository + Send + Sync,
@@ -486,6 +379,34 @@ where
             forwards,
             output,
             subscribers,
+        }
+    }
+
+    /// Dispatch a `forward://` read.
+    ///
+    /// With `port_forward` enabled this queries the forward repository;
+    /// with the feature disabled it rejects the read with
+    /// `FEATURE_DISABLED` (matching legacy behaviour) while keeping the
+    /// always-present `forwards` field live via [`forward_read_disabled`].
+    #[cfg_attr(
+        not(feature = "port_forward"),
+        expect(
+            clippy::unused_async,
+            reason = "async parity with the port_forward build, which awaits read_forward"
+        )
+    )]
+    async fn dispatch_forward(
+        &self,
+        parsed: &ParsedUri,
+        canonical: &str,
+    ) -> Result<ReadResourceOutcome, DomainError> {
+        #[cfg(feature = "port_forward")]
+        {
+            read_forward(&*self.forwards, &*self.subscribers, parsed, canonical).await
+        }
+        #[cfg(not(feature = "port_forward"))]
+        {
+            forward_read_disabled(&self.forwards, parsed, canonical)
         }
     }
 
@@ -536,9 +457,7 @@ where
             ResourceKind::Session => {
                 read_session(&*self.sessions, &*self.subscribers, &parsed, &canonical).await
             }
-            ResourceKind::Forward => {
-                read_forward(&*self.forwards, &*self.subscribers, &parsed, &canonical).await
-            }
+            ResourceKind::Forward => self.dispatch_forward(&parsed, &canonical).await,
             ResourceKind::Serial => Err(DomainError::InvalidArgument(
                 "serial:// reads are dispatched at the MCP infra layer (see resource_handlers::read_serial); the application use case is bypassed for v5.2 — see ADR 0009"
                     .to_string(),
@@ -758,6 +677,27 @@ where
     })
 }
 
+/// Reject a `forward://` read when the `port_forward` feature is disabled.
+///
+/// Consumes the always-present forward-repository handle (plus the parsed
+/// URI / canonical form) by reference so the [`ReadResourceUseCase`]
+/// `forwards` field and the dispatch parameters stay live in this build;
+/// the repository is inert here. Reproduces the legacy `FEATURE_DISABLED`
+/// rejection byte-for-byte.
+#[cfg(not(feature = "port_forward"))]
+fn forward_read_disabled<FR>(
+    _forwards: &Arc<FR>,
+    _parsed: &ParsedUri,
+    _canonical: &str,
+) -> Result<ReadResourceOutcome, DomainError>
+where
+    FR: ForwardRepository + Send + Sync,
+{
+    Err(DomainError::InvalidArgument(
+        "FEATURE_DISABLED: forward:// resources require the port_forward Cargo feature".to_string(),
+    ))
+}
+
 fn resolve_start_offset<Sub: SubscriberRegistryPort>(
     cursor: CursorMode,
     subscribers: &Sub,
@@ -823,7 +763,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    #[cfg(feature = "port_forward")]
     use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
     #[cfg(feature = "port_forward")]
     use crate::domain::forward::ForwardEntity;
@@ -905,23 +844,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "port_forward")]
     type UseCaseUnderTest = ReadResourceUseCase<
         DashMapShellRepo,
         DashMapCommandRepo,
         DashMapTransferRepo,
         DashMapSessionRepo,
         DashMapForwardRepo,
-        StubOutput,
-        StubRegistry,
-    >;
-
-    #[cfg(not(feature = "port_forward"))]
-    type UseCaseUnderTest = ReadResourceUseCase<
-        DashMapShellRepo,
-        DashMapCommandRepo,
-        DashMapTransferRepo,
-        DashMapSessionRepo,
         StubOutput,
         StubRegistry,
     >;
@@ -943,26 +871,15 @@ mod tests {
         let commands = Arc::new(DashMapCommandRepo::new());
         let transfers = Arc::new(DashMapTransferRepo::new());
         let sessions = Arc::new(DashMapSessionRepo::new());
-        #[cfg(feature = "port_forward")]
         let forwards = Arc::new(DashMapForwardRepo::new());
         let output = Arc::new(StubOutput::default());
         let subscribers = Arc::new(StubRegistry::default());
-        #[cfg(feature = "port_forward")]
         let uc = ReadResourceUseCase::new(
             Arc::clone(&shells),
             Arc::clone(&commands),
             Arc::clone(&transfers),
             Arc::clone(&sessions),
             Arc::clone(&forwards),
-            Arc::clone(&output),
-            Arc::clone(&subscribers),
-        );
-        #[cfg(not(feature = "port_forward"))]
-        let uc = ReadResourceUseCase::new(
-            Arc::clone(&shells),
-            Arc::clone(&commands),
-            Arc::clone(&transfers),
-            Arc::clone(&sessions),
             Arc::clone(&output),
             Arc::clone(&subscribers),
         );

@@ -48,7 +48,6 @@ use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
 use crate::adapters::notifier::rmcp_adapter::RmcpNotifier;
 use crate::adapters::output_stream::russh_output::RusshOutputAdapter;
 use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
-#[cfg(feature = "port_forward")]
 use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
 use crate::adapters::repo::dashmap::rsync::DashMapRsyncRepo;
 use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
@@ -132,8 +131,8 @@ type ConcreteCommandRepo = DashMapCommandRepo;
 type ConcreteShellRepo = DashMapShellRepo;
 /// Production transfer repository adapter (`DashMap`).
 type ConcreteTransferRepo = DashMapTransferRepo;
-/// Production forward repository adapter (`DashMap`, feature-gated).
-#[cfg(feature = "port_forward")]
+/// Production forward repository adapter (`DashMap`). Always compiled;
+/// inert (empty) when the `port_forward` feature is disabled.
 type ConcreteForwardRepo = DashMapForwardRepo;
 /// Production rmcp notifier adapter.
 type ConcreteNotifier = RmcpNotifier;
@@ -164,7 +163,10 @@ type ConcreteRsyncSftpFs = RusshRsyncSftpFs;
 type ConcreteRsyncRepo = DashMapRsyncRepo;
 
 /// Concrete `UseCases` shape pinned to the production adapters above.
-#[cfg(feature = "port_forward")]
+///
+/// Single alias across both feature configurations — the forward
+/// repository parameter is always [`ConcreteForwardRepo`]; only the
+/// `forward_port` field inside [`UseCases`] is gated by `port_forward`.
 pub type ProdUseCases = UseCases<
     ConcreteSsh,
     ConcreteSftp,
@@ -173,27 +175,6 @@ pub type ProdUseCases = UseCases<
     ConcreteShellRepo,
     ConcreteTransferRepo,
     ConcreteForwardRepo,
-    ConcreteNotifier,
-    ConcreteAuth,
-    ConcreteOutput,
-    ConcreteSubscribers,
-    ConcreteClock,
-    ConcreteConfig,
-    ConcreteIds,
-    ConcreteRsyncWire,
-    ConcreteRsyncSftp,
-    ConcreteRsyncSftpFs,
-    ConcreteRsyncRepo,
->;
-
-#[cfg(not(feature = "port_forward"))]
-pub type ProdUseCases = UseCases<
-    ConcreteSsh,
-    ConcreteSftp,
-    ConcreteSessionRepo,
-    ConcreteCommandRepo,
-    ConcreteShellRepo,
-    ConcreteTransferRepo,
     ConcreteNotifier,
     ConcreteAuth,
     ConcreteOutput,
@@ -298,7 +279,8 @@ pub fn build_use_cases() -> ProdWiring {
             .with_status_sink(transfer_sink)
             .with_registration_sink(transfer_registration_sink),
     );
-    #[cfg(feature = "port_forward")]
+    // Always built (inert when `port_forward` is disabled) so the
+    // resource-enumeration use cases carry a single forward-repo slot.
     let forwards = Arc::new(DashMapForwardRepo::new());
 
     let peer_table = new_peer_table();
@@ -504,7 +486,6 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&config),
     ));
 
-    #[cfg(feature = "port_forward")]
     let list_resources = Arc::new(ListResourcesUseCase::new(
         Arc::clone(&sessions),
         Arc::clone(&commands),
@@ -512,15 +493,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&transfers),
         Arc::clone(&forwards),
     ));
-    #[cfg(not(feature = "port_forward"))]
-    let list_resources = Arc::new(ListResourcesUseCase::new(
-        Arc::clone(&sessions),
-        Arc::clone(&commands),
-        Arc::clone(&shells),
-        Arc::clone(&transfers),
-    ));
 
-    #[cfg(feature = "port_forward")]
     let read_resource = Arc::new(ReadResourceUseCase::new(
         Arc::clone(&shells),
         Arc::clone(&commands),
@@ -530,30 +503,7 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&output),
         Arc::clone(&subscribers),
     ));
-    #[cfg(not(feature = "port_forward"))]
-    let read_resource = Arc::new(ReadResourceUseCase::new(
-        Arc::clone(&shells),
-        Arc::clone(&commands),
-        Arc::clone(&transfers),
-        Arc::clone(&sessions),
-        Arc::clone(&output),
-        Arc::clone(&subscribers),
-    ));
 
-    #[cfg(feature = "port_forward")]
-    let subscribe_resource = Arc::new(
-        SubscribeResourceUseCase::new(
-            Arc::clone(&shells),
-            Arc::clone(&commands),
-            Arc::clone(&transfers),
-            Arc::clone(&sessions),
-            Arc::clone(&forwards),
-            Arc::clone(&subscribers),
-            Arc::clone(&lifecycle),
-        )
-        .with_subscriber_lane(Arc::clone(&lane_admin)),
-    );
-    #[cfg(not(feature = "port_forward"))]
     let subscribe_resource = Arc::new(
         SubscribeResourceUseCase::new(
             Arc::clone(&shells),

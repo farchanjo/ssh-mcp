@@ -35,10 +35,11 @@
 //!
 //! ## Feature gate
 //!
-//! Compiled only when the `port_forward` Cargo feature is enabled,
-//! mirroring the legacy module gate.
-
-#![cfg(feature = "port_forward")]
+//! Always compiled. The repository is inert when the `port_forward`
+//! feature is disabled (nothing ever inserts into it), but keeping the
+//! type always present lets [`crate::composition::UseCases`] carry a
+//! single forward-repository type parameter across both feature
+//! configurations.
 
 use std::collections::HashSet;
 use std::sync::Arc;

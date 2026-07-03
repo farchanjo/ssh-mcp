@@ -36,9 +36,6 @@ use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy};
 use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryAsync};
 use crate::ports::transfer_repo::TransferRepository;
 
-#[cfg(feature = "port_forward")]
-use crate::ports::forward_repo::ForwardRepository;
-
 /// Inbound DTO. The peer handle is wrapped in [`Arc`] so the registry
 /// can keep its own clone alongside the use-case's.
 #[derive(Debug, Clone)]
@@ -63,8 +60,13 @@ pub struct SubscribeResourceOutcome {
     pub sub_id: Option<SubId>,
 }
 
-/// Subscribe-resource use case (no `port_forward` feature).
-#[cfg(not(feature = "port_forward"))]
+/// Subscribe-resource use case.
+///
+/// The forward repository is intentionally **not** a type parameter: the
+/// subscribe path never queries it (forward URIs are accepted permissively
+/// so subscribers can attach before the producer publishes), so carrying
+/// `FR` here would be dead plumbing. This keeps a single shape across both
+/// `port_forward` feature configurations.
 #[derive(Debug)]
 pub struct SubscribeResourceUseCase<ShR, CR, TR, SR, Sub>
 where
@@ -88,30 +90,6 @@ where
     lane: Option<Arc<dyn LaneAdmin>>,
 }
 
-/// Subscribe-resource use case with the `port_forward` feature enabled.
-#[cfg(feature = "port_forward")]
-#[derive(Debug)]
-pub struct SubscribeResourceUseCase<ShR, CR, TR, SR, FR, Sub>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    FR: ForwardRepository + Send + Sync,
-    Sub: SubscriberRegistryAsync + Send + Sync,
-{
-    shells: Arc<ShR>,
-    commands: Arc<CR>,
-    transfers: Arc<TR>,
-    sessions: Arc<SR>,
-    forwards: Arc<FR>,
-    subscribers: Arc<Sub>,
-    lifecycle: Arc<dyn LifecyclePolicyPort>,
-    /// v5 Phase 2 — optional [`LaneAdmin`] handle.
-    lane: Option<Arc<dyn LaneAdmin>>,
-}
-
-#[cfg(not(feature = "port_forward"))]
 impl<ShR, CR, TR, SR, Sub> SubscribeResourceUseCase<ShR, CR, TR, SR, Sub>
 where
     ShR: ShellRepository + Send + Sync,
@@ -143,7 +121,7 @@ where
 
     /// Install the v5 Phase 2 [`LaneAdmin`] handle. Each subscribe
     /// call will mint a per-`SubId` lane through the admin and
-    /// surface the SubId on the outcome. Compositional opt-in: v4
+    /// surface the `SubId` on the outcome. Compositional opt-in: v4
     /// callers that omit this builder method see identical v4
     /// behaviour.
     #[must_use]
@@ -173,106 +151,6 @@ where
             &*self.commands,
             &*self.transfers,
             &*self.sessions,
-        )
-        .await?;
-        let canonical = canonical_uri(parsed.kind, &parsed.id);
-        let parsed_kind = parsed.kind;
-        let parsed_id = parsed.id.clone();
-        self.subscribers
-            .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
-            .await?;
-        // v5 lifecycle: bump the resource refcount so the policy can
-        // drive Owned -> Observed transitions.
-        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
-        let sub_id = self
-            .open_lane_if_wired(canonical.clone(), parsed_kind, parsed_id)
-            .await?;
-        Ok(SubscribeResourceOutcome {
-            uri: canonical,
-            sub_id,
-        })
-    }
-
-    async fn open_lane_if_wired(
-        &self,
-        canonical: String,
-        kind: ResourceKind,
-        resource_id: String,
-    ) -> Result<Option<SubId>, DomainError> {
-        match self.lane.as_ref() {
-            Some(lane) => {
-                let policy = LanePolicy::default();
-                let sub_id = lane.open(canonical, kind, resource_id, policy).await?;
-                Ok(Some(sub_id))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-#[cfg(feature = "port_forward")]
-impl<ShR, CR, TR, SR, FR, Sub> SubscribeResourceUseCase<ShR, CR, TR, SR, FR, Sub>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    FR: ForwardRepository + Send + Sync,
-    Sub: SubscriberRegistryAsync + Send + Sync,
-{
-    /// Wire the use case from already-shared adapter handles.
-    #[must_use]
-    pub const fn new(
-        shells: Arc<ShR>,
-        commands: Arc<CR>,
-        transfers: Arc<TR>,
-        sessions: Arc<SR>,
-        forwards: Arc<FR>,
-        subscribers: Arc<Sub>,
-        lifecycle: Arc<dyn LifecyclePolicyPort>,
-    ) -> Self {
-        Self {
-            shells,
-            commands,
-            transfers,
-            sessions,
-            forwards,
-            subscribers,
-            lifecycle,
-            lane: None,
-        }
-    }
-
-    /// Install the v5 Phase 2 [`LaneAdmin`] handle.
-    #[must_use]
-    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
-        self.lane = Some(lane);
-        self
-    }
-
-    /// Drive the subscribe orchestration.
-    ///
-    /// # Errors
-    ///
-    /// Same as the non-feature build, plus
-    /// [`DomainError::ForwardNotFound`] is surfaced only if the inbound
-    /// adapter has a stricter policy — the v3 default behaviour accepts
-    /// every forward URI so subscribers can attach to a freshly minted
-    /// forwarder before the producer publishes the first event.
-    pub async fn execute(
-        &self,
-        req: SubscribeResourceRequest,
-    ) -> Result<SubscribeResourceOutcome, DomainError> {
-        let parsed =
-            parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
-        ensure_exists_with_forward(
-            parsed.kind,
-            &parsed.id,
-            &*self.shells,
-            &*self.commands,
-            &*self.transfers,
-            &*self.sessions,
-            &*self.forwards,
         )
         .await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
@@ -390,32 +268,6 @@ async fn ensure_session<SR: SessionRepository + Send + Sync>(
     Ok(())
 }
 
-#[cfg(feature = "port_forward")]
-async fn ensure_exists_with_forward<ShR, CR, TR, SR, FR>(
-    kind: ResourceKind,
-    id: &str,
-    shells: &ShR,
-    commands: &CR,
-    transfers: &TR,
-    sessions: &SR,
-    forwards: &FR,
-) -> Result<(), DomainError>
-where
-    ShR: ShellRepository + Send + Sync,
-    CR: CommandRepository + Send + Sync,
-    TR: TransferRepository + Send + Sync,
-    SR: SessionRepository + Send + Sync,
-    FR: ForwardRepository + Send + Sync,
-{
-    // Forward arm: see `ensure_exists` for the permissive rationale.
-    // The `forwards` reference is intentionally unused so the use case
-    // stays generic over `FR`; flip to `forwards.get(...)?` here when
-    // a stricter existence check is desired.
-    let forwards_unused: &FR = forwards;
-    let _ = forwards_unused;
-    ensure_exists(kind, id, shells, commands, transfers, sessions).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SubscribeResourceRequest, SubscribeResourceUseCase};
@@ -442,9 +294,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Duration;
-
-    #[cfg(feature = "port_forward")]
-    use crate::adapters::repo::dashmap::forward::DashMapForwardRepo;
 
     #[derive(Debug)]
     struct StubPeer {
@@ -525,17 +374,6 @@ mod tests {
         async fn drop_peer(&self, _peer_id: &PeerId) {}
     }
 
-    #[cfg(feature = "port_forward")]
-    type UseCaseUnderTest = SubscribeResourceUseCase<
-        DashMapShellRepo,
-        DashMapCommandRepo,
-        DashMapTransferRepo,
-        DashMapSessionRepo,
-        DashMapForwardRepo,
-        RecordingRegistry,
-    >;
-
-    #[cfg(not(feature = "port_forward"))]
     type UseCaseUnderTest = SubscribeResourceUseCase<
         DashMapShellRepo,
         DashMapCommandRepo,
@@ -558,24 +396,11 @@ mod tests {
         let commands = Arc::new(DashMapCommandRepo::new());
         let transfers = Arc::new(DashMapTransferRepo::new());
         let sessions = Arc::new(DashMapSessionRepo::new());
-        #[cfg(feature = "port_forward")]
-        let forwards = Arc::new(DashMapForwardRepo::new());
         let registry = Arc::new(RecordingRegistry::default());
         let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
         let clock = Arc::new(crate::adapters::clock::system::SystemClock);
         let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
             crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
-        #[cfg(feature = "port_forward")]
-        let uc = SubscribeResourceUseCase::new(
-            Arc::clone(&shells),
-            Arc::clone(&commands),
-            Arc::clone(&transfers),
-            Arc::clone(&sessions),
-            Arc::clone(&forwards),
-            Arc::clone(&registry),
-            lifecycle,
-        );
-        #[cfg(not(feature = "port_forward"))]
         let uc = SubscribeResourceUseCase::new(
             Arc::clone(&shells),
             Arc::clone(&commands),
@@ -809,8 +634,6 @@ mod tests {
         let commands = Arc::new(DashMapCommandRepo::new());
         let transfers = Arc::new(DashMapTransferRepo::new());
         let sessions = Arc::new(DashMapSessionRepo::new());
-        #[cfg(feature = "port_forward")]
-        let forwards = Arc::new(DashMapForwardRepo::new());
         let registry = Arc::new(RecordingRegistry::default());
         let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
         let clock = Arc::new(crate::adapters::clock::system::SystemClock);
@@ -818,18 +641,6 @@ mod tests {
             crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
         let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> =
             SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
-        #[cfg(feature = "port_forward")]
-        let uc = SubscribeResourceUseCase::new(
-            Arc::clone(&shells),
-            Arc::clone(&commands),
-            Arc::clone(&transfers),
-            Arc::clone(&sessions),
-            Arc::clone(&forwards),
-            Arc::clone(&registry),
-            lifecycle,
-        )
-        .with_subscriber_lane(lane);
-        #[cfg(not(feature = "port_forward"))]
         let uc = SubscribeResourceUseCase::new(
             Arc::clone(&shells),
             Arc::clone(&commands),

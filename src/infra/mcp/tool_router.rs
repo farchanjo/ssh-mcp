@@ -31,6 +31,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use serde_json::Value as JsonValue;
 
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
@@ -115,7 +116,6 @@ use crate::ports::auth_strategy::AuthStrategyPort;
 use crate::ports::clock::ClockPort;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::config::ConfigPort;
-#[cfg(feature = "port_forward")]
 use crate::ports::forward_repo::ForwardRepository;
 use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::{NotifierPort, PeerHandle};
@@ -327,6 +327,10 @@ async fn collect_forward_suggestions(target: &str, lister: &dyn IdLister) -> Vec
 }
 
 #[cfg(not(feature = "port_forward"))]
+#[expect(
+    clippy::unused_async,
+    reason = "async parity with the port_forward variant, which awaits lister.list_forwards(); the shared call site awaits this fn"
+)]
 async fn collect_forward_suggestions(_target: &str, _lister: &dyn IdLister) -> Vec<String> {
     Vec::new()
 }
@@ -1454,10 +1458,15 @@ fn run_daemon_stats(use_case: &DaemonStatsUseCase) -> CallToolResult {
 }
 
 // ---------------------------------------------------------------------------
-// `#[tool_router]` impl — `port_forward` enabled
+// `#[tool_router]` impl — base router (all tools except `ssh_forward`)
 // ---------------------------------------------------------------------------
+//
+// Single, always-compiled impl. The `ssh_forward` tool lives in a separate
+// `port_forward`-gated `#[tool_router(router = forward_router)]` impl below
+// and is merged in via `combined_tool_router`; the rmcp `#[tool_router]`
+// macro does not propagate `#[cfg]` onto its generated route table, so a
+// gated tool cannot live inside this shared block.
 
-#[cfg(feature = "port_forward")]
 #[tool_router]
 impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
     McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
@@ -2319,53 +2328,6 @@ where
         .await
     }
 
-    // ---------- Forward domain --------------------------------------
-
-    #[tool(
-        title = "Forward TCP port",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false
-        ),
-        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n- IMMEDIATELY after the forwarder is up, call `sub_open uri=forward://<FORWARD_ID>/events` for live accept/connect/close pushes — strictly preferred over polling resources/read.\n\nImportant identifiers in response:\n- `FORWARD_ID`: target of `sub_open uri=forward://<FORWARD_ID>/events` (PREFERRED — push event log).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_forward session_id=... local_port=... remote_address=... remote_port=...\n3. sub_open uri=forward://<FORWARD_ID>/events (PREFERRED — push lifecycle events).\n4. Connect local clients to localhost:<local_port>; observe accept/connect/close events on the lane.\n5. ssh_disconnect (cascades to forwarder teardown) or close session — sub_close lane.\n\nOverlap guidance:\n- Prefer ssh_forward for tunnelled TCP. For ad-hoc port use, prefer the underlying ssh_exec + remote daemon if you control both endpoints.\n- Cascading teardown via ssh_disconnect is simpler than tracking individual FORWARD_IDs in long-running agents.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward.",
-        output_schema = schema_for_type::<SshForwardResult>()
-    )]
-    async fn ssh_forward(
-        &self,
-        Parameters(args): Parameters<SshForwardArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_forward",
-            fingerprint_args(&args),
-            || async {
-                let req = ForwardPortRequest {
-                    session_id: SessionId::new(args.session_id),
-                    local_port: args.local_port,
-                    remote_address: args.remote_address,
-                    remote_port: args.remote_port,
-                };
-                match self.use_cases.forward_port.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::forward::forward_structured(&outcome);
-                        let body = render::forward::forward_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => {
-                        Ok(
-                            render_tool_error_smart("SSH_FORWARD", &err, self.id_lister.as_ref())
-                                .await,
-                        )
-                    }
-                }
-            },
-        )
-        .await
-    }
-
     // ---------- Subscription administration (v5 Phase 3) -------------
 
     #[tool(
@@ -2740,13 +2702,19 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// `#[tool_router]` impl — `port_forward` disabled
+// `#[tool_router]` impl — `ssh_forward` (only when `port_forward` is enabled)
 // ---------------------------------------------------------------------------
+//
+// Generates a separate `forward_router()` that `combined_tool_router` merges
+// onto the base `tool_router()`. Kept apart from the base impl because the
+// rmcp `#[tool_router]` macro emits an unconditional `.with_route(...)` per
+// `#[tool]` fn — a `#[cfg]`-gated tool inside the base block would reference a
+// route that does not exist when the feature is off.
 
-#[cfg(not(feature = "port_forward"))]
-#[tool_router]
-impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
-    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
+#[cfg(feature = "port_forward")]
+#[tool_router(router = forward_router)]
+impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
+    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
 where
     S: SshClientPort + Send + Sync + 'static,
     F: SftpClientPort + Send + Sync + 'static,
@@ -2754,6 +2722,7 @@ where
     CR: CommandRepository + Send + Sync + 'static,
     ShR: ShellRepository + Send + Sync + 'static,
     TR: TransferRepository + Send + Sync + 'static,
+    FR: ForwardRepository + Send + Sync + 'static,
     N: NotifierPort + Send + Sync + 'static,
     AS: AuthStrategyPort + Send + Sync + 'static,
     OS: OutputStreamPort + Send + Sync + 'static,
@@ -2766,218 +2735,44 @@ where
     Sfs: RsyncSftpFsPort + Send + Sync + 'static,
     Rs: RsyncRepository + Send + Sync + 'static,
 {
-    /// Build an [`McpSshServer`] with the provided container, peer
-    /// table, and shared idempotency cache.
-    #[must_use]
-    #[allow(
-        clippy::type_complexity,
-        reason = "the Arc<UseCases<...>> generic surface is the natural shape of the production wiring; the prod alias `ProdUseCases` collapses it at the call site"
-    )]
-    pub fn new(
-        use_cases: Arc<
-            UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>,
-        >,
-        peer_table: Arc<PeerTable>,
-        idempotency: Arc<IdempotencyCache>,
-    ) -> Self {
-        Self::from_parts(use_cases, peer_table, idempotency)
-    }
-
-    // ---------- Connection domain ------------------------------------
+    // ---------- Forward domain --------------------------------------
 
     #[tool(
-        title = "Connect to SSH server",
+        title = "Forward TCP port",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Connect to an SSH server and store the session.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retried calls within the v4.7-step5 cache TTL.",
-        output_schema = schema_for_type::<SshConnectResult>()
-    )]
-    async fn ssh_connect(
-        &self,
-        Parameters(args): Parameters<SshConnectArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_connect",
-            fingerprint_args(&args),
-            || async { run_connect(self.use_cases.connect.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Disconnect SSH session",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Disconnect an SSH session.\n\nCost: O(1). Always succeeds.",
-        output_schema = schema_for_type::<SshDisconnectResult>()
-    )]
-    async fn ssh_disconnect(
-        &self,
-        Parameters(args): Parameters<SshDisconnectArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_disconnect",
-            fingerprint_args(&args),
-            || async {
-                match self
-                    .use_cases
-                    .disconnect
-                    .execute(DisconnectRequest {
-                        session_id: SessionId::new(args.session_id),
-                    })
-                    .await
-                {
-                    Ok(outcome) => {
-                        let structured = render::connection::disconnect_structured(&outcome);
-                        let body = render::connection::disconnect_render(&outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_DISCONNECT",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "List SSH sessions",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "List active SSH sessions.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
-        output_schema = schema_for_type::<SshSessionsResult>()
-    )]
-    async fn ssh_sessions(
-        &self,
-        Parameters(args): Parameters<SshSessionsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let filter = args.agent_id.clone();
-        match self
-            .use_cases
-            .list_sessions
-            .execute(ListSessionsRequest {
-                filter_agent_id: args.agent_id.map(AgentId::new),
-                max_items: args.max_items,
-            })
-            .await
-        {
-            Ok(outcome) => {
-                let alerts = self
-                    .leak_probe
-                    .as_ref()
-                    .map(|p| p.current_alerts())
-                    .unwrap_or_default();
-                let structured = render::connection::list_sessions_structured_with_warnings(
-                    &outcome,
-                    filter.as_deref(),
-                    &alerts,
-                );
-                let body = render::connection::list_sessions_render_with_warnings(outcome, &alerts);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => Ok(render_tool_error("SSH_SESSIONS", &err)),
-        }
-    }
-
-    #[tool(
-        title = "Disconnect all agent sessions",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Disconnect every session bound to a given agent.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
-        output_schema = schema_for_type::<SshDisconnectAgentResult>()
-    )]
-    async fn ssh_disconnect_agent(
-        &self,
-        Parameters(args): Parameters<SshDisconnectAgentArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_disconnect_agent",
-            fingerprint_args(&args),
-            || async {
-                match self
-                    .use_cases
-                    .disconnect_agent
-                    .execute(DisconnectAgentRequest {
-                        agent_id: AgentId::new(args.agent_id),
-                    })
-                    .await
-                {
-                    Ok(outcome) => {
-                        let structured = render::connection::disconnect_agent_structured(&outcome);
-                        let body = render::connection::disconnect_agent_render(&outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error("SSH_DISCONNECT_AGENT", &err)),
-                }
-            },
-        )
-        .await
-    }
-
-    // ---------- Execute domain ---------------------------------------
-
-    #[tool(
-        title = "Run remote command",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
             idempotent_hint = false
         ),
-        description = "Spawn an asynchronous command on an SSH session. Prefer subscribing to `command://<COMMAND_ID>/output` (push) over polling via ssh_exec_output.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
-        output_schema = schema_for_type::<SshExecResult>()
+        description = "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n- IMMEDIATELY after the forwarder is up, call `sub_open uri=forward://<FORWARD_ID>/events` for live accept/connect/close pushes — strictly preferred over polling resources/read.\n\nImportant identifiers in response:\n- `FORWARD_ID`: target of `sub_open uri=forward://<FORWARD_ID>/events` (PREFERRED — push event log).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_forward session_id=... local_port=... remote_address=... remote_port=...\n3. sub_open uri=forward://<FORWARD_ID>/events (PREFERRED — push lifecycle events).\n4. Connect local clients to localhost:<local_port>; observe accept/connect/close events on the lane.\n5. ssh_disconnect (cascades to forwarder teardown) or close session — sub_close lane.\n\nOverlap guidance:\n- Prefer ssh_forward for tunnelled TCP. For ad-hoc port use, prefer the underlying ssh_exec + remote daemon if you control both endpoints.\n- Cascading teardown via ssh_disconnect is simpler than tracking individual FORWARD_IDs in long-running agents.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward.",
+        output_schema = schema_for_type::<SshForwardResult>()
     )]
-    async fn ssh_exec(
+    async fn ssh_forward(
         &self,
-        Parameters(args): Parameters<SshExecArgs>,
+        Parameters(args): Parameters<SshForwardArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         with_idempotency(
             &self.idempotency,
             &ctx,
-            "ssh_exec",
+            "ssh_forward",
             fingerprint_args(&args),
             || async {
-                let req = ExecuteRequest {
+                let req = ForwardPortRequest {
                     session_id: SessionId::new(args.session_id),
-                    command: args.command,
-                    timeout: args.timeout_secs.map(Duration::from_secs),
-                    use_pty: args.pty.unwrap_or(false),
-                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
+                    local_port: args.local_port,
+                    remote_address: args.remote_address,
+                    remote_port: args.remote_port,
                 };
-                match self.use_cases.execute.execute(req).await {
+                match self.use_cases.forward_port.execute(req).await {
                     Ok(outcome) => {
-                        let structured = render::execute::execute_structured(&outcome);
-                        let body = render::execute::execute_render(outcome);
+                        let structured = render::forward::forward_structured(&outcome);
+                        let body = render::forward::forward_render(outcome);
                         Ok(ok_text_and_structured(body, structured))
                     }
                     Err(err) => {
                         Ok(
-                            render_tool_error_smart("SSH_EXEC", &err, self.id_lister.as_ref())
+                            render_tool_error_smart("SSH_FORWARD", &err, self.id_lister.as_ref())
                                 .await,
                         )
                     }
@@ -2986,990 +2781,44 @@ where
         )
         .await
     }
+}
 
-    #[tool(
-        title = "Get command output",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Fetch the current output of an asynchronous command. Polling fallback path; prefer sub_open `command://<COMMAND_ID>/output` for streaming.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
-        output_schema = schema_for_type::<SshExecOutputResult>()
-    )]
-    async fn ssh_exec_output(
-        &self,
-        Parameters(args): Parameters<SshExecOutputArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let req = GetCommandOutputRequest {
-            command_id: CommandId::new(args.command_id),
-            wait: args.wait.unwrap_or(false),
-            wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
-            max_output_bytes: args.max_output_bytes,
-        };
-        let emitter = ProgressEmitter::new(&ctx);
-        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
-        let use_case = self.use_cases.get_command_output.as_ref();
-        let streams = use_case.streams();
-        let outcome = drive_with_command_progress(use_case, streams, req, emitter).await;
-        leak_bridge.shutdown().await;
-        match outcome {
-            Ok(result) => {
-                let structured = render::execute::get_command_output_structured(&result);
-                let body = render::execute::get_command_output_render(result);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => {
-                Ok(render_tool_error_smart("SSH_EXEC_OUTPUT", &err, self.id_lister.as_ref()).await)
-            }
-        }
-    }
+// ---------------------------------------------------------------------------
+// Combined tool router — base router plus the optional `ssh_forward` route
+// ---------------------------------------------------------------------------
 
-    #[tool(
-        title = "List async commands",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "List asynchronous commands tracked on the server.\n\nCost: O(N) over async commands. Cheap.",
-        output_schema = schema_for_type::<SshCommandsResult>()
-    )]
-    async fn ssh_commands(
-        &self,
-        Parameters(args): Parameters<SshCommandsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let req = ListCommandsRequest {
-            filter_session_id: args.session_id.map(SessionId::new),
-            filter_status: args
-                .status
-                .map(super::args::execute::CommandStatus::into_domain),
-            max_items: args.max_items,
-        };
-        match self.use_cases.list_commands.execute(req).await {
-            Ok(outcome) => {
-                let alerts = self
-                    .leak_probe
-                    .as_ref()
-                    .map(|p| p.current_alerts())
-                    .unwrap_or_default();
-                let structured =
-                    render::execute::list_commands_structured_with_warnings(&outcome, &alerts);
-                let body = render::execute::list_commands_render_with_warnings(outcome, &alerts);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => Ok(render_tool_error("SSH_COMMANDS", &err)),
-        }
-    }
-
-    #[tool(
-        title = "Cancel running command",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Cancel an asynchronous command.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).",
-        output_schema = schema_for_type::<SshExecCancelResult>()
-    )]
-    async fn ssh_exec_cancel(
-        &self,
-        Parameters(args): Parameters<SshExecCancelArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_exec_cancel",
-            fingerprint_args(&args),
-            || async {
-                let req = CancelCommandRequest {
-                    command_id: CommandId::new(args.command_id),
-                    max_output_bytes: args.max_output_bytes,
-                };
-                match self.use_cases.cancel_command.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::execute::cancel_command_structured(&outcome);
-                        let body = render::execute::cancel_command_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_EXEC_CANCEL",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    // ---------- Shell domain -----------------------------------------
-
-    #[tool(
-        title = "Open PTY shell",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false
-        ),
-        description = "Open an interactive PTY shell.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
-        output_schema = schema_for_type::<SshShellOpenResult>()
-    )]
-    async fn ssh_shell_open(
-        &self,
-        Parameters(args): Parameters<SshShellOpenArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_shell_open",
-            fingerprint_args(&args),
-            || async {
-                let req = OpenShellRequest {
-                    session_id: SessionId::new(args.session_id),
-                    term: args.term,
-                    cols: args.cols,
-                    rows: args.rows,
-                    inactivity_ttl_secs: args.inactivity_ttl,
-                    max_buffer_size: parse_human_bytes(args.max_buffer_size.as_deref()),
-                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-                };
-                match self.use_cases.open_shell.execute(req).await {
-                    Ok(outcome) => {
-                        let streams = self.use_cases.read_shell.streams();
-                        let peek =
-                            peek_initial_shell_buffer(streams.as_ref(), &outcome.shell.id).await;
-                        let bytes_ref = peek.as_ref().map(|p| p.bytes.as_slice());
-                        let structured =
-                            render::shell::shell_open_structured_with_initial(&outcome, bytes_ref);
-                        let body =
-                            render::shell::shell_open_render_with_initial(outcome, bytes_ref);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_SHELL_OPEN",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Write to PTY shell",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Write raw bytes to a PTY shell.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response.",
-        output_schema = schema_for_type::<SshShellWriteResult>()
-    )]
-    async fn ssh_shell_write(
-        &self,
-        Parameters(args): Parameters<SshShellWriteArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_shell_write",
-            fingerprint_args(&args),
-            || async {
-                let req = WriteShellRequest {
-                    shell_id: ShellId::new(args.shell_id),
-                    bytes: Bytes::from(args.input.into_bytes()),
-                };
-                match self.use_cases.write_shell.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::shell::shell_write_structured(&outcome);
-                        let body = render::shell::shell_write_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_SHELL_WRITE",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Send keystroke to PTY",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response.",
-        output_schema = schema_for_type::<SshShellPressResult>()
-    )]
-    async fn ssh_shell_press(
-        &self,
-        Parameters(args): Parameters<SshShellPressArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_shell_press",
-            fingerprint_args(&args),
-            || async {
-                let req = SendKeyRequest {
-                    shell_id: ShellId::new(args.shell_id),
-                    key: args.key,
-                    modifiers: pick_modifiers(args.shift, args.alt, args.ctrl),
-                    repeat: args.repeat.unwrap_or(1),
-                };
-                match self.use_cases.send_key.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::shell::shell_send_key_structured(&outcome);
-                        let body = render::shell::shell_send_key_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_SHELL_PRESS",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Read PTY buffer",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Read the buffered output of a PTY shell. Polling fallback path; prefer sub_open `shell://<SHELL_ID>/output` for streaming.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.",
-        output_schema = schema_for_type::<SshShellReadResult>()
-    )]
-    async fn ssh_shell_read(
-        &self,
-        Parameters(args): Parameters<SshShellReadArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let cleared = args.clear.unwrap_or(true);
-        let req = ReadShellRequest {
-            shell_id: ShellId::new(args.shell_id),
-            clear: cleared,
-            max_output_bytes: args.max_output_bytes,
-            wait: args.wait.unwrap_or(false),
-            wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
-            min_bytes: args.min_bytes,
-        };
-        match self.use_cases.read_shell.execute(req).await {
-            Ok(outcome) => {
-                let structured = render::shell::shell_read_structured(&outcome, cleared);
-                let body = render::shell::shell_read_render(outcome);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => {
-                Ok(render_tool_error_smart("SSH_SHELL_READ", &err, self.id_lister.as_ref()).await)
-            }
-        }
-    }
-
-    #[tool(
-        title = "Wait for shell pattern",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Block until a substring pattern appears in the shell output.\n\nOverlap: 1-shot pattern gate (cheapest here). For streaming pattern matches, prefer sub_open `shell://<SHELL_ID>/output` with `filter=<pattern>`.\n\nCost: blocks up to timeout_secs. Use for single-shot prompt gating.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
-        output_schema = schema_for_type::<SshShellWaitForResult>()
-    )]
-    async fn ssh_shell_wait_for(
-        &self,
-        Parameters(args): Parameters<SshShellWaitForArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let req = WaitForPatternRequest {
-            shell_id: ShellId::new(args.shell_id),
-            patterns: args.patterns,
-            timeout: args.timeout_secs.map(Duration::from_secs),
-            max_output_bytes: args.max_output_bytes,
-            clear: args.clear.unwrap_or(true),
-        };
-        let emitter = ProgressEmitter::new(&ctx);
-        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
-        let outcome =
-            drive_with_wait_for_progress(self.use_cases.wait_for_pattern.as_ref(), req, emitter)
-                .await;
-        leak_bridge.shutdown().await;
-        match outcome {
-            Ok(outcome) => {
-                let structured = render::shell::shell_wait_for_structured(&outcome);
-                let body = render::shell::shell_wait_for_render(&outcome);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => {
-                Ok(
-                    render_tool_error_smart("SSH_SHELL_WAIT_FOR", &err, self.id_lister.as_ref())
-                        .await,
-                )
-            }
-        }
-    }
-
-    #[tool(
-        title = "Close PTY shell",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Close a PTY shell.\n\nCost: O(1). Always succeeds.",
-        output_schema = schema_for_type::<SshShellCloseResult>()
-    )]
-    async fn ssh_shell_close(
-        &self,
-        Parameters(args): Parameters<SshShellCloseArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_shell_close",
-            fingerprint_args(&args),
-            || async {
-                match self
-                    .use_cases
-                    .close_shell
-                    .execute(CloseShellRequest {
-                        shell_id: ShellId::new(args.shell_id),
-                    })
-                    .await
-                {
-                    Ok(outcome) => {
-                        let structured = render::shell::shell_close_structured(&outcome);
-                        let body = render::shell::shell_close_render(&outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => Ok(render_tool_error_smart(
-                        "SSH_SHELL_CLOSE",
-                        &err,
-                        self.id_lister.as_ref(),
-                    )
-                    .await),
-                }
-            },
-        )
-        .await
-    }
-
-    // ---------- SFTP domain ------------------------------------------
-
-    #[tool(
-        title = "Upload file via SFTP",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Upload a local file to the remote host via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
-        output_schema = schema_for_type::<SshUploadResult>()
-    )]
-    async fn ssh_upload(
-        &self,
-        Parameters(args): Parameters<SshUploadArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_upload",
-            fingerprint_args(&args),
-            || async {
-                let req = UploadRequest {
-                    session_id: SessionId::new(args.session_id),
-                    local_path: args.local_path,
-                    remote_path: args.remote_path,
-                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-                    resume: args.resume.unwrap_or(false),
-                    verify: args.verify.unwrap_or(false),
-                };
-                match self.use_cases.upload_file.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::sftp::upload_structured(&outcome);
-                        let body = render::sftp::upload_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => {
-                        Ok(
-                            render_tool_error_smart("SSH_UPLOAD", &err, self.id_lister.as_ref())
-                                .await,
-                        )
-                    }
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Download file via SFTP",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false
-        ),
-        description = "Download a remote file via SFTP.\n\nCost: O(file.size). Returns immediately, transfer runs async. Subscribe to transfer://<id>/progress.",
-        output_schema = schema_for_type::<SshDownloadResult>()
-    )]
-    async fn ssh_download(
-        &self,
-        Parameters(args): Parameters<SshDownloadArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_download",
-            fingerprint_args(&args),
-            || async {
-                let req = DownloadRequest {
-                    session_id: SessionId::new(args.session_id),
-                    remote_path: args.remote_path,
-                    local_path: args.local_path,
-                    lifecycle_policy: lifecycle_from_args(args.release_when_no_subs, args.grace_ms),
-                    resume: args.resume.unwrap_or(false),
-                    verify: args.verify.unwrap_or(false),
-                };
-                match self.use_cases.download_file.execute(req).await {
-                    Ok(outcome) => {
-                        let structured = render::sftp::download_structured(&outcome);
-                        let body = render::sftp::download_render(outcome);
-                        Ok(ok_text_and_structured(body, structured))
-                    }
-                    Err(err) => {
-                        Ok(
-                            render_tool_error_smart("SSH_DOWNLOAD", &err, self.id_lister.as_ref())
-                                .await,
-                        )
-                    }
-                }
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Get transfer progress",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Snapshot the progress of an SFTP transfer. Polling fallback path; prefer sub_open `transfer://<TRANSFER_ID>/progress` for live progress events.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
-        output_schema = schema_for_type::<SshTransferProgressResult>()
-    )]
-    async fn ssh_transfer_progress(
-        &self,
-        Parameters(args): Parameters<SshTransferProgressArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let req = GetTransferProgressRequest {
-            transfer_id: TransferId::new(args.transfer_id),
-            wait: args.wait.unwrap_or(false),
-            wait_timeout: args.wait_timeout_secs.map(Duration::from_secs),
-        };
-        let emitter = ProgressEmitter::new(&ctx);
-        let leak_bridge = spawn_leak_warn_bridge_if_wired(&emitter, self.leak_watcher.as_ref());
-        let use_case = self.use_cases.get_transfer_progress.as_ref();
-        let transfers = use_case.transfers();
-        let outcome = drive_with_transfer_progress(use_case, transfers, req, emitter).await;
-        leak_bridge.shutdown().await;
-        match outcome {
-            Ok(result) => {
-                let structured = render::sftp::transfer_progress_structured(&result);
-                let body = render::sftp::transfer_progress_render(&result);
-                Ok(ok_text_and_structured(body, structured))
-            }
-            Err(err) => {
-                Ok(
-                    render_tool_error_smart("SSH_TRANSFER_PROGRESS", &err, self.id_lister.as_ref())
-                        .await,
-                )
-            }
-        }
-    }
-
-    // ---------- v4.7-step3 convenience + batch tools -----------------
-
-    #[tool(
-        title = "Run remote command (one-shot)",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Connect, execute a short command synchronously, and (by default) disconnect.\n\nCost: 1 SSH handshake + 1 channel + (optional) disconnect. Returns when the command finishes or timeout_secs expires.",
-        output_schema = schema_for_type::<SshRunResult>()
-    )]
-    async fn ssh_run(
-        &self,
-        Parameters(args): Parameters<SshRunArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_run",
-            fingerprint_args(&args),
-            || async {
-                run_one_shot(
-                    self.use_cases.connect.as_ref(),
-                    self.use_cases.execute.as_ref(),
-                    self.use_cases.get_command_output.as_ref(),
-                    self.use_cases.disconnect.as_ref(),
-                    args,
-                )
-                .await
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Execute a batch of commands on one session",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Run up to 16 commands sequentially on a single session.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
-        output_schema = schema_for_type::<SshExecBatchResult>()
-    )]
-    async fn ssh_exec_batch(
-        &self,
-        Parameters(args): Parameters<SshExecBatchArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_exec_batch",
-            fingerprint_args(&args),
-            || async {
-                run_execute_batch(
-                    self.use_cases.execute.as_ref(),
-                    self.use_cases.get_command_output.as_ref(),
-                    args,
-                )
-                .await
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Disconnect multiple SSH sessions",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Best-effort bulk disconnect of up to 64 sessions.\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
-        output_schema = schema_for_type::<SshDisconnectManyResult>()
-    )]
-    async fn ssh_disconnect_many(
-        &self,
-        Parameters(args): Parameters<SshDisconnectManyArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_disconnect_many",
-            fingerprint_args(&args),
-            || async { run_disconnect_many(self.use_cases.disconnect.as_ref(), args).await },
-        )
-        .await
-    }
-
-    // ---------- Subscription administration (v5 Phase 3) -------------
-
-    #[tool(
-        title = "Subscribe to a resource lane",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false
-        ),
-        description = "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://`, `rsync://` without polling.\n- Strictly preferred over polling tools (ssh_shell_read, ssh_exec_output, ssh_transfer_progress, ssh_rsync_stats) for any stream with >1 expected delta.\n\nLag policies (decision matrix):\n- `snapshot` (default) — drop lane backlog, rebuild from per-resource ring buffer on next push. Zero loss while ring covers the gap; emits `LAG_DETECTED` otherwise. Pick for general observation.\n- `drop_oldest` — FIFO rotation when lane mpsc full. Marks `lagged`. Pick for tail logs / monitoring with gap tolerance.\n- `drop_newest` — drop new event when full. Pick when start-of-stream matters more than current.\n- `block_slow` — producer awaits drain. Zero loss, latency cost. Pick for audit / every-event-matters workloads.\n\nLifetime knobs:\n- `manual` (default) — close via sub_close.\n- `auto_close` — closes after `grace_ms` of consumer inactivity (default 2000).\n- `lease` — hard cap via `ttl_secs`.\n\nFilter:\n- Optional Rust-regex compiled at subscribe time; mutate live via sub_filter without re-opening.\n\nReplay:\n- sub_replay re-emits from `from_cursor` within the per-resource ring window. Independent of what the lane already dropped.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nWorkflow:\n1. Open the source resource (ssh_shell_open / ssh_exec / ssh_upload / ssh_rsync / serial_open / ssh_forward).\n2. sub_open uri=<scheme>://<id>/<lane> (returns SUB_ID).\n3. Await `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n4. sub_close sub_id=... (REQUIRED — leaks become SUB_LEAK_RISK).\n\nSuccessor tools:\n- sub_filter — mutate lane regex without re-subscribing\n- sub_pause / sub_resume — temporary throttle without dropping the lane\n- sub_replay — recover events dropped by lag_policy\n- sub_stats — diagnose drops + queue pressure\n- sub_close — cleanup (REQUIRED — leaks become SUB_LEAK_RISK)\n\nStatus values: OK.\n\nErrors: SUB_INVALID_FILTER (regex compile), SUB_LIMIT_EXCEEDED, RESOURCE_NOT_FOUND.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie (watcher emits SUB_LEAK_RISK).\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing."
-    )]
-    async fn sub_open(
-        &self,
-        Parameters(args): Parameters<SubOpenArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_open",
-            fingerprint_args(&args),
-            || async {
-                let peer: Option<Arc<dyn PeerHandle>> =
-                    Some(Arc::new(RmcpPeerHandle::resolve(&ctx, &self.peer_table)));
-                run_sub_subscribe(self.use_cases.sub_subscribe.as_ref(), args, peer).await
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Unsubscribe from a resource lane",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Close a Channel Mux lane previously opened with sub_open.\n\nCost: O(1)."
-    )]
-    async fn sub_close(
-        &self,
-        Parameters(args): Parameters<SubCloseArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_close",
-            fingerprint_args(&args),
-            || async { run_sub_unsubscribe(self.use_cases.sub_unsubscribe.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Pause a subscription lane",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Suspend lane drain.\n\nCost: O(1)."
-    )]
-    async fn sub_pause(
-        &self,
-        Parameters(args): Parameters<SubPauseArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_pause",
-            fingerprint_args(&args),
-            || async { run_sub_pause(self.use_cases.sub_pause.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Resume a subscription lane",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Resume lane drain.\n\nCost: O(1)."
-    )]
-    async fn sub_resume(
-        &self,
-        Parameters(args): Parameters<SubResumeArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_resume",
-            fingerprint_args(&args),
-            || async { run_sub_resume(self.use_cases.sub_resume.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Hot-reload a subscription filter",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Replace the lane regex filter.\n\nCost: 1 regex compile + atomic swap."
-    )]
-    async fn sub_filter(
-        &self,
-        Parameters(args): Parameters<SubFilterArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_filter",
-            fingerprint_args(&args),
-            || async { run_sub_filter(self.use_cases.sub_filter.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Replay a subscription lane from cursor",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Re-emit lane events from `from_cursor`.\n\nCost: O(window-bytes)."
-    )]
-    async fn sub_replay(
-        &self,
-        Parameters(args): Parameters<SubReplayArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "sub_replay",
-            fingerprint_args(&args),
-            || async { run_sub_replay(self.use_cases.sub_replay.as_ref(), args).await },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "List active subscription lanes",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Snapshot the per-`SubId` lane registry.\n\nCost: O(N) over open lanes."
-    )]
-    async fn sub_list(
-        &self,
-        Parameters(args): Parameters<SubListArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(run_sub_list(self.use_cases.sub_list.as_ref(), args))
-    }
-
-    #[tool(
-        title = "Snapshot subscription lane stats",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Per-lane atomic counter snapshot.\n\nCost: O(1)."
-    )]
-    async fn sub_stats(
-        &self,
-        Parameters(args): Parameters<SubStatsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(run_sub_stats(self.use_cases.sub_stats.as_ref(), args))
-    }
-
-    #[tool(
-        title = "Aggregate daemon-wide subscription stats",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Sum / max of every per-lane atomic counter.\n\nCost: O(N) over open lanes."
-    )]
-    async fn sub_stats_all(
-        &self,
-        Parameters(_args): Parameters<SubStatsAllArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(run_daemon_stats(self.use_cases.daemon_stats.as_ref()))
-    }
-
-    // -----------------------------------------------------------------------
-    // v5.2 — Serial transport (ADR 0009). Identical surface to the
-    // `port_forward = enabled` flavour above; mirrors so the
-    // catalogue stays consistent regardless of feature flags.
-    // -----------------------------------------------------------------------
-
-    #[tool(
-        title = "Open a serial port",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialOpenResult>()
-    )]
-    async fn serial_open(
-        &self,
-        Parameters(args): Parameters<SerialOpenArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_open(args))
-    }
-
-    #[tool(
-        title = "Close a serial port",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialCloseResult>()
-    )]
-    async fn serial_close(
-        &self,
-        Parameters(args): Parameters<SerialCloseArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "serial_close",
-            fingerprint_args(&args),
-            || async { Ok(serial_tool_helpers::run_serial_close(args)) },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Write to a serial port",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialWriteResult>()
-    )]
-    async fn serial_write(
-        &self,
-        Parameters(args): Parameters<SerialWriteArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_write(args))
-    }
-
-    #[tool(
-        title = "Send a named keystroke to a serial port",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialPressResult>()
-    )]
-    async fn serial_press(
-        &self,
-        Parameters(args): Parameters<SerialPressArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_send_key(args))
-    }
-
-    #[tool(
-        title = "List OS-visible serial devices",
-        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialListPortsResult>()
-    )]
-    async fn serial_scan(
-        &self,
-        Parameters(args): Parameters<SerialListPortsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_list_ports(&args))
-    }
-
-    #[tool(
-        title = "List currently open serial ports",
-        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true),
-        description = "See port_forward variant for full doc — same surface.",
-        output_schema = schema_for_type::<SerialListOpenResult>()
-    )]
-    async fn serial_active(
-        &self,
-        Parameters(args): Parameters<SerialListOpenArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(serial_tool_helpers::run_serial_list_open(&args))
-    }
-
-    // ---------- v7.0 — ADR 0011 rsync hybrid transport (stub) -------
-    //
-    // Mirror of the port_forward-enabled impl. Bodies return
-    // `RSYNC_NOT_IMPLEMENTED`; phases 5–10 wire the real path.
-
-    #[tool(
-        title = "Sync a directory tree over SSH (rsync)",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false
-        ),
-        description = "Drives a recursive sync over an existing SSH session. Both transports are LIVE: Wire (rsync v32 wire-compat, downgrades to v31 — openrsync-faithful port, byte-identical against rsync 3.2.x and 3.4.x) drives delta-sync via remote `rsync --server`; Sftp (universal fallback) walks plain SFTP for hosts without rsync v3.2+.\n\nTransport selection:\n- `transport=auto` (default) — probe the remote; rsync v31+ routes to the Wire transport (local advertises v32, downgrades to v31 against legacy servers), otherwise routes to the SFTP fallback.\n- `transport=wire` — force the wire-compat client (advertises v32, downgrades to v31); returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older than v3.2.0.\n- `transport=sftp` — universal fallback; drives plain SFTP `readdir` + `stat` + `read` + `write` + `setstat` against any host with a working SFTP subsystem.\n\nWhen to use:\n- Recursive directory mirror over SSH (with `--delete`, `--exclude`, `--bwlimit`, attribute preservation).\n- Delta-syncing large append-only files (logs, dumps, container layers) — only changed blocks cross the wire (Wire transport only).\n\nOverlap guidance:\n- Prefer ssh_rsync over chained ssh_upload calls when transferring >5 files or syncing a directory tree — single SSH channel + delta-sync (Wire) or capability-probed SFTP batch (Sftp).\n- For a single file, ssh_upload is simpler (no transport probe, no per-file lane events).\n- Cancel mid-flight via ssh_rsync_cancel; snapshot progress via ssh_rsync_stats (or PREFERRED — subscribe to `rsync://<RSYNC_ID>/progress`).\n\nIdentifiers:\n- `RSYNC_ID`: pass to ssh_rsync_stats (snapshot) and ssh_rsync_cancel (terminal cancel). ALSO subscribe via `sub_open uri=rsync://<RSYNC_ID>/progress` for live per-file + aggregate push events (PREFERRED over polling stats).\n\nWorkflow:\n1. ssh_connect.\n2. ssh_rsync (returns STARTED + RSYNC_ID).\n3. sub_open uri=rsync://<RSYNC_ID>/progress.\n4. Drain `notifications/resources/updated` events.\n5. sub_close + ssh_rsync_cancel (or wait for `SyncCompleted`).\n\nStatus values: STARTED.\n\nErrors: RSYNC_NOT_FOUND, RSYNC_VERSION_TOO_OLD, RSYNC_PROTOCOL_ERROR, RSYNC_FILE_LIST_TOO_LARGE, RSYNC_PARTIAL_TRANSFER, SFTP_FEATURE_MISSING, SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED.\n\nCost: O(N) over file count + delta bytes. Idempotency: pass `_meta.idempotency_key` to dedup retries."
-    )]
-    async fn ssh_rsync(
-        &self,
-        Parameters(args): Parameters<SshRsyncArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        with_idempotency(
-            &self.idempotency,
-            &ctx,
-            "ssh_rsync",
-            fingerprint_args(&args),
-            || async {
-                Ok(run_ssh_rsync(
-                    self.use_cases.rsync_sync.as_ref(),
-                    self.id_lister.as_ref(),
-                    args,
-                )
-                .await)
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        title = "Cancel an in-flight rsync session",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true
-        ),
-        description = "Cancel a running rsync session by RSYNC_ID. Flips the session aggregate to `Cancelled` and tears down the russh channel + reader/writer task pair. Idempotent: cancelling a missing or already-terminal session returns OK.\n\nWhen to use:\n- Operator-driven abort (subscribed lane shows runaway file list).\n- Cleanup before ssh_disconnect.\n\nOverlap guidance:\n- Prefer ssh_rsync_cancel for operator-driven abort. For natural completion, await the `SyncCompleted` event on the rsync://<RSYNC_ID>/progress lane instead.\n- Cancelling a session that already finished is a no-op (returns OK) — safe to call defensively.\n\nWorkflow:\n1. Look up RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_cancel.\n3. Drain any final lane events; sub_close.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND.\n\nCost: O(1) — flips status atom + drops russh channel handle. Always succeeds locally."
-    )]
-    async fn ssh_rsync_cancel(
-        &self,
-        Parameters(args): Parameters<SshRsyncCancelArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(run_ssh_rsync_cancel(
-            self.use_cases.rsync_sync.as_ref(),
-            self.id_lister.as_ref(),
-            args,
-        )
-        .await)
-    }
-
-    #[tool(
-        title = "Get rsync session stats",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        ),
-        description = "Snapshot stats for an in-flight or completed rsync session. Returns the live `RsyncStats` aggregate (files_total, files_done, files_deleted, files_failed, bytes_total, bytes_transferred, bytes_skipped) plus the current session status (pending / probing / running / completed / failed / cancelled).\n\nWhen to use:\n- Polling caller without a subscription lane.\n- Aggregate snapshot after `SyncCompleted` event for final summary.\n\nPush: subscribe to `rsync://<RSYNC_ID>/progress` instead of polling — same data flows through the lane debouncer at 200ms granularity.\n\nOverlap guidance:\n- Prefer sub_open uri=rsync://<RSYNC_ID>/progress over polling ssh_rsync_stats — the lane carries the same RsyncStats aggregate plus per-file events.\n- Use ssh_rsync_stats for one-shot final summary after `SyncCompleted` (or when no subscription lane is desired).\n\nWorkflow:\n1. Capture RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_stats.\n3. Inspect status field; loop or move on based on terminal vs running state.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND.\n\nCost: O(1) atomic loads — no network I/O."
-    )]
-    async fn ssh_rsync_stats(
-        &self,
-        Parameters(args): Parameters<SshRsyncStatsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(run_ssh_rsync_stats(
-            self.use_cases.rsync_sync.as_ref(),
-            self.id_lister.as_ref(),
-            args,
-        )
-        .await)
+impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>
+    McpSshServer<UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
+where
+    S: SshClientPort + Send + Sync + 'static,
+    F: SftpClientPort + Send + Sync + 'static,
+    SR: SessionRepository + Send + Sync + 'static,
+    CR: CommandRepository + Send + Sync + 'static,
+    ShR: ShellRepository + Send + Sync + 'static,
+    TR: TransferRepository + Send + Sync + 'static,
+    FR: ForwardRepository + Send + Sync + 'static,
+    N: NotifierPort + Send + Sync + 'static,
+    AS: AuthStrategyPort + Send + Sync + 'static,
+    OS: OutputStreamPort + Send + Sync + 'static,
+    SubR: SubscriberRegistryPort + SubscriberRegistryAsync + Send + Sync + 'static,
+    C: ClockPort + Send + Sync + 'static,
+    Cfg: ConfigPort + Send + Sync + 'static,
+    Idg: IdGeneratorPort + Send + Sync + 'static,
+    W: RsyncTransportPort + Send + Sync + 'static,
+    Sf: RsyncTransportPort + Send + Sync + 'static,
+    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
+    Rs: RsyncRepository + Send + Sync + 'static,
+{
+    /// Compose the always-on base [`ToolRouter`] with the feature-gated
+    /// `ssh_forward` router. With `port_forward` disabled this is exactly the
+    /// base router; enabled, it merges the single `ssh_forward` route so the
+    /// [`ServerHandler`] `#[tool_handler]` sees the full catalogue.
+    fn combined_tool_router() -> ToolRouter<Self> {
+        #[cfg(feature = "port_forward")]
+        let router = Self::tool_router() + Self::forward_router();
+        #[cfg(not(feature = "port_forward"))]
+        let router = Self::tool_router();
+        router
     }
 }
 
@@ -5253,8 +4102,7 @@ lines and EXPIRES_AT. Pass _meta.idempotency_key on retries to dedup.";
 // `#[tool_handler]` impl
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "port_forward")]
-#[tool_handler]
+#[tool_handler(router = Self::combined_tool_router())]
 impl<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs> ServerHandler
     for McpSshServer<
         UseCases<S, F, SR, CR, ShR, TR, FR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>,
@@ -5280,153 +4128,14 @@ where
     Rs: RsyncRepository + Send + Sync + 'static,
 {
     fn get_info(&self) -> ServerInfo {
+        #[cfg(feature = "port_forward")]
+        let instructions = INSTRUCTIONS_WITH_FORWARD;
+        #[cfg(not(feature = "port_forward"))]
+        let instructions = INSTRUCTIONS_WITHOUT_FORWARD;
         ServerInfo::new(server_capabilities())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(build_implementation())
-            .with_instructions(INSTRUCTIONS_WITH_FORWARD)
-    }
-
-    async fn initialize(
-        &self,
-        request: InitializeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<InitializeResult, McpError> {
-        // rmcp's default `initialize` stashes the peer info on
-        // first arrival — preserve that contract before recording.
-        if context.peer.peer_info().is_none() {
-            context.peer.set_peer_info(request.clone());
-        }
-        if let Some(registry) = self.capability_registry.as_ref() {
-            record_inline_push_capability(registry, &self.peer_table, &context, &request);
-        }
-        Ok(self.get_info())
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, McpError> {
-        let mut result = resource_handlers::list_resources_impl(
-            &self.use_cases.list_resources,
-            self.leak_probe.as_ref(),
-        )
-        .await?;
-        // ADR 0011 — splice in live `rsync://<id>/progress` URIs so
-        // host enumerations see every active session.
-        resource_handlers::attach_rsync_resources(&mut result, &self.use_cases.rsync_sync)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(result)
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult::with_all_items(
-            resource_templates::build_list(),
-        ))
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        // ADR 0011 — short-circuit `rsync://<id>/progress` reads
-        // before falling through to the generic dispatcher.
-        if let Some(outcome) =
-            resource_handlers::try_rsync_read(&self.use_cases.rsync_sync, &request.uri).await
-        {
-            return outcome
-                .map(|content| ReadResourceResult::new(vec![content]))
-                .map_err(|e| resource_handlers::map_rsync_read_error(&e));
-        }
-        resource_handlers::read_resource_impl(
-            &self.use_cases.read_resource,
-            request,
-            &context,
-            &self.peer_table,
-        )
-        .await
-    }
-
-    async fn subscribe(
-        &self,
-        request: SubscribeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        resource_handlers::subscribe_impl(
-            &self.use_cases.subscribe_resource,
-            request,
-            &context,
-            &self.peer_table,
-        )
-        .await
-    }
-
-    async fn unsubscribe(
-        &self,
-        request: UnsubscribeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        resource_handlers::unsubscribe_impl(
-            &self.use_cases.unsubscribe_resource,
-            request,
-            &context,
-            &self.peer_table,
-        )
-        .await
-    }
-
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, McpError> {
-        Ok(ListPromptsResult::with_all_items(prompts::list_prompts()))
-    }
-
-    async fn get_prompt(
-        &self,
-        request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
-        let args = request.arguments.unwrap_or_default();
-        prompts::get_prompt(&request.name, &args)
-    }
-}
-
-#[cfg(not(feature = "port_forward"))]
-#[tool_handler]
-impl<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs> ServerHandler
-    for McpSshServer<UseCases<S, F, SR, CR, ShR, TR, N, AS, OS, SubR, C, Cfg, Idg, W, Sf, Sfs, Rs>>
-where
-    S: SshClientPort + Send + Sync + 'static,
-    F: SftpClientPort + Send + Sync + 'static,
-    SR: SessionRepository + Send + Sync + 'static,
-    CR: CommandRepository + Send + Sync + 'static,
-    ShR: ShellRepository + Send + Sync + 'static,
-    TR: TransferRepository + Send + Sync + 'static,
-    N: NotifierPort + Send + Sync + 'static,
-    AS: AuthStrategyPort + Send + Sync + 'static,
-    OS: OutputStreamPort + Send + Sync + 'static,
-    SubR: SubscriberRegistryPort + SubscriberRegistryAsync + Send + Sync + 'static,
-    C: ClockPort + Send + Sync + 'static,
-    Cfg: ConfigPort + Send + Sync + 'static,
-    Idg: IdGeneratorPort + Send + Sync + 'static,
-    W: RsyncTransportPort + Send + Sync + 'static,
-    Sf: RsyncTransportPort + Send + Sync + 'static,
-    Sfs: RsyncSftpFsPort + Send + Sync + 'static,
-    Rs: RsyncRepository + Send + Sync + 'static,
-{
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(server_capabilities())
-            .with_protocol_version(ProtocolVersion::V_2025_06_18)
-            .with_server_info(build_implementation())
-            .with_instructions(INSTRUCTIONS_WITHOUT_FORWARD)
+            .with_instructions(instructions)
     }
 
     async fn initialize(
