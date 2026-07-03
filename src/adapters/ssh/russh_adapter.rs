@@ -875,10 +875,11 @@ impl SshClientPort for RusshAdapter {
     }
 
     async fn close_forward(&self, local_port: u16) -> Result<(), DomainError> {
-        if let Some((_, record)) = self.forwards.remove(&local_port) {
-            record.cancel.cancel();
-            record.accept_handle.abort();
-        }
+        let Some((_, record)) = self.forwards.remove(&local_port) else {
+            return Err(DomainError::ForwardPortNotFound(local_port));
+        };
+        record.cancel.cancel();
+        record.accept_handle.abort();
         Ok(())
     }
 }

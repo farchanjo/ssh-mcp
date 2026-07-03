@@ -245,6 +245,7 @@ mod tests {
             | DomainError::ShellNotFound(_)
             | DomainError::TransferNotFound(_)
             | DomainError::ForwardNotFound(_)
+            | DomainError::ForwardPortNotFound(_)
             | DomainError::SerialNotFound(_)
             | DomainError::Serial(_)
             | DomainError::MaxCommandsExceeded { .. }

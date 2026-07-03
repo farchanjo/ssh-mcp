@@ -34,6 +34,14 @@ pub enum DomainError {
     #[error("forward not found: {0}")]
     ForwardNotFound(ForwardId),
 
+    /// No forwarder is listening on the given local port. Distinct from
+    /// [`DomainError::ForwardNotFound`], which keys on the domain
+    /// `ForwardId` minted for `forward://` resource URIs — this variant
+    /// keys on the raw `local_port` used by [`crate::ports::ssh_client::SshClientPort::close_forward`],
+    /// which has no `ForwardId` in scope.
+    #[error("no forwarder listening on local port: {0}")]
+    ForwardPortNotFound(u16),
+
     /// An open serial port referenced by id was not found.
     /// v5.2 (ADR 0009).
     #[error("serial not found: {0}")]
