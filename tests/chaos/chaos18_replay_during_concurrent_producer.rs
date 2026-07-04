@@ -1,9 +1,10 @@
 //! Chaos 18 — replay during a concurrent producer.
 //!
 //! Producer emits at high rate while a parallel task issues
-//! `replay_from_cursor` calls. Requirement: the cursor advances
-//! monotonically (`fetch_max`) regardless of the interleaving and
-//! every replay completes deterministically.
+//! `replay_from_cursor` calls. Requirement (ADR 0012 replay-cursor fix):
+//! replay clamps to the live byte cursor and never advances it past
+//! production, the cursor never regresses under any interleaving, and
+//! every replay completes deterministically with no lost events.
 
 use std::sync::Arc;
 
@@ -54,8 +55,9 @@ async fn chaos18_replay_during_producer_keeps_cursor_monotonic() {
         }
     });
 
-    // Replay churner: requests cursors in a non-monotonic sequence so
-    // the adapter's `fetch_max` is genuinely exercised.
+    // Replay churner: requests cursors in a non-monotonic sequence, all
+    // beyond the live byte cursor. Each request must clamp to the live
+    // cursor (never advancing it) and never regress a prior observation.
     let replay_adapter = Arc::clone(&adapter);
     let replay_id = sub_id.clone();
     let replayer = tokio::spawn(async move {
@@ -84,9 +86,14 @@ async fn chaos18_replay_during_producer_keeps_cursor_monotonic() {
 
     producer.await.unwrap();
     let final_cursor = replayer.await.unwrap();
-    assert!(
-        final_cursor >= u64::from(REPLAYS - 1) * 3_u64,
-        "final cursor too low: {final_cursor}",
+    // Replay no longer advances the cursor via `fetch_max`; it clamps to
+    // the live byte cursor. `LaneMsg::Data` delivery does not byte-account
+    // the lane cursor, so every out-of-range replay target clamps to 0 —
+    // the point of the fix is precisely that a client-supplied cursor can
+    // never pin the shared byte-accumulator forward past production.
+    assert_eq!(
+        final_cursor, 0,
+        "replay must clamp to the live byte cursor, not advance past production: {final_cursor}",
     );
     // Lane unaffected by the replay race. Under Snapshot policy, each
     // produced event is either delivered (`events_sent`) or triggers
