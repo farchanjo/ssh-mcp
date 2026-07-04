@@ -31,13 +31,13 @@ fn chaos25_cascade_simultaneous_close_fires_hook_once() {
     }));
 
     let session = SessionId::new("cascade-many".to_string());
+    // The cascade coordinator is only notified for resources whose policy
+    // opts into session cascade (`cascade_session = true`); the default
+    // policy deliberately keeps legacy callers out of session teardown.
+    let mut policy = LifecyclePolicy::default();
+    policy.cascade_session = true;
     for i in 0..SHELLS {
-        adapter.track_resource(
-            ResourceKind::Shell,
-            &format!("sh-{i}"),
-            &session,
-            LifecyclePolicy::default(),
-        );
+        adapter.track_resource(ResourceKind::Shell, &format!("sh-{i}"), &session, policy);
     }
     assert_eq!(cascade.session_active_refs(&session), SHELLS);
 

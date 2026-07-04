@@ -54,6 +54,15 @@ use crate::ports::subscriber_registry::ResourceKind;
 /// Composite key used by the lifecycle store.
 type ResourceKey = (ResourceKind, String);
 
+/// Retention window (milliseconds) a [`LifecycleState::Closed`] entry is
+/// kept in the store before the leak-watcher eviction sweep drops it.
+///
+/// The window preserves the `on_subscribe`-after-close
+/// [`DomainError::ResourceGone`] contract: while the entry is present and
+/// `Closed`, a late subscribe still reports the resource gone; only after
+/// the entry is evicted does the call soften to the absent-entry no-op.
+pub const CLOSED_RETENTION_MS: u64 = 60_000;
+
 /// Read-only entry returned by [`RefcountedLifecycleAdapter::scan`].
 ///
 /// Used by the `SUB_LEAK_RISK` leak watcher (v5 Phase 3) to surface
@@ -102,6 +111,20 @@ pub struct ResourceLifecycle {
     /// `SUB_LEAK_RISK` leak watcher (Phase 3) reads it to flag resources
     /// that have stayed `Owned` past the warn threshold.
     created_at_ms: AtomicU64,
+    /// Wall-clock time (Unix-millis) at which the resource reached
+    /// [`LifecycleState::Closed`]. Stamped on every close transition
+    /// (`force_close` and the grace-timer fire); `0` while the resource is
+    /// still live. The leak-watcher eviction sweep reads it to enforce a
+    /// short retention window ([`CLOSED_RETENTION_MS`]) before dropping the
+    /// entry, keeping the `on_subscribe`-after-close `ResourceGone`
+    /// contract intact.
+    closed_at: AtomicU64,
+    /// Records whether this resource contributed a session refcount
+    /// increment at track time (i.e. `policy.cascade_session == true`).
+    /// Frozen at construction and mirrored on close so the cascade
+    /// inc/dec stays balanced even when a re-track swaps the policy — the
+    /// close side never decrements a ref it never incremented.
+    contributed_session_inc: bool,
 }
 
 impl fmt::Debug for ResourceLifecycle {
@@ -115,6 +138,8 @@ impl fmt::Debug for ResourceLifecycle {
             )
             .field("policy", &self.policy.load_full())
             .field("session_id", &self.session_id)
+            .field("closed_at", &self.closed_at.load(Ordering::Acquire))
+            .field("contributed_session_inc", &self.contributed_session_inc)
             .finish_non_exhaustive()
     }
 }
@@ -130,6 +155,10 @@ impl ResourceLifecycle {
             waker: Arc::new(Notify::new()),
             session_id,
             created_at_ms: AtomicU64::new(now_ms),
+            closed_at: AtomicU64::new(0),
+            // `LifecyclePolicy` is `Copy`, so reading the flag after moving
+            // `policy` into the `ArcSwap` is fine.
+            contributed_session_inc: policy.cascade_session,
         })
     }
 
@@ -139,6 +168,23 @@ impl ResourceLifecycle {
     #[must_use]
     pub fn created_at_ms(&self) -> u64 {
         self.created_at_ms.load(Ordering::Acquire)
+    }
+
+    /// Read the close timestamp (Unix-millis). `0` while the resource is
+    /// still live; stamped on the transition into
+    /// [`LifecycleState::Closed`]. The eviction sweep reads it to enforce
+    /// the [`CLOSED_RETENTION_MS`] retention window.
+    #[must_use]
+    pub fn closed_at(&self) -> u64 {
+        self.closed_at.load(Ordering::Acquire)
+    }
+
+    /// Whether this resource contributed a session refcount increment at
+    /// track time. Read on close so the cascade decrement mirrors the
+    /// increment, keeping the session accounting balanced.
+    #[must_use]
+    pub const fn contributed_session_inc(&self) -> bool {
+        self.contributed_session_inc
     }
 
     /// Decode the current state. Falls back to
@@ -219,6 +265,15 @@ impl ResourceLifecycle {
     #[must_use]
     pub const fn grace_until_ms_atomic(&self) -> &AtomicU64 {
         &self.grace_until_ms
+    }
+
+    /// Borrow the raw close-timestamp atomic. Used by the grace timer to
+    /// stamp the close time when it fires the `Releasing -> Closed`
+    /// transition, matching the stamp `force_close` writes on the manual
+    /// close path.
+    #[must_use]
+    pub const fn closed_at_atomic(&self) -> &AtomicU64 {
+        &self.closed_at
     }
 }
 
@@ -311,6 +366,27 @@ impl<C: ClockPort> RefcountedLifecycleAdapter<C> {
                 })
             })
             .collect()
+    }
+
+    /// Evict terminal resource entries and reaped-idle sessions to keep
+    /// the lock-free maps bounded on long-running daemons (BUG #18).
+    ///
+    /// A [`LifecycleState::Closed`] entry is retained until it has been
+    /// closed for longer than `retention_ms`. Within the window,
+    /// `on_subscribe` after close keeps returning
+    /// [`DomainError::ResourceGone`] (entry present + `Closed`); only once
+    /// the entry is dropped does the call soften to the absent-entry
+    /// no-op. Reaped, idle sessions are dropped from the cascade
+    /// coordinator in the same pass.
+    pub fn sweep_terminal(&self, retention_ms: u64) {
+        let now = self.now_ms();
+        self.resources.retain(|_key, entry| {
+            if entry.current_state() != LifecycleState::Closed {
+                return true;
+            }
+            now.saturating_sub(entry.closed_at()) <= retention_ms
+        });
+        self.cascade.sweep_reaped_sessions();
     }
 
     /// Drive `Owned -> Observed` or `Releasing -> Observed`. Returns
@@ -433,10 +509,16 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
         let now_ms = self.now_ms();
         let entry = ResourceLifecycle::new(session_clone, policy, now_ms);
         self.resources.insert(key, entry);
-        // First-time tracking debits the session refcount so the
-        // cascade coordinator knows the session has at least one
-        // active resource.
-        self.cascade.inc_session(session_id);
+        // First-time tracking debits the session refcount ONLY when the
+        // policy opts in to session cascade. `cascade_session == false`
+        // (the v4 default) keeps the resource out of the session's
+        // active-ref accounting so its close never triggers an
+        // auto-disconnect. The entry's frozen `contributed_session_inc`
+        // flag mirrors this decision on close so inc/dec stay balanced
+        // across a re-track policy swap.
+        if policy.cascade_session {
+            self.cascade.inc_session(session_id);
+        }
     }
 
     fn on_subscribe(&self, kind: ResourceKind, resource_id: &str) -> Result<(), DomainError> {
@@ -486,9 +568,17 @@ impl<C: ClockPort> LifecyclePolicyPort for RefcountedLifecycleAdapter<C> {
         let prev = entry.swap_state(LifecycleState::Closed);
         if !prev.is_terminal() {
             entry.grace_until_ms.store(0, Ordering::Release);
+            // Stamp the close time so the eviction sweep can apply the
+            // retention window before dropping the entry.
+            entry.closed_at.store(self.now_ms(), Ordering::Release);
             entry.waker.notify_one();
-            self.cascade
-                .on_resource_closed(kind, resource_id, entry.session_id());
+            // Only decrement the session refcount when this resource
+            // actually incremented it (frozen at track time), so the
+            // cascade dec mirrors the inc and never underflows a sibling.
+            if entry.contributed_session_inc() {
+                self.cascade
+                    .on_resource_closed(kind, resource_id, entry.session_id());
+            }
         }
         Ok(())
     }
@@ -700,8 +790,20 @@ mod tests {
     fn track_resource_inc_session_only_on_first_track() {
         let (a, _c, cascade) = build();
         let s = sess("s-1");
-        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
-        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
+        // cascade_session=true so the inc is actually issued; the re-track
+        // must be idempotent and not inc a second time.
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
         assert_eq!(cascade.session_active_refs(&s), 1);
     }
 
@@ -991,7 +1093,12 @@ mod tests {
     fn force_close_decrements_session_refcount_only_on_first_close() {
         let (a, _c, cascade) = build();
         let s = sess("s-x");
-        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
         assert_eq!(cascade.session_active_refs(&s), 1);
         a.force_close(ResourceKind::Shell, "sh-1").expect("c1");
         assert_eq!(cascade.session_active_refs(&s), 0);
@@ -1187,8 +1294,18 @@ mod tests {
     fn track_then_close_decrements_session_refs_to_zero() {
         let (a, _c, cascade) = build();
         let s = sess("s");
-        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
-        a.track_resource(ResourceKind::Command, "c-1", &s, LifecyclePolicy::default());
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        a.track_resource(
+            ResourceKind::Command,
+            "c-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
         assert_eq!(cascade.session_active_refs(&s), 2);
         a.force_close(ResourceKind::Shell, "sh-1").expect("c1");
         a.force_close(ResourceKind::Command, "c-1").expect("c2");
@@ -1248,8 +1365,18 @@ mod tests {
         let (a, _c, cascade) = build();
         let s1 = sess("s-1");
         let s2 = sess("s-2");
-        a.track_resource(ResourceKind::Shell, "sh-1", &s1, LifecyclePolicy::default());
-        a.track_resource(ResourceKind::Shell, "sh-2", &s2, LifecyclePolicy::default());
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s1,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-2",
+            &s2,
+            LifecyclePolicy::release_with_cascade(),
+        );
         assert_eq!(cascade.session_active_refs(&s1), 1);
         assert_eq!(cascade.session_active_refs(&s2), 1);
     }
@@ -1293,5 +1420,181 @@ mod tests {
         a.force_close(ResourceKind::Shell, "sh-1").expect("close");
         let snap = a.snapshot(ResourceKind::Shell, "sh-1").expect("snap");
         assert!(snap.state.is_terminal());
+    }
+
+    // --- BUG #2: cascade_session gates session cascade ---------------
+
+    #[test]
+    fn default_policy_close_does_not_cascade_disconnect() {
+        // BUG #2: cascade_session=false (the default) must keep the
+        // resource out of the session's active-ref accounting so a close
+        // never triggers the auto-disconnect hook.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (a, _c, cascade) = build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        cascade.install_auto_disconnect_hook(Arc::new(move |_| {
+            captured.fetch_add(1, Ordering::AcqRel);
+        }));
+        let s = sess("s-1");
+        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
+        // Default policy never inc'd the session.
+        assert_eq!(cascade.session_active_refs(&s), 0);
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "cascade_session=false must not auto-disconnect the session"
+        );
+    }
+
+    #[test]
+    fn cascade_policy_close_fires_disconnect_once() {
+        // Complement: cascade_session=true inc's the session and its close
+        // drives the auto-disconnect hook exactly once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (a, _c, cascade) = build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        cascade.install_auto_disconnect_hook(Arc::new(move |_| {
+            captured.fetch_add(1, Ordering::AcqRel);
+        }));
+        let s = sess("s-1");
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        assert_eq!(cascade.session_active_refs(&s), 1);
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        assert_eq!(cascade.session_active_refs(&s), 0);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn retrack_cascade_then_default_keeps_balance() {
+        // Edge: track cascade_session=true (inc), re-track cascade_session
+        // =false (policy swap). The contribution flag is frozen at track
+        // time so close still decrements exactly once — never a dec
+        // without a matching inc.
+        let (a, _c, cascade) = build();
+        let s = sess("s-1");
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        assert_eq!(cascade.session_active_refs(&s), 1);
+        // Swap to a non-cascade policy — must not inc again and must not
+        // drop the existing contribution.
+        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
+        assert_eq!(cascade.session_active_refs(&s), 1);
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        assert_eq!(
+            cascade.session_active_refs(&s),
+            0,
+            "close mirrors the frozen inc"
+        );
+    }
+
+    #[test]
+    fn retrack_default_then_cascade_never_decs_a_siblings_ref() {
+        // Reverse edge: track cascade_session=false (no inc), re-track
+        // cascade_session=true. The frozen flag stays false so close does
+        // NOT dec — no underflow, no phantom reap of a sibling's ref.
+        let (a, _c, cascade) = build();
+        let s = sess("s-1");
+        // A sibling holds a real cascade ref so an erroneous dec would be
+        // observable as a premature reap.
+        a.track_resource(
+            ResourceKind::Command,
+            "c-sib",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        assert_eq!(cascade.session_active_refs(&s), 1);
+        a.track_resource(ResourceKind::Shell, "sh-1", &s, LifecyclePolicy::default());
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        // Still only the sibling contributed.
+        assert_eq!(cascade.session_active_refs(&s), 1);
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        assert_eq!(
+            cascade.session_active_refs(&s),
+            1,
+            "close must not dec a ref it never inc'd"
+        );
+    }
+
+    // --- BUG #18: terminal-entry eviction sweep ---------------------
+
+    #[test]
+    fn sweep_terminal_retains_closed_within_window_then_evicts() {
+        let (a, c, _) = build();
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &sess("s"),
+            LifecyclePolicy::default(),
+        );
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        // Within the retention window the Closed entry survives and a late
+        // subscribe still reports ResourceGone.
+        a.sweep_terminal(super::CLOSED_RETENTION_MS);
+        assert!(a.entry(ResourceKind::Shell, "sh-1").is_some());
+        match a.on_subscribe(ResourceKind::Shell, "sh-1") {
+            Err(DomainError::ResourceGone(_)) => {}
+            other => panic!("expected ResourceGone, got {other:?}"),
+        }
+        // Past the retention window the entry is evicted.
+        c.advance(Duration::from_millis(super::CLOSED_RETENTION_MS + 1_000));
+        a.sweep_terminal(super::CLOSED_RETENTION_MS);
+        assert!(a.entry(ResourceKind::Shell, "sh-1").is_none());
+        // on_subscribe now softens to the absent-entry no-op.
+        assert!(a.on_subscribe(ResourceKind::Shell, "sh-1").is_ok());
+    }
+
+    #[test]
+    fn sweep_terminal_keeps_live_resources_regardless_of_age() {
+        let (a, c, _) = build();
+        a.track_resource(
+            ResourceKind::Shell,
+            "live",
+            &sess("s"),
+            LifecyclePolicy::default(),
+        );
+        c.advance(Duration::from_millis(120_000));
+        a.sweep_terminal(super::CLOSED_RETENTION_MS);
+        assert!(a.entry(ResourceKind::Shell, "live").is_some());
+    }
+
+    #[test]
+    fn sweep_terminal_drops_reaped_idle_sessions() {
+        let (a, _c, cascade) = build();
+        let s = sess("s-reap");
+        a.track_resource(
+            ResourceKind::Shell,
+            "sh-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        a.force_close(ResourceKind::Shell, "sh-1").expect("close");
+        assert!(cascade.is_session_reaped(&s));
+        a.sweep_terminal(super::CLOSED_RETENTION_MS);
+        // A brand-new inc after the drop starts from a fresh Active entry.
+        a.track_resource(
+            ResourceKind::Command,
+            "c-1",
+            &s,
+            LifecyclePolicy::release_with_cascade(),
+        );
+        assert!(!cascade.is_session_reaped(&s));
+        assert_eq!(cascade.session_active_refs(&s), 1);
     }
 }

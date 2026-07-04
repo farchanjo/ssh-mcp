@@ -38,6 +38,9 @@ async fn chaos27_grace_vs_close_closes_exactly_once() {
         let resource_id = format!("sh-grace-close-{iter}");
         let mut policy = LifecyclePolicy::release_with_default_grace();
         policy.grace_ms = GRACE_MS;
+        // Opt into session cascade so the auto-disconnect hook is notified
+        // on close — the default policy keeps cascade gated off.
+        policy.cascade_session = true;
         adapter.track_resource(ResourceKind::Shell, &resource_id, &session, policy);
         adapter
             .on_subscribe(ResourceKind::Shell, &resource_id)

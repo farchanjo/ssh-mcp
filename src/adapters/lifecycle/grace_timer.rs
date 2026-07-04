@@ -99,7 +99,7 @@ fn next_iteration<C: ClockPort>(
     }
     let now = current_now_ms(clock);
     if now >= until {
-        fire_close(kind, resource_id, lifecycle, cascade);
+        fire_close(kind, resource_id, lifecycle, cascade, now);
         return None;
     }
     let remaining = until.saturating_sub(now);
@@ -117,12 +117,12 @@ fn fire_close(
     resource_id: &str,
     lifecycle: &Arc<ResourceLifecycle>,
     cascade: &Arc<CascadeCoordinator>,
+    now_ms: u64,
 ) {
     // Atomically transition Releasing -> Closed. If the CAS fails
     // someone else (force_close or a concurrent grace task) already
     // closed the resource — exit silently.
-    let observed = lifecycle.current_state();
-    if observed != LifecycleState::Releasing {
+    if lifecycle.current_state() != LifecycleState::Releasing {
         return;
     }
     let cas_ok = lifecycle
@@ -137,10 +137,30 @@ fn fire_close(
     if !cas_ok {
         return;
     }
+    commit_close(kind, resource_id, lifecycle, cascade, now_ms);
+}
+
+/// Finalise a won `Releasing -> Closed` transition: clear the deadline,
+/// stamp the close time so the eviction sweep applies the same retention
+/// window as `force_close`, and — only when the resource contributed a
+/// session refcount at track time (`cascade_session`) — notify the
+/// cascade coordinator so the session decrement mirrors its increment.
+fn commit_close(
+    kind: ResourceKind,
+    resource_id: &str,
+    lifecycle: &Arc<ResourceLifecycle>,
+    cascade: &Arc<CascadeCoordinator>,
+    now_ms: u64,
+) {
     lifecycle
         .grace_until_ms_atomic()
         .store(0, Ordering::Release);
-    cascade.on_resource_closed(kind, resource_id, lifecycle.session_id());
+    lifecycle
+        .closed_at_atomic()
+        .store(now_ms, Ordering::Release);
+    if lifecycle.contributed_session_inc() {
+        cascade.on_resource_closed(kind, resource_id, lifecycle.session_id());
+    }
     trace!(%resource_id, "grace timer fired close");
 }
 
@@ -179,11 +199,13 @@ mod tests {
     }
 
     fn arm_release(a: &Arc<RefcountedLifecycleAdapter<FakeClock>>, kind: ResourceKind, id: &str) {
+        // cascade_session=true so the session inc is issued and the grace
+        // fire's cascade dec is actually exercised (BUG #2 gating).
         a.track_resource(
             kind,
             id,
             &sess("s"),
-            LifecyclePolicy::release_with_default_grace(),
+            LifecyclePolicy::release_with_cascade(),
         );
         a.on_subscribe(kind, id).expect("sub");
         a.on_unsubscribe(kind, id).expect("uns");
@@ -272,7 +294,7 @@ mod tests {
             ResourceKind::Shell,
             "sh-1",
             &s,
-            LifecyclePolicy::release_with_default_grace(),
+            LifecyclePolicy::release_with_cascade(),
         );
         a.on_subscribe(ResourceKind::Shell, "sh-1").expect("sub");
         a.on_unsubscribe(ResourceKind::Shell, "sh-1").expect("uns");
