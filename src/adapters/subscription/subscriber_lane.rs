@@ -330,6 +330,15 @@ pub struct SubscriberLaneAdapter<I: IdGeneratorPort> {
     /// `ArcSwap<Option<...>>` so the wiring can be installed after
     /// adapter construction without races.
     rx_sink: ArcSwap<Option<RxSink>>,
+    /// Sink fired on lane close so the composition root can unregister
+    /// the lane from the channel mux. Mirrors `rx_sink`; without it the
+    /// mux lane table leaks one entry per closed lane (BUG #3).
+    close_sink: ArcSwap<Option<CloseSink>>,
+    /// Reserve-style live lane count. CAS-incremented against
+    /// `max_total` BEFORE a lane is allocated and decremented in
+    /// `remove_lane`, so two concurrent opens cannot both slip past the
+    /// global cap through a racy `self.lanes.len()` read (BUG #25).
+    total_lanes: AtomicUsize,
 }
 
 impl<I: IdGeneratorPort + fmt::Debug> fmt::Debug for SubscriberLaneAdapter<I> {
@@ -347,6 +356,14 @@ impl<I: IdGeneratorPort + fmt::Debug> fmt::Debug for SubscriberLaneAdapter<I> {
 /// installs a sink that hands the receiver to the channel mux drain
 /// task. Tests can install a no-op sink.
 pub type RxSink = Box<dyn Fn(SubId, mpsc::Receiver<LaneMsg>) + Send + Sync>;
+
+/// Closure invoked when a lane closes.
+///
+/// The composition root installs a sink that unregisters the lane from
+/// the channel mux. Without it the mux lane table grows unbounded for the
+/// process lifetime because `close_lane` only drops the adapter-local
+/// maps.
+pub type CloseSink = Box<dyn Fn(&SubId) + Send + Sync>;
 
 impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// Build a fresh adapter.
@@ -369,6 +386,8 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
             max_per_uri,
             max_total,
             rx_sink: ArcSwap::from_pointee(None),
+            close_sink: ArcSwap::from_pointee(None),
+            total_lanes: AtomicUsize::new(0),
         })
     }
 
@@ -376,6 +395,22 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// previous sink without dropping in-flight lanes.
     pub fn install_rx_sink(&self, sink: RxSink) {
         self.rx_sink.store(Arc::new(Some(sink)));
+    }
+
+    /// Install the close sink. Idempotent: a later install replaces the
+    /// previous sink. Fired from `close_lane` after the lane is removed
+    /// so the composition root can drop the channel-mux registration
+    /// and bound the mux lane table (BUG #3).
+    pub fn install_close_sink(&self, sink: CloseSink) {
+        self.close_sink.store(Arc::new(Some(sink)));
+    }
+
+    /// Invoke the installed close sink (if any) for `sub_id`.
+    fn fire_close_sink(&self, sub_id: &SubId) {
+        let sink = self.close_sink.load_full();
+        if let Some(sink) = sink.as_ref() {
+            (sink)(sub_id);
+        }
     }
 
     /// Push a [`LaneMsg`] onto every lane currently bound to `uri`.
@@ -418,23 +453,33 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
         })
     }
 
-    fn ensure_uri_capacity(&self, uri: &str) -> Result<(), DomainError> {
-        if self.lanes.len() >= usize::from(self.max_total) {
-            return Err(DomainError::MaxSubsTotalExceeded {
+    /// Reserve one global lane slot, CAS-incrementing `total_lanes`
+    /// against `max_total`. Two concurrent opens can no longer both pass
+    /// a racy `self.lanes.len()` read (BUG #25). Release via
+    /// [`Self::release_total`] on any early return.
+    fn reserve_total(&self) -> Result<(), DomainError> {
+        let max = usize::from(self.max_total);
+        let updated =
+            self.total_lanes
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    (current < max).then_some(current + 1)
+                });
+        if updated.is_ok() {
+            Ok(())
+        } else {
+            Err(DomainError::MaxSubsTotalExceeded {
                 limit: self.max_total,
-            });
+            })
         }
-        let count = self.by_uri.get(uri).map_or(0, |entry| entry.value().len());
-        if count >= usize::from(self.max_per_uri) {
-            return Err(DomainError::MaxSubsPerUriExceeded {
-                uri: uri.to_string(),
-                limit: self.max_per_uri,
-            });
-        }
-        Ok(())
     }
 
-    fn allocate_lane(
+    /// Release a previously reserved global lane slot.
+    fn release_total(&self) {
+        self.total_lanes.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Build a fresh lane `Arc` without touching the registry maps.
+    fn build_lane_arc(
         &self,
         uri: &str,
         kind: ResourceKind,
@@ -451,18 +496,47 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
         } else {
             policy.buffer_size
         };
-        let lane = LaneState::build(
-            sub_id.clone(),
+        Arc::new(LaneState::build(
+            sub_id,
             kind,
             resource_id.to_string(),
             uri.to_string(),
             policy,
             capacity,
-        );
-        let lane_arc = Arc::new(lane);
-        self.lanes.insert(sub_id.clone(), Arc::clone(&lane_arc));
-        self.by_uri.entry(uri.to_string()).or_default().push(sub_id);
-        lane_arc
+        ))
+    }
+
+    /// Enforce the per-URI cap and insert the lane under ONE `by_uri`
+    /// shard write guard so the length check and the push are atomic on
+    /// that shard (BUG #25). The global slot is reserved separately via
+    /// [`Self::reserve_total`] before this call.
+    fn allocate_lane_checked(
+        &self,
+        uri: &str,
+        kind: ResourceKind,
+        resource_id: &str,
+        policy: LanePolicy,
+    ) -> Result<Arc<LaneState>, DomainError> {
+        let lane_arc = self.build_lane_arc(uri, kind, resource_id, policy);
+        let sub_id = lane_arc.sub_id.clone();
+        // One shard guard spans the cap check and the push. `self.lanes`
+        // is a distinct DashMap, so inserting into it under this guard
+        // cannot deadlock the `by_uri` shard; the lane is inserted only
+        // after the check passes, so a rejected open leaves no orphan.
+        // The guard is scoped to this block so it drops before the return
+        // (keeps the critical section tight).
+        {
+            let mut slot = self.by_uri.entry(uri.to_string()).or_default();
+            if slot.len() >= usize::from(self.max_per_uri) {
+                return Err(DomainError::MaxSubsPerUriExceeded {
+                    uri: uri.to_string(),
+                    limit: self.max_per_uri,
+                });
+            }
+            self.lanes.insert(sub_id.clone(), Arc::clone(&lane_arc));
+            slot.push(sub_id);
+        }
+        Ok(lane_arc)
     }
 
     async fn forward_rx(&self, lane: &LaneState) {
@@ -483,6 +557,8 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
         }
         // Empty entries get pruned eagerly so iteration stays cheap.
         self.by_uri.retain(|_, v| !v.is_empty());
+        // Release the reserved global slot now the lane is gone (BUG #25).
+        self.total_lanes.fetch_sub(1, Ordering::AcqRel);
         Some(lane)
     }
 }
@@ -545,10 +621,15 @@ fn lane_dispatch_drop_oldest(
         }
         Err(TrySendError::Full(_)) => {}
     }
-    // The mpsc was full — a real drop_oldest would pop the receiver
-    // side, but the lane never owns the receiver after open. Emit a
-    // `Lagged` marker, increment the drop counter, and try once more
-    // (some racing consumer may have drained between attempts).
+    // BUG #19: DropOldest cannot evict the HEAD from here. The lane
+    // handed its mpsc Receiver to the channel-mux drain task at open
+    // time, so the producer side only has `try_send` and cannot pop the
+    // oldest buffered event. Under sustained overflow this path
+    // therefore degrades to newest-drop — the same observable effect as
+    // DropNewest — plus a `Lagged` marker. True head-eviction needs a
+    // lane-owned ring buffer (tracked as a known limitation). We emit
+    // the marker, bump the drop counter, and retry once in case a racing
+    // consumer drained a slot between attempts.
     lane.atomics.record_drop();
     let _ = lane.tx.try_send(LaneMsg::Lagged { dropped: 1 });
     match lane.tx.try_send(msg) {
@@ -715,18 +796,32 @@ impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
         resource_id: String,
         policy: LanePolicy,
     ) -> Result<SubId, DomainError> {
-        self.ensure_uri_capacity(&uri)?;
-        // Validate filter regex before allocating any state.
+        // Validate the filter regex before reserving any capacity so a
+        // bad pattern never consumes a global slot.
         if let FilterRule::Regex(pattern) = &policy.filter {
             FilterPipeline::compile_regex(pattern)?;
         }
-        let lane = self.allocate_lane(&uri, kind, &resource_id, policy);
-        self.forward_rx(&lane).await;
-        Ok(lane.sub_id.clone())
+        // Reserve the global slot first (CAS), then enforce the per-URI
+        // cap atomically under one shard guard; release the reservation
+        // if the per-URI insert is rejected (BUG #25).
+        self.reserve_total()?;
+        match self.allocate_lane_checked(&uri, kind, &resource_id, policy) {
+            Ok(lane) => {
+                self.forward_rx(&lane).await;
+                Ok(lane.sub_id.clone())
+            }
+            Err(e) => {
+                self.release_total();
+                Err(e)
+            }
+        }
     }
 
     async fn close_lane(&self, sub_id: &SubId) -> Result<(), DomainError> {
         if self.remove_lane(sub_id).is_some() {
+            // BUG #3: drop the channel-mux registration too, else the
+            // mux lane table grows unbounded for the process lifetime.
+            self.fire_close_sink(sub_id);
             Ok(())
         } else {
             Err(DomainError::SubNotFound(sub_id.clone()))
@@ -765,16 +860,25 @@ impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
             || Err(DomainError::SubNotFound(sub_id.clone())),
             |entry| {
                 let lane = entry.value();
+                // BUG #5: `cursor` is client-controlled. The lane's
+                // `cursor` atomic doubles as the inline-push byte
+                // accumulator (`compose_inline_payload` fetch_adds it),
+                // so an out-of-range replay cursor must NOT pin it
+                // forward. Clamp the request to the bytes actually
+                // produced and emit the Snapshot from the clamped
+                // target; the live cursor is never advanced past
+                // production (no `fetch_max` here on purpose).
+                let produced = lane.cursor.load(Ordering::Relaxed);
+                let target = cursor.min(produced);
                 // Phase 2 emits a Snapshot marker so the consumer can
                 // refresh from the resource ring buffer. The actual
                 // bytes flow through the standard `produce` path on
                 // the next push.
                 let _ = lane.tx.try_send(LaneMsg::Snapshot {
-                    cursor,
+                    cursor: target,
                     delta: Vec::new(),
                 });
                 lane.atomics.record_recovery();
-                lane.cursor.fetch_max(cursor, Ordering::Relaxed);
                 Ok(())
             },
         )
@@ -975,7 +1079,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn replay_advances_cursor_monotonically() {
+    async fn replay_clamps_to_produced_cursor() {
+        // BUG #5: replay must not advance the shared byte cursor past the
+        // bytes actually produced, so a client-supplied `from_cursor`
+        // cannot pin the inline-push accumulator forward.
         let a = adapter();
         let sid = a
             .open_lane(
@@ -986,13 +1093,14 @@ mod tests {
             )
             .await
             .unwrap();
+        // Simulate 10 produced bytes so the live cursor sits at 10.
+        a.advance_cursor(&sid, "shell://x/output", 10);
+        // Replay within the produced window leaves the cursor untouched.
         a.replay_from_cursor(&sid, 5).await.unwrap();
-        assert_eq!(a.current_cursor(&sid, "shell://x/output"), 5);
-        a.replay_from_cursor(&sid, 3).await.unwrap();
-        // Cursor monotonic — 3 < 5, so still 5.
-        assert_eq!(a.current_cursor(&sid, "shell://x/output"), 5);
-        a.replay_from_cursor(&sid, 9).await.unwrap();
-        assert_eq!(a.current_cursor(&sid, "shell://x/output"), 9);
+        assert_eq!(a.current_cursor(&sid, "shell://x/output"), 10);
+        // An out-of-range replay cursor is clamped, never pinned forward.
+        a.replay_from_cursor(&sid, 100_000_000).await.unwrap();
+        assert_eq!(a.current_cursor(&sid, "shell://x/output"), 10);
     }
 
     #[tokio::test(flavor = "multi_thread")]

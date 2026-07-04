@@ -73,8 +73,16 @@ pub enum LagPolicy {
     /// Zero loss; latency cost grows with lag. Use for audit-class
     /// workloads where every event matters.
     BlockSlow,
-    /// Pop the oldest event from the lane, push the new event. Emit
-    /// a `lagged` marker. Use for monitoring with gap tolerance.
+    /// Intended to pop the oldest buffered event and push the new one,
+    /// emitting a `lagged` marker. Use for monitoring with gap tolerance.
+    ///
+    /// KNOWN LIMITATION (BUG #19): the lane hands its mpsc `Receiver` to
+    /// the channel-mux drain task at open time, so the producer side can
+    /// only `try_send` — it cannot pop the head of a full queue. When the
+    /// buffer is full this therefore degrades to newest-drop (the same
+    /// observable effect as [`Self::DropNewest`]) plus a `lagged` marker.
+    /// True head-eviction requires a lane-owned ring buffer and is
+    /// tracked as a follow-up.
     DropOldest,
     /// Ignore the new event when the lane is full. Emit a `lagged`
     /// marker. Use when historical context is more valuable than

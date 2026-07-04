@@ -333,6 +333,14 @@ pub fn build_use_cases() -> ProdWiring {
     subscriber_lane_adapter.install_rx_sink(Box::new(move |sub_id, rx| {
         mux_for_sink.register_lane(sub_id, rx);
     }));
+    // BUG #3: pair every `register_lane` with an `unregister_lane` on
+    // lane close, else the mux lane table grows unbounded for the
+    // process lifetime (`close_lane` previously only dropped the
+    // adapter-local maps).
+    let mux_for_close = Arc::clone(&channel_mux);
+    subscriber_lane_adapter.install_close_sink(Box::new(move |sub_id| {
+        mux_for_close.unregister_lane(sub_id);
+    }));
     let (mux_outbound_tx, _mux_outbound_rx) = mpsc::channel(resolve_mux_buffer());
     channel_mux.install_outbound(mux_outbound_tx);
     let lane_admin: Arc<dyn LaneAdmin> = lane_admin_from(&subscriber_lane_adapter);

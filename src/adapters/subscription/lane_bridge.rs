@@ -66,7 +66,7 @@ type InlineChannels = DashMap<String, mpsc::Sender<InlineDispatch>>;
 /// A pre-composed inline-push work item.
 ///
 /// ADR 0012 phase 9 (B2 ordering fix): the `seq`/`cursor_after` inside
-/// `payload` are minted synchronously on the producer thread by
+/// every fragment are minted synchronously on the producer thread by
 /// [`LaneFanoutBridge::prepare_inline_dispatch`]; the only work left is
 /// the async notifier send. BUG #6 fix: rather than one detached task
 /// per producer write (whose sends race on the multi-thread runtime and
@@ -76,7 +76,12 @@ type InlineChannels = DashMap<String, mpsc::Sender<InlineDispatch>>;
 struct InlineDispatch {
     lane: Arc<LaneState>,
     peer: Arc<dyn PeerHandle>,
-    payload: InlinePayload,
+    /// Pre-split, pre-numbered inline fragments. BUG #4 fix: the split
+    /// and the seq reservation happen together at compose time so a
+    /// multi-fragment write reserves EXACTLY as many seq slots as it
+    /// emits — a single `fetch_add(1)` would let a trailing fragment
+    /// reuse the next write's seq.
+    fragments: Vec<InlinePayload>,
 }
 
 /// Concrete [`LaneNotifierBridge`] implementation.
@@ -172,25 +177,38 @@ where
         lane: &LaneState,
         uri: &str,
         bytes_added: &[u8],
-    ) -> Option<InlinePayload> {
+        inline_max_bytes: usize,
+    ) -> Vec<InlinePayload> {
         if !lane.inline_push.load(Ordering::Acquire) {
-            return None;
+            return Vec::new();
         }
         if bytes_added.is_empty() {
-            return None;
+            return Vec::new();
         }
         let len = u64::try_from(bytes_added.len()).unwrap_or(u64::MAX);
-        let seq = lane.inline_seq.fetch_add(1, Ordering::Release);
         let prev = lane.cursor.fetch_add(len, Ordering::Release);
         let cursor_after = prev.saturating_add(len);
-        Some(InlinePayload::new(
+        // BUG #4 fix -- split FIRST (with a placeholder base seq), then
+        // reserve EXACTLY `fragments.len()` seq slots and renumber. The
+        // UTF-8 back-walk can yield more fragments than a
+        // `div_ceil(len, max)` estimate, so the count must come from the
+        // real split; a single `fetch_add(1)` would let a trailing
+        // fragment reuse the next write's seq.
+        let placeholder = InlinePayload::new(
             lane.sub_id.clone(),
             uri.to_string(),
-            seq,
+            0,
             cursor_after,
             bytes_added.to_vec(),
             false,
-        ))
+        );
+        let mut fragments = placeholder.split(inline_max_bytes, is_text_uri(uri));
+        let reserve = u64::try_from(fragments.len()).unwrap_or(u64::MAX);
+        let base = lane.inline_seq.fetch_add(reserve, Ordering::Release);
+        for (offset, fragment) in fragments.iter_mut().enumerate() {
+            fragment.seq = base.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+        }
+        fragments
     }
 
     /// Inline-aware fan-out. Phase 4 production caller is the trait
@@ -245,13 +263,15 @@ where
             let Some(peer) = lane.peer().map(Arc::clone) else {
                 continue;
             };
-            let Some(payload) = Self::compose_inline_payload(&lane, uri, bytes_added) else {
+            let fragments =
+                Self::compose_inline_payload(&lane, uri, bytes_added, self.inline_max_bytes);
+            if fragments.is_empty() {
                 continue;
-            };
+            }
             dispatches.push(InlineDispatch {
                 lane,
                 peer,
-                payload,
+                fragments,
             });
         }
         dispatches
@@ -261,16 +281,9 @@ where
         let Some(peer) = lane.peer().map(Arc::clone) else {
             return;
         };
-        let inline_payload = Self::compose_inline_payload(lane, uri, bytes_added);
-        if let Some(payload) = inline_payload {
-            Self::ship_inline_fragments(
-                &self.notifier,
-                self.inline_max_bytes,
-                lane,
-                Arc::clone(&peer),
-                payload,
-            )
-            .await;
+        let fragments = Self::compose_inline_payload(lane, uri, bytes_added, self.inline_max_bytes);
+        if !fragments.is_empty() {
+            Self::ship_inline_fragments(&self.notifier, lane, Arc::clone(&peer), fragments).await;
         }
         self.ship_legacy_notify(lane, peer, uri, bytes_added).await;
     }
@@ -279,23 +292,21 @@ where
         let Some(peer) = lane.peer().map(Arc::clone) else {
             return;
         };
-        let Some(payload) = Self::compose_inline_payload(lane, uri, bytes_added) else {
+        let fragments = Self::compose_inline_payload(lane, uri, bytes_added, self.inline_max_bytes);
+        if fragments.is_empty() {
             return;
-        };
-        Self::ship_inline_fragments(&self.notifier, self.inline_max_bytes, lane, peer, payload)
-            .await;
+        }
+        Self::ship_inline_fragments(&self.notifier, lane, peer, fragments).await;
     }
 
     async fn ship_inline_fragments(
         notifier: &Arc<N>,
-        inline_max_bytes: usize,
         lane: &LaneState,
         peer: Arc<dyn PeerHandle>,
-        payload: InlinePayload,
+        fragments: Vec<InlinePayload>,
     ) {
         let peer_id = peer.id();
-        let is_text = is_text_uri(&payload.uri);
-        for fragment in payload.split(inline_max_bytes, is_text) {
+        for fragment in fragments {
             let frag_len = fragment.bytes.len();
             let peer_for_frag = Arc::clone(&peer);
             if let Err(err) = notifier.notify_ssh_output(peer_for_frag, fragment).await {
@@ -392,10 +403,10 @@ where
         match tx.try_send(dispatch) {
             Err(TrySendError::Full(dropped)) => {
                 let policy = **dropped.lane.policy.load();
+                let base_seq = dropped.fragments.first().map_or(0, |f| f.seq);
                 debug!(
-                    "inline backpressure: lane {} channel full (policy {policy:?}, seq {}); dropping newest fragment to bound memory",
+                    "inline backpressure: lane {} channel full (policy {policy:?}, base seq {base_seq}); dropping newest fragments to bound memory",
                     dropped.lane.sub_id.as_str(),
-                    dropped.payload.seq
                 );
             }
             Ok(()) | Err(TrySendError::Closed(_)) => {}
@@ -408,10 +419,8 @@ where
         let notifier = Arc::clone(&self.notifier);
         let lanes = Arc::clone(&self.lanes);
         let channels = Arc::clone(&self.inline_channels);
-        let inline_max_bytes = self.inline_max_bytes;
         tokio::spawn(async move {
-            Self::run_inline_consumer(&notifier, &lanes, &channels, uri, inline_max_bytes, rx)
-                .await;
+            Self::run_inline_consumer(&notifier, &lanes, &channels, uri, rx).await;
         });
     }
 
@@ -433,13 +442,12 @@ where
         lanes: &Arc<SubscriberLaneAdapter<I>>,
         channels: &Arc<InlineChannels>,
         uri: String,
-        inline_max_bytes: usize,
         mut rx: mpsc::Receiver<InlineDispatch>,
     ) {
         loop {
             match timeout(INLINE_CONSUMER_IDLE_CHECK, rx.recv()).await {
                 Ok(Some(dispatch)) => {
-                    Self::ship_one(notifier, inline_max_bytes, dispatch).await;
+                    Self::ship_one(notifier, dispatch).await;
                 }
                 Ok(None) => break,
                 Err(_elapsed) => {
@@ -449,7 +457,7 @@ where
                         // The URI had no lanes; drain any last-moment
                         // enqueue for safety, then exit.
                         while let Ok(dispatch) = rx.try_recv() {
-                            Self::ship_one(notifier, inline_max_bytes, dispatch).await;
+                            Self::ship_one(notifier, dispatch).await;
                         }
                         break;
                     }
@@ -458,14 +466,14 @@ where
         }
     }
 
-    /// Ship a single pre-composed dispatch through the fragment splitter.
-    async fn ship_one(notifier: &Arc<N>, inline_max_bytes: usize, dispatch: InlineDispatch) {
+    /// Ship a single pre-composed dispatch's fragments in order.
+    async fn ship_one(notifier: &Arc<N>, dispatch: InlineDispatch) {
         let InlineDispatch {
             lane,
             peer,
-            payload,
+            fragments,
         } = dispatch;
-        Self::ship_inline_fragments(notifier, inline_max_bytes, &lane, peer, payload).await;
+        Self::ship_inline_fragments(notifier, &lane, peer, fragments).await;
     }
 }
 
@@ -642,8 +650,12 @@ mod tests {
             &lane,
             "shell://x/output",
             &[1, 2, 3],
+            DEFAULT_INLINE_MAX_BYTES,
         );
-        assert!(out.is_none(), "expected None when inline_push is off");
+        assert!(
+            out.is_empty(),
+            "expected no fragments when inline_push is off"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -651,12 +663,14 @@ mod tests {
         let a = adapter();
         let lane = open_lane(&a, StubPeer::new("p1"), "shell://x/output").await;
         lane.set_inline_push(true);
-        let payload = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
+        let fragments = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
             &lane,
             "shell://x/output",
             b"hello",
-        )
-        .expect("payload composed");
+            DEFAULT_INLINE_MAX_BYTES,
+        );
+        assert_eq!(fragments.len(), 1);
+        let payload = &fragments[0];
         assert_eq!(payload.bytes, b"hello".to_vec());
         assert_eq!(payload.uri, "shell://x/output");
         assert_eq!(payload.seq, 0);
@@ -673,23 +687,23 @@ mod tests {
             &lane,
             "shell://x/output",
             b"a",
-        )
-        .unwrap();
+            DEFAULT_INLINE_MAX_BYTES,
+        );
         let p1 = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
             &lane,
             "shell://x/output",
             b"b",
-        )
-        .unwrap();
+            DEFAULT_INLINE_MAX_BYTES,
+        );
         let p2 = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
             &lane,
             "shell://x/output",
             b"c",
-        )
-        .unwrap();
-        assert_eq!(p0.seq, 0);
-        assert_eq!(p1.seq, 1);
-        assert_eq!(p2.seq, 2);
+            DEFAULT_INLINE_MAX_BYTES,
+        );
+        assert_eq!(p0[0].seq, 0);
+        assert_eq!(p1[0].seq, 1);
+        assert_eq!(p2[0].seq, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -701,23 +715,52 @@ mod tests {
             &lane,
             "shell://x/output",
             &vec![0_u8; 10],
-        )
-        .unwrap();
+            DEFAULT_INLINE_MAX_BYTES,
+        );
         let p1 = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
             &lane,
             "shell://x/output",
             &vec![0_u8; 20],
-        )
-        .unwrap();
+            DEFAULT_INLINE_MAX_BYTES,
+        );
         let p2 = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
             &lane,
             "shell://x/output",
             &vec![0_u8; 5],
-        )
-        .unwrap();
-        assert_eq!(p0.cursor_after, 10);
-        assert_eq!(p1.cursor_after, 30);
-        assert_eq!(p2.cursor_after, 35);
+            DEFAULT_INLINE_MAX_BYTES,
+        );
+        assert_eq!(p0[0].cursor_after, 10);
+        assert_eq!(p1[0].cursor_after, 30);
+        assert_eq!(p2[0].cursor_after, 35);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_fragment_write_reserves_contiguous_non_overlapping_seq() {
+        // BUG #4 regression: a write that splits into N fragments must
+        // reserve N seq slots, so the NEXT write starts at base + N and
+        // never reuses a seq already assigned to a trailing fragment.
+        let a = adapter();
+        let lane = open_lane(&a, StubPeer::new("peer-bug4"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        // 64 KiB at a 32 KiB cap -> 2 fragments, seq 0 and 1.
+        let first = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
+            &lane,
+            "shell://x/output",
+            &vec![b'a'; 64 * 1024],
+            32 * 1024,
+        );
+        // The very next write must start at seq 2, not reuse seq 1.
+        let second = LaneFanoutBridge::<UuidIds, RecordingNotifier>::compose_inline_payload(
+            &lane,
+            "shell://x/output",
+            b"tail",
+            32 * 1024,
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].seq, 0);
+        assert_eq!(first[1].seq, 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].seq, 2, "next write must not reuse seq 1");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -740,15 +783,18 @@ mod tests {
 
         assert_eq!(first.len(), 1, "one opt-in lane -> one dispatch");
         assert_eq!(second.len(), 1, "one opt-in lane -> one dispatch");
+        // Small writes -> exactly one fragment each.
+        assert_eq!(first[0].fragments.len(), 1);
+        assert_eq!(second[0].fragments.len(), 1);
         // seq is producer-ordered: first write gets 0, second gets 1.
-        assert_eq!(first[0].payload.seq, 0);
-        assert_eq!(second[0].payload.seq, 1);
+        assert_eq!(first[0].fragments[0].seq, 0);
+        assert_eq!(second[0].fragments[0].seq, 1);
         // cursor accumulates in producer order: 4 then 4 + 6 = 10.
-        assert_eq!(first[0].payload.cursor_after, 4);
-        assert_eq!(second[0].payload.cursor_after, 10);
+        assert_eq!(first[0].fragments[0].cursor_after, 4);
+        assert_eq!(second[0].fragments[0].cursor_after, 10);
         // Payload bytes are preserved verbatim on each write.
-        assert_eq!(first[0].payload.bytes, b"AAAA".to_vec());
-        assert_eq!(second[0].payload.bytes, b"BBBBBB".to_vec());
+        assert_eq!(first[0].fragments[0].bytes, b"AAAA".to_vec());
+        assert_eq!(second[0].fragments[0].bytes, b"BBBBBB".to_vec());
     }
 
     #[tokio::test(flavor = "multi_thread")]

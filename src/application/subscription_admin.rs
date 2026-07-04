@@ -916,7 +916,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn replay_advances_cursor() {
+    async fn replay_clamps_cursor_to_live_position() {
+        // A client-supplied `from_cursor` beyond the lane's live byte cursor
+        // is clamped to the live position instead of pinning the shared
+        // inline byte-accumulator forward (ADR 0012 replay-cursor fix). On a
+        // fresh lane (live cursor 0), replay(from_cursor=100) resolves to 0.
         let adapter = lane_admin_concrete();
         let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
         let sub_id = adapter
@@ -937,8 +941,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.sub_id, sub_id);
+        // The use case echoes the requested cursor back to the caller...
         assert_eq!(outcome.from_cursor, 100);
-        assert_eq!(adapter.current_cursor(&sub_id, ""), 100);
+        // ...but the live lane cursor is clamped, never advanced past production.
+        assert_eq!(adapter.current_cursor(&sub_id, ""), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

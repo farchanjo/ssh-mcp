@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(m.active_lane_count(), 0);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn round_robin_drain_alternates_lanes() {
         let m = ChannelMuxAdapter::new();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<(SubId, LaneMsg)>(16);
@@ -292,16 +292,15 @@ mod tests {
             .unwrap();
         }
 
-        // Allow the drain to spin a few times.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
+        // Collect forwarded messages as the drain produces them (bounded
+        // per-recv wait) instead of racing a fixed sleep, which flaked under
+        // heavy parallel test load. Current-thread runtime schedules the
+        // drain task cooperatively when we await `recv`.
         let mut received = Vec::new();
-        while let Ok(Some((sid, _msg))) =
-            tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await
-        {
-            received.push(sid.as_str().to_string());
-            if received.len() >= 8 {
-                break;
+        while received.len() < 8 {
+            match tokio::time::timeout(Duration::from_secs(2), out_rx.recv()).await {
+                Ok(Some((sid, _msg))) => received.push(sid.as_str().to_string()),
+                Ok(None) | Err(_) => break,
             }
         }
         // Both lanes must have made progress (no starvation).
@@ -315,7 +314,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn aggregate_stats_increments_on_forward() {
         let m = ChannelMuxAdapter::new();
         let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<(SubId, LaneMsg)>(16);
@@ -331,15 +330,27 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let stats = m.aggregate_stats();
+        // Drive the drain cooperatively on the current-thread runtime: the
+        // spawned drain task shares this thread, so yielding hands it control
+        // to forward the queued event. Deterministic regardless of host load
+        // — the previous fixed-sleep multi-thread form flaked under the OS
+        // thread oversubscription of the full parallel lib-test run.
+        let mut stats = m.aggregate_stats();
+        for _ in 0..1_000_u32 {
+            if stats.events_sent >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            stats = m.aggregate_stats();
+        }
         assert_eq!(stats.active_lanes, 1);
         assert!(stats.events_sent >= 1);
         assert!(stats.bytes_sent >= 16);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn ordering_within_a_lane_is_preserved() {
         let m = ChannelMuxAdapter::new();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<(SubId, LaneMsg)>(16);
@@ -359,14 +370,16 @@ mod tests {
             .unwrap();
         }
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
+        // Collect forwarded messages as the drain task produces them (bounded
+        // per-recv wait) instead of racing a single fixed sleep, which flaked
+        // under heavy parallel test load. On the current-thread runtime the
+        // drain task shares this thread, so awaiting `recv` schedules it.
         let mut seqs = Vec::new();
-        while let Ok(Some((_sid, msg))) =
-            tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await
-        {
-            if let LaneMsg::Data { seq, .. } = msg {
-                seqs.push(seq);
+        while seqs.len() < 5 {
+            match tokio::time::timeout(Duration::from_secs(2), out_rx.recv()).await {
+                Ok(Some((_sid, LaneMsg::Data { seq, .. }))) => seqs.push(seq),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
             }
         }
         assert_eq!(seqs, vec![0, 1, 2, 3, 4], "ordering broken: {seqs:?}");

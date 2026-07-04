@@ -3,8 +3,10 @@
 //! The replay validator (`validate_cursor`) is the canonical guard
 //! between the use case and the lane adapter. A cursor past the
 //! recorded `bytes_available` MUST surface `InvalidArgument` rather
-//! than silently truncating or panicking; the adapter-level cursor
-//! cap (`fetch_max`) handles the in-window case.
+//! than silently truncating or panicking; the adapter-level replay path
+//! additionally clamps any client-supplied cursor to the lane's live
+//! byte cursor (ADR 0012 replay-cursor fix) so it can never pin the
+//! shared inline byte-accumulator forward past production.
 
 use std::sync::Arc;
 
@@ -35,10 +37,11 @@ async fn chaos29_replay_beyond_window_returns_invalid_argument() {
     validate_cursor(RING_SIZE / 2, RING_SIZE).unwrap();
     validate_cursor(RING_SIZE, RING_SIZE).unwrap();
 
-    // The lane adapter's replay path advances the cursor via fetch_max,
-    // so a past-end cursor never moves backwards even when the
-    // validator would reject it. Confirm that monotonicity is intact
-    // even after a "would-be-invalid" advance attempt.
+    // The lane adapter's replay path clamps a client-supplied cursor to the
+    // lane's live byte cursor instead of advancing via fetch_max, so an
+    // out-of-window target can never pin the shared inline byte-accumulator
+    // forward. On a fresh lane (no bytes produced, live cursor 0) every
+    // replay therefore resolves to 0.
     let adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 8, 8, 64);
     let policy = LanePolicy {
         lag_policy: LagPolicy::Snapshot,
@@ -59,12 +62,16 @@ async fn chaos29_replay_beyond_window_returns_invalid_argument() {
     let target = RING_SIZE * 4;
     adapter.replay_from_cursor(&sub_id, target).await.unwrap();
     let observed = adapter.current_cursor(&sub_id, URI);
-    assert_eq!(observed, target, "fetch_max must accept the bigger cursor");
+    assert_eq!(
+        observed, 0,
+        "out-of-window replay must clamp to the live cursor, not pin forward",
+    );
 
-    // A subsequent smaller cursor does not regress.
+    // A subsequent out-of-window replay likewise stays clamped — it never
+    // advances the live cursor past production.
     adapter
         .replay_from_cursor(&sub_id, target / 2)
         .await
         .unwrap();
-    assert_eq!(adapter.current_cursor(&sub_id, URI), target);
+    assert_eq!(adapter.current_cursor(&sub_id, URI), 0);
 }
