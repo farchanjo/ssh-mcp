@@ -20,7 +20,12 @@
 //!
 //! ## Cache shape
 //!
-//! - `DashMap<(String, String), CachedResponse>` — lock-free hot path.
+//! - `DashMap<(String, String), CacheSlot>` — lock-free hot path. Each
+//!   slot is either `Pending` (a claim is in flight; concurrent callers
+//!   with the same key await its [`tokio::sync::Notify`]) or `Done` (a
+//!   replayable [`CachedResponse`]). The `Pending` state is what makes two
+//!   concurrent calls with the same `_meta.idempotency_key` collapse to a
+//!   single use-case execution instead of duplicating the side effect.
 //! - TTL-based eviction enforced lazily on `get` (returns `None` when
 //!   the entry is expired) plus an explicit [`IdempotencyCache::evict_expired`]
 //!   sweep called on every insert and optionally driven by the
@@ -45,14 +50,17 @@
 //! fine; we only need collision-resistance within a 5-minute TTL window.
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use rmcp::RoleServer;
 use rmcp::model::{CallToolResult, Meta};
 use rmcp::service::RequestContext;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::infra::mcp::helpers::structured::ok_text_and_structured;
 
@@ -90,6 +98,47 @@ pub struct CachedResponse {
     pub inserted_at: Instant,
 }
 
+/// A single cache slot: either an in-flight claim or a finished response.
+///
+/// The `Pending` state is the concurrency fix — the first caller to miss
+/// atomically installs a `Pending` slot under the shard lock, so a second
+/// caller racing the same `(tool, key)` observes `Pending` (and awaits the
+/// shared [`Notify`]) instead of independently driving the mutating use
+/// case a second time.
+#[derive(Debug)]
+enum CacheSlot {
+    /// A claim is in flight. Concurrent callers park on `waker` and replay
+    /// the `Done` slot once the winner publishes it.
+    Pending(PendingSlot),
+    /// A completed, replayable response.
+    Done(CachedResponse),
+}
+
+/// The in-flight half of a [`CacheSlot`].
+#[derive(Debug)]
+struct PendingSlot {
+    /// Woken via `notify_waiters` when the winning caller finishes — whether
+    /// it published a `Done` slot, errored, or was cancelled.
+    waker: Arc<Notify>,
+    /// Fingerprint of the in-flight call's args, so a concurrent caller
+    /// reusing the key with a *different* argument shape short-circuits to
+    /// `Mismatch` instead of waiting on a result it could never replay.
+    fingerprint: String,
+    /// When the claim was installed; lets a stale `Pending` (a winner that
+    /// leaked without running `Drop`) age out under the TTL sweep.
+    claimed_at: Instant,
+}
+
+impl PendingSlot {
+    fn new(waker: Arc<Notify>, fingerprint: &str) -> Self {
+        Self {
+            waker,
+            fingerprint: fingerprint.to_string(),
+            claimed_at: Instant::now(),
+        }
+    }
+}
+
 /// Outcome of an [`IdempotencyCache::get_with_fingerprint`] lookup.
 #[derive(Debug, Clone)]
 pub enum IdempotencyOutcome {
@@ -106,7 +155,7 @@ pub enum IdempotencyOutcome {
 /// Lock-free idempotency cache.
 #[derive(Debug)]
 pub struct IdempotencyCache {
-    inner: DashMap<(String, String), CachedResponse>,
+    inner: DashMap<(String, String), CacheSlot>,
     ttl: Duration,
     max_entries: usize,
 }
@@ -145,12 +194,18 @@ impl IdempotencyCache {
     pub fn get(&self, tool: &str, key: &str) -> Option<CachedResponse> {
         let composite = (tool.to_string(), key.to_string());
         let entry = self.inner.get(&composite)?;
-        if entry.inserted_at.elapsed() <= self.ttl {
-            return Some(entry.value().clone());
-        }
+        let (found, expired) = match entry.value() {
+            CacheSlot::Done(done) if done.inserted_at.elapsed() <= self.ttl => {
+                (Some(done.clone()), false)
+            }
+            CacheSlot::Done(_) => (None, true),
+            CacheSlot::Pending(_) => (None, false),
+        };
         drop(entry);
-        self.inner.remove(&composite);
-        None
+        if expired {
+            self.inner.remove(&composite);
+        }
+        found
     }
 
     /// Lookup with an args fingerprint comparison.
@@ -173,16 +228,21 @@ impl IdempotencyCache {
         let Some(entry) = self.inner.get(&composite) else {
             return IdempotencyOutcome::Miss;
         };
-        if entry.inserted_at.elapsed() > self.ttl {
-            drop(entry);
+        let (outcome, expired) = match entry.value() {
+            CacheSlot::Done(done) if done.inserted_at.elapsed() > self.ttl => {
+                (IdempotencyOutcome::Miss, true)
+            }
+            CacheSlot::Done(done) if done.args_fingerprint == fingerprint => {
+                (IdempotencyOutcome::Hit(done.clone()), false)
+            }
+            CacheSlot::Done(_) => (IdempotencyOutcome::Mismatch, false),
+            CacheSlot::Pending(_) => (IdempotencyOutcome::Miss, false),
+        };
+        drop(entry);
+        if expired {
             self.inner.remove(&composite);
-            return IdempotencyOutcome::Miss;
         }
-        if entry.value().args_fingerprint == fingerprint {
-            IdempotencyOutcome::Hit(entry.value().clone())
-        } else {
-            IdempotencyOutcome::Mismatch
-        }
+        outcome
     }
 
     /// Insert a fresh response under `(tool, key)`, evicting expired
@@ -205,23 +265,23 @@ impl IdempotencyCache {
         if self.inner.len() >= self.max_entries {
             self.shrink_to_max();
         }
-        let now = Instant::now();
         let entry = CachedResponse {
             body,
             structured,
             args_fingerprint: fingerprint,
-            inserted_at: now,
+            inserted_at: Instant::now(),
         };
         self.inner
-            .insert((tool.to_string(), key.to_string()), entry);
+            .insert((tool.to_string(), key.to_string()), CacheSlot::Done(entry));
     }
 
-    /// Drop every expired entry. Called from `put` on every insert and
-    /// optionally from a periodic composition-root task.
+    /// Drop every expired entry (stale `Done` responses and `Pending`
+    /// claims that leaked without running their `Drop`). Called from `put`
+    /// / `claim` on every write and optionally from a periodic
+    /// composition-root task.
     pub fn evict_expired(&self) {
         let ttl = self.ttl;
-        self.inner
-            .retain(|_, value| value.inserted_at.elapsed() <= ttl);
+        self.inner.retain(|_, slot| slot_is_live(slot, ttl));
     }
 
     /// Drop the oldest `inner.len() - max_entries + 1` entries. Pulled
@@ -235,7 +295,13 @@ impl IdempotencyCache {
         let mut victims: Vec<((String, String), Instant)> = self
             .inner
             .iter()
-            .map(|kv| (kv.key().clone(), kv.value().inserted_at))
+            .map(|kv| {
+                let ts = match kv.value() {
+                    CacheSlot::Done(done) => done.inserted_at,
+                    CacheSlot::Pending(pending) => pending.claimed_at,
+                };
+                (kv.key().clone(), ts)
+            })
             .collect();
         victims.sort_by_key(|(_, ts)| *ts);
         for ((tool, key), _) in victims.into_iter().take(extra) {
@@ -243,10 +309,186 @@ impl IdempotencyCache {
         }
     }
 
+    /// Atomically claim `(tool, key)` for a fresh use-case run, or resolve
+    /// to a replay / wait / mismatch verdict against the current slot.
+    ///
+    /// The whole check-and-claim happens under one shard lock (the `entry`
+    /// API) and NEVER awaits, so two concurrent callers racing the same key
+    /// cannot both win: exactly one gets [`ClaimOutcome::Claimed`] and
+    /// installs the `Pending` slot; a racing duplicate gets
+    /// [`ClaimOutcome::Wait`] (or `Hit` / `Mismatch`). This is the fix for
+    /// the duplicate-side-effect race on retried mutating tool calls.
+    #[must_use]
+    pub fn claim(&self, tool: &str, key: &str, fingerprint: &str) -> ClaimOutcome<'_> {
+        // Reap expired slots first so the `Occupied` arm only sees live
+        // entries; an expired slot falls through to the fresh-claim path.
+        self.evict_expired();
+        if self.inner.len() >= self.max_entries {
+            self.shrink_to_max();
+        }
+        match self.inner.entry((tool.to_string(), key.to_string())) {
+            Entry::Occupied(occ) => classify_live(occ.get(), fingerprint),
+            Entry::Vacant(slot) => {
+                let waker = Arc::new(Notify::new());
+                drop(slot.insert(CacheSlot::Pending(PendingSlot::new(
+                    Arc::clone(&waker),
+                    fingerprint,
+                ))));
+                ClaimOutcome::Claimed(self.guard(tool, key, waker))
+            }
+        }
+    }
+
+    /// Build the RAII [`ClaimGuard`] handed to the winning caller.
+    fn guard(&self, tool: &str, key: &str, waker: Arc<Notify>) -> ClaimGuard<'_> {
+        ClaimGuard {
+            cache: self,
+            tool: tool.to_string(),
+            key: key.to_string(),
+            waker,
+            published: false,
+        }
+    }
+
+    /// Swap the caller's in-flight `Pending` slot for a finished `Done`
+    /// slot. Guarded by [`is_our_pending`] so a slower-than-TTL winner that
+    /// was already superseded by a newer claim never clobbers it.
+    fn complete_pending(&self, tool: &str, key: &str, waker: &Arc<Notify>, done: CacheSlot) {
+        match self.inner.entry((tool.to_string(), key.to_string())) {
+            Entry::Occupied(mut occ) => {
+                if is_our_pending(occ.get(), waker) {
+                    drop(occ.insert(done));
+                }
+            }
+            Entry::Vacant(slot) => {
+                drop(slot.insert(done));
+            }
+        }
+    }
+
+    /// Remove the caller's in-flight `Pending` slot iff it is still ours
+    /// (identity via the `Notify` pointer). Called from [`ClaimGuard::drop`]
+    /// when the winner finished without publishing a cacheable success.
+    fn abandon_pending(&self, tool: &str, key: &str, waker: &Arc<Notify>) {
+        drop(
+            self.inner
+                .remove_if(&(tool.to_string(), key.to_string()), |_, slot| {
+                    is_our_pending(slot, waker)
+                }),
+        );
+    }
+
     /// Number of entries currently held. Test helper; not public.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.len()
+    }
+}
+
+/// Verdict of [`IdempotencyCache::claim`].
+#[derive(Debug)]
+pub enum ClaimOutcome<'a> {
+    /// This caller won the race and must drive the use case, then either
+    /// [`ClaimGuard::publish`] the success or drop the guard to release the
+    /// claim. The guard's `Drop` always wakes parked callers.
+    Claimed(ClaimGuard<'a>),
+    /// A live `Done` slot with a matching args fingerprint exists — replay
+    /// it verbatim.
+    Hit(CachedResponse),
+    /// A live slot exists under the same key but a different args
+    /// fingerprint — surface `IDEMPOTENCY_KEY_MISMATCH`.
+    Mismatch,
+    /// A concurrent caller is mid-flight for this exact key + fingerprint.
+    /// Await the [`Notify`] then re-read via
+    /// [`IdempotencyCache::get_with_fingerprint`].
+    Wait(Arc<Notify>),
+}
+
+/// RAII claim held by the winning caller for a `(tool, key)`.
+///
+/// While alive it owns the `Pending` slot. On `Drop` it ALWAYS wakes every
+/// parked caller and, unless [`Self::publish`] already swapped in a `Done`
+/// slot, removes the `Pending` slot — so a cancelled or panicked winner can
+/// never wedge the key permanently.
+#[derive(Debug)]
+pub struct ClaimGuard<'a> {
+    cache: &'a IdempotencyCache,
+    tool: String,
+    key: String,
+    waker: Arc<Notify>,
+    published: bool,
+}
+
+impl ClaimGuard<'_> {
+    /// Replace the in-flight `Pending` slot with the successful response so
+    /// concurrent and future callers replay it. Consumes the guard; its
+    /// `Drop` then wakes the parked callers.
+    pub fn publish(mut self, fingerprint: String, response: &CallToolResult) {
+        let body = response
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        let structured = response.structured_content.clone().unwrap_or(Value::Null);
+        let done = CacheSlot::Done(CachedResponse {
+            body,
+            structured,
+            args_fingerprint: fingerprint,
+            inserted_at: Instant::now(),
+        });
+        self.cache
+            .complete_pending(&self.tool, &self.key, &self.waker, done);
+        self.published = true;
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.cache
+                .abandon_pending(&self.tool, &self.key, &self.waker);
+        }
+        // Always wake parked callers — even on a cancelled / panicked winner
+        // — so they re-read and never block forever on a dropped claim.
+        self.waker.notify_waiters();
+    }
+}
+
+/// Classify a *live* slot for [`IdempotencyCache::claim`]. The `'a` is free:
+/// this never builds a borrowing [`ClaimOutcome::Claimed`].
+fn classify_live<'a>(slot: &CacheSlot, fingerprint: &str) -> ClaimOutcome<'a> {
+    match slot {
+        CacheSlot::Done(done) => {
+            if done.args_fingerprint == fingerprint {
+                ClaimOutcome::Hit(done.clone())
+            } else {
+                ClaimOutcome::Mismatch
+            }
+        }
+        CacheSlot::Pending(pending) => {
+            if pending.fingerprint == fingerprint {
+                ClaimOutcome::Wait(Arc::clone(&pending.waker))
+            } else {
+                ClaimOutcome::Mismatch
+            }
+        }
+    }
+}
+
+/// True iff `slot` is a `Pending` whose `Notify` is pointer-identical to
+/// `waker` — i.e. the very claim the caller installed.
+fn is_our_pending(slot: &CacheSlot, waker: &Arc<Notify>) -> bool {
+    match slot {
+        CacheSlot::Pending(pending) => Arc::ptr_eq(&pending.waker, waker),
+        CacheSlot::Done(_) => false,
+    }
+}
+
+/// Liveness predicate shared by [`IdempotencyCache::evict_expired`].
+fn slot_is_live(slot: &CacheSlot, ttl: Duration) -> bool {
+    match slot {
+        CacheSlot::Done(done) => done.inserted_at.elapsed() <= ttl,
+        CacheSlot::Pending(pending) => pending.claimed_at.elapsed() <= ttl,
     }
 }
 
@@ -730,6 +972,82 @@ mod tests {
         match cache.get_with_fingerprint("ssh_exec", "k1", "") {
             IdempotencyOutcome::Hit(c) => assert_eq!(c.body, "body"),
             other => unreachable!("expected Hit on legacy entry, got {other:?}"),
+        }
+    }
+
+    // ---- concurrency: claim / publish / abandon (Bug #23) -------------
+
+    use super::ClaimOutcome;
+
+    #[test]
+    fn concurrent_claims_collapse_to_single_run() {
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        // First caller wins the claim and installs the Pending slot.
+        let ClaimOutcome::Claimed(guard) = cache.claim("ssh_exec", "k1", "fp") else {
+            unreachable!("first claim must win");
+        };
+        // A concurrent duplicate observes the in-flight Pending -> Wait,
+        // NOT a second Claimed. This is the duplicate-side-effect fix: the
+        // mutating use case is never driven twice for one key.
+        assert!(matches!(
+            cache.claim("ssh_exec", "k1", "fp"),
+            ClaimOutcome::Wait(_)
+        ));
+        // Winner finishes and publishes its rendered response.
+        let response = super::ok_text_and_structured("body".to_string(), json!({"v": 1}));
+        guard.publish("fp".to_string(), &response);
+        // Every subsequent caller now replays the Done slot.
+        match cache.get_with_fingerprint("ssh_exec", "k1", "fp") {
+            IdempotencyOutcome::Hit(c) => assert_eq!(c.body, "body"),
+            other => unreachable!("expected Hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_mismatch_when_pending_has_different_fingerprint() {
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        let ClaimOutcome::Claimed(_guard) = cache.claim("ssh_exec", "k1", "fp-A") else {
+            unreachable!("first claim must win");
+        };
+        // Same key, different args mid-flight -> Mismatch, never Wait.
+        assert!(matches!(
+            cache.claim("ssh_exec", "k1", "fp-B"),
+            ClaimOutcome::Mismatch
+        ));
+    }
+
+    #[test]
+    fn abandoned_claim_frees_the_key() {
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        {
+            let ClaimOutcome::Claimed(_guard) = cache.claim("ssh_exec", "k1", "fp") else {
+                unreachable!("first claim must win");
+            };
+            // `_guard` drops here WITHOUT publish -> the claim is abandoned.
+        }
+        // The key is free again; the abandoned Pending left no residue.
+        assert!(matches!(
+            cache.get_with_fingerprint("ssh_exec", "k1", "fp"),
+            IdempotencyOutcome::Miss
+        ));
+        assert!(matches!(
+            cache.claim("ssh_exec", "k1", "fp"),
+            ClaimOutcome::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn claim_replays_after_publish() {
+        let cache = IdempotencyCache::new(Duration::from_secs(60), 16);
+        let ClaimOutcome::Claimed(guard) = cache.claim("ssh_exec", "k1", "fp") else {
+            unreachable!("first claim must win");
+        };
+        let response = super::ok_text_and_structured("done".to_string(), json!({"v": 2}));
+        guard.publish("fp".to_string(), &response);
+        // A later caller with the same key + fingerprint replays via Hit.
+        match cache.claim("ssh_exec", "k1", "fp") {
+            ClaimOutcome::Hit(c) => assert_eq!(c.body, "done"),
+            other => unreachable!("expected Hit, got {other:?}"),
         }
     }
 }
