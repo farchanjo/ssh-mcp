@@ -31,7 +31,7 @@ use tracing::{debug, error};
 
 use crate::adapters::ssh::internal::shell::RingBuffer;
 use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
-use crate::domain::ids::SerialId;
+use crate::domain::ids::{PeerId, SerialId};
 use uuid::Uuid;
 
 /// Per-port write-queue capacity. Drives the bounded `mpsc::channel`
@@ -401,6 +401,7 @@ pub fn close_port(id: &SerialId) -> bool {
         return false;
     };
     state.cancel_token.cancel();
+    clear_peer_cursors_for(&state.uri());
     true
 }
 
@@ -443,6 +444,55 @@ pub fn read_history_from_cursor(state: &SerialPortState, cursor: u64) -> (Bytes,
     let cursor_usize = usize::try_from(cursor_clamped).unwrap_or(usize::MAX);
     let slice = snapshot.data.slice(cursor_usize..total_usize);
     (slice, total)
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer read cursor (`?cursor=auto`)
+// ---------------------------------------------------------------------------
+//
+// The MCP infra layer's `serial://<id>/output` read short-circuit bypasses
+// `ReadResourceUseCase` entirely (ADR 0009), so it cannot reach the
+// production `SubscriberRegistryPort` instance that backs `?cursor=auto`
+// for `shell://` / `command://` / `forward://` — that instance is private
+// to `application::read_resource` and not otherwise exposed. This cache
+// reproduces the same `(peer, uri) -> byte cursor` semantics locally so
+// `serial://` reads honor `?cursor=auto` too (BUG #11 / BUG #14).
+
+/// Per-`(peer, uri)` byte cursor backing `serial://<id>/output?cursor=auto`
+/// reads. Entries are purged per-URI on port close — see
+/// [`clear_peer_cursors_for`] — since a closed port's `UUIDv7` id is never
+/// reissued.
+static SERIAL_PEER_CURSORS: LazyLock<DashMap<(PeerId, String), AtomicU64>> =
+    LazyLock::new(DashMap::new);
+
+/// Read the last-recorded byte cursor for `(peer_id, uri)`. Returns `0`
+/// when no cursor has been recorded yet (fresh peer, or a `?cursor=0` /
+/// snapshot read).
+#[must_use]
+pub fn peer_cursor(peer_id: &PeerId, uri: &str) -> u64 {
+    SERIAL_PEER_CURSORS
+        .get(&(peer_id.clone(), uri.to_string()))
+        .map_or(0, |entry| entry.load(Ordering::Relaxed))
+}
+
+/// Advance the byte cursor for `(peer_id, uri)` to at least `target`
+/// (atomic max — mirrors
+/// `SubscriberRegistryPort::advance_peer_byte_cursor`). Returns the
+/// cursor value after the bump.
+#[must_use]
+pub fn advance_peer_cursor(peer_id: &PeerId, uri: &str, target: u64) -> u64 {
+    let entry = SERIAL_PEER_CURSORS
+        .entry((peer_id.clone(), uri.to_string()))
+        .or_default();
+    entry.fetch_max(target, Ordering::Relaxed);
+    entry.load(Ordering::Relaxed)
+}
+
+/// Drop every recorded cursor for `uri`. Called on port close so cursor
+/// churn across repeated `serial_open` / `serial_close` cycles never
+/// accumulates stale rows.
+fn clear_peer_cursors_for(uri: &str) {
+    SERIAL_PEER_CURSORS.retain(|(_, entry_uri), _| entry_uri != uri);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,10 +612,20 @@ fn flush_if_pending(state: &Arc<SerialPortState>, local: &mut Vec<u8>) {
 }
 
 /// Cleanup: ensure registry entry vanishes once the reader exits
-/// (e.g. unplugged USB). A subsequent `serial_close` call is a
-/// no-op via the idempotent contract.
+/// (e.g. unplugged USB), and cancel the shared token so the writer
+/// task's `select!` also observes shutdown.
+///
+/// Without the cancellation, an abnormal reader exit (OS read error
+/// or `Ok(0)` EOF — e.g. a USB unplug) removed the registry entry but
+/// left the writer task parked forever on `rx.recv()` /
+/// `cancel_token.cancelled()`, leaking its half of the OS
+/// `SerialStream`. `CancellationToken::cancel` is idempotent, so this
+/// is also safe to call on the normal `close_port` path where the
+/// token may already be cancelled.
 fn deregister_reader(state: &Arc<SerialPortState>) {
+    state.cancel_token.cancel();
     SERIAL_REGISTRY.ports.remove(&state.id);
+    clear_peer_cursors_for(&state.uri());
 }
 
 /// Flush a local staging buffer into [`SerialPortState::history`] via
@@ -712,5 +772,34 @@ mod tests {
         // behind during `--test-threads=1`. The default expectation is
         // simply that the registry is reachable as a singleton.
         let _ = SERIAL_REGISTRY.len();
+    }
+
+    #[test]
+    fn peer_cursor_defaults_to_zero_for_unknown_pair() {
+        let peer = PeerId::new("peer-cursor-test-unknown".to_string());
+        assert_eq!(peer_cursor(&peer, "serial://ghost/output"), 0);
+    }
+
+    #[test]
+    fn advance_peer_cursor_is_monotonic_max() {
+        let peer = PeerId::new("peer-cursor-test-monotonic".to_string());
+        let uri = "serial://port-a/output";
+        assert_eq!(advance_peer_cursor(&peer, uri, 10), 10);
+        // A smaller target must not roll the cursor backwards.
+        assert_eq!(advance_peer_cursor(&peer, uri, 4), 10);
+        assert_eq!(advance_peer_cursor(&peer, uri, 25), 25);
+        assert_eq!(peer_cursor(&peer, uri), 25);
+    }
+
+    #[test]
+    fn clear_peer_cursors_for_only_drops_matching_uri() {
+        let peer = PeerId::new("peer-cursor-test-clear".to_string());
+        let uri_a = "serial://port-clear-a/output";
+        let uri_b = "serial://port-clear-b/output";
+        let _ = advance_peer_cursor(&peer, uri_a, 42);
+        let _ = advance_peer_cursor(&peer, uri_b, 7);
+        clear_peer_cursors_for(uri_a);
+        assert_eq!(peer_cursor(&peer, uri_a), 0);
+        assert_eq!(peer_cursor(&peer, uri_b), 7);
     }
 }
