@@ -656,11 +656,21 @@ async fn apply_post_phase_attrs(
     if !apply.preserve_perms && !apply.preserve_mtime && !apply.preserve_links {
         return;
     }
+    // Pass 1 — materialise every symlink first. Creating a symlink adds
+    // a dir entry to its parent, which bumps that parent's mtime; all
+    // such mutations must land before any directory mtime is stamped.
     for entry in entries {
-        let target = dst_root.join(&entry.path);
         if is_lnk(entry.mode) {
+            let target = dst_root.join(&entry.path);
             apply_symlink_entry(&target, entry, apply, stats).await;
-        } else if is_dir(entry.mode) {
+        }
+    }
+    // Pass 2 — stamp directory mode + mtime. Regular-file writes (earlier
+    // per-file phase) and symlink creation (pass 1) are both done, so no
+    // fs mutation inside a directory happens after its mtime is set.
+    for entry in entries {
+        if is_dir(entry.mode) {
+            let target = dst_root.join(&entry.path);
             apply_directory_attrs(&target, entry, apply);
         }
     }

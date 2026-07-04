@@ -248,6 +248,38 @@ fn child_name<'a>(parent: &str, candidate: &'a str) -> Option<&'a str> {
     }
 }
 
+/// Merge a setstat payload onto existing node metadata, honouring the `0`
+/// skip-sentinel for every field the caller opted out of via `PreserveFlags`
+/// (mirrors production `remote_meta_to_attrs` skip-on-zero). Size and the
+/// kind flags are never carried by a setstat, so they stay untouched.
+const fn merge_setstat_meta(existing: RemoteMetadata, incoming: RemoteMetadata) -> RemoteMetadata {
+    RemoteMetadata {
+        size: existing.size,
+        mode: if incoming.mode == 0 {
+            existing.mode
+        } else {
+            incoming.mode
+        },
+        mtime: if incoming.mtime == 0 {
+            existing.mtime
+        } else {
+            incoming.mtime
+        },
+        uid: if incoming.uid == 0 {
+            existing.uid
+        } else {
+            incoming.uid
+        },
+        gid: if incoming.gid == 0 {
+            existing.gid
+        } else {
+            incoming.gid
+        },
+        is_dir: existing.is_dir,
+        is_symlink: existing.is_symlink,
+    }
+}
+
 impl RsyncSftpFsPort for FakeRsyncSftpFs {
     async fn readdir(
         &self,
@@ -390,13 +422,7 @@ impl RsyncSftpFsPort for FakeRsyncSftpFs {
         let Some(mut node) = self.inner.nodes.get_mut(path) else {
             return Err(DomainError::Sftp(format!("missing path: {path}")));
         };
-        node.meta = RemoteMetadata {
-            // Preserve kind flags discovered at create-time; only the
-            // fields the executor passes through are overwritten.
-            is_dir: node.meta.is_dir,
-            is_symlink: node.meta.is_symlink,
-            ..meta
-        };
+        node.meta = merge_setstat_meta(node.meta, meta);
         Ok(())
     }
 
