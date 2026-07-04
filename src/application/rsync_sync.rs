@@ -314,7 +314,18 @@ where
         }
         let outcome = self.start_transport(&req, picked).await?;
         let rsync_id = outcome.rsync_id.clone();
-        let session = self.register_session(&req.session_id, &rsync_id).await?;
+        // `start_transport` has already spawned a live background sync
+        // task on the picked transport. If registration then loses the
+        // atomic cap race (or fails for any other reason), that task
+        // would leak as an uncancellable orphan — close the just-opened
+        // lane before propagating so its cancel token fires.
+        let session = match self.register_session(&req.session_id, &rsync_id).await {
+            Ok(session) => session,
+            Err(err) => {
+                self.close_transport(picked, &rsync_id).await;
+                return Err(err);
+            }
+        };
         self.spawn_progress_pump(picked, &rsync_id, session);
         Ok(RsyncStartedOutcome {
             rsync_id,
@@ -450,6 +461,19 @@ where
             .insert_if_under_cap(Arc::clone(&session), cap)
             .await?;
         Ok(session)
+    }
+
+    /// Best-effort close of the just-opened transport lane on the picked
+    /// tier. Called on the `execute` unwind path when session
+    /// registration fails after [`Self::start_transport`] already spawned
+    /// the background sync task. Both transports' `close` is idempotent;
+    /// a close error is swallowed because the caller is already
+    /// propagating the original registration error.
+    async fn close_transport(&self, picked: RsyncTransportPicked, rsync_id: &RsyncId) {
+        let _ = match picked {
+            RsyncTransportPicked::Wire => self.wire.close(rsync_id).await,
+            RsyncTransportPicked::Sftp => self.sftp.close(rsync_id).await,
+        };
     }
 
     /// Cancel a live rsync session.

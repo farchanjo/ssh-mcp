@@ -35,12 +35,16 @@ pub const CHUNK_BYTES: usize = 32 * 1024;
 /// Cluster of metadata fields the executor passes to
 /// [`SftpExecutor::run_setstat`]. Exists so the function signature stays
 /// under the strict 7-argument cap.
+///
+/// Every field is `Some` only when the comparator's [`PreserveFlags`]
+/// mask requested it — a `None` field is never applied to the
+/// destination, so metadata the caller opted out of stays untouched.
 #[derive(Debug, Clone, Copy)]
 struct SetstatArgs {
-    mode: u32,
-    mtime: i64,
-    uid: u32,
-    gid: u32,
+    mode: Option<u32>,
+    mtime: Option<i64>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 /// Outcome of [`SftpExecutor::copy_chunks`] driving the chunked
@@ -519,12 +523,16 @@ where
             return;
         }
         let abs = join_root(&self.dst_root, rel_path);
+        // `None` fields collapse to the `0` skip-sentinel both SFTP
+        // adapters honour (`remote_meta_to_attrs` in production, the
+        // fake's merge) — a field the caller opted out of via
+        // PreserveFlags is never re-applied to the destination.
         let meta = RemoteMetadata {
             size: 0,
-            mode: args.mode,
-            mtime: args.mtime,
-            uid: args.uid,
-            gid: args.gid,
+            mode: args.mode.unwrap_or(0),
+            mtime: args.mtime.unwrap_or(0),
+            uid: args.uid.unwrap_or(0),
+            gid: args.gid.unwrap_or(0),
             is_dir: false,
             is_symlink: false,
         };

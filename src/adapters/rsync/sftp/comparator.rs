@@ -56,18 +56,22 @@ pub enum SyncAction {
         /// Link target.
         target: String,
     },
-    /// Apply metadata after the payload (perms / mtime / owner / group).
+    /// Apply metadata after the payload. Each field is `Some` only when
+    /// the matching [`PreserveFlags`] bit was requested; `None` fields
+    /// are left untouched on the destination so a caller that opted out
+    /// of (say) mtime never has its destination mtime overwritten.
     Setstat {
         /// Path relative to the sync root.
         rel_path: String,
-        /// Mode bits.
-        mode: u32,
-        /// Modification time (unix seconds).
-        mtime: i64,
-        /// Numeric owner uid.
-        uid: u32,
-        /// Numeric owner gid.
-        gid: u32,
+        /// Mode bits — `Some` only under `preserve.perms`.
+        mode: Option<u32>,
+        /// Modification time (unix seconds) — `Some` only under
+        /// `preserve.mtime`.
+        mtime: Option<i64>,
+        /// Numeric owner uid — `Some` only under `preserve.owner`.
+        uid: Option<u32>,
+        /// Numeric owner gid — `Some` only under `preserve.group`.
+        gid: Option<u32>,
     },
     /// Remove an entry from the destination.
     Delete {
@@ -142,7 +146,7 @@ fn push_kind_actions(
                 });
             }
             if needs_setstat(entry, dst_match, opts.preserve) {
-                actions.push(make_setstat(entry));
+                actions.push(make_setstat(entry, opts.preserve));
             }
         }
         FileKind::Symlink => {
@@ -207,13 +211,16 @@ const fn needs_setstat(
         || (preserve.group && src.gid != dst.gid)
 }
 
-fn make_setstat(src: &RsyncEntry) -> SyncAction {
+fn make_setstat(src: &RsyncEntry, preserve: PreserveFlags) -> SyncAction {
+    // Only bake in the fields the caller actually opted into via the
+    // preserve mask — an un-requested field stays `None` so the executor
+    // never overwrites destination metadata the caller wanted preserved.
     SyncAction::Setstat {
         rel_path: src.rel_path.clone(),
-        mode: src.mode,
-        mtime: src.mtime,
-        uid: src.uid,
-        gid: src.gid,
+        mode: preserve.perms.then_some(src.mode),
+        mtime: preserve.mtime.then_some(src.mtime),
+        uid: preserve.owner.then_some(src.uid),
+        gid: preserve.group.then_some(src.gid),
     }
 }
 
@@ -226,7 +233,7 @@ fn file_actions(src: &RsyncEntry, dst: Option<&RsyncEntry>, opts: CompareOpts) -
             rel_path: src.rel_path.clone(),
         });
         if needs_setstat(src, dst, opts.preserve) {
-            out.push(make_setstat(src));
+            out.push(make_setstat(src, opts.preserve));
         }
         return out;
     }
@@ -235,7 +242,7 @@ fn file_actions(src: &RsyncEntry, dst: Option<&RsyncEntry>, opts: CompareOpts) -
         size: src.size,
     });
     if needs_setstat(src, dst, opts.preserve) {
-        out.push(make_setstat(src));
+        out.push(make_setstat(src, opts.preserve));
     }
     out
 }
@@ -398,7 +405,11 @@ mod tests {
         assert!(matches!(actions[0], SyncAction::Skip { .. }));
         assert!(matches!(
             actions[1],
-            SyncAction::Setstat { mode: 0o600, .. }
+            SyncAction::Setstat {
+                mode: Some(0o600),
+                mtime: None,
+                ..
+            }
         ));
     }
 
