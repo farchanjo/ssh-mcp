@@ -30,6 +30,7 @@ pub fn detail_for(code: &str) -> Option<&'static str> {
         .or_else(|| detail_for_state(code))
         .or_else(|| detail_for_internal(code))
         .or_else(|| detail_for_resume(code))
+        .or_else(|| detail_for_truncated_source(code))
         .or_else(|| detail_for_rsync(code))
         .or_else(|| detail_for_serial(code))
         .or_else(|| detail_for_inline_push(code))
@@ -205,6 +206,22 @@ const fn detail_for_resume(code: &str) -> Option<&'static str> {
         }
         b"RESUME_MISMATCH" => {
             "Re-run with resume=false to overwrite the destination, or fix (truncate/repair) the partial file before retrying with verify=true."
+        }
+        _ => return None,
+    })
+}
+
+/// Chunk-loop short-read reconciliation code (transfer streaming fix).
+/// `STATE` category, non-retryable without addressing the underlying
+/// source mutation — the streaming task now compares the bytes moved
+/// against the byte count announced by the preflight stat instead of
+/// treating any short read (EOF) as a successful completion, so a
+/// source file truncated, rotated, or grown out from under the
+/// transfer surfaces here instead of silently reporting `Completed`.
+const fn detail_for_truncated_source(code: &str) -> Option<&'static str> {
+    Some(match code.as_bytes() {
+        b"TRUNCATED_SOURCE" => {
+            "The source file changed size during the transfer; verify it is not being modified concurrently and re-issue the transfer once it is stable."
         }
         _ => return None,
     })
@@ -410,6 +427,11 @@ mod tests {
     }
 
     #[test]
+    fn truncated_source_code_has_pedagogy() {
+        assert!(detail_for("TRUNCATED_SOURCE").is_some());
+    }
+
+    #[test]
     fn rsync_codes_have_pedagogy() {
         for code in [
             "RSYNC_NOT_FOUND",
@@ -484,6 +506,8 @@ mod tests {
             // v6.1 (ADR 0010) resume codes.
             "RESUME_OVERSHOOT",
             "RESUME_MISMATCH",
+            // Chunk-loop short-read reconciliation code.
+            "TRUNCATED_SOURCE",
             // v7.0 (ADR 0011) rsync hybrid transport codes.
             "RSYNC_NOT_FOUND",
             "RSYNC_VERSION_TOO_OLD",
@@ -501,8 +525,8 @@ mod tests {
             assert!(detail_for(code).is_some(), "missing DETAIL for {code}");
         }
         assert!(
-            codes.len() >= 48,
-            "expected >=48 entries, got {}",
+            codes.len() >= 49,
+            "expected >=49 entries, got {}",
             codes.len()
         );
     }

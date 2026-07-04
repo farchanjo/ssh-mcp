@@ -378,11 +378,28 @@ impl RusshSftpAdapter {
     }
 
     /// Common preflight for both `upload` and `download`: enforce the
-    /// per-session cap and resolve the russh handle. Pure validation —
-    /// no `await` happens at any point.
+    /// per-session cap, resolve the russh handle, and reserve the
+    /// transfer's [`InflightTransfers`] slot — all synchronously, with
+    /// no `await` between the count check and the reservation.
+    ///
+    /// Bug #22 fix: the cap check and the slot registration used to be
+    /// separated by several `.await` points (`stat_local_size` /
+    /// `stat_remote_size`, then `preflight_resume_upload` /
+    /// `preflight_resume_download`), so concurrent `upload`/`download`
+    /// calls on the same session could all observe `count <
+    /// max_per_session` before any of them actually registered. Taking
+    /// the reservation here closes that window. [`Self::prepare_streaming`]
+    /// later re-registers the same `transfer_id` with the real
+    /// `CancellationToken` — `InflightTransfers::register` is an upsert,
+    /// so that call transparently upgrades this placeholder.
+    ///
+    /// Every `.await?` between this call and `prepare_streaming` MUST
+    /// roll the reservation back via [`Self::release_reservation`] on
+    /// failure, or a failed preflight permanently consumes a slot.
     fn preflight(
         &self,
         session_id: &SessionId,
+        transfer_id: &TransferId,
     ) -> Result<Arc<client::Handle<SshClientHandler>>, DomainError> {
         let count = self.count_inflight_for_session(session_id);
         if count >= self.max_per_session {
@@ -390,7 +407,77 @@ impl RusshSftpAdapter {
                 limit: self.max_per_session,
             });
         }
-        self.resolve_handle(session_id)
+        let handle = self.resolve_handle(session_id)?;
+        self.inflight.register(
+            transfer_id.clone(),
+            session_id.clone(),
+            CancellationToken::new(),
+        );
+        Ok(handle)
+    }
+
+    /// Roll back the [`InflightTransfers`] reservation taken by
+    /// [`Self::preflight`] when a later `.await?` (stat / resume
+    /// preflight / verify) fails before [`Self::prepare_streaming`] can
+    /// upgrade it with the real `CancellationToken`. The entry is
+    /// expected to still be present at this point — its absence would
+    /// mean something else already raced the reservation away — so a
+    /// miss is logged rather than silently ignored.
+    fn release_reservation(&self, transfer_id: &TransferId) {
+        if self.inflight.unregister(transfer_id).is_none() {
+            warn!(
+                transfer_id = %transfer_id,
+                "preflight reservation already cleared before rollback"
+            );
+        }
+    }
+
+    /// Run the upload pre-spawn sequence (local stat + resume preflight)
+    /// with the Bug #22 reservation rolled back on failure. Extracted so
+    /// [`SftpClientPort::upload`] stays under the project's 30-line
+    /// clippy threshold.
+    async fn upload_preflight_stats(
+        &self,
+        transfer_id: &TransferId,
+        handle: &Arc<client::Handle<SshClientHandler>>,
+        resolved_local: &Path,
+        remote_path: &str,
+        resume: bool,
+        verify: bool,
+    ) -> Result<(u64, ResumePlan), DomainError> {
+        let total_bytes = stat_local_size(resolved_local)
+            .await
+            .inspect_err(|_| self.release_reservation(transfer_id))?;
+        let resume_plan =
+            preflight_resume_upload(handle, resolved_local, remote_path, resume, verify)
+                .await
+                .map_err(DomainError::Sftp)
+                .inspect_err(|_| self.release_reservation(transfer_id))?;
+        Ok((total_bytes, resume_plan))
+    }
+
+    /// Run the download pre-spawn sequence (remote stat + resume
+    /// preflight) with the Bug #22 reservation rolled back on failure.
+    /// Extracted so [`SftpClientPort::download`] stays under the
+    /// project's 30-line clippy threshold.
+    async fn download_preflight_stats(
+        &self,
+        transfer_id: &TransferId,
+        handle: &Arc<client::Handle<SshClientHandler>>,
+        remote_path: &str,
+        resolved_local: &Path,
+        resume: bool,
+        verify: bool,
+    ) -> Result<(u64, ResumePlan), DomainError> {
+        let total_bytes = stat_remote_size(handle, remote_path)
+            .await
+            .inspect_err(|_| self.release_reservation(transfer_id))?;
+        let resume_plan =
+            preflight_resume_download(handle, remote_path, resolved_local, resume, verify)
+                .await
+                .map_err(DomainError::Sftp)
+                .inspect_err(|_| self.release_reservation(transfer_id))?;
+        Ok((total_bytes, resume_plan))
     }
 
     /// Spawn the upload streaming task. Returns the resolved local path
@@ -937,13 +1024,18 @@ impl SftpClientPort for RusshSftpAdapter {
             resume,
             verify,
         } = request;
-        let handle = self.preflight(&session_id)?;
+        let handle = self.preflight(&session_id, &transfer_id)?;
         let resolved_local = resolve_local_path(&local_path);
-        let total_bytes = stat_local_size(&resolved_local).await?;
-        let resume_plan =
-            preflight_resume_upload(&handle, &resolved_local, &remote_path, resume, verify)
-                .await
-                .map_err(DomainError::Sftp)?;
+        let (total_bytes, resume_plan) = self
+            .upload_preflight_stats(
+                &transfer_id,
+                &handle,
+                &resolved_local,
+                &remote_path,
+                resume,
+                verify,
+            )
+            .await?;
         Ok(self.dispatch_upload(
             handle,
             transfer_id,
@@ -968,7 +1060,8 @@ impl SftpClientPort for RusshSftpAdapter {
             verify,
         } = request;
 
-        let handle = self.preflight(&session_id)?;
+        let handle = self.preflight(&session_id, &transfer_id)?;
+        let resolved_local = resolve_local_path(&local_path);
         // Stat the remote path synchronously before spawning the
         // streaming task so genuine metadata failures surface as
         // `REMOTE_METADATA_ERROR:` (the v4.5 wire tag) instead of
@@ -976,12 +1069,16 @@ impl SftpClientPort for RusshSftpAdapter {
         // snapshot for an unreachable file. The streaming task still
         // opens its own session for the actual transfer so this stat
         // is a one-RTT pre-flight only.
-        let total_bytes = stat_remote_size(&handle, &remote_path).await?;
-        let resolved_local = resolve_local_path(&local_path);
-        let resume_plan =
-            preflight_resume_download(&handle, &remote_path, &resolved_local, resume, verify)
-                .await
-                .map_err(DomainError::Sftp)?;
+        let (total_bytes, resume_plan) = self
+            .download_preflight_stats(
+                &transfer_id,
+                &handle,
+                &remote_path,
+                &resolved_local,
+                resume,
+                verify,
+            )
+            .await?;
         Ok(self.dispatch_download(
             handle,
             transfer_id,
