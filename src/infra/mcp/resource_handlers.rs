@@ -33,7 +33,8 @@ use crate::application::list_resources::{
     ListResourcesRequest, ListResourcesUseCase, ResourceListing,
 };
 use crate::application::read_resource::{
-    ReadResourceOutcome, ReadResourceRequest, ReadResourceUseCase,
+    CursorMode, ReadResourceOutcome, ReadResourceRequest, ReadResourceUseCase, canonical_uri,
+    parse_uri,
 };
 use crate::application::rsync_sync::{RsyncStatsSnapshot, RsyncSyncUseCase};
 use crate::application::subscribe_resource::{
@@ -43,6 +44,7 @@ use crate::application::unsubscribe_resource::{
     UnsubscribeResourceRequest, UnsubscribeResourceUseCase,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ids::PeerId;
 use crate::domain::rsync_ids::RsyncId;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::config::ConfigPort;
@@ -374,13 +376,14 @@ where
     OS: OutputStreamPort + Send + Sync,
     Sub: SubscriberRegistryPort,
 {
-    if let Some(content) = try_serial_read(&request.uri) {
+    let handle = RmcpPeerHandle::resolve(ctx, peer_table);
+    let peer_id = handle.id();
+    if let Some(content) = try_serial_read(&request.uri, &peer_id) {
         return Ok(ReadResourceResult::new(vec![content]));
     }
-    let handle = RmcpPeerHandle::resolve(ctx, peer_table);
     let req = ReadResourceRequest {
         uri: request.uri,
-        peer_id: handle.id(),
+        peer_id,
     };
     let outcome = use_case
         .execute(req)
@@ -398,32 +401,70 @@ const COMMAND_BLOCK_CAP_BYTES: usize = 64 * 1024;
 /// v5.2 (ADR 0009) — serial state lives on the static
 /// `SERIAL_REGISTRY` and is therefore reachable directly from the
 /// MCP infra layer without going through the application read use
-/// case. Returns `None` for any non-serial URI so the caller can
-/// fall through to the existing flow.
-fn try_serial_read(uri: &str) -> Option<ResourceContents> {
-    use crate::adapters::serial::state::{SERIAL_REGISTRY, read_history_from_cursor};
+/// case. Returns `None` for any non-serial URI (or a URI that fails to
+/// parse) so the caller can fall through to the existing flow.
+///
+/// Honors `?cursor=auto|<N>|0` exactly like the `shell://` / `command://`
+/// / `forward://` read paths (BUG #11 / BUG #14): the query is parsed via
+/// the shared `parse_uri` helper, `Auto` resolves against the per-peer
+/// cursor cache in [`crate::adapters::serial::state`], and that cache is
+/// advanced to the new tail after the read so a follow-up `?cursor=auto`
+/// poll only sees fresh bytes.
+fn try_serial_read(uri: &str, peer_id: &PeerId) -> Option<ResourceContents> {
+    use crate::adapters::serial::state::{
+        SERIAL_REGISTRY, advance_peer_cursor, read_history_from_cursor,
+    };
     use crate::domain::ids::SerialId;
 
-    let (scheme, rest) = uri.split_once("://")?;
-    if scheme != "serial" {
+    let parsed = parse_uri(uri).ok()?;
+    if parsed.kind != ResourceKind::Serial {
         return None;
     }
-    let serial_id = rest.split_once('/').map_or(rest, |(id, _)| id).to_string();
-    let id = SerialId::new(serial_id);
-    let state = SERIAL_REGISTRY.get(&id)?;
-    let (data, cursor) = read_history_from_cursor(&state, 0);
+    let canonical = canonical_uri(ResourceKind::Serial, &parsed.id);
+    let state = SERIAL_REGISTRY.get(&SerialId::new(parsed.id))?;
+    let start = resolve_serial_start(parsed.cursor, peer_id, &canonical);
+    let (data, new_cursor) = read_history_from_cursor(&state, start);
+    // Mirrors the shell/command/forward path in
+    // `read_resource.rs::resolve_start_offset` callers: the ratcheted
+    // return is discarded — the response reports the cursor computed
+    // for *this* read, not a value a racing concurrent read may have
+    // pushed higher in the meantime.
+    let _new_cursor = advance_peer_cursor(peer_id, &canonical, new_cursor);
     let text = String::from_utf8_lossy(&data).into_owned();
     let meta = serde_json::json!({
-        "cursor":      cursor,
-        "buffer_size": data.len(),
+        "cursor":      new_cursor,
+        // `new_cursor` is the ring buffer's total length (see
+        // `read_history_from_cursor`), not `data.len()` (the slice
+        // served for THIS read) — matches the `buffer_size` contract
+        // used by `build_stream_meta` for shell/command (cumulative
+        // length at snapshot time, independent of the requested
+        // cursor window).
+        "buffer_size": new_cursor,
         "kind":        "serial",
     });
     Some(ResourceContents::TextResourceContents {
-        uri: state.uri(),
+        uri: canonical,
         mime_type: Some("text/plain".to_string()),
         text,
         meta: Some(serde_json::from_value(meta).unwrap_or_default()),
     })
+}
+
+/// Resolve the `serial://` read start offset from `?cursor=`.
+///
+/// Mirrors [`crate::application::read_resource`]'s (private)
+/// `resolve_start_offset` helper used by the shell / command / forward
+/// paths, except the `Auto` branch consults the local per-peer cursor
+/// cache in [`crate::adapters::serial::state`] instead of a
+/// [`SubscriberRegistryPort`] — see the cross-file note on
+/// [`try_serial_read`].
+fn resolve_serial_start(cursor: CursorMode, peer_id: &PeerId, canonical: &str) -> u64 {
+    use crate::adapters::serial::state::peer_cursor;
+    match cursor {
+        CursorMode::Snapshot => 0,
+        CursorMode::At(n) => n,
+        CursorMode::Auto => peer_cursor(peer_id, canonical),
+    }
 }
 
 /// Error mapping helper specific to the rsync read short-circuit.
