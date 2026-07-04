@@ -14,12 +14,13 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, ReadResourceRequestParams, SubscribeRequestParams,
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, SubscribeRequestParams,
     UnsubscribeRequestParams,
 };
 use rmcp::service::{RoleClient, RunningService, Service};
 use serde_json::{Map, Value};
 
+use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
 use crate::domain::subscription::SubId;
 
 use crate::embed::event_mux::EventTx;
@@ -441,7 +442,7 @@ where
     let name = op_tool_name(op);
     let params = CallToolRequestParams::new(name).with_arguments(arguments);
     match client.peer().call_tool(params).await {
-        Ok(_result) => ack_with_id(opt_owned(correlation)),
+        Ok(result) => ack_from_result(op, correlation, &result),
         Err(err) => Event::Err {
             id: opt_owned(correlation),
             code: "TOOL_CALL_FAILED".to_string(),
@@ -449,6 +450,85 @@ where
             detail: Some(err.to_string()),
         },
     }
+}
+
+/// Populated identifier fields extracted from a successful tool call's
+/// `structured_content` payload. Every field defaults to `None` so an
+/// op that mints no new identifier (e.g. `ssh_shell_write`) still
+/// produces a well-formed all-`None` [`Event::Ack`].
+#[derive(Debug, Default)]
+struct AckIds {
+    sid: Option<SessionId>,
+    cid: Option<CommandId>,
+    shid: Option<ShellId>,
+    tid: Option<TransferId>,
+}
+
+/// Build the [`Event::Ack`] for a completed tool call, reading the
+/// newly minted identifier back out of `result.structured_content`.
+///
+/// DAEMON.md documents each op returning its identifier on the ack
+/// (`sid` for `connect`, `cid` for `exec`, `shid` for `shell_open`,
+/// `tid` for `upload`/`download`). A missing or mistyped key falls
+/// back to `None` rather than panicking on an unexpected server-side
+/// shape.
+fn ack_from_result(op: &Op, correlation: Option<&str>, result: &CallToolResult) -> Event {
+    let AckIds {
+        sid,
+        cid,
+        shid,
+        tid,
+    } = ack_ids_for(op, result.structured_content.as_ref());
+    Event::Ack {
+        id: opt_owned(correlation),
+        sid,
+        cid,
+        shid,
+        sub_id: None,
+        tid,
+        uri: None,
+    }
+}
+
+/// Map an op kind to the structured-content key that carries its
+/// newly minted identifier, per each tool's `*_structured` renderer in
+/// `src/infra/mcp/render`. Ops that mint no identifier fall through to
+/// the all-`None` default.
+fn ack_ids_for(op: &Op, structured: Option<&Value>) -> AckIds {
+    match op {
+        Op::Connect { .. } => AckIds {
+            sid: structured_string(structured, "session_id").map(SessionId::new),
+            ..AckIds::default()
+        },
+        Op::Exec { .. } => AckIds {
+            cid: structured_string(structured, "command_id").map(CommandId::new),
+            ..AckIds::default()
+        },
+        Op::ShellOpen { .. } => AckIds {
+            shid: structured_string(structured, "shell_id").map(ShellId::new),
+            ..AckIds::default()
+        },
+        Op::Upload { .. } | Op::Download { .. } => AckIds {
+            tid: structured_string(structured, "transfer_id").map(TransferId::new),
+            ..AckIds::default()
+        },
+        Op::ShellWrite { .. }
+        | Op::ShellKey { .. }
+        | Op::Cancel { .. }
+        | Op::Disconnect { .. }
+        | Op::Subscribe { .. }
+        | Op::Unsubscribe { .. }
+        | Op::Read { .. }
+        | Op::Shutdown { .. } => AckIds::default(),
+    }
+}
+
+/// Read a string field out of a tool call's structured-content JSON
+/// object. Returns `None` when the payload is absent, not an object,
+/// the key is missing, or the value is not a string — never panics on
+/// a malformed or forward-incompatible server response.
+fn structured_string(value: Option<&Value>, key: &str) -> Option<String> {
+    value?.as_object()?.get(key)?.as_str().map(str::to_string)
 }
 
 fn tool_call_unrouted(correlation: Option<&str>) -> Event {
@@ -609,6 +689,7 @@ mod tests {
     use super::*;
     use crate::domain::ids::{CommandId, SessionId, ShellId};
     use crate::domain::subscription::SubId;
+    use serde_json::json;
 
     fn connect_op() -> Op {
         Op::Connect {
@@ -865,5 +946,135 @@ mod tests {
     fn dispatch_outcome_continue_default() {
         let outcome = DispatchOutcome::Continue;
         assert_ne!(outcome, DispatchOutcome::Shutdown);
+    }
+
+    // Bug #0 regression coverage — `ack_ids_for` / `ack_from_result` must
+    // read the daemon's Ack identifiers back out of the tool call's
+    // `structured_content`, keyed per each tool's `*_structured` renderer.
+
+    #[test]
+    fn ack_ids_for_connect_reads_session_id_from_structured_content() {
+        let structured = json!({ "session_id": "s-123" });
+        let ids = ack_ids_for(&connect_op(), Some(&structured));
+        assert_eq!(ids.sid, Some(SessionId::new("s-123".to_string())));
+        assert_eq!(ids.cid, None);
+        assert_eq!(ids.shid, None);
+        assert_eq!(ids.tid, None);
+    }
+
+    #[test]
+    fn ack_ids_for_exec_reads_command_id_from_structured_content() {
+        let op = Op::Exec {
+            sid: SessionId::new("s".to_string()),
+            cmd: "ls".to_string(),
+            pty: None,
+            release_when_no_subs: None,
+            id: None,
+        };
+        let structured = json!({ "command_id": "c-1" });
+        assert_eq!(
+            ack_ids_for(&op, Some(&structured)).cid,
+            Some(CommandId::new("c-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn ack_ids_for_shell_open_reads_shell_id_from_structured_content() {
+        let op = Op::ShellOpen {
+            sid: SessionId::new("s".to_string()),
+            cols: 80,
+            rows: 24,
+            release_when_no_subs: None,
+            inactivity_ttl_secs: None,
+            max_buffer_size: None,
+            id: None,
+        };
+        let structured = json!({ "shell_id": "sh-1" });
+        assert_eq!(
+            ack_ids_for(&op, Some(&structured)).shid,
+            Some(ShellId::new("sh-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn ack_ids_for_upload_and_download_read_transfer_id_from_structured_content() {
+        let structured = json!({ "transfer_id": "t-1" });
+        let upload = Op::Upload {
+            sid: SessionId::new("s".to_string()),
+            local: "/tmp/a".to_string(),
+            remote: "/srv/a".to_string(),
+            release_when_no_subs: None,
+            resume: None,
+            verify: None,
+            id: None,
+        };
+        let download = Op::Download {
+            sid: SessionId::new("s".to_string()),
+            remote: "/srv/a".to_string(),
+            local: "/tmp/a".to_string(),
+            release_when_no_subs: None,
+            resume: None,
+            verify: None,
+            id: None,
+        };
+        assert_eq!(
+            ack_ids_for(&upload, Some(&structured)).tid,
+            Some(TransferId::new("t-1".to_string()))
+        );
+        assert_eq!(
+            ack_ids_for(&download, Some(&structured)).tid,
+            Some(TransferId::new("t-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn ack_ids_for_falls_back_to_none_on_missing_or_mistyped_key() {
+        let missing = json!({});
+        let mistyped = json!({ "session_id": 42 });
+        assert_eq!(ack_ids_for(&connect_op(), Some(&missing)).sid, None);
+        assert_eq!(ack_ids_for(&connect_op(), Some(&mistyped)).sid, None);
+        assert_eq!(ack_ids_for(&connect_op(), None).sid, None);
+    }
+
+    #[test]
+    fn ack_ids_for_non_minting_ops_stay_all_none() {
+        let op = Op::ShellWrite {
+            shid: ShellId::new("sh".to_string()),
+            bytes: "ls\n".to_string(),
+            id: None,
+        };
+        // Even when the (unrelated) structured payload happens to carry
+        // recognisable keys, an op that mints no identifier must never
+        // populate an Ack field from it.
+        let structured = json!({ "session_id": "s-1", "shell_id": "sh-1" });
+        let ids = ack_ids_for(&op, Some(&structured));
+        assert_eq!(ids.sid, None);
+        assert_eq!(ids.cid, None);
+        assert_eq!(ids.shid, None);
+        assert_eq!(ids.tid, None);
+    }
+
+    #[test]
+    fn ack_from_result_builds_populated_ack_event() {
+        let mut result = CallToolResult::success(Vec::new());
+        result.structured_content = Some(json!({ "session_id": "s-9" }));
+        let event = ack_from_result(&connect_op(), Some("corr-9"), &result);
+        match event {
+            Event::Ack {
+                id,
+                sid,
+                cid,
+                shid,
+                tid,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("corr-9"));
+                assert_eq!(sid, Some(SessionId::new("s-9".to_string())));
+                assert_eq!(cid, None);
+                assert_eq!(shid, None);
+                assert_eq!(tid, None);
+            }
+            other => panic!("expected Event::Ack, got {other:?}"),
+        }
     }
 }

@@ -356,33 +356,59 @@ where
 
     /// Read the next NDJSON line. Returns [`ParseOutcome::Eof`] on stdin
     /// closure and [`ParseOutcome::Invalid`] on a single malformed line.
+    ///
+    /// Blank / whitespace-only lines are skipped iteratively (bounded
+    /// stack depth regardless of how many consecutive blank lines are
+    /// read) — see [`Self::decode_line`].
     pub async fn next(&mut self) -> ParseOutcome {
-        self.buf.clear();
-        match self.fill_bounded_line().await {
-            Ok(LineStatus::Eof) => ParseOutcome::Eof,
-            Ok(LineStatus::TooLong(len)) => ParseOutcome::Invalid(ParseError::LineTooLong(len)),
-            Ok(LineStatus::Line) => match str::from_utf8(&self.buf) {
-                Ok(text) => {
-                    let trimmed = text.trim();
-                    if trimmed.is_empty() {
-                        // Empty / whitespace-only line — treat as a benign skip.
-                        return Box::pin(self.next()).await;
-                    }
-                    match serde_json::from_str::<Op>(trimmed) {
-                        Ok(op) => ParseOutcome::Op(op),
-                        Err(err) => ParseOutcome::Invalid(ParseError::InvalidJson(err.to_string())),
-                    }
+        loop {
+            self.buf.clear();
+            match self.fill_bounded_line().await {
+                Ok(LineStatus::Eof) => return ParseOutcome::Eof,
+                Ok(LineStatus::TooLong(len)) => {
+                    return ParseOutcome::Invalid(ParseError::LineTooLong(len));
                 }
-                Err(err) => ParseOutcome::Invalid(ParseError::InvalidUtf8(err.to_string())),
-            },
-            Err(err) => {
-                let kind = err.kind();
-                if matches!(kind, ErrorKind::InvalidData) {
-                    ParseOutcome::Invalid(ParseError::InvalidUtf8(err.to_string()))
-                } else {
-                    ParseOutcome::Invalid(ParseError::Io(err.to_string()))
+                Ok(LineStatus::Line) => {
+                    if let Some(outcome) = Self::decode_line(&self.buf) {
+                        return outcome;
+                    }
+                    // Empty / whitespace-only line — loop back around and
+                    // read the next physical line instead of recursing.
                 }
+                Err(err) => return Self::io_error_outcome(&err),
             }
+        }
+    }
+
+    /// Decode one already-drained physical line into a [`ParseOutcome`].
+    /// Returns `None` when the line is empty/whitespace-only so the
+    /// caller's loop can read the next physical line without recursing.
+    fn decode_line(bytes: &[u8]) -> Option<ParseOutcome> {
+        let text = match str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(err) => {
+                return Some(ParseOutcome::Invalid(ParseError::InvalidUtf8(
+                    err.to_string(),
+                )));
+            }
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(match serde_json::from_str::<Op>(trimmed) {
+            Ok(op) => ParseOutcome::Op(op),
+            Err(err) => ParseOutcome::Invalid(ParseError::InvalidJson(err.to_string())),
+        })
+    }
+
+    /// Map an I/O failure from [`Self::fill_bounded_line`] into the
+    /// matching [`ParseOutcome::Invalid`] variant.
+    fn io_error_outcome(err: &io::Error) -> ParseOutcome {
+        if matches!(err.kind(), ErrorKind::InvalidData) {
+            ParseOutcome::Invalid(ParseError::InvalidUtf8(err.to_string()))
+        } else {
+            ParseOutcome::Invalid(ParseError::Io(err.to_string()))
         }
     }
 

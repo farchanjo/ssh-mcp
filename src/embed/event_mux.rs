@@ -73,7 +73,10 @@ where
 {
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => break,
+            () = shutdown.cancelled() => {
+                drain_remaining(&mut rx, &mut writer).await;
+                break;
+            }
             maybe = rx.recv() => match maybe {
                 Some(event) => {
                     if let Err(err) = writer.write(&event).await {
@@ -87,6 +90,29 @@ where
     }
     if let Err(err) = writer.shutdown().await {
         tracing::debug!("ndjson writer shutdown: {err}");
+    }
+}
+
+/// Flush every event already buffered in the mpsc before the drain
+/// loop exits on a shutdown signal.
+///
+/// Without this step, a `shutdown.cancelled()` branch racing an
+/// already-populated `rx` in the surrounding `tokio::select!` could
+/// win the race and `break` immediately, silently discarding events
+/// enqueued before the signal fired — contradicting the module
+/// contract that every event is written before the next is dequeued.
+/// Closes `rx` first so no further sender can enqueue once draining
+/// starts, then drains whatever is already buffered with `try_recv`.
+async fn drain_remaining<W>(rx: &mut EventRx, writer: &mut NdjsonWriter<W>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    rx.close();
+    while let Ok(event) = rx.try_recv() {
+        if let Err(err) = writer.write(&event).await {
+            tracing::warn!("ndjson write failed during shutdown drain: {err}");
+            break;
+        }
     }
 }
 
@@ -452,6 +478,30 @@ mod tests {
         token.cancel();
         handle.await.unwrap();
         drop(tx);
+    }
+
+    // Bug #24 regression coverage — a `shutdown.cancelled()` signal must
+    // never discard events already buffered in the mpsc.
+    #[tokio::test]
+    async fn drain_remaining_flushes_buffered_events_and_closes_rx() {
+        let (tx, mut rx) = make_pair();
+        tx.try_send(Event::Closed {
+            id: None,
+            sid: SessionId::new("s1".to_string()),
+        })
+        .unwrap();
+        tx.try_send(Event::Closed {
+            id: None,
+            sid: SessionId::new("s2".to_string()),
+        })
+        .unwrap();
+        let buf: Vec<u8> = Vec::new();
+        let mut writer = NdjsonWriter::new(buf);
+        drain_remaining(&mut rx, &mut writer).await;
+        // Every already-enqueued event must be drained before the
+        // channel is left closed and empty — nothing silently dropped.
+        assert!(rx.try_recv().is_err());
+        assert!(tx.is_closed());
     }
 
     #[tokio::test]
