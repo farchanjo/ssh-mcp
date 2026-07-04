@@ -181,6 +181,24 @@ impl CascadeCoordinator {
         self.sessions.remove(session_id);
     }
 
+    /// Drop every session that has already fired its auto-disconnect hook
+    /// (`SESSION_REAPED`) and carries no active resource refs.
+    ///
+    /// Called by the leak-watcher eviction sweep (BUG #18) so the
+    /// coordinator's `DashMap` stays bounded across long-running
+    /// deployments — the per-session [`Self::drop_session`] path is never
+    /// reached in production. A re-`inc_session` after the drop simply
+    /// recreates a fresh `Active` entry.
+    pub fn sweep_reaped_sessions(&self) {
+        // Retain a session while it still holds active refs OR has not yet
+        // been reaped; drop only the reaped-and-idle entries.
+        self.sessions.retain(|_sid, entry| {
+            let active = entry.active_refs.load(Ordering::Acquire) > 0;
+            let live = entry.state.load(Ordering::Acquire) != SESSION_REAPED;
+            active || live
+        });
+    }
+
     fn try_fire_hook(&self, session_id: &SessionId, entry: &Arc<SessionEntry>) {
         // CAS Active -> Reaped. Only the winner fires the hook so the
         // disconnect call lands at most once per session.
@@ -478,6 +496,37 @@ mod tests {
         c.on_resource_closed(ResourceKind::Shell, "x", &s);
         assert_eq!(first.load(Ordering::Acquire), 0);
         assert_eq!(second.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn sweep_reaped_sessions_drops_reaped_idle_only() {
+        let c = CascadeCoordinator::new();
+        let reaped = sess("reaped");
+        let active = sess("active");
+        // reaped: inc then close to zero -> reaped + idle.
+        c.inc_session(&reaped);
+        c.on_resource_closed(ResourceKind::Shell, "x", &reaped);
+        assert!(c.is_session_reaped(&reaped));
+        // active: still holds a ref.
+        c.inc_session(&active);
+        assert!(format!("{c:?}").contains("sessions_len: 2"));
+        c.sweep_reaped_sessions();
+        // Only the active session survives the sweep.
+        assert!(format!("{c:?}").contains("sessions_len: 1"));
+        assert_eq!(c.session_active_refs(&active), 1);
+    }
+
+    #[test]
+    fn sweep_reaped_sessions_keeps_active_sessions() {
+        let c = CascadeCoordinator::new();
+        let s = sess("busy");
+        c.inc_session(&s);
+        c.inc_session(&s);
+        c.on_resource_closed(ResourceKind::Shell, "x", &s);
+        // Still one ref outstanding -> not reaped -> retained.
+        c.sweep_reaped_sessions();
+        assert_eq!(c.session_active_refs(&s), 1);
+        assert!(!c.is_session_reaped(&s));
     }
 
     #[test]

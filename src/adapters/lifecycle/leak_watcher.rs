@@ -30,7 +30,9 @@ use crate::adapters::clock::system::SystemClock;
 use crate::adapters::config::internal::{
     resolve_sub_leak_risk_kill_s, resolve_sub_leak_risk_warn_s,
 };
-use crate::adapters::lifecycle::refcount::{LifecycleScanEntry, RefcountedLifecycleAdapter};
+use crate::adapters::lifecycle::refcount::{
+    CLOSED_RETENTION_MS, LifecycleScanEntry, RefcountedLifecycleAdapter,
+};
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::lifecycle::LifecycleState;
 use crate::ports::clock::ClockPort;
@@ -292,6 +294,9 @@ fn run_scan_pass<C>(
     // Drop alerts that are no longer firing — e.g. a peer subscribed
     // (resource transitioned to `Observed`), or the resource closed.
     active.retain(|key, _| still_active.contains(key));
+    // BUG #18: reuse this cadence to evict terminal entries + reaped
+    // sessions so the lifecycle maps stay bounded (retention-gated).
+    adapter.sweep_terminal(CLOSED_RETENTION_MS);
 }
 
 /// Pure classification helper. Decoupled from the loop so unit tests
