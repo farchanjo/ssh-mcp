@@ -13,7 +13,7 @@
 //! `UseCases<Fakes...>` instance with the exact same shape.
 
 use core::future::Future;
-use core::pin::Pin;
+use core::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ use serde_json::Value as JsonValue;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
@@ -90,8 +91,8 @@ use crate::infra::mcp::error_detail;
 use crate::infra::mcp::helpers::error::{format_error, format_error_structured};
 use crate::infra::mcp::helpers::structured::{error_text_and_structured, ok_text_and_structured};
 use crate::infra::mcp::idempotency::{
-    IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, IdempotencyOutcome, KeyOutcome,
-    extract_idempotency_key, fingerprint_args, replay,
+    ClaimGuard, ClaimOutcome, IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, IdempotencyOutcome,
+    KeyOutcome, extract_idempotency_key, fingerprint_args, replay,
 };
 use crate::infra::mcp::leak_warn_bridge::{LeakWarnBridgeHandle, spawn_bridge};
 use crate::infra::mcp::progress::{COMMAND_TICK, ProgressEmitter, WAIT_FOR_TICK};
@@ -404,10 +405,12 @@ pub fn noop_id_lister() -> Arc<dyn IdLister> {
 ///    `args_fingerprint`. On a [`IdempotencyOutcome::Hit`] replay the
 ///    cached response verbatim. On a [`IdempotencyOutcome::Mismatch`]
 ///    surface `IDEMPOTENCY_KEY_MISMATCH` and skip the use case.
-///  * On a [`IdempotencyOutcome::Miss`] drive the use case `f` and
-///    cache the rendered response if it was a success path. Errors are
-///    intentionally NOT cached (the LLM should be able to retry after
-///    fixing the input).
+///  * On a miss, atomically CLAIM the `(tool, key)` under the cache shard
+///    lock ([`IdempotencyCache::claim`]) so two concurrent duplicates
+///    collapse to a single use-case run: the winner drives `f` and caches
+///    the success; a racing duplicate awaits the winner and replays its
+///    result. Errors are intentionally NOT cached (the LLM should be able
+///    to retry after fixing the input).
 ///
 /// When the request omits the key the use case is driven directly.
 /// When the key is too long, return `IDEMPOTENCY_KEY_TOO_LONG` as an
@@ -461,16 +464,14 @@ where
         KeyResolution::Reject(error) => return Ok(error),
         KeyResolution::Use(k) => k,
     };
-    match cache.get_with_fingerprint(tool, &key, &args_fingerprint) {
-        IdempotencyOutcome::Hit(cached) => return Ok(replay(&cached)),
-        IdempotencyOutcome::Mismatch => return Ok(render_mismatch(tool, &key)),
-        IdempotencyOutcome::Miss => {}
+    match cache.claim(tool, &key, &args_fingerprint) {
+        ClaimOutcome::Hit(cached) => Ok(replay(&cached)),
+        ClaimOutcome::Mismatch => Ok(render_mismatch(tool, &key)),
+        ClaimOutcome::Wait(waker) => {
+            Ok(await_in_flight(cache, &waker, tool, &key, &args_fingerprint).await)
+        }
+        ClaimOutcome::Claimed(guard) => run_claimed(guard, args_fingerprint, f).await,
     }
-    let response = f().await?;
-    if response.is_error != Some(true) {
-        cache_success(cache, tool, &key, args_fingerprint, &response);
-    }
-    Ok(response)
 }
 
 /// Outcome of normalising the inbound idempotency key. Returned by
@@ -509,26 +510,72 @@ fn render_mismatch(tool: &str, key: &str) -> CallToolResult {
     )
 }
 
-/// Persist a successful response into the idempotency cache. Pulled
-/// out so the [`with_idempotency`] body stays small and so we can swap
-/// in a no-op stub later if the rendering shape changes.
-fn cache_success(
+/// Winner path: drive the use case under `guard`, publishing the rendered
+/// response on success. Any `?` early-return, cancellation, or panic drops
+/// `guard`, whose `Drop` abandons the claim and wakes every parked caller
+/// (see [`crate::infra::mcp::idempotency::ClaimGuard`]). Errors are NOT
+/// cached — the LLM may retry after fixing the input.
+async fn run_claimed<F, Fut>(
+    guard: ClaimGuard<'_>,
+    args_fingerprint: String,
+    f: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<CallToolResult, McpError>>,
+{
+    let response = f().await?;
+    if response.is_error != Some(true) {
+        guard.publish(args_fingerprint, &response);
+    }
+    Ok(response)
+}
+
+/// Loser path: park on the winner's completion `Notify`, then replay its
+/// result. Interest is registered via `enable()` BEFORE the state re-check
+/// so a winner that finishes between `claim()` and here cannot cause a lost
+/// wakeup that wedges this caller forever.
+async fn await_in_flight(
+    cache: &IdempotencyCache,
+    waker: &Notify,
+    tool: &str,
+    key: &str,
+    fingerprint: &str,
+) -> CallToolResult {
+    let mut notified = pin!(waker.notified());
+    let _ = notified.as_mut().enable();
+    if let Some(done) = replay_terminal(cache, tool, key, fingerprint) {
+        return done;
+    }
+    notified.await;
+    replay_terminal(cache, tool, key, fingerprint).unwrap_or_else(|| render_in_progress(tool, key))
+}
+
+/// Map the current cache state for `key` to a replayable result, or `None`
+/// when no terminal `Done` / `Mismatch` verdict exists yet.
+fn replay_terminal(
     cache: &IdempotencyCache,
     tool: &str,
     key: &str,
-    fingerprint: String,
-    response: &CallToolResult,
-) {
-    let body = response
-        .content
-        .first()
-        .and_then(|c| c.as_text().map(|t| t.text.clone()))
-        .unwrap_or_default();
-    let structured = response
-        .structured_content
-        .clone()
-        .unwrap_or(serde_json::Value::Null);
-    cache.put_with_fingerprint(tool, key, fingerprint, body, structured);
+    fingerprint: &str,
+) -> Option<CallToolResult> {
+    match cache.get_with_fingerprint(tool, key, fingerprint) {
+        IdempotencyOutcome::Hit(cached) => Some(replay(&cached)),
+        IdempotencyOutcome::Mismatch => Some(render_mismatch(tool, key)),
+        IdempotencyOutcome::Miss => None,
+    }
+}
+
+/// Render the `IDEMPOTENCY_IN_PROGRESS` advisory returned to a caller whose
+/// in-flight duplicate finished without publishing a cacheable success
+/// (winner errored, was cancelled, or a newer claim is still running).
+fn render_in_progress(tool: &str, key: &str) -> CallToolResult {
+    render_tool_error(
+        tool,
+        &DomainError::InvalidArgument(format!(
+            "IDEMPOTENCY_IN_PROGRESS: idempotency_key '{key}' is being processed by a concurrent call; retry with the same key to replay the result"
+        )),
+    )
 }
 
 /// Tags surfaced through [`DomainError::InvalidArgument`] messages. Each
@@ -4757,6 +4804,9 @@ mod tests {
                 stdout: self.0.clone(),
                 stderr: Bytes::new(),
             })
+        }
+        async fn shell_produced_total(&self, _id: &ShellId) -> Result<u64, DomErr> {
+            Ok(u64::try_from(self.0.len()).unwrap_or(u64::MAX))
         }
     }
 
