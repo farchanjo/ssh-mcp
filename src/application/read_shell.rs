@@ -116,6 +116,11 @@ pub struct ReadShellOutcome {
     /// drain from the head of the rolling buffer). `0` when `clear=false`
     /// or when the rendered window was empty.
     pub bytes_consumed: usize,
+    /// Echo of [`ReadShellRequest::max_output_bytes`]. The render layer
+    /// caps its output block at this value (falling back to a 16 KiB
+    /// default only when the caller omitted the argument) so it never
+    /// re-truncates below the budget the caller explicitly asked for.
+    pub max_output_bytes: Option<usize>,
 }
 
 /// Lifecycle outcome surfaced to the inbound adapter.
@@ -201,6 +206,7 @@ where
         let bytes_consumed = if req.clear { data.len() } else { 0 };
 
         Ok(ReadShellOutcome {
+            max_output_bytes: req.max_output_bytes,
             shell_id: req.shell_id,
             status,
             data,
@@ -244,24 +250,30 @@ where
         let cap = req.max_output_bytes.unwrap_or(usize::MAX).max(1);
         let target_min = req.min_bytes.unwrap_or(1).clamp(1, cap);
 
-        let initial = self.streams.snapshot_shell(&req.shell_id).await?;
-        let initial_len = initial.stdout.len();
+        // Track fresh output via the monotonic producer counter, not the
+        // snapshot length: once the shell's rolling buffer reaches its cap
+        // the length stops growing, so a raw `len - initial_len` delta would
+        // wedge at 0 and this long-poll would always time out on a chatty
+        // shell. `shell_produced_total` keeps counting past the cap.
+        let target_min = u64::try_from(target_min).unwrap_or(u64::MAX);
+        let initial_total = self.streams.shell_produced_total(&req.shell_id).await?;
 
         loop {
-            let snapshot = self.streams.snapshot_shell(&req.shell_id).await?;
-            let new_bytes = snapshot.stdout.len().saturating_sub(initial_len);
-            if new_bytes >= target_min {
+            let produced = self.streams.shell_produced_total(&req.shell_id).await?;
+            if produced.saturating_sub(initial_total) >= target_min {
+                let snapshot = self.streams.snapshot_shell(&req.shell_id).await?;
                 return Ok((ReadShellStatus::Open, snapshot));
             }
 
             let status = self.current_status(&req.shell_id).await?;
-            match status {
-                ShellStatus::Closed => return Ok((ReadShellStatus::Closed, snapshot)),
-                ShellStatus::Open => {}
+            if status == ShellStatus::Closed {
+                let snapshot = self.streams.snapshot_shell(&req.shell_id).await?;
+                return Ok((ReadShellStatus::Closed, snapshot));
             }
 
             let now = Instant::now();
             if now >= deadline {
+                let snapshot = self.streams.snapshot_shell(&req.shell_id).await?;
                 return Ok((ReadShellStatus::Timeout, snapshot));
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -361,6 +373,13 @@ mod tests {
             let map = self.shell_snapshots.lock().expect("snapshot map mutex");
             map.get(id)
                 .cloned()
+                .ok_or_else(|| DomainError::ShellNotFound(id.clone()))
+        }
+
+        async fn shell_produced_total(&self, id: &ShellId) -> Result<u64, DomainError> {
+            let map = self.shell_snapshots.lock().expect("snapshot map mutex");
+            map.get(id)
+                .map(|s| u64::try_from(s.stdout.len()).unwrap_or(u64::MAX))
                 .ok_or_else(|| DomainError::ShellNotFound(id.clone()))
         }
     }

@@ -116,6 +116,11 @@ pub struct WaitForPatternOutcome {
     /// Latest sequence number from the output stream snapshot. Lets clients
     /// correlate this snapshot with subsequent `resources/read` cursor pages.
     pub last_seq: u64,
+    /// Echo of [`WaitForPatternRequest::max_output_bytes`]. The render layer
+    /// caps its output block at this value (falling back to a 16 KiB default
+    /// only when the caller omitted the argument) so it never re-truncates
+    /// below the budget the caller explicitly asked for.
+    pub max_output_bytes: Option<usize>,
 }
 
 /// Final status reached by [`WaitForPatternUseCase::execute`].
@@ -237,10 +242,10 @@ where
         deadline: Instant,
         max_pat_len: usize,
     ) -> Result<WaitForPatternOutcome, DomainError> {
-        let mut last_scanned_offset = 0_usize;
+        let mut last_scanned_produced = 0_u64;
         loop {
             if let Some(out) = self
-                .poll_once(req, deadline, max_pat_len, &mut last_scanned_offset)
+                .poll_once(req, deadline, max_pat_len, &mut last_scanned_produced)
                 .await?
             {
                 return Ok(out);
@@ -258,10 +263,23 @@ where
         req: &WaitForPatternRequest,
         deadline: Instant,
         max_pat_len: usize,
-        last_scanned_offset: &mut usize,
+        last_scanned_produced: &mut u64,
     ) -> Result<Option<WaitForPatternOutcome>, DomainError> {
         let snapshot = self.streams.snapshot_shell(&req.shell_id).await?;
-        let scan_start = last_scanned_offset.saturating_sub(max_pat_len.saturating_sub(1_usize));
+        // Track scan progress in *produced* space (cumulative bytes ever
+        // emitted), not as a raw buffer index: once the rolling buffer wraps
+        // at `max_buffer_size`, an absolute buffer offset shifts left on every
+        // head-eviction, so a stale index would blind the scanner to any
+        // pattern that appears after the first wrap. Re-base into the current
+        // buffer's coordinate space via the evicted-byte count.
+        let produced = self.streams.shell_produced_total(&req.shell_id).await?;
+        let buf_len = u64::try_from(snapshot.stdout.len()).unwrap_or(u64::MAX);
+        let evicted = produced.saturating_sub(buf_len);
+        let overlap = last_scanned_produced
+            .saturating_sub(u64::try_from(max_pat_len.saturating_sub(1_usize)).unwrap_or(u64::MAX));
+        let scan_start = usize::try_from(overlap.saturating_sub(evicted))
+            .unwrap_or(usize::MAX)
+            .min(snapshot.stdout.len());
         if let Some(matched) = scan_for_first_match(&snapshot.stdout, &req.patterns, scan_start) {
             return Ok(Some(build_matched(
                 req,
@@ -270,7 +288,7 @@ where
                 matched,
             )));
         }
-        *last_scanned_offset = snapshot.stdout.len();
+        *last_scanned_produced = produced;
         let terminal = self.terminal_status(&req.shell_id, deadline).await?;
         Ok(terminal.map(|status| build_terminal(req, snapshot.stdout, snapshot.last_seq, status)))
     }
@@ -393,6 +411,7 @@ fn build_matched(
         matched_pattern: Some(matched.pattern),
         data,
         last_seq,
+        max_output_bytes: req.max_output_bytes,
     }
 }
 
@@ -410,6 +429,7 @@ fn build_terminal(
         matched_pattern: None,
         data,
         last_seq,
+        max_output_bytes: req.max_output_bytes,
     }
 }
 
@@ -478,6 +498,13 @@ mod tests {
             let map = self.shell_snapshots.lock().expect("snapshot map mutex");
             map.get(id)
                 .cloned()
+                .ok_or_else(|| DomainError::ShellNotFound(id.clone()))
+        }
+
+        async fn shell_produced_total(&self, id: &ShellId) -> Result<u64, DomainError> {
+            let map = self.shell_snapshots.lock().expect("snapshot map mutex");
+            map.get(id)
+                .map(|s| u64::try_from(s.stdout.len()).unwrap_or(u64::MAX))
                 .ok_or_else(|| DomainError::ShellNotFound(id.clone()))
         }
     }

@@ -493,10 +493,7 @@ async fn open_and_exec_command(
     handle_arc: &Arc<client::Handle<SshClientHandler>>,
     command: &str,
 ) -> Result<Channel<client::Msg>, String> {
-    let channel = handle_arc
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Failed to open channel: {e}"))?;
+    let channel = open_session_with_retry(handle_arc).await?;
 
     channel
         .exec(true, command)
@@ -504,6 +501,43 @@ async fn open_and_exec_command(
         .map_err(|e| format!("Failed to execute command: {e}"))?;
 
     Ok(channel)
+}
+
+/// Open a session channel, retrying the transient `MaxSessions` /
+/// `RESOURCE_SHORTAGE` refusal OpenSSH raises during rapid
+/// `execute + cancel` channel churn. Mirrors [`open_async_channel`] (the
+/// async path) so synchronous `ssh_exec` / `health_check` calls survive
+/// the same bursts instead of failing hard on a transient shortage.
+async fn open_session_with_retry(
+    handle_arc: &Arc<client::Handle<SshClientHandler>>,
+) -> Result<Channel<client::Msg>, String> {
+    const MAX_ATTEMPTS: u32 = 25;
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match handle_arc.channel_open_session().await {
+            Ok(ch) => return Ok(ch),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_transient_open_error(&msg) && attempt < MAX_ATTEMPTS {
+                    time::sleep(Duration::from_millis(open_backoff_ms(attempt))).await;
+                    continue;
+                }
+                return Err(format!("Failed to open channel: {e}"));
+            }
+        }
+    }
+}
+
+/// Exponential channel-open backoff in milliseconds, capped at 1 s.
+/// Shared by the synchronous retry path; the async path folds the same
+/// schedule into [`wait_with_cancel`].
+fn open_backoff_ms(attempt: u32) -> u64 {
+    const BASE_BACKOFF_MS: u64 = 100;
+    const MAX_BACKOFF_MS: u64 = 1_000;
+    let shift = attempt.saturating_sub(1).min(20);
+    let step = BASE_BACKOFF_MS.saturating_mul(1_u64 << shift);
+    step.min(MAX_BACKOFF_MS)
 }
 
 /// Collect output from a channel synchronously into provided buffers.
@@ -681,28 +715,39 @@ async fn exec_async_command(
     Ok(())
 }
 
+/// Terminal reason [`collect_async_output`] stopped reading the channel.
+enum CollectStop {
+    /// Channel closed normally; carries the observed exit code (if any).
+    Completed(Option<i32>),
+    /// The command's cancellation token fired.
+    Cancelled,
+    /// The per-command timeout elapsed.
+    TimedOut,
+}
+
 /// Run async output collection with cancellation and timeout support.
+///
+/// Cancellation and timeout are handled *inside* [`collect_async_output`] so
+/// that its staging buffers are always flushed before the collector returns —
+/// dropping the collector future mid-`select!` (the previous design) silently
+/// discarded up to `FLUSH_THRESHOLD - 1` already-received bytes.
 async fn run_with_cancellation_and_timeout(
     channel: &mut Channel<client::Msg>,
     command_text: &str,
     timeout: Duration,
     command: &Arc<RunningCommand>,
 ) {
-    tokio::select! {
-        biased;
-        () = command.cancel_token.cancelled() => {
-            handle_cancellation(channel, command_text, command).await;
-        }
-        () = time::sleep(timeout) => {
-            handle_timeout(channel, command_text, timeout, command).await;
-        }
-        result = collect_async_output(channel, command) => {
-            if let Some(code) = result {
-                let _ = command.exit_code.set(code);
+    match collect_async_output(channel, command, timeout).await {
+        CollectStop::Completed(code) => {
+            if let Some(c) = code {
+                let _ = command.exit_code.set(c);
             }
-            broadcast_close(command, result);
+            let _ = channel.close().await;
+            broadcast_close(command, code);
             let _ = command.status_tx.send(AsyncCommandStatus::Completed);
         }
+        CollectStop::Cancelled => handle_cancellation(channel, command_text, command).await,
+        CollectStop::TimedOut => handle_timeout(channel, command_text, timeout, command).await,
     }
 }
 
@@ -881,34 +926,73 @@ const FLUSH_THRESHOLD: usize = 8192;
 /// After each batch is flushed it publishes a fresh snapshot through
 /// `output_history.store(...)` and broadcasts the delta as an `OutputChunk`.
 ///
-/// Returns the exit code when the channel closes.
+/// Returns the terminal [`CollectStop`] reason. The staging buffers are
+/// always flushed before returning so a cancel / timeout never drops
+/// output the collector already received.
 async fn collect_async_output(
     channel: &mut Channel<client::Msg>,
     command: &Arc<RunningCommand>,
-) -> Option<i32> {
+    timeout: Duration,
+) -> CollectStop {
     let max = usize::try_from(resolve_command_max_buffer_size()).unwrap_or(usize::MAX);
-    let mut exit_code: Option<i32> = None;
-    let mut owned = OutputBuffer::with_capacity(4096, 1024);
-    let mut local_stdout = Vec::with_capacity(4096);
-    let mut local_stderr = Vec::with_capacity(1024);
-    while !process_channel_msg(
-        channel.wait().await,
-        &mut exit_code,
-        &mut local_stdout,
-        &mut local_stderr,
-        &mut owned,
-        command,
-        max,
-    ) {}
+    let mut buf = CollectBuffers {
+        exit_code: None,
+        owned: OutputBuffer::with_capacity(4096, 1024),
+        stdout: Vec::with_capacity(4096),
+        stderr: Vec::with_capacity(1024),
+    };
+    let stop = run_collect_loop(channel, command, timeout, &mut buf, max).await;
     flush_local_buffers(
-        &mut local_stdout,
-        &mut local_stderr,
-        &mut owned,
+        &mut buf.stdout,
+        &mut buf.stderr,
+        &mut buf.owned,
         command,
         max,
     );
-    let _ = channel.close().await;
-    exit_code
+    stop
+}
+
+/// Mutable staging state owned exclusively by the async output collector.
+struct CollectBuffers {
+    exit_code: Option<i32>,
+    owned: OutputBuffer,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Read-loop for [`collect_async_output`]: races cancellation and the
+/// timeout against inbound channel messages, breaking with the matching
+/// [`CollectStop`]. Flushing is the caller's responsibility so it runs on
+/// every exit path.
+async fn run_collect_loop(
+    channel: &mut Channel<client::Msg>,
+    command: &Arc<RunningCommand>,
+    timeout: Duration,
+    buf: &mut CollectBuffers,
+    max: usize,
+) -> CollectStop {
+    let sleep_to = time::sleep(timeout);
+    tokio::pin!(sleep_to);
+    loop {
+        tokio::select! {
+            biased;
+            () = command.cancel_token.cancelled() => break CollectStop::Cancelled,
+            () = &mut sleep_to => break CollectStop::TimedOut,
+            msg = channel.wait() => {
+                if process_channel_msg(
+                    msg,
+                    &mut buf.exit_code,
+                    &mut buf.stdout,
+                    &mut buf.stderr,
+                    &mut buf.owned,
+                    command,
+                    max,
+                ) {
+                    break CollectStop::Completed(buf.exit_code);
+                }
+            }
+        }
+    }
 }
 
 /// Process a single channel message, returning true if the loop should break.

@@ -513,6 +513,12 @@ mod tests {
                 "ScriptedOutput::snapshot_shell unused".to_string(),
             ))
         }
+
+        async fn shell_produced_total(&self, _id: &ShellId) -> Result<u64, DomainError> {
+            Err(DomainError::Internal(
+                "ScriptedOutput::shell_produced_total unused".to_string(),
+            ))
+        }
     }
 
     // --- Harness ---------------------------------------------------------

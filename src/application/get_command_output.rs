@@ -313,6 +313,13 @@ mod tests {
         ) -> Result<OutputSnapshot, DomainError> {
             Err(DomainError::ShellNotFound(id.clone()))
         }
+
+        async fn shell_produced_total(
+            &self,
+            id: &crate::domain::ids::ShellId,
+        ) -> Result<u64, DomainError> {
+            Ok(self.snapshot_shell(id).await?.byte_cursor)
+        }
     }
 
     type UseCaseUnderTest = GetCommandOutputUseCase<DashMapCommandRepo, FakeOutputStream>;

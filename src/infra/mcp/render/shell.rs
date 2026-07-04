@@ -211,6 +211,7 @@ pub fn shell_read_render(outcome: ReadShellOutcome) -> String {
         data,
         last_seq: _,
         bytes_consumed: _,
+        max_output_bytes,
     } = outcome;
     let nonce = generate_nonce();
     let status_label = match status {
@@ -218,7 +219,11 @@ pub fn shell_read_render(outcome: ReadShellOutcome) -> String {
         ReadShellStatus::Closed => "CLOSED",
         ReadShellStatus::Timeout => "TIMEOUT",
     };
-    let data_block = render_output_block("data", &nonce, &data, DEFAULT_OUTPUT_BYTES, None);
+    // Honour the caller's `max_output_bytes`; the use case already
+    // head-truncated `data` to it, so re-capping at the 16 KiB default
+    // would silently discard bytes the caller explicitly requested.
+    let cap = max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
+    let data_block = render_output_block("data", &nonce, &data, cap, None);
     let mut out = String::with_capacity(192 + data_block.len());
     out.push_str("SSH_SHELL_READ: ");
     out.push_str(status_label);
@@ -263,8 +268,13 @@ pub fn shell_wait_for_render(outcome: &WaitForPatternOutcome) -> String {
         WaitForPatternStatus::Timeout => ("TIMEOUT", None),
         WaitForPatternStatus::Closed => ("CLOSED", None),
     };
-    let data_block = render_output_block("data", &nonce, &outcome.data, DEFAULT_OUTPUT_BYTES, None);
-    let bytes_returned = outcome.data.len().min(DEFAULT_OUTPUT_BYTES);
+    // Honour the caller's `max_output_bytes`; the use case already
+    // head-truncated `outcome.data` to it. Derive `bytes_returned` from the
+    // SAME UTF-8-safe truncation the data block uses so the two never
+    // disagree (a boundary back-walk can drop a few trailing bytes).
+    let cap = outcome.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
+    let data_block = render_output_block("data", &nonce, &outcome.data, cap, None);
+    let bytes_returned = truncate_utf8_safe_tail(&outcome.data, cap).1.shown_bytes;
     let mut out = String::with_capacity(192 + data_block.len());
     out.push_str("SSH_SHELL_WAIT_FOR: ");
     out.push_str(status_label);
@@ -419,7 +429,8 @@ const fn read_status_lower(s: ReadShellStatus) -> &'static str {
 /// LLM can branch on whether the buffer was drained.
 #[must_use]
 pub fn shell_read_structured(outcome: &ReadShellOutcome, cleared: bool) -> Value {
-    let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
+    let cap = outcome.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
+    let (data, info) = truncate_utf8_safe_tail(&outcome.data, cap);
     json!({
         "tool":     "ssh_shell_read",
         "status":   read_status_lower(outcome.status),
@@ -444,7 +455,8 @@ const fn wait_for_status_lower(s: WaitForPatternStatus) -> &'static str {
 /// [`shell_wait_for_render`].
 #[must_use]
 pub fn shell_wait_for_structured(outcome: &WaitForPatternOutcome) -> Value {
-    let (data, info) = truncate_utf8_safe_tail(&outcome.data, DEFAULT_OUTPUT_BYTES);
+    let cap = outcome.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
+    let (data, info) = truncate_utf8_safe_tail(&outcome.data, cap);
     let next = match outcome.status {
         WaitForPatternStatus::Matched => Some(json!([
             "sub_open uri=shell://<shell_id>/output (await push for the next response)",
@@ -571,6 +583,7 @@ mod tests {
             matched_pattern: Some("$ ".to_string()),
             data: Bytes::from_static(b"login\nuser@host:~$ "),
             last_seq: 0,
+            max_output_bytes: None,
         });
         assert!(
             m.contains(
@@ -588,6 +601,7 @@ mod tests {
             matched_pattern: None,
             data: Bytes::from_static(b""),
             last_seq: 0,
+            max_output_bytes: None,
         });
         assert!(
             m.contains("\nNEXT: sub_open uri=shell://shell-1/output (PREFERRED — push-first"),
@@ -623,6 +637,7 @@ mod tests {
             data: Bytes::from_static(b"$ ls\nfile1"),
             last_seq: 0,
             bytes_consumed: 0,
+            max_output_bytes: None,
         });
         assert!(m.starts_with("SSH_SHELL_READ: OPEN\n"));
         assert!(m.contains("SHELL_ID: shell-1"));
@@ -637,6 +652,7 @@ mod tests {
             matched_pattern: Some("$ ".to_string()),
             data: Bytes::from_static(b"login\nuser@host:~$ "),
             last_seq: 0,
+            max_output_bytes: None,
         });
         assert!(m.starts_with("SSH_SHELL_WAIT_FOR: MATCHED\n"));
         assert!(m.contains("MATCHED_PATTERN: $ "));
