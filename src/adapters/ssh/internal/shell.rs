@@ -119,6 +119,13 @@ pub struct RunningShell {
     /// exceeded). Wrapped in an `Arc<AtomicU64>` so it can be tuned at
     /// runtime without touching the reader task.
     pub max_buffer_size: Arc<AtomicU64>,
+    /// Monotonic count of every byte ever appended to the rolling output
+    /// buffer, incremented before head-truncation. Unlike the snapshot
+    /// length (which pins at `max_buffer_size` once the buffer wraps),
+    /// this never decreases, so long-poll / `wait_for` readers can detect
+    /// fresh output on a chatty shell whose buffer has already reached the
+    /// cap. Surfaced via `OutputStreamPort::shell_produced_total`.
+    pub produced_total: Arc<AtomicU64>,
 }
 
 impl RunningShell {
@@ -138,6 +145,7 @@ impl RunningShell {
             data_notify: Arc::new(Notify::new()),
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             max_buffer_size: Arc::new(AtomicU64::new(max_buffer_size)),
+            produced_total: Arc::new(AtomicU64::new(0)),
         }
     }
 }

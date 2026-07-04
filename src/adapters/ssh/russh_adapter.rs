@@ -794,10 +794,15 @@ impl SshClientPort for RusshAdapter {
             cancel_token,
             ..
         } = record;
-        // Drain order matches v3: enqueue Close first so the writer
-        // closes the russh channel cleanly, then cancel the token to
-        // unblock the select arm if the queue was already drained.
-        let _ = input_tx.send(WriteRequest::Close).await;
+        // Drain order matches v3: enqueue Close first so the writer closes
+        // the russh channel cleanly, then cancel the token to unblock the
+        // select arm if the queue was already drained. The enqueue is a
+        // non-blocking `try_send`: a writer stuck on a russh write leaves
+        // the bounded input channel full, and a blocking `send().await`
+        // there would wedge `close_shell` indefinitely — the cancel below
+        // is the guaranteed teardown path (the writer's cancelled() arm
+        // closes the channel), so a dropped Close on a full queue is safe.
+        let _ = input_tx.try_send(WriteRequest::Close);
         cancel_token.cancel();
         // Pump the explicit `Closed` notification into the domain repo
         // so `read_shell` long-polls observe the terminal state without
@@ -1448,6 +1453,7 @@ struct ShellReaderHandles {
     cancel_token: CancellationToken,
     max_buffer_size: Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
+    produced_total: Arc<AtomicU64>,
     shell_id: ShellId,
 }
 
@@ -1463,6 +1469,7 @@ impl ShellReaderHandles {
             cancel_token: running.cancel_token.clone(),
             max_buffer_size: Arc::clone(&running.max_buffer_size),
             last_activity_ms: Arc::clone(&running.last_activity_ms),
+            produced_total: Arc::clone(&running.produced_total),
             shell_id,
         }
     }
@@ -1512,6 +1519,8 @@ async fn run_shell_reader(mut read_half: russh::ChannelReadHalf, handles: ShellR
             &handles.data_notify,
             &mut local,
             &handles.max_buffer_size,
+            handles.shell_id.as_str(),
+            &handles.produced_total,
         );
         notify_shell_resource(handles.shell_id.as_str(), &tail);
     }
@@ -1547,6 +1556,8 @@ fn handle_reader_msg(
                     &handles.data_notify,
                     local,
                     &handles.max_buffer_size,
+                    handles.shell_id.as_str(),
+                    &handles.produced_total,
                 );
                 notify_shell_resource(handles.shell_id.as_str(), &tail);
             }
@@ -1566,10 +1577,23 @@ fn flush_shell_buffer(
     data_notify: &Notify,
     local: &mut Vec<u8>,
     max_buffer_size: &AtomicU64,
+    shell_id: &str,
+    produced_total: &AtomicU64,
 ) {
     let chunk = Bytes::copy_from_slice(local);
     local.clear();
+    // Count every produced byte *before* head-truncation so long-poll /
+    // `wait_for` readers can still detect fresh output once the rolling
+    // buffer has reached its cap and stopped growing.
+    produced_total.fetch_add(
+        u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     let max_size = usize::try_from(max_buffer_size.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+    // Capture the buffer length either side of the rcu so head-eviction is
+    // measured outside the (potentially retried) closure. The shell reader
+    // task is the sole writer of `history`, so these loads are exact.
+    let before = history.load().data.len();
     history.rcu(|current| {
         let mut combined = Vec::with_capacity(current.data.len() + chunk.len());
         combined.extend_from_slice(&current.data);
@@ -1582,6 +1606,18 @@ fn flush_shell_buffer(
             data: Bytes::from(combined),
         }
     });
+    let after = history.load().data.len();
+    // Decrement per-peer byte cursors in lockstep with head-eviction so
+    // `resources/read shell://<id>/output?cursor=auto` keeps producing a
+    // valid start offset — mirrors the async-command path in
+    // `internal::client::publish_stdout`.
+    let dropped = chunk.len().saturating_add(before).saturating_sub(after);
+    if dropped > 0 {
+        use crate::adapters::subscription::legacy::SUBSCRIPTION_REGISTRY;
+        let uri = format!("shell://{shell_id}/output");
+        SUBSCRIPTION_REGISTRY
+            .compensate_truncation(&uri, u64::try_from(dropped).unwrap_or(u64::MAX));
+    }
     let _ = output_tx.send(chunk);
     data_notify.notify_waiters();
 }
@@ -1954,6 +1990,7 @@ mod tests {
         let data_notify = Notify::new();
         let cap_bytes: u64 = 4 * 1024;
         let max_buffer_size = AtomicU64::new(cap_bytes);
+        let produced_total = AtomicU64::new(0);
 
         let mut local: Vec<u8> = vec![b'a'; 4 * 1024];
         flush_shell_buffer(
@@ -1962,6 +1999,8 @@ mod tests {
             &data_notify,
             &mut local,
             &max_buffer_size,
+            "test-shell",
+            &produced_total,
         );
         let mut second: Vec<u8> = vec![b'b'; 4 * 1024];
         flush_shell_buffer(
@@ -1970,6 +2009,8 @@ mod tests {
             &data_notify,
             &mut second,
             &max_buffer_size,
+            "test-shell",
+            &produced_total,
         );
 
         let snapshot = history.load_full();
@@ -2023,6 +2064,7 @@ mod tests {
         let (output_tx, _rx) = broadcast::channel::<Bytes>(64);
         let data_notify = Notify::new();
         let max_buffer_size = AtomicU64::new(10 * 1024 * 1024);
+        let produced_total = AtomicU64::new(0);
 
         let mut local: Vec<u8> = vec![b'a'; 4 * 1024];
         flush_shell_buffer(
@@ -2031,6 +2073,8 @@ mod tests {
             &data_notify,
             &mut local,
             &max_buffer_size,
+            "test-shell",
+            &produced_total,
         );
         let mut second: Vec<u8> = vec![b'b'; 4 * 1024];
         flush_shell_buffer(
@@ -2039,6 +2083,8 @@ mod tests {
             &data_notify,
             &mut second,
             &max_buffer_size,
+            "test-shell",
+            &produced_total,
         );
 
         let snapshot = history.load_full();

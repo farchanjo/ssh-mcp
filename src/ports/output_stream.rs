@@ -45,6 +45,20 @@ pub trait LocalOutputStreamPort: Sync {
     /// Returns `DomainError::ShellNotFound` if the id is unknown, or
     /// `DomainError::Storage` on backend failure.
     async fn snapshot_shell(&self, id: &ShellId) -> Result<OutputSnapshot, DomainError>;
+
+    /// Monotonic count of bytes ever produced on a shell's stdout stream.
+    ///
+    /// Unlike `snapshot_shell().byte_cursor` (which pins at the rolling
+    /// buffer cap once the buffer wraps), this value never decreases — so
+    /// long-poll / `wait_for` callers can detect fresh output on a chatty
+    /// shell whose buffer is already full. Adapters that do not track
+    /// production may return the current snapshot length; the russh adapter
+    /// returns the true cumulative counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::ShellNotFound` if the id is unknown.
+    async fn shell_produced_total(&self, id: &ShellId) -> Result<u64, DomainError>;
 }
 
 #[cfg(test)]

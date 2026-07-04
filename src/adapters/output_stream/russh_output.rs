@@ -45,6 +45,7 @@
 //!   cheap `Arc` snapshots and copies bytes through `Bytes::copy_from_slice`.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -150,6 +151,21 @@ impl OutputStreamPort for RusshOutputAdapter {
             stdout,
             stderr: Bytes::new(),
         })
+    }
+
+    async fn shell_produced_total(&self, id: &ShellId) -> Result<u64, DomainError> {
+        // Read the true cumulative producer counter (incremented before
+        // head-truncation) rather than the current snapshot length, which
+        // pins at the buffer cap. Drop the shard guard before the atomic
+        // load; no `.await` runs while it is held.
+        let produced = {
+            let entry = self
+                .shells
+                .get(id)
+                .ok_or_else(|| DomainError::ShellNotFound(id.clone()))?;
+            Arc::clone(&entry.value().running.produced_total)
+        };
+        Ok(produced.load(Ordering::Relaxed))
     }
 }
 

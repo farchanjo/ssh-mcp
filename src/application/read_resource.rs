@@ -860,6 +860,10 @@ mod tests {
                 .and_then(|g| g.clone())
                 .ok_or_else(|| DomainError::ShellNotFound(id.clone()))
         }
+
+        async fn shell_produced_total(&self, id: &ShellId) -> Result<u64, DomainError> {
+            Ok(self.snapshot_shell(id).await?.byte_cursor)
+        }
     }
 
     #[derive(Debug, Default)]
