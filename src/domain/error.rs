@@ -91,6 +91,19 @@ pub enum DomainError {
     Timeout(String),
 
     /// SFTP-level error surfaced by the adapter.
+    ///
+    /// Some call sites prefix the message with a bracketed wire-code
+    /// tag so LLM callers can branch on the tag string even though the
+    /// top-level classification stays the collapsed `SFTP_ERROR` (the
+    /// `SFTP_TAGS` colon-tag list in `crate::infra::mcp::tool_router`
+    /// promotes only a different, disjoint subset of tags to a
+    /// dedicated top-level code). Known bracket tags:
+    /// - `[RESUME_OVERSHOOT]` / `[RESUME_MISMATCH]` — ADR 0010 (v6.1)
+    ///   resume preflight / verify failures.
+    /// - `[TRUNCATED_SOURCE]` — the upload/download chunk loop detected
+    ///   that the source changed size (was truncated, rotated, or grew)
+    ///   during the transfer, so the final byte count no longer
+    ///   matches the total announced by the preflight stat.
     #[error("sftp error: {0}")]
     Sftp(String),
 

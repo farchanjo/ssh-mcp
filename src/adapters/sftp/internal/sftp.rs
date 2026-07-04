@@ -15,6 +15,7 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::env;
+use std::fmt::Display;
 use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -985,6 +986,32 @@ async fn flush_remote_file(remote_file: &mut SftpFile, remote_path: &str) -> Res
     })
 }
 
+/// Reconcile a short read (EOF) against the byte count announced by the
+/// preflight stat.
+///
+/// A chunk loop that treats any short read as successful completion
+/// lets a source file that is truncated, rotated, or grown out from
+/// under the transfer after the preflight stat silently report
+/// `Completed`. Compares with `!=` (not `<`) so a source that grew
+/// mid-transfer is caught too, not just one that shrank.
+///
+/// Returns `Ok(false)` (transfer completed) when `moved == expected`,
+/// or a `[TRUNCATED_SOURCE]`-tagged error otherwise.
+fn short_read_outcome(
+    moved: u64,
+    expected: u64,
+    direction: &str,
+    path: impl Display,
+) -> Result<bool, String> {
+    if moved == expected {
+        return Ok(false);
+    }
+    Err(format!(
+        "[TRUNCATED_SOURCE] {direction} '{path}': source changed during transfer \
+         (moved {moved} bytes, expected {expected} bytes)"
+    ))
+}
+
 /// Reads chunks from a local file and writes them to a remote SFTP file.
 ///
 /// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
@@ -1020,7 +1047,9 @@ async fn upload_chunks(
         })?;
 
         if n == 0 {
-            return Ok(false);
+            let moved = bytes_transferred.load(Ordering::SeqCst);
+            let expected = total_bytes.load(Ordering::SeqCst);
+            return short_read_outcome(moved, expected, "upload", local_path.display());
         }
 
         write_to_sftp_file(remote_file, &buf[..n], remote_path).await?;
@@ -1220,6 +1249,18 @@ async fn flush_local_file(local_file: &mut File, local_path: &Path) -> Result<()
     })
 }
 
+/// Read one chunk from the remote SFTP file, mapping an I/O error to the
+/// classified transfer-error string the download loop propagates.
+async fn read_remote_chunk(
+    remote_file: &mut SftpFile,
+    buf: &mut [u8],
+    remote_path: &str,
+) -> Result<usize, String> {
+    remote_file.read(buf).await.map_err(|e| {
+        classify_transfer_error(&format!("read remote file '{remote_path}'"), &e.to_string())
+    })
+}
+
 /// Reads chunks from a remote SFTP file and writes them to a local file.
 ///
 /// Returns `Ok(true)` if the transfer was cancelled, `Ok(false)` if completed.
@@ -1247,12 +1288,12 @@ async fn download_chunks(
             return Ok(true);
         }
 
-        let n = remote_file.read(&mut buf).await.map_err(|e| {
-            classify_transfer_error(&format!("read remote file '{remote_path}'"), &e.to_string())
-        })?;
+        let n = read_remote_chunk(remote_file, &mut buf, remote_path).await?;
 
         if n == 0 {
-            return Ok(false);
+            let moved = bytes_transferred.load(Ordering::SeqCst);
+            let expected = total_bytes.load(Ordering::SeqCst);
+            return short_read_outcome(moved, expected, "download", remote_path);
         }
 
         local_file.write_all(&buf[..n]).await.map_err(|e| {
@@ -1262,18 +1303,37 @@ async fn download_chunks(
             )
         })?;
 
-        bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
-        // ADR 0006 Amendment 1 — per-chunk delta into the
-        // byte-threshold counter (mirror of the upload path).
-        SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Transfer, transfer_id, n);
-        emit_tick(
+        record_download_progress(
+            n,
             transfer_id,
+            bytes_transferred,
             progress_tx,
             data_notify,
-            bytes_transferred,
             total_bytes,
         );
     }
+}
+
+/// Account one downloaded chunk of `n` bytes: bump the transferred counter,
+/// feed the push byte-threshold counter (ADR 0006 Amendment 1), and emit a
+/// progress tick — the per-chunk tail shared by the download loop.
+fn record_download_progress(
+    n: usize,
+    transfer_id: &str,
+    bytes_transferred: &Arc<AtomicU64>,
+    progress_tx: &broadcast::Sender<ProgressEvent>,
+    data_notify: &Notify,
+    total_bytes: &Arc<AtomicU64>,
+) {
+    bytes_transferred.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::SeqCst);
+    SUBSCRIPTION_REGISTRY.record_bytes(ResourceKind::Transfer, transfer_id, n);
+    emit_tick(
+        transfer_id,
+        progress_tx,
+        data_notify,
+        bytes_transferred,
+        total_bytes,
+    );
 }
 
 #[cfg(test)]
