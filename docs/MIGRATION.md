@@ -864,6 +864,25 @@ Operational follow-on:
 - [RESOURCES.md](./RESOURCES.md) — resource scheme contract.
 - [CONFIGURATION.md](./CONFIGURATION.md) — full env var table.
 
+## v7.1.0 → v7.1.1 (bug-fix patch)
+
+For **everyone** on v7.1.0. Pure correctness/leak patch — **nothing to do**. No tool string, response envelope, structured-content key, error code, or env-var default changed; a v7.1.0 client is byte-identical against a v7.1.1 server. Upgrade is a binary swap with no config, wire, or on-disk migration.
+
+A multi-agent bug hunt fixed **27 confirmed defects** across the hexagonal core. The behaviour deltas a host may *observe* are all corrections of previously-broken behaviour, never new obligations:
+
+- `resources/read shell://<id>/output?cursor=auto` and `serial://<id>/output?cursor=…` now return only fresh bytes across a buffer wrap instead of wedging empty (shell) or replaying the full history every poll (serial).
+- `ssh_shell_read(wait=true)` and `ssh_shell_wait_for` again see output on a shell whose rolling buffer has reached its cap.
+- `ssh_shell_read` / `ssh_shell_wait_for` honour `max_output_bytes` up to the documented 1 MiB instead of silently capping at 16 KiB.
+- Cancelling/timing out an async command no longer drops the last (sub-8 KiB) chunk of stdout/stderr.
+- The NDJSON daemon populates `sid`/`cid`/`shid`/`tid` on `connect`/`exec`/`shell_open`/`upload`/`download` acks (previously always `null`), so scripted daemon pipelines can resolve the new id from the ack as documented in [DAEMON.md](./DAEMON.md).
+- An SFTP transfer whose source is truncated/rotated mid-flight now errors with `[TRUNCATED_SOURCE]` instead of reporting `Completed`.
+- rsync SFTP `--perms`/`--times`/`--owner`/`--group` are honoured independently — a `Setstat` no longer overwrites metadata the caller opted out of.
+- Concurrent tool calls sharing one `_meta.idempotency_key` now collapse to a single execution (the second awaits and replays) instead of both running the mutating use case.
+
+Operational upside on long-running daemons: the subscription mux lane table, the lifecycle resource/session maps, and serial/writer tasks no longer leak on `sub_close` / resource close / serial unplug, and cascade auto-disconnect only fires for resources that opted into `cascade_session`.
+
+Full list and per-file references: [CHANGELOG.md → [7.1.1]](../CHANGELOG.md).
+
 ## v7.0 → v7.1 (ADR 0012)
 
 For **MCP host operators, contributors, and downstream automations** moving from v7.0.x to v7.1.0. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped. The only opt-in surface is a single new `inline_push: bool` field on `sub_open` plus the matching `experimental.ssh_inline_push` capability handshake. Hosts that ignore both keep the v7.0.x wire identical.
