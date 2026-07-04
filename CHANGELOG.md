@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.1] — 2026-07-03
+
+Patch release. A multi-agent bug hunt across the hexagonal core surfaced **27 confirmed defects** (each adversarially verified before fixing) spanning the shell/command output buffers, subscription lanes, lifecycle refcount, rsync SFTP + wire transports, SFTP file transfer, serial transport, the MCP infra layer, and the NDJSON daemon. **Fully backwards compatible with `[7.1.0]`** — no tool string, env-var default, response envelope, or structured-content key changed; every fix is a correctness/leak repair on an existing surface. The `[Cargo.toml]` package version is bumped from `7.1.0` to `7.1.1`; `[Cargo.lock]` is refreshed in lockstep.
+
+### Fixed
+
+**Interactive shell & async command output**
+
+- **`resources/read shell://<id>/output?cursor=auto` no longer wedges empty after the rolling buffer wraps.** Shell buffer head-truncation now calls `compensate_truncation` on the subscriber registry in lockstep with eviction (mirroring the async-command path), so the per-peer byte cursor stays aligned instead of pinning at the buffer cap and returning an empty snapshot forever (`src/adapters/ssh/russh_adapter.rs`).
+- **`ssh_shell_read(wait=true)` again observes new output on a chatty shell whose buffer reached its cap.** Long-poll now compares a monotonic `shell_produced_total` counter (bytes ever produced) instead of the snapshot length, which pins at the cap (`src/application/read_shell.rs`, `src/ports/output_stream.rs`).
+- **`ssh_shell_wait_for` no longer goes blind to patterns that appear after the buffer wraps.** The scan offset is now tracked in produced-byte space and re-based on every head-eviction instead of using a stale absolute buffer index (`src/application/wait_for_pattern.rs`).
+- **Cancelling / timing out an async SSH command no longer discards up to 8 KiB of already-received stdout/stderr.** Cancellation and timeout are handled inside the collector loop so its staging buffers are always flushed before it returns, instead of dropping the collector future mid-`select!` (`src/adapters/ssh/internal/client.rs`).
+- **`ssh_shell_close` can no longer hang on a shell whose writer task is stuck on a russh write.** The graceful-close frame is enqueued with a non-blocking `try_send`; the cancellation token is the guaranteed teardown path (`src/adapters/ssh/russh_adapter.rs`).
+- **`ssh_shell_read` / `ssh_shell_wait_for` render layer stopped silently re-truncating output to 16 KiB.** The caller's `max_output_bytes` (documented cap 1 MiB) is now threaded through both the markdown block and structured payload; `BYTES_RETURNED` is derived from the same UTF-8-safe truncation the data block uses so it can no longer overstate the shown count (`src/infra/mcp/render/shell.rs`).
+- **Synchronous `ssh_exec` / health checks now retry the transient `MaxSessions` / `RESOURCE_SHORTAGE` channel-open refusal** during rapid `execute + cancel` bursts, matching the async path instead of failing hard (`src/adapters/ssh/internal/client.rs`).
+
+**Subscription lanes & inline push**
+
+- **`sub_close` now unregisters the lane from the channel mux** — the mux lane table previously grew without bound for the life of the process (`src/adapters/subscription/subscriber_lane.rs`, `src/composition/prod.rs`).
+- **Inline-push `seq` numbers no longer collide across split writes.** A write split into N wire fragments now reserves exactly N sequence slots (split-then-reserve) instead of one, so the next write can never reuse a trailing fragment's `seq` (`src/adapters/subscription/lane_bridge.rs`).
+- **`sub_replay` can no longer pin the shared inline byte-accumulator forward.** A client-supplied `from_cursor` is clamped to the lane's live cursor instead of being `fetch_max`-applied unvalidated, so an out-of-range replay cannot break subsequent inline delivery (`src/adapters/subscription/subscriber_lane.rs`).
+- **`sub_open` per-URI / global lane caps are now enforced atomically** — the check-then-insert race that let concurrent opens exceed `SSH_MAX_SUBS_PER_URI` / `SSH_MAX_SUBS_TOTAL` is closed with a single-shard entry guard plus a reserve-style total counter (`src/adapters/subscription/subscriber_lane.rs`).
+- **`LagPolicy::DropOldest` documentation now matches its actual (drop-newest) behavior** — a lane cannot evict from an `mpsc` receiver it has handed away; true head-eviction is documented as a known limitation pending a lane-owned ring (`src/domain/subscription.rs`).
+
+**Resource lifecycle**
+
+- **`LifecyclePolicy::cascade_session` is now honoured on both sides.** A resource tracked with the default policy (`cascade_session = false`) no longer triggers an unwanted session auto-disconnect on close; inc/dec stay balanced across a re-track policy swap via a write-once contribution flag (`src/adapters/lifecycle/refcount.rs`, `grace_timer.rs`).
+- **Terminal lifecycle entries are now swept.** The `resources` / cascade `sessions` maps evict `Closed` entries after a 60 s retention window (piggybacking the leak-watcher scan), fixing unbounded growth on long-running daemons while preserving the `ResourceGone`-within-window contract (`src/adapters/lifecycle/refcount.rs`, `cascade.rs`, `leak_watcher.rs`).
+
+**rsync transport**
+
+- **rsync SFTP `Setstat` no longer overwrites destination metadata the caller opted out of.** The action carries only the requested `PreserveFlags` fields (`mode`/`mtime`/`uid`/`gid` as `Option`s) instead of baking in all four from the source (`src/adapters/rsync/sftp/comparator.rs`, `executor.rs`, `fake.rs`).
+- **A failed rsync session registration no longer leaks a running background sync task.** The just-started transport is closed on any error after `start_transport` (`src/application/rsync_sync.rs`).
+- **rsync wire pull no longer clobbers a directory's preserved mtime** when it contains a symlink — symlinks are materialised in a first pass, directory attrs stamped in a second, so no in-directory mutation follows the mtime stamp (`src/adapters/rsync/wire/receiver.rs`).
+
+**SFTP file transfer**
+
+- **A source file truncated or rotated mid-transfer is now reported as an error, not `Completed`.** Both chunk loops reconcile bytes moved against the announced total and surface `[TRUNCATED_SOURCE]` on a mismatch (`src/adapters/sftp/internal/sftp.rs`).
+- **The per-session transfer cap is now enforced atomically** — a slot is reserved synchronously in `preflight` (released on every early-return path) instead of registering only after several `.await` points, so concurrent transfers can no longer all pass the cap check (`src/adapters/sftp/russh_sftp_adapter.rs`).
+
+**Serial transport**
+
+- **An abnormal serial reader exit (EOF / USB unplug) now cancels the port token**, so the writer task and its open OS write-half are no longer leaked forever (`src/adapters/serial/state.rs`).
+- **`resources/read serial://<id>/output?cursor=…` now honours the cursor** instead of always replaying the full retained buffer from offset 0, restoring the documented delta-read contract for the serial scheme (`src/infra/mcp/resource_handlers.rs`).
+
+**MCP infra & idempotency**
+
+- **Concurrent tool calls carrying the same `_meta.idempotency_key` no longer both execute the mutating use case.** The cache gains a `Pending`/`Done` slot state machine: the first caller atomically claims the key, duplicates await a `Notify` and replay the result; a cancelled/panicked winner can never wedge the key (`src/infra/mcp/idempotency.rs`, `tool_router.rs`).
+
+**NDJSON daemon**
+
+- **Daemon acks now carry the new identifier.** `connect` / `exec` / `shell_open` / `upload` / `download` acks populate `sid` / `cid` / `shid` / `tid` from the tool's structured content instead of emitting all-`None`, so a follow-up op can reference the id (`src/embed/dispatcher.rs`).
+- **A long run of blank NDJSON input lines can no longer overflow the reader task's stack** — blank-line skipping is iterative instead of unbounded async self-recursion (`src/embed/parser.rs`).
+- **Shutdown no longer silently drops events already buffered in the mux** — `drain_loop` flushes the remaining queue before breaking on cancellation (`src/embed/event_mux.rs`).
+
+### Verified
+
+- `cargo clippy --release --all-features --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo test --release --lib`: **2101 passed**.
+- `cargo test --release --tests --features test-fixtures`: green across all integration binaries (chaos 41 incl. 3 assertions re-based to the corrected replay-clamp / cascade-gating contracts, chaos_rsync 16, property 32, property_rsync 9, v4/v5/v6/v7 smoke suites).
+
+### Method
+
+The 27 defects were found by a fan-out review workflow (10 parallel subsystem reviewers → adversarial per-finding verification; 32 raw findings, 5 rejected on verification) and fixed by 8 file-disjoint agents plus a coordinated shell-buffer cluster, then integrated behind a single central build + lint + test gate.
+
 ## [7.1.0] — 2026-05-11
 
 Minor release stacking [ADR 0012](docs/adr/0012-inline-push-notifications.md) (inline-push notifications for `shell://*`, `command://*`, and `serial://*` lanes) on top of the v7.0.x hexagonal core. **Wire-additive on EVERY existing surface** — every v7.0.x client (24 `ssh_*` tools, 9 `sub_*` tools, 6 `serial_*` tools, 7 push schemes, NDJSON daemon) keeps working byte-for-byte against a v7.1 server. No tool string changed, no error code was renumbered, no env var default flipped, no structured-content key was renamed. The only opt-in surfaces are a single new `inline_push: bool` field on `sub_open`, a matching `experimental.ssh_inline_push` capability handshake at `initialize`, and one `notifications/ssh/output` custom notification carrying base64-encoded byte payloads. Hosts that ignore all three keep the v7.0.x wire identical. The `[Cargo.toml]` package version is bumped from `7.0.2` to `7.1.0`; `[Cargo.lock]` is refreshed in lockstep.
