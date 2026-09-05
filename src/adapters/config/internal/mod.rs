@@ -1162,6 +1162,18 @@ fn clamp_inline_push_max_bytes(parsed: usize) -> usize {
     parsed
 }
 
+/// Serialize every test that mutates process-wide `SSH_*` env vars.
+///
+/// Lives at module scope (rather than inside the local `tests` module) so
+/// the `EnvConfig` defaults test in `adapters::config::env` can hold the
+/// same lock: without it, a resolver test that temporarily exports, say,
+/// `SSH_COMMAND_BROADCAST_CAP=65536` can race the defaults test and make
+/// it observe a clamped value instead of the unset default. Shared across
+/// the crate under `cfg(test)` for exactly that reason.
+#[cfg(test)]
+pub(crate) static ENV_TEST_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1172,13 +1184,7 @@ fn clamp_inline_push_max_bytes(parsed: usize) -> usize {
     reason = "Rust 2024 requires unsafe for env::set_var; tests serialize via ENV_TEST_MUTEX"
 )]
 mod tests {
-    use std::sync::{LazyLock, Mutex as StdMutex};
-
     use super::*;
-
-    // Use a mutex to serialize env var tests to avoid race conditions
-    // SAFETY: Tests are serialized via ENV_TEST_MUTEX to prevent data races
-    static ENV_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
     /// Helper to set an environment variable safely within tests.
     /// SAFETY: Must be called while holding ENV_TEST_MUTEX to prevent data races.

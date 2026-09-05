@@ -187,6 +187,7 @@ mod tests {
     use std::time::Duration;
 
     use super::EnvConfig;
+    use crate::adapters::config::internal::ENV_TEST_MUTEX;
     use crate::ports::config::ConfigPort;
 
     #[test]
@@ -195,6 +196,17 @@ mod tests {
         // defaults the v3 resolvers expose. We assert a representative
         // subset rather than every accessor; the resolver tests in
         // `adapters::config::internal` cover the full value surface.
+        //
+        // The lock keeps us serialized against the resolver tests that
+        // temporarily export `SSH_*` overrides via `env::set_var` — without
+        // it this test can observe, say, `SSH_COMMAND_BROADCAST_CAP=65536`
+        // from a concurrently running test and fail on a clamped value.
+        // SAFETY: ENV_TEST_MUTEX is the crate-wide discipline for
+        // mutating/reading process env vars in tests.
+        let _guard = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let cfg = EnvConfig;
 
         assert_eq!(cfg.connect_timeout(), Duration::from_secs(30));
