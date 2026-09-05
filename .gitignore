@@ -47,8 +47,10 @@ Thumbs.db
 .claude/
 .venv/
 
-# GitHub configuration kept local-only on this checkout (per project policy)
-.github/
+# v7.1+ CI: .github/workflows must live on GitHub for Actions to run it.
+# (Older policy kept .github/ local-only; obsolete since the self-hosted
+# runner pipeline landed.) Local-only GitHub bits can still be ignored below.
+!.github/
 
 # Local script caches (mypy / ruff / coverage / tox when invoked under scripts/)
 scripts/.cache/
