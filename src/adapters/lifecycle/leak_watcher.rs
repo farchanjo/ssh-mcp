@@ -282,6 +282,12 @@ fn run_scan_pass<C>(
     let mut still_active: HashSet<AlertKey> = HashSet::new();
     for entry in adapter.scan() {
         if let Some(alert) = classify(&entry, warn_ms, kill_ms) {
+            // Apply the kill BEFORE publishing so an observer woken by
+            // the Kill notification always sees the resource already
+            // force-closed (raced on the Windows CI runner otherwise).
+            if alert.severity == LeakRiskSeverity::Kill {
+                let _ = adapter.force_close(alert.kind, &alert.resource_id);
+            }
             // Publish to the active map BEFORE broadcasting so an
             // observer woken by the notification always sees the
             // matching entry in current_alerts(). Notifying first let
@@ -291,9 +297,6 @@ fn run_scan_pass<C>(
             active.insert((alert.kind, alert.resource_id.clone()), alert.clone());
             // best-effort send — slow consumers handle Lagged on recv.
             let _ = tx.send(alert.clone());
-            if alert.severity == LeakRiskSeverity::Kill {
-                let _ = adapter.force_close(alert.kind, &alert.resource_id);
-            }
         }
     }
     // Drop alerts that are no longer firing — e.g. a peer subscribed
