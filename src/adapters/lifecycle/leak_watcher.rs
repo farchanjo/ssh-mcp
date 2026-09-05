@@ -282,10 +282,15 @@ fn run_scan_pass<C>(
     let mut still_active: HashSet<AlertKey> = HashSet::new();
     for entry in adapter.scan() {
         if let Some(alert) = classify(&entry, warn_ms, kill_ms) {
-            // best-effort send — slow consumers handle Lagged on recv.
-            let _ = tx.send(alert.clone());
+            // Publish to the active map BEFORE broadcasting so an
+            // observer woken by the notification always sees the
+            // matching entry in current_alerts(). Notifying first let
+            // a multi-threaded consumer read the map before the insert
+            // landed (observed on the Windows CI runner).
             still_active.insert((alert.kind, alert.resource_id.clone()));
             active.insert((alert.kind, alert.resource_id.clone()), alert.clone());
+            // best-effort send — slow consumers handle Lagged on recv.
+            let _ = tx.send(alert.clone());
             if alert.severity == LeakRiskSeverity::Kill {
                 let _ = adapter.force_close(alert.kind, &alert.resource_id);
             }

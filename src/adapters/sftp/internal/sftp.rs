@@ -1547,10 +1547,22 @@ mod tests {
     mod resolve_local_path {
         use super::*;
 
+        #[cfg(unix)]
         #[test]
         fn test_absolute_path_returned_as_is() {
             let path = resolve_local_path("/tmp/file.txt");
             assert_eq!(path, PathBuf::from("/tmp/file.txt"));
+        }
+
+        // On Windows a leading `/` is drive-relative, NOT absolute
+        // (is_absolute() requires a prefix like `C:\`), so the Unix
+        // variant above cannot apply. Assert the real Windows absolute
+        // form passes through untouched instead.
+        #[cfg(windows)]
+        #[test]
+        fn test_absolute_path_returned_as_is() {
+            let path = resolve_local_path(r"C:\tmp\file.txt");
+            assert_eq!(path, PathBuf::from(r"C:\tmp\file.txt"));
         }
 
         #[test]
@@ -1567,10 +1579,18 @@ mod tests {
             assert!(path_str.ends_with("subdir/file.txt"));
         }
 
+        #[cfg(unix)]
         #[test]
         fn test_absolute_path_with_spaces() {
             let path = resolve_local_path("/tmp/my files/doc.txt");
             assert_eq!(path, PathBuf::from("/tmp/my files/doc.txt"));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn test_absolute_path_with_spaces() {
+            let path = resolve_local_path(r"C:\tmp\my files\doc.txt");
+            assert_eq!(path, PathBuf::from(r"C:\tmp\my files\doc.txt"));
         }
 
         #[test]
