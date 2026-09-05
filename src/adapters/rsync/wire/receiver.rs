@@ -1439,10 +1439,12 @@ impl ZeroStats {
 )]
 mod tests {
     use super::{
-        ITEM_MISSING_DATA, ITEM_TRANSFER, ReceiverApplyOpts, apply_file_attrs, build_keep_set,
-        consume_token_stream, delete_extras, next_token, sort_entries_for_request_index,
-        tempfile_for, write_null_sum_blockset,
+        ITEM_MISSING_DATA, ITEM_TRANSFER, build_keep_set, consume_token_stream, delete_extras,
+        next_token, sort_entries_for_request_index, tempfile_for, write_null_sum_blockset,
     };
+    // Only the cfg(unix) attr tests below consume these two symbols.
+    #[cfg(unix)]
+    use super::{ReceiverApplyOpts, apply_file_attrs};
     use crate::adapters::rsync::wire::flist::Flist;
     use crate::adapters::rsync::wire::hash::FileHasher;
     use crate::adapters::rsync::wire::io::{MplexReader, MplexWriter};
