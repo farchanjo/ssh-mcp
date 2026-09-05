@@ -38,13 +38,35 @@ impl AuthStrategyPort for AgentAuth {
             return Ok(AuthOutcome::Rejected);
         };
 
+        // Unix: `socket` (or SSH_AUTH_SOCK when None) names a Unix-domain
+        // socket. Windows: OpenSSH for Windows always serves the fixed
+        // named pipe \\.\pipe\openssh-ssh-agent — `socket`, when present,
+        // overrides it with a custom pipe path.
         let mut client = match socket {
+            #[cfg(unix)]
             Some(path) => keys::agent::client::AgentClient::connect_uds(path.as_path())
                 .await
                 .map_err(|err| AuthError::AgentUnavailable(err.to_string()))?,
+            #[cfg(windows)]
+            Some(path) => keys::agent::client::AgentClient::connect_named_pipe(path.as_path())
+                .await
+                .map_err(|err| AuthError::AgentUnavailable(err.to_string()))?,
+            #[cfg(unix)]
             None => keys::agent::client::AgentClient::connect_env()
                 .await
                 .map_err(|err| AuthError::AgentUnavailable(err.to_string()))?,
+            #[cfg(windows)]
+            None => {
+                keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
+                    .await
+                    .map_err(|err| AuthError::AgentUnavailable(err.to_string()))?
+            }
+            #[cfg(not(any(unix, windows)))]
+            _ => {
+                return Err(AuthError::AgentUnavailable(
+                    "SSH agent transport unsupported on this platform".to_string(),
+                ));
+            }
         };
 
         let identities = client
