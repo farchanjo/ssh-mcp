@@ -1,6 +1,7 @@
 //! SSH agent authentication.
 
 use russh::{client, keys};
+use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tracing::{debug, info};
@@ -88,7 +89,7 @@ async fn try_identities<S>(
     agent: &mut keys::agent::client::AgentClient<S>,
 ) -> Result<bool, String>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     for identity in identities {
         debug!("Trying SSH agent identity: {:?}", identity.comment());
