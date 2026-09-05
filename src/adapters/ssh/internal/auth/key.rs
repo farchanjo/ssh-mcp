@@ -94,6 +94,14 @@ mod tests {
 
     #[test]
     fn tilde_is_expanded() {
+        if std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .is_err()
+        {
+            // Documented fallback: expand_tilde returns the raw path when
+            // no home directory can be resolved. Nothing to assert.
+            return;
+        }
         let auth = KeyAuth::new("~/.ssh/id_rsa");
         assert!(!auth.key_path.starts_with("~"));
         assert!(auth.key_path.to_string_lossy().ends_with(".ssh/id_rsa"));
@@ -207,6 +215,12 @@ mod tests {
 
     #[test]
     fn nested_tilde_path_expanded_at_start() {
+        if std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .is_err()
+        {
+            return;
+        }
         let auth = KeyAuth::new("~/.ssh/keys/server-prod");
         assert!(!auth.key_path.starts_with("~"));
         assert!(

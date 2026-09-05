@@ -1575,6 +1575,11 @@ mod tests {
 
         #[test]
         fn test_tilde_path_expanded() {
+            if home_dir().is_none() {
+                // Documented fallback: without HOME/USERPROFILE the path is
+                // returned untouched. Nothing to assert about expansion.
+                return;
+            }
             let path = resolve_local_path("~/.ssh/id_rsa");
             assert!(!path.to_string_lossy().starts_with('~'));
             assert!(path.to_string_lossy().ends_with(".ssh/id_rsa"));
@@ -1583,6 +1588,9 @@ mod tests {
 
         #[test]
         fn test_tilde_alone_expanded() {
+            if home_dir().is_none() {
+                return;
+            }
             let path = resolve_local_path("~");
             assert!(!path.to_string_lossy().starts_with('~'));
             assert!(path.is_absolute());
@@ -1594,6 +1602,9 @@ mod tests {
 
         #[test]
         fn test_tilde_slash_prefix() {
+            if home_dir().is_none() {
+                return;
+            }
             let result = expand_tilde("~/.ssh/id_rsa");
             assert!(!result.starts_with('~'));
             assert!(result.ends_with(".ssh/id_rsa"));
@@ -1601,6 +1612,9 @@ mod tests {
 
         #[test]
         fn test_tilde_alone() {
+            if home_dir().is_none() {
+                return;
+            }
             let result = expand_tilde("~");
             assert!(!result.starts_with('~'));
         }
