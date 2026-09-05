@@ -108,7 +108,7 @@ jobs:
 
       - name: Install Python test deps
         shell: bash
-        run: '$VPY -m pip install --quiet --upgrade pip pytest pytest-timeout paramiko'
+        run: '$VPY -m pip install --quiet --upgrade pip pytest pytest-timeout paramiko requests'
 
       - name: Expose extension-less binaries (fixtures hardcode target/release/ssh-mcp)
         if: runner.os == 'Windows'

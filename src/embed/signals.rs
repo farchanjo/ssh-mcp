@@ -20,6 +20,7 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+#[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -28,11 +29,24 @@ use tokio_util::sync::CancellationToken;
 /// Spawn the signal listener task. Cancels `shutdown` on the first
 /// SIGTERM / SIGINT / SIGHUP. Returns the join handle so callers can
 /// optionally `.await` it on graceful exit.
+///
+/// On Windows there is no portable SIGTERM/SIGHUP surface in tokio, so
+/// the listener simply parks on the cancellation token: the daemon still
+/// drains cooperatively when shutdown fires from another path (stdin
+/// EOF, explicit cancel).
 #[must_use]
 pub fn spawn_signal_listener(shutdown: CancellationToken) -> JoinHandle<()> {
-    tokio::spawn(signal_listener_loop(shutdown))
+    #[cfg(unix)]
+    {
+        tokio::spawn(signal_listener_loop(shutdown))
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async move { shutdown.cancelled().await })
+    }
 }
 
+#[cfg(unix)]
 async fn signal_listener_loop(shutdown: CancellationToken) {
     let Some(signals) = open_signals() else {
         // The handler init failed: park on the cancellation token
@@ -45,12 +59,14 @@ async fn signal_listener_loop(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
+#[cfg(unix)]
 struct OpenedSignals {
     term: Signal,
     int: Signal,
     hup: Signal,
 }
 
+#[cfg(unix)]
 fn open_signals() -> Option<OpenedSignals> {
     if let (Ok(term), Ok(int), Ok(hup)) = (
         signal(SignalKind::terminate()),
@@ -64,6 +80,7 @@ fn open_signals() -> Option<OpenedSignals> {
     }
 }
 
+#[cfg(unix)]
 async fn wait_for_signal(mut signals: OpenedSignals, shutdown: &CancellationToken) {
     tokio::select! {
         _ = signals.term.recv() => tracing::info!("SIGTERM received"),
