@@ -1,0 +1,217 @@
+name: CI
+
+# master / PR / dispatch = quality gates + build + tests, NO release.
+# v* tag                 = release build per OS, binaries published to a GitHub Release.
+# Every job cleans its target dir at the end, but only on success
+# (a failed job keeps target/ warm for the next rerun).
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Quality gates: fmt, strict production clippy, no-default-features build
+  # ---------------------------------------------------------------------
+  quality:
+    name: Quality (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/') == false
+    runs-on: [self-hosted, "${{ matrix.os }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Linux, Windows, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          rustc -vV
+          cargo -V
+          rustup show || echo "no rustup — rust-toolchain.toml pin ignored, system toolchain used"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (production gate)
+        run: cargo clippy --release --all-features -- -D warnings
+
+      - name: Clippy (all targets — informational)
+        continue-on-error: true
+        run: cargo clippy --release --all-features --all-targets -- -D warnings
+
+      - name: Build without default features (38-tool surface)
+        run: cargo build --release --no-default-features
+
+      - name: Cleanup target dir
+        if: success()
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE/target"
+
+  # ---------------------------------------------------------------------
+  # Build + test: release binaries, lib tests, integration/chaos/property
+  # suites, loom (informational), Python MCP integration suites.
+  # ---------------------------------------------------------------------
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/') == false
+    runs-on: [self-hosted, "${{ matrix.os }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Linux, Windows, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Lib tests
+        run: cargo test --lib --quiet
+
+      - name: Integration tests (test-fixtures)
+        run: cargo test --tests --features test-fixtures --quiet
+
+      - name: Loom invariants (informational — upstream russh/axum block full loom)
+        continue-on-error: true
+        shell: bash
+        run: RUSTFLAGS="--cfg loom" cargo test --tests --features test-fixtures --quiet
+
+      - name: Set up Python venv
+        shell: bash
+        run: |
+          python3 -m venv .venv-ci
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "VPY=$GITHUB_WORKSPACE/.venv-ci/Scripts/python.exe" >> "$GITHUB_ENV"
+          else
+            echo "VPY=$GITHUB_WORKSPACE/.venv-ci/bin/python" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Python test deps
+        shell: bash
+        run: '$VPY -m pip install --quiet --upgrade pip pytest pytest-timeout paramiko'
+
+      - name: Expose extension-less binaries (fixtures hardcode target/release/ssh-mcp)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for b in ssh-mcp ssh-mcp-stdio ssh-mcp-tail; do
+            cp "target/release/$b.exe" "target/release/$b"
+          done
+
+      - name: Python MCP integration tests
+        shell: bash
+        working-directory: scripts
+        run: '$VPY -m pytest test_http.py test_stdio.py test_resources.py test_v47_batches.py test_v47_idempotency.py test_v47_llm_workflows.py test_v47_prompts.py test_v47_subscriptions.py test_v7_rsync_http.py test_v7_rsync_stdio.py -q'
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          mkdir -p dist
+          for b in ssh-mcp ssh-mcp-stdio ssh-mcp-tail; do
+            cp "target/release/$b$EXT" dist/
+          done
+          ( cd dist && sha256sum * > SHA256SUMS.txt )
+
+      - name: Package tarball
+        shell: bash
+        run: tar czf "ssh-mcp-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz" -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-mcp-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            ssh-mcp-*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Cleanup target dir and venv
+        if: success()
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE/.venv-ci"
+
+  # ---------------------------------------------------------------------
+  # Release: v* tag only. Version guard, release build per OS, publish
+  # binaries + checksums as release assets.
+  # ---------------------------------------------------------------------
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: [self-hosted, "${{ matrix.os }}"]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Linux, Windows, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version guard (tag must match Cargo.toml)
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(grep -m1 '^version' Cargo.toml | tr -d ' "' | cut -d= -f2)"
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Smoke (lib tests)
+        run: cargo test --lib --quiet
+
+      - name: Stage and package
+        shell: bash
+        run: |
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          mkdir -p dist
+          for b in ssh-mcp ssh-mcp-stdio ssh-mcp-tail; do
+            cp "target/release/$b$EXT" dist/
+          done
+          ( cd dist && sha256sum * > SHA256SUMS.txt )
+          ARCHIVE="ssh-mcp-${GITHUB_REF_NAME}-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+          tar czf "$ARCHIVE" -C dist .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE }}
+            dist/SHA256SUMS.txt
+            dist/ssh-mcp*
+
+      - name: Cleanup target dir
+        if: success()
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE/target"
