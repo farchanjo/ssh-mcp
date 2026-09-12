@@ -19,8 +19,8 @@ cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
 cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
 cargo build --release --no-default-features        # No port forwarding
 
-cargo test --lib --quiet                                   # 1986 lib tests (1986 on v7.0.1 master)
-cargo test --tests --features test-fixtures --quiet        # 134 integration tests across 9 binaries (v4_smoke 2, v5_smoke 8, v5_daemon_smoke 5, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_rsync 16, property 32, property_rsync 9)
+cargo test --lib --quiet                                   # 2101 lib tests
+cargo test --tests --features test-fixtures --quiet        # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10)
 cargo test --features test-fixtures                # Use cases vs deterministic adapters
 
 cargo fmt --all -- --check
@@ -62,10 +62,10 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 | Layer | Path | What it covers | Cost |
 |---|---|---|---|
-| Lib unit tests | `src/**/{mod,*}.rs::tests` | 1986 tests (1986 on v7.0.1 master) across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
+| Lib unit tests | `src/**/{mod,*}.rs::tests` | 2101 tests across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
 | `test-fixtures` | gated by `cargo test --features test-fixtures` | Use cases against deterministic adapters (`FakeClock`, `DeterministicIdGen`) for reproducible bug bisection. | seconds |
-| Integration tests | `tests/*.rs` | 134 active tests across 9 binaries: `v4_smoke` (2, wire-compat snapshot), `v5_smoke` (8), `v5_daemon_smoke` (5, against `ssh-mcp-tail daemon`), `v6_resume_smoke` (12, ADR 0010 SFTP resume), `v7_rsync_smoke` (9, ADR 0011 rsync hybrid), `chaos` (41, ADR-driven failure-mode coverage), `chaos_rsync` (16, ADR 0011 chaos), `property` (32, lifecycle / mux / lane invariants), `property_rsync` (9, ADR 0011 property). Most need `--features test-fixtures`. e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6) are gated `--features e2e-vm`. | tens of seconds |
-| Loom invariants | `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` (both `#[cfg(loom)]`) | 27 interleavings total: 20 in `lockfree_invariants` (v4 baseline + Phase 1 lifecycle + Phase 2 mux) + 7 in `lockfree_invariants_rsync` (RsyncSession state, rsync lane pause/resume, file-list ordering, sparse-file handling). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
+| Integration tests | `tests/*.rs` | 167 active tests across 12 binaries: `v4_smoke` (2, wire-compat snapshot), `v5_smoke` (12), `v5_daemon_smoke` (7, against `ssh-mcp-tail daemon`), `v6_resume_smoke` (12, ADR 0010 SFTP resume), `v7_rsync_smoke` (9, ADR 0011 rsync hybrid), `chaos` (41, ADR-driven failure-mode coverage), `chaos_inline_push` (9, ADR 0012 inline push), `chaos_rsync` (16, ADR 0011 chaos), `property` (32, lifecycle / mux / lane invariants), `property_inline_push` (11, ADR 0012 ordering), `property_resume` (6, ADR 0010 resume arithmetic), `property_rsync` (10, ADR 0011 property). Most need `--features test-fixtures`. e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6) are gated `--features e2e-vm`. | tens of seconds |
+| Loom invariants | `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` + `tests/lockfree_invariants_inline_push.rs` (all `#[cfg(loom)]`) | 32 interleavings total: 20 in `lockfree_invariants` (v4 baseline + Phase 1 lifecycle + Phase 2 mux) + 7 in `lockfree_invariants_rsync` (RsyncSession state, rsync lane pause/resume, file-list ordering, sparse-file handling) + 5 in `lockfree_invariants_inline_push` (ADR 0012 inline-push atomics). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
 | Python integration | `scripts/test_*.py` | `requires_sshd` end-to-end suites against a real OpenSSH server. | minutes |
 | Stress | `scripts/stress_*.py` | 5 stress scripts (concurrent writes, lagged sub, locks, multi-host, subscribe). | varies |
 
@@ -84,8 +84,9 @@ The tests permute concurrent interleavings on:
 - **Phase 2 mux (4 new)**: `loom_mux_round_robin_no_starvation`, `loom_lane_mpsc_drop_oldest_monotonic`, `loom_lane_pause_resume_no_loss`, `loom_subid_cursor_atomic_advance`.
 - **Phase 2/3/4 extensions (4 new)**: `loom_phase2_replay_during_concurrent_subscribe`, `loom_phase3_leak_watcher_no_double_alert`, `loom_phase3_release_when_no_subs_grace`, `loom_phase4_embed_transport_shutdown_race`.
 - **Phase 5 rsync (7 new, `tests/lockfree_invariants_rsync.rs`)**: `RsyncSession` state CAS transitions, rsync lane pause/resume under concurrent producer pressure, file-list ordering, sparse-hole detection race, terminal-event observation order, cancel vs natural-completion race, capability-probe cache write/read race.
+- **v7.1 inline push (5 new, `tests/lockfree_invariants_inline_push.rs`)**: lane inline-push gate set/read, inline seq concurrent `fetch_add`, capability record/read, capability record/forget, inline counter increments.
 
-Total currently shipped: **27 `#[test]` annotations** across two files — `tests/lockfree_invariants.rs` (20 = 8 + 4 + 4 + 4) + `tests/lockfree_invariants_rsync.rs` (7, v7.0).
+Total currently shipped: **32 `#[test]` annotations** across three files — `tests/lockfree_invariants.rs` (20 = 8 + 4 + 4 + 4) + `tests/lockfree_invariants_rsync.rs` (7, v7.0) + `tests/lockfree_invariants_inline_push.rs` (5, v7.1).
 
 Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum (documented in the test file and `Cargo.toml`).
 
