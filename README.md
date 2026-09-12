@@ -105,7 +105,7 @@ Scheme | Channel | Producer
 
 This server is tested using a layered local + CI gate. To learn more about testing, refer to [CI.md](CI.md).
 
-Quick numbers — **1986 lib tests** + **134 integration tests** across 9 binaries + **27 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **21 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
+Quick numbers — **2101 lib tests** + **167 integration tests** across 12 binaries + **32 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **24 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
 
 ## Installation
 
@@ -179,13 +179,13 @@ See the [changelog](CHANGELOG.md).
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — hexagonal layer map, lifecycle adapter, channel mux
 - [docs/API.md](docs/API.md) — every MCP tool, schema, response shape
 - [docs/RESOURCES.md](docs/RESOURCES.md) — push resource contracts and cursor semantics
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — full env-var matrix (40 settings)
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — full env-var matrix (52 settings)
 - [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) — push-first prompts, error handbook, hint escalation
 - [docs/DAEMON.md](docs/DAEMON.md) — `ssh-mcp-tail` NDJSON wire format
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — lock-free invariants, contributor narrative
 - [docs/MIGRATION.md](docs/MIGRATION.md) — host migration guide across versions
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — production runbook
-- [docs/adr/](docs/adr/) — 11 ADRs (rmcp adoption, hexagonal, lifecycle, channel mux, LLM UX, backpressure, error taxonomy, NDJSON daemon, serial, SFTP resume, rsync hybrid)
+- [docs/adr/](docs/adr/) — 12 ADRs (rmcp adoption, hexagonal, lifecycle, channel mux, LLM UX, backpressure, error taxonomy, NDJSON daemon, serial, SFTP resume, rsync hybrid, inline push)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor guide
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community code of conduct
 - [REVIEW_CHECKLIST.md](REVIEW_CHECKLIST.md) — PR review checklist
