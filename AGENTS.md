@@ -15,7 +15,7 @@ cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
 cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
 cargo build --release --no-default-features        # No port forwarding
 cargo test --lib --quiet                           # 2101 lib tests
-cargo test --tests --features test-fixtures --quiet  # 134 integration tests across 9 binaries (v4_smoke 2, v5_smoke 8, v5_daemon_smoke 5, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_rsync 16, property 32, property_rsync 9) + 27 loom invariants in lockfree_invariants + lockfree_invariants_rsync (gated #[cfg(loom)]) + 8 e2e VM tests (v7_rsync_e2e_vm 2 + v7_rsync_wire_e2e_vm 6, gated e2e-vm) + 21 Python integration tests in scripts/test_v7_rsync_*.py (19 passed + 2 xfailed; xfails cover deferred local-FS adapter for RsyncSftpFsPort)
+cargo test --tests --features test-fixtures --quiet  # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10) + 32 loom invariants across lockfree_invariants + lockfree_invariants_rsync + lockfree_invariants_inline_push (gated #[cfg(loom)]) + 8 e2e VM tests (v7_rsync_e2e_vm 2 + v7_rsync_wire_e2e_vm 6, gated e2e-vm) + 24 Python integration tests in scripts/test_v7_rsync_*.py (22 passed + 2 xfailed; xfails cover deferred local-FS adapter for RsyncSftpFsPort)
 cargo test --features test-fixtures                # Use cases vs deterministic adapters
 cargo fmt --all -- --check
 cargo clippy --release --all-features -- -D warnings   # Strict lint gate (production-only)
@@ -44,7 +44,7 @@ flowchart TB
         PROMPTS["prompts.rs"]
     end
     subgraph APP["application — use cases"]
-        UC["~22 *UseCase generic<br/>over ports"]
+        UC["~33 *UseCase generic<br/>over ports"]
     end
     subgraph PORTS["ports — trait skeletons"]
         VPORTS["v4 ports + v5:<br/>lifecycle_policy<br/>channel_mux<br/>subscriber_lane"]
@@ -82,11 +82,11 @@ flowchart TB
     style SUBLANE fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
 ```
 
-The four v5 deltas in one line each:
+The five v5 deltas in one line each:
 
-- **Lifecycle binding** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — every long-lived resource is wrapped in a CAS state machine (`Owned → Observed → Releasing → Closed`) plus a per-session refcount. Grace timer arms when last subscriber detaches; new subscribes within the window cancel it. Cascade through `SessionLifecycle.active_refs` so a session with active resources is never reaped by inactivity TTL alone.
+- **Lifecycle binding** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — every long-lived resource is wrapped in a CAS state machine (`Owned → Observed → Releasing → Closed`) plus a per-session refcount. Grace timer arms when last subscriber detaches; new subscribes within the window cancel it. Cascade through `SessionEntry.active_refs` so a session with active resources is never reaped by inactivity TTL alone.
 - **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) — push lanes key on `(SubId, Uri)` (UUIDv7). Each subscription owns its own `mpsc::channel(N)`, `LagPolicy`, filter pipeline, replay window, and `SubscriberStats`. A `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy `(PeerId, Uri)` hosts get a synthesised `sub_id`.
-- **LLM UX overhaul** ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged) — 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause/resume/filter/replay/list/stats`, `sub_stats_all`); `HINT:` line severity escalation; 10-prompt catalog; `SUB_LEAK_RISK` watcher; 38-code error taxonomy ([ADR 0007](docs/adr/0007-error-taxonomy.md)).
+- **LLM UX overhaul** ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged) — 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause/resume/filter/replay/list/stats`, `sub_stats_all`); `HINT:` line severity escalation; 10-prompt catalog; `SUB_LEAK_RISK` watcher; the error taxonomy ([ADR 0007](docs/adr/0007-error-taxonomy.md)).
 - **NDJSON daemon binary** ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged) — `ssh-mcp-tail` embeds rmcp server + in-process rmcp client across `tokio::io::duplex` and translates stdin NDJSON ops into MCP tool calls + stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable.
 - **Serial transport** ([ADR 0009](docs/adr/0009-serial-transport.md), v5.2 — merged) — 6 native UART / TTY / COM tools (`serial_open`, `serial_close`, `serial_write`, `serial_press`, `serial_scan`, `serial_active`) with the same lock-free reader / writer split, `serial://<id>/output` push lane, and `SUBSCRIPTION_REGISTRY` debouncer integration as `command://*/output`.
 
@@ -94,7 +94,7 @@ The text channel stays byte-identical to v4.7.1 / v4.8 on the 21 carry-over tool
 
 ### Lifecycle state machine
 
-CAS state machine driven from `src/adapters/lifecycle/refcount.rs` with all hot-path fields atomic (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker). Cascade through `SessionLifecycle.active_refs: AtomicUsize` (`src/adapters/lifecycle/cascade.rs`). The session reaper consults `active_refs > 0` before honouring the inactivity TTL — refcount supersedes TTL.
+CAS state machine driven from `src/adapters/lifecycle/refcount.rs` with all hot-path fields atomic (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker). Cascade through `SessionEntry.active_refs: AtomicUsize` inside `CascadeCoordinator` (`src/adapters/lifecycle/cascade.rs`). The session reaper consults `active_refs > 0` before honouring the inactivity TTL — refcount supersedes TTL.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -107,7 +107,7 @@ stateDiagram-v2
     Releasing --> Closed: grace_until_ms expired<br/>(timer fires)
     Owned --> Closed: explicit close
     Observed --> Closed: explicit close
-    Closed --> [*]: cascade refcount--<br/>(SessionLifecycle)
+    Closed --> [*]: cascade refcount--<br/>(CascadeCoordinator)
 
     classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
     classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
@@ -124,16 +124,16 @@ Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt
 
 ### Channel mux pipeline
 
-Each `resources/subscribe` (legacy) or `sub_open` (new tool) call mints a `SubId` (UUIDv7) and creates a `MultiplexLane` (`byte_cursor`, `tx`, `policy`, `filter`, `lifecycle` link, `stats`, `pause_flag`). The `ChannelMux` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, MultiplexLane>` plus `cursor_lane: AtomicUsize` for round-robin draining. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain.
+Each `resources/subscribe` (legacy) or `sub_open` (new tool) call mints a `SubId` (UUIDv7) and creates a `LaneState` (`byte_cursor`, `tx`, `policy`, `filter`, `lifecycle` link, `stats`, `pause_flag`). The `ChannelMuxAdapter` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, Arc<LaneDrain>>` plus `cursor_lane: AtomicUsize` for round-robin draining. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
 flowchart LR
     Producer["Producer<br/>(russh / SFTP / health)"]
     Debouncer["per-resource debouncer<br/>1 s / 5 s flush"]
-    LaneA["MultiplexLane<br/>SubId A<br/>policy + filter + stats"]
-    LaneB["MultiplexLane<br/>SubId B<br/>policy + filter + stats"]
-    LaneN["MultiplexLane<br/>SubId N<br/>..."]
+    LaneA["LaneState<br/>SubId A<br/>policy + filter + stats"]
+    LaneB["LaneState<br/>SubId B<br/>policy + filter + stats"]
+    LaneN["LaneState<br/>SubId N<br/>..."]
     Mux["ChannelMux<br/>cursor_lane: AtomicUsize<br/>round-robin"]
     Out["outbound writer<br/>rmcp Peer or NDJSON"]
 
@@ -166,7 +166,7 @@ Per-lane field table and full subscribe pipeline (producer → debouncer → lan
 3. Wire `HINT:` line — `REQUIRED NEXT STEP:` for required actions, `RECOMMENDED:` for soft suggestions.
 4. Wire `NEXT:` line — concrete tool calls in push-first priority order.
 
-Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 46-code error taxonomy with one-sentence DETAIL lines tuned for direct LLM consumption. Full guide: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
+Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 56-code error taxonomy with one-sentence DETAIL lines tuned for direct LLM consumption. Full guide: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
 
 ### Binary targets
 
@@ -184,7 +184,7 @@ All three binaries are thin shells over `composition::prod` (and, for the daemon
 
 > **Lane fanout (v5.3)**: `sub_open` lanes carry the rmcp peer captured at tool-invocation time and receive `notifications/resources/updated` push delivery on stdio/HTTP transports through `LaneFanoutBridge` (in `src/adapters/subscription/lane_bridge.rs`). The bridge is installed on `MemoryRegistry` at composition; legacy `broadcast` walks the lane snapshot for the URI before the v4 peer fan-out, calls `notifier.notify_resource_updated` per lane peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
 
-Each session serializes one russh channel at a time through a per-session semaphore (`CHANNEL_CONCURRENCY_PER_SESSION = 1`) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
+Each channel open retries the transient `MaxSessions` refusal (`open_session_with_retry`, backoff capped at 1 s) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
 
 ### MCP resources
 
@@ -203,11 +203,11 @@ The v4 / v5 markdown shape is byte-identical to v3 on the legacy text channel (v
 
 ### Configuration
 
-All settings follow: **Parameter → Environment Variable → Default**. Full table (40 env vars across SSH, shell, command, transfer, notification, peer GC, subscriber lanes, daemon): [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Defaults preserve v4 behaviour.
+All settings follow: **Parameter → Environment Variable → Default**. Full table (52 env vars across SSH, shell, command, transfer, notification, peer GC, subscriber lanes, daemon): [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Defaults preserve v4 behaviour.
 
 ### Error handling
 
-- **Categorised** ([ADR 0007](docs/adr/0007-error-taxonomy.md), extended by [ADR 0010](docs/adr/0010-sftp-resume.md) and [ADR 0011](docs/adr/0011-rsync-hybrid-transport.md)): 46 codes across 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics. v6.1 adds `RESUME_OVERSHOOT` and `RESUME_MISMATCH` to the `STATE` bucket. LLM hosts can branch on category alone.
+- **Categorised** ([ADR 0007](docs/adr/0007-error-taxonomy.md), extended by [ADR 0010](docs/adr/0010-sftp-resume.md) and [ADR 0011](docs/adr/0011-rsync-hybrid-transport.md)): 56 codes across 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics. v6.1 adds `RESUME_OVERSHOOT` and `RESUME_MISMATCH` to the `STATE` bucket. LLM hosts can branch on category alone.
 - **Retryable**: `TRANSPORT` class — exponential backoff via `backon`, max 10 s.
 - **Non-retryable**: `AUTH`, `RESOURCE`, `STATE` (without `_meta.idempotency_key`), `INTERNAL`.
 - All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers use `Result<T, DomainError>` (`thiserror`).
@@ -221,7 +221,7 @@ Strict enforcement via `Cargo.toml` `[lints.clippy]`. Lock-free invariants are t
 
 - **Lint groups**: `clippy::all`, `clippy::pedantic`, `clippy::nursery`, `clippy::cargo` at `deny`.
 - **Layer A (forbid)**: `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_stdout`, `print_stderr`.
-- **Lock-free invariants** (deny): `await_holding_lock`, `await_holding_refcell_ref`, `significant_drop_in_scrutinee`, `significant_drop_tightening`, `mutex_atomic`, `mutex_integer`. Every hot-path state type (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, `ResourceLifecycle`, `SessionLifecycle`, `MultiplexLane`, `ChannelMux`) carries **zero** `Mutex` fields.
+- **Lock-free invariants** (deny): `await_holding_lock`, `await_holding_refcell_ref`, `significant_drop_in_scrutinee`, `significant_drop_tightening`, `mutex_atomic`, `mutex_integer`. Every hot-path state type (`RunningCommand`, `RunningShell`, `TransferShared`, `SessionRecord`, `ForwardHandle`, `ResourceLifecycle`, `SessionEntry`, `LaneState`, `ChannelMux`) carries **zero** `Mutex` fields.
 - **Quality denies**: `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, `allow_attributes_without_reason`, `format_push_string`, `if_then_some_else_none`, `rc_mutex`, `redundant_type_annotations`, `same_name_method`, `tests_outside_test_module`, etc.
 - **Thresholds** (`clippy.toml`): `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`, `type-complexity-threshold = 250`.
 - **Allowed**: `multiple_crate_versions` (transitive deps from russh / axum).
@@ -239,7 +239,7 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 - Use cases stay generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT; the dyn-safe slices (`LaneAdmin`) live alongside the async slice for cold-path operations.
 - Match exhaustively (no `_ =>` for closed enums; `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 2101 ssh-mcp lib tests + 134 integration tests across 9 binaries (`v4_smoke` 2, `v5_smoke` 8, `v5_daemon_smoke` 5, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41, `chaos_rsync` 16, `property` 32, `property_rsync` 9) + 27 loom invariants across 2 files (`tests/lockfree_invariants.rs` 20 + `tests/lockfree_invariants_rsync.rs` 7, both gated `#[cfg(loom)]`) + 8 e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6, gated `e2e-vm`) + Python integration suites (`scripts/test_*.py`, including `scripts/test_v7_rsync_{http,stdio,vm}.py` 21 tests / 19 passed + 2 xfailed for the v7.0 `ssh_rsync` MCP surface) + 5 stress scripts (`scripts/stress_*.py`).
+- 2101 ssh-mcp lib tests + 167 integration tests across 12 binaries (`v4_smoke` 2, `v5_smoke` 12, `v5_daemon_smoke` 7, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41, `chaos_inline_push` 9, `chaos_rsync` 16, `property` 32, `property_inline_push` 11, `property_resume` 6, `property_rsync` 10) + 32 loom invariants across 3 files (`tests/lockfree_invariants.rs` 20 + `tests/lockfree_invariants_rsync.rs` 7 + `tests/lockfree_invariants_inline_push.rs` 5, all gated `#[cfg(loom)]`) + 8 e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6, gated `e2e-vm`) + Python integration suites (`scripts/test_*.py`, including `scripts/test_v7_rsync_{http,stdio,vm}.py` 24 tests / 22 passed + 2 xfailed for the v7.0 `ssh_rsync` MCP surface) + 5 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - Loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`); 20 `#[test]` annotations covering lifecycle CAS race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity, mux fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, cursor advance under contention. Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum.
 
