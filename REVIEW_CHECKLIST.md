@@ -4,12 +4,12 @@ This checklist is the gate every pull request must satisfy before it is merged. 
 
 ## 1. Build, lint, tests
 
-- [ ] `cargo build --release --all-features` succeeds clean.
+- [ ] `sudo make release` succeeds clean and installs to `/usr/local/bin`.
 - [ ] `cargo build --release --no-default-features` succeeds clean (no `port_forward`).
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo clippy --release --all-features --all-targets --workspace -- -D warnings` passes.
-- [ ] `cargo test --lib --quiet` passes (1986 tests).
-- [ ] `cargo test --tests --features test-fixtures --quiet` passes (134 tests).
+- [ ] `make fmt` passes.
+- [ ] `make lint` passes (strict production clippy gate).
+- [ ] `make test` passes (2101 tests).
+- [ ] `make test-integration` passes (167 tests).
 - [ ] No `#[allow(...)]` added without a `reason = "..."` justification.
 - [ ] No `unwrap()` / `expect()` outside `#[cfg(test)]` modules.
 - [ ] No `Mutex` / `RwLock` added on the hot path (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, `ResourceLifecycle`, `SessionLifecycle`, `MultiplexLane`, `ChannelMux`, rsync transport state). Use `DashMap`, `ArcSwap`, `Atomic*`, `mpsc`, `broadcast`, `Notify` instead.
@@ -62,7 +62,7 @@ This checklist is the gate every pull request must satisfy before it is merged. 
 
 - [ ] Commits follow the Angular Conventional Commits format: `<type>(<scope>): <subject>`.
 - [ ] Subject is ≤50 chars; body explains the **why** when not obvious.
-- [ ] No bundled commit covering more than one logical change — break into small contextual commits per [CLAUDE.md](CLAUDE.md).
+- [ ] No bundled commit covering more than one logical change — break into small contextual commits per [AGENTS.md](AGENTS.md).
 - [ ] Branch name matches the change: `feat/<scope>`, `fix/<scope>`, `docs/<scope>`, etc.
 
 ---

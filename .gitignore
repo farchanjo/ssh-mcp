@@ -43,7 +43,7 @@ Thumbs.db
 *.swo
 *~
 
-# Claude Code local state (per-machine, never committed)
+# Local agent-harness state (per-machine, never committed)
 .claude/
 .venv/
 

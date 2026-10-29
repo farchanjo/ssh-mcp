@@ -35,7 +35,7 @@ flowchart TD
 | [API.md](./API.md) | All 39 MCP tools (38 without `port_forward`) — inputs, outputs, structured content, error codes. |
 | [RESOURCES.md](./RESOURCES.md) | Seven push schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), cursor + sequence semantics, `_meta` envelope, `resources/templates/list`. |
 | [CONFIGURATION.md](./CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles (verbose shells, many subscribers, low-RAM, real-time UX, rsync probe). |
-| [LLM_GUIDE.md](./LLM_GUIDE.md) | Single canonical LLM doc — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 46-code error handbook. |
+| [LLM_GUIDE.md](./LLM_GUIDE.md) | Single canonical LLM doc — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 56-code error handbook. |
 | [OPERATIONS.md](./OPERATIONS.md) | Symptom → cure runbook, wire-format error envelope, per-tool error catalogue, recovery sequence diagrams, diagnostic toolbox. |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | Build / test / clippy gates, lock-free invariants, hot-path sequence diagrams (lifecycle CAS, mux drain, debouncer), Cargo features. |
 | [DAEMON.md](./DAEMON.md) | `ssh-mcp-tail` reference — NDJSON op and event schema, architecture, shutdown sequence, composition recipes. |

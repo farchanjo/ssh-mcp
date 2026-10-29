@@ -255,7 +255,7 @@ pub const PEER_GC_INTERVAL_S_ENV_VAR: &str = "SSH_MCP_PEER_GC_INTERVAL_S";
 ///
 /// The v4.7 contract emits a typed JSON twin alongside the legacy
 /// markdown body so smaller LLMs can index keys without parsing prose.
-/// Some MCP hosts (notably the Claude Code UI) render BOTH payloads,
+/// Some MCP hosts (notably some IDE hosts) render BOTH payloads,
 /// which clutters the human view. This env var lets operators silence
 /// the JSON payload per process while keeping the markdown body and
 /// the schema advertisement (`output_schema` on `#[tool]`) untouched.
@@ -446,10 +446,7 @@ pub fn resolve_compression(compress_param: Option<bool>) -> bool {
 #[must_use]
 pub fn resolve_skip_host_key_check() -> bool {
     env::var(INSECURE_SKIP_HOST_KEY_CHECK_ENV_VAR)
-        .ok()
-        .is_some_and(|v| {
-            v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes")
-        })
+        .is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes"))
 }
 
 /// Resolve the `known_hosts` file path used for TOFU host-key verification.

@@ -75,7 +75,7 @@ pub fn truncate_utf8_safe_head(s: &str, max_bytes: usize) -> (&str, bool) {
 }
 
 /// Find the next valid UTF-8 char boundary at or after `from`.
-fn find_char_boundary_forward(buffer: &[u8], from: usize) -> usize {
+const fn find_char_boundary_forward(buffer: &[u8], from: usize) -> usize {
     let mut idx = from;
     while idx < buffer.len() {
         if buffer[idx] & 0xC0 != 0x80 {

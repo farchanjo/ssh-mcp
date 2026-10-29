@@ -6,6 +6,10 @@
     clippy::multiple_crate_versions,
     reason = "transitive dependencies from russh/poem bring duplicate versions we cannot control"
 )]
+#![allow(
+    clippy::unused_async_trait_impl,
+    reason = "AFIT impls cannot drop `async` when the body never awaits — the trait fixes the signature"
+)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]

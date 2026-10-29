@@ -459,11 +459,11 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// [`Self::release_total`] on any early return.
     fn reserve_total(&self) -> Result<(), DomainError> {
         let max = usize::from(self.max_total);
-        let updated =
-            self.total_lanes
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
-                    (current < max).then_some(current + 1)
-                });
+        let updated = self
+            .total_lanes
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                (current < max).then_some(current + 1)
+            });
         if updated.is_ok() {
             Ok(())
         } else {
@@ -633,16 +633,13 @@ fn lane_dispatch_drop_oldest(
     lane.atomics.record_drop();
     let _ = lane.tx.try_send(LaneMsg::Lagged { dropped: 1 });
     match lane.tx.try_send(msg) {
-        Ok(()) => {
-            lane.atomics.record_send(payload_size);
-            Ok(())
-        }
+        Ok(()) => lane.atomics.record_send(payload_size),
         Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
             // Still no room — double-drop is documented in ADR 0006.
             lane.atomics.record_drop();
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn lane_dispatch_snapshot(
@@ -888,7 +885,7 @@ impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
-    reason = "tests use unwrap for brevity per CLAUDE.md test policy"
+    reason = "tests use unwrap for brevity per AGENTS.md test policy"
 )]
 mod tests {
     use std::sync::Arc;

@@ -287,7 +287,7 @@ The resume path adds zero new shared state. Existing atomics (`bytes_transferred
 | 4 | Verify — sha256 streaming local + `ssh_exec` round-trip + diff. Gated behind `verify = true`. | Medium. POSIX-tooling assumption documented. |
 | 5 | Tool router — surface `resume` / `verify` params; emit `RESUMED_FROM:` line; structured field. Update tool descriptions + HINT/NEXT lines. | Low. |
 | 6 | Daemon — extend NDJSON request parser; pass-through of new fields. | Low. |
-| 7 | Docs — `docs/API.md`, `docs/LLM_GUIDE.md` (new "Resuming a failed transfer" section), `docs/RESOURCES.md`, `docs/CONFIGURATION.md` (no new env vars; explicit "no config" note), `CLAUDE.md` summary. | Low. |
+| 7 | Docs — `docs/API.md`, `docs/LLM_GUIDE.md` (new "Resuming a failed transfer" section), `docs/RESOURCES.md`, `docs/CONFIGURATION.md` (no new env vars; explicit "no config" note), `AGENTS.md` summary. | Low. |
 | 8 | Tests — adapter, use case, loopback, property, snapshot extensions, loom invariant. | Medium. |
 | 9 | Migration note — `docs/MIGRATION.md` v6.0 → v6.1: opt-in flags, no breaking change, suggested upgrade path. | Low. |
 

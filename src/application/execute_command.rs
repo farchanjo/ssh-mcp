@@ -637,7 +637,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_id_propagates_from_session_to_outcome() {
         let wired = build_wired();
-        let agent = AgentId::new("claude-instance-9".to_string());
+        let agent = AgentId::new("host-instance-9".to_string());
         let seeded = seed_session(&wired.sessions, "sess-agent", Some(agent.clone()));
         let outcome = wired
             .uc

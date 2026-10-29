@@ -158,7 +158,7 @@ pub struct SshConnectArgs {
     pub persistent: Option<bool>,
 
     /// Optional `AGENT_ID` for grouping sessions
-    /// (e.g. `claude-code-instance-abc123`). Use `ssh_disconnect_agent`
+    /// (e.g. `host-instance-abc123`). Use `ssh_disconnect_agent`
     /// to bulk-disconnect all sessions for an agent.
     pub agent_id: Option<String>,
 

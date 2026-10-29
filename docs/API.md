@@ -2,7 +2,7 @@
 
 Complete API reference for the **39 MCP tools** (or 38 without `port_forward`) split across three semantic eixos — **`ssh_*`** (24), **`sub_*`** (9), **`serial_*`** (6) — the **7 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v7.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x / v6.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), v6.0 renamed tool strings, v6.1 added `resume` + `verify` to `ssh_upload` / `ssh_download` ([ADR 0010](./adr/0010-sftp-resume.md)), and **v7.0 adds 3 net-new rsync tools** (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`) plus the `rsync://` push lane ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)). Resource URIs / push narrative / structured-content payloads / env vars carry forward byte-identical from v6.0 except for the additive `rsync://` scheme and 8 new error codes (2 v6.1 resume codes + 6 v7.0 rsync codes). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x / v7.0 extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
-> **v7.0 — wire-additive on tool name strings.** Resource URI schemes (now 7 with `rsync://`), `_meta` envelope, structured-content schemas, error taxonomy (46 codes total — 38 base + 2 v6.1 + 6 v7.0), and env vars are byte-identical to v6.x except for the additive deltas. Existing v6.0 / v6.1 hosts work unchanged; opt into rsync by calling the new `ssh_rsync*` tools.
+> **v7.0 — wire-additive on tool name strings.** Resource URI schemes (now 7 with `rsync://`), `_meta` envelope, structured-content schemas, error taxonomy (56 codes total — 38 base + 2 v6.1 + 6 v7.0 + 10 v7.1), and env vars are byte-identical to v6.x except for the additive deltas. Existing v6.0 / v6.1 hosts work unchanged; opt into rsync by calling the new `ssh_rsync*` tools.
 
 > **v4.7 conversation surface.** Every tool emits Markdown + typed JSON (`structured_content`). v4.8 expanded `output_schema` advertisement from 9 / 21 to 21 / 21 tools. Errors render as `{ tool, status: "error", code, reason, detail }` on the structured channel. See [LLM_GUIDE.md section K](./LLM_GUIDE.md#k-structured_content-channel-v47).
 
@@ -97,7 +97,7 @@ Connect to an SSH server and store the session.
 SSH_CONNECT: OK
 SESSION_ID: a3f2b1d7-1234-5678-9abc-def012345678
 HOST: alice@example.com:22
-AGENT_ID: claude-code-instance-abc123
+AGENT_ID: host-instance-abc123
 RETRY: 0
 PERSISTENT: false
 EXPIRES_AT: 2026-05-03T12:05:00+00:00
@@ -111,7 +111,7 @@ NEXT: ssh_exec(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id
 SSH_CONNECT: REUSED
 SESSION_ID: a3f2b1d7-...
 HOST: alice@example.com:22
-AGENT_ID: claude-code-instance-abc123
+AGENT_ID: host-instance-abc123
 NEXT: ssh_exec(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id=a3f2b1d7-...) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
@@ -122,7 +122,7 @@ NEXT: ssh_exec(session_id=a3f2b1d7-..., command=...) | ssh_shell_open(session_id
 SSH_CONNECT: SUGGESTED
 EXISTING_SESSION_ID: a3f2b1d7-...
 HOST: alice@example.com:22
-AGENT_ID: claude
+AGENT_ID: host
 NAME: prod-db
 CONNECTED_AT: 2026-05-02T18:00:00Z
 HEALTHY: true
@@ -134,8 +134,8 @@ NEXT: ssh_connect(session_id=a3f2b1d7-...) | ssh_connect(reuse="force_new")
 ```
 SSH_CONNECT: SUGGESTED
 MATCHES: 2
-- a3f2b1d7-... alice@example.com:22 [agent: claude, name: prod-db, connected: 2026-05-02T18:00:00Z, healthy]
-- 9b1c2d3e-... alice@example.com:22 [agent: claude, name: prod-db-2, connected: 2026-05-02T17:50:00Z, healthy]
+- a3f2b1d7-... alice@example.com:22 [agent: host, name: prod-db, connected: 2026-05-02T18:00:00Z, healthy]
+- 9b1c2d3e-... alice@example.com:22 [agent: host, name: prod-db-2, connected: 2026-05-02T17:50:00Z, healthy]
 HINT: pick an existing SESSION_ID, or retry with reuse="force_new"
 NEXT: ssh_connect(session_id=<existing>) | ssh_connect(reuse="force_new")
 ```
@@ -201,9 +201,9 @@ The tool runs an `echo 1` health probe against every candidate session and remov
 ```
 SSH_SESSIONS: OK
 COUNT: 2
-- a3f2b1d7-... alice@prod-db:22 [agent: claude, healthy]
-- 9b1c2d3e-... alice@stage-db:22 [agent: claude, name: stage, healthy]
-NEXT: ssh_disconnect_agent(agent_id=claude) | ssh_disconnect(session_id=a3f2b1d7-...)
+- a3f2b1d7-... alice@prod-db:22 [agent: host, healthy]
+- 9b1c2d3e-... alice@stage-db:22 [agent: host, name: stage, healthy]
+NEXT: ssh_disconnect_agent(agent_id=host) | ssh_disconnect(session_id=a3f2b1d7-...)
 ```
 
 Each item is `<SESSION_ID> <username>@<host>` followed by an optional `[…]` annotation block. Annotations include any of `agent: <id>`, `name: <label>`, `compression: off`, and the health label (`healthy` / `unhealthy`). When `max_items` truncates, the COUNT line becomes `COUNT: N (showing N of M)`. When >5 healthy sessions are owned by one `agent_id`, an anti-leak `HINT: agent 'X' owns N sessions; consider ssh_disconnect_agent to bulk-cleanup` line is appended. v4.6 `NEXT:` is emitted on non-empty lists (suggesting `ssh_disconnect_agent` when an agent owns sessions, else `ssh_disconnect`); empty list (`COUNT: 0`) omits `NEXT:`.
@@ -225,7 +225,7 @@ Cancels commands, closes shells, aborts transfers, and disconnects each session'
 **Response**:
 ```
 SSH_DISCONNECT_AGENT: OK
-AGENT_ID: claude-code-instance-abc123
+AGENT_ID: host-instance-abc123
 SESSIONS: 3
 COMMANDS: 5
 ```
@@ -294,7 +294,7 @@ Limits: up to 100 concurrent multiplexed commands per session.
 SSH_EXEC: STARTED
 COMMAND_ID: 7d4c8e2a-...
 SESSION_ID: a3f2b1d7-...
-AGENT_ID: claude-code-instance-abc123
+AGENT_ID: host-instance-abc123
 HINT: subscribe to command://7d4c8e2a-.../output for realtime output (preferred over polling)
 NEXT: ssh_exec_output(command_id=7d4c8e2a-..., wait=true) | ssh_exec_cancel(command_id=7d4c8e2a-...)
 ```
@@ -510,7 +510,7 @@ SSH_SHELL_OPEN: OK
 SHELL_ID: 4b9c8e2a-...
 SESSION_ID: a3f2b1d7-...
 TERM: xterm 80x24
-AGENT_ID: claude-code-instance-abc123
+AGENT_ID: host-instance-abc123
 INITIAL_BUFFER: Last login: Sat May  3 14:22:01 2026 from 10.0.0.4\r\n$ 
 HINT: subscribe to shell://4b9c8e2a-.../output for realtime output (preferred over polling)
 NEXT: sub_open uri=shell://4b9c8e2a-.../output (PREFERRED — push-first) | ssh_shell_write | ssh_shell_press
@@ -725,7 +725,7 @@ Limits: up to 10 concurrent transfers per session.
 SSH_UPLOAD: STARTED
 TRANSFER_ID: 8f7e6d5c-...
 SESSION_ID: a3f2b1d7-...
-AGENT_ID: claude
+AGENT_ID: host
 FROM: /home/alice/data.csv
 TO: /tmp/data.csv
 SIZE: 2.3 MB (2412544 bytes)

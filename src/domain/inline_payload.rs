@@ -162,7 +162,7 @@ impl InlinePayload {
 /// (top two bits `10xxxxxx`) and `end > start`. Bounded by three
 /// iterations in the worst case (a 4-byte code point at the
 /// boundary).
-fn utf8_safe_split(bytes: &[u8], start: usize, end: usize, is_text: bool) -> usize {
+const fn utf8_safe_split(bytes: &[u8], start: usize, end: usize, is_text: bool) -> usize {
     if !is_text {
         return end;
     }

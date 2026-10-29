@@ -25,7 +25,7 @@ This project ships a subscribe-first **Model Context Protocol (MCP) server** tha
 
 ## Description
 
-This server enables any MCP host (Claude Desktop, Claude Code, Cline, IDE plugins, mcp-inspector, custom agents) to interact with SSH targets through automation. [MCP](https://modelcontextprotocol.io/) is a standardized protocol for communication between AI systems and external tools or data sources.
+This server enables any MCP host (desktop apps, CLI harnesses, IDE plugins, inspectors, custom agents) to interact with SSH targets through automation. [MCP](https://modelcontextprotocol.io/) is a standardized protocol for communication between AI systems and external tools or data sources.
 
 The server provides tools to open persistent SSH sessions, run async commands, drive interactive PTYs, transfer files via SFTP (with resume + verify), mirror directory trees through a built-in rsync wire-protocol v32 client (downgrades to v31 against legacy servers via negotiation) (byte-identical against `rsync 3.2.7`), bind local TCP forwards, and talk to local serial ports — all streamed back to the model as MCP `notifications/resources/updated` push events the moment bytes arrive. No polling loops, no empty payloads, no wasted tokens.
 
@@ -37,7 +37,7 @@ Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 ### Rust version compatibility
 
-This server has been tested against the following Rust versions: **>=1.95.0** (Rust 2024 edition, resolver 3).
+This server has been tested against the following Rust versions: **>=1.99.1** (Rust 2024 edition, resolver 3).
 
 ### Operating system compatibility
 
@@ -74,7 +74,7 @@ This server depends on the following Rust crates (top-level — full transitive 
 Name | Description
 --- | ---
 [`ssh-mcp`](src/main.rs) | HTTP transport (axum 0.8 + rmcp StreamableHttpService). Default bind `0.0.0.0:8000`, path `/`. Tracks sessions through `Mcp-Session-Id` header.
-[`ssh-mcp-stdio`](src/bin/ssh_mcp_stdio.rs) | Stdio MCP transport (`rmcp::transport::io::stdio()`). For Claude Desktop / Cline / mcp-inspector / IDE plugins.
+[`ssh-mcp-stdio`](src/bin/ssh_mcp_stdio.rs) | Stdio MCP transport (`rmcp::transport::io::stdio()`). For desktop apps / CLI harnesses / inspectors / IDE plugins.
 [`ssh-mcp-tail`](src/bin/ssh_mcp_tail.rs) | NDJSON daemon over stdin/stdout. Three subcommands (`run`, `shell`, `daemon`). Unix-pipeline composable. Reference: [docs/DAEMON.md](docs/DAEMON.md).
 
 ### MCP tools
@@ -112,14 +112,13 @@ Quick numbers — **2101 lib tests** + **167 integration tests** across 12 binar
 ```bash
 git clone https://github.com/farchanjo/ssh-mcp.git
 cd ssh-mcp
-cargo build --release
-sudo install -m 0755 target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
+sudo make release        # build optimised binaries + install to /usr/local/bin
 ```
 
 Three binaries — pick the transport that matches your host:
 
 ```bash
-# Local hosts (Claude Desktop, Cline, mcp-inspector, IDE plugins)
+# Local hosts (desktop apps, CLI harnesses, inspectors, IDE plugins)
 /usr/local/bin/ssh-mcp-stdio
 
 # HTTP hosts (browser- or service-based)
@@ -129,9 +128,9 @@ Three binaries — pick the transport that matches your host:
 /usr/local/bin/ssh-mcp-tail daemon
 ```
 
-Skip TCP forwarding via `cargo build --release --no-default-features` (38 tools, smaller binary).
+Skip TCP forwarding via `sudo make release-min` (38 tools, smaller binary).
 
-You can also wire ssh-mcp into an MCP host config file (Claude Desktop, Cline, etc.):
+You can also wire ssh-mcp into an MCP host config file (desktop apps, CLI harnesses, etc.):
 
 ```json
 {
@@ -148,18 +147,37 @@ To upgrade to the latest available version, pull and rebuild:
 
 ```bash
 git -C ssh-mcp pull --ff-only
-cargo build --release
-sudo install -m 0755 target/release/ssh-mcp{,-stdio,-tail} /usr/local/bin/
+sudo make release
 ```
 
 You can also pin a specific version, for example, if you need to downgrade when something is broken in the latest version (please report an issue in this repository). Use the following syntax where `X.Y.Z` is any [released tag](https://github.com/farchanjo/ssh-mcp/releases):
 
 ```bash
 git -C ssh-mcp checkout vX.Y.Z
-cargo build --release
+sudo make release
 ```
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for production deployment, systemd units, Docker, and observability wiring.
+
+## Development
+
+Everything runs through the `Makefile`; `JOBS` defaults to the CPU count and
+caps cargo plus nextest parallelism (`JOBS=4 make test`).
+
+```bash
+sudo make all         # gates + build + sign + install + verify, one shot
+make dev              # incremental, unoptimised build
+make test             # 2101 lib tests, one process per test (nextest)
+make test-integration # 167 integration tests
+make fmt lint check   # gates
+sudo make release     # optimised, stripped build + install to /usr/local/bin
+```
+
+Dev and test profiles are incremental, release is not. `.cargo/config.toml`
+supplies the sccache wrapper and an en-US locale. On macOS the release
+binaries are ad-hoc codesigned before install; pass
+`CODESIGN_IDENTITY="Developer ID Application: ..."` for a real signature.
+Full loop in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Support
 

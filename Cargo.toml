@@ -13,7 +13,7 @@ resolver = "3"
 name = "ssh-mcp"
 version = "7.1.1"
 edition = "2024"
-rust-version = "1.95"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.95
+rust-version = "1.99"   # Rust 2024 edition baseline + AFIT + APIs stabilized through 1.99
 description = "SSH Model Context Protocol Server (hexagonal architecture) with realtime resources/subscribe"
 authors = ["farchanjo"]
 default-run = "ssh-mcp"
@@ -230,9 +230,44 @@ unexpected_cfgs            = { level = "warn", check-cfg = ['cfg(loom)'] }
 #   dead_code, unused_variables, unused_qualifications,
 #   trivial_numeric_casts, trivial_casts, let_underscore_drop
 
-# Build-output tuning for the crypto + byte-pumping (SSH/SFTP/rsync) workload.
-# Thin LTO + single codegen unit trade a slower release build for tighter
-# codegen on hot paths; no runtime/behavioral change.
+# Build tuning for the crypto + byte-pumping (SSH/SFTP/rsync) workload.
+# Dev trades optimisation for turnaround; release trades build time for run
+# time. `sccache` arrives through `.cargo/config.toml` and needs no profile
+# switch — it serves third-party crates in every profile.
+
+# Development: no optimisation, full incremental reuse, 256 codegen units so
+# rustc parallelises per module, and no debuginfo written per object.
+[profile.dev]
+incremental = true
+opt-level = 0
+codegen-units = 256
+debug = 0
+overflow-checks = true
+
+# Same knobs for the test profile so it never drifts from dev.
+[profile.test]
+incremental = true
+opt-level = 0
+codegen-units = 256
+debug = 0
+
+# Dependencies stay unoptimised in dev/test: this is the "go fast" profile.
+[profile.dev.package."*"]
+opt-level = 0
+
+[profile.test.package."*"]
+opt-level = 0
+
+# Release: every codegen optimisation, no incremental artifacts, stripped
+# symbols. `panic = "abort"` drops landing pads; cargo keeps `unwind` for test
+# targets on its own, so `cargo test --release` still reports panics normally.
 [profile.release]
-lto = "thin"
+incremental = false
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+debug-assertions = false
+overflow-checks = false

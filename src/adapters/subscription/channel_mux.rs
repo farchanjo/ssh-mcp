@@ -221,7 +221,7 @@ impl ChannelMuxPort for ChannelMuxAdapter {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
-    reason = "tests use unwrap for brevity per CLAUDE.md test policy"
+    reason = "tests use unwrap for brevity per AGENTS.md test policy"
 )]
 mod tests {
     use std::sync::Arc;

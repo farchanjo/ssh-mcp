@@ -520,7 +520,7 @@ where
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "tests use unwrap/expect for brevity per CLAUDE.md test policy"
+    reason = "tests use unwrap/expect for brevity per AGENTS.md test policy"
 )]
 mod tests {
     use std::sync::Arc;

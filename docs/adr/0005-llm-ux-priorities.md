@@ -6,7 +6,7 @@ Accepted. Implemented in v5.0 (Phase 3 of the v5 roadmap); carried forward uncha
 
 ## Context
 
-ssh-mcp v4 ships a layered LLM-facing surface optimised for capable hosts (Claude Desktop, mcp-inspector, custom rmcp clients):
+ssh-mcp v4 ships a layered LLM-facing surface optimised for capable hosts (desktop apps, inspectors, custom rmcp clients):
 
 - `Implementation.instructions` — root prompt with three happy paths.
 - `ServerCapabilities` — `enable_tools`, `enable_resources_subscribe`, `enable_prompts`, `enable_*_list_changed`.
@@ -48,7 +48,7 @@ The v5 design anticipates lifecycle binding (ADR 0003) and channel mux (ADR 0004
 Three approaches were evaluated:
 
 1. **Train a custom small model on the v4 surface.** Out of scope; would not benefit users running open-source 27B-class models.
-2. **Move all complexity into prompt engineering on the host.** Rejected because the host (Claude Code, Cline, custom) is out of our control; the server has to remain the single source of truth.
+2. **Move all complexity into prompt engineering on the host.** Rejected because the host (any CLI harness, IDE, custom client) is out of our control; the server has to remain the single source of truth.
 3. **Re-engineer the server-emitted UX so 27B-class models cannot fail safely.** Selected.
 
 ## Decision
@@ -216,7 +216,7 @@ The full taxonomy lives in ADR 0007.
 ### Negative
 
 - **Larger response bodies.** The added `Hygiene:`, `WARN:`, and richer `HINT` lines grow the per-tool response by ~80 bytes on average. Negligible at the daemon level but worth noting at high throughput. The structured-content channel (JSON) is unchanged in size.
-- **Documentation surface to maintain.** Per-tool description rewrites mean docs/code drift is an active risk. The `docs/` reorganisation collapsed the original `docs/llm-ux/` tree into a single canonical [docs/LLM_GUIDE.md](../LLM_GUIDE.md) (golden rules + anti-patterns + error handbook); CLAUDE.md, README, MIGRATION align with that single doc; CI lint catches drift.
+- **Documentation surface to maintain.** Per-tool description rewrites mean docs/code drift is an active risk. The `docs/` reorganisation collapsed the original `docs/llm-ux/` tree into a single canonical [docs/LLM_GUIDE.md](../LLM_GUIDE.md) (golden rules + anti-patterns + error handbook); AGENTS.md, README, MIGRATION align with that single doc; CI lint catches drift.
 
 ### Neutral
 

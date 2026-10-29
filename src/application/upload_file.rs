@@ -665,7 +665,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_id_propagates_into_outcome() {
         let wired = build_wired();
-        let agent = AgentId::new("claude-agent-7".to_string());
+        let agent = AgentId::new("host-agent-7".to_string());
         let seeded = seed_session(&wired.sessions, "sess-agent", Some(agent.clone()));
         wired.sftp.queue_upload_ok(512);
 

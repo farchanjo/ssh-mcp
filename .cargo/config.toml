@@ -1,0 +1,18 @@
+# Repository-local cargo settings. Precedence, highest first: CLI flags, env
+# vars, this file, `$CARGO_HOME/config.toml`. Everything here serves the dev
+# loop; release tuning lives in `Cargo.toml` under `[profile.release]`.
+
+[build]
+# No `incremental` key here: `build.incremental` outranks `[profile.*]`, so
+# setting it would also force release incremental. The profiles in `Cargo.toml`
+# own that switch (dev/test on, release off).
+# Shared compilation cache, wrapped because sccache 0.19 aborts on an exported
+# `CARGO_INCREMENTAL`. Registry dependencies stay cacheable; workspace crates
+# compile incrementally and pass through the cache by design.
+rustc-wrapper = "scripts/sccache-rustc.sh"
+
+[env]
+# Keep compiler, linker and build-script output in en-US on any host locale.
+LANG = { value = "C.UTF-8", force = true }
+LC_ALL = { value = "C.UTF-8", force = true }
+LANGUAGE = { value = "en_US:en", force = true }

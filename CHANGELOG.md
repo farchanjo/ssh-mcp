@@ -868,7 +868,7 @@ Lane fanout pipeline + production port-forward listener. Wire-compatible drop-in
 - **Shell PTY producer wired.** `flush_shell_buffer` now calls `SUBSCRIPTION_REGISTRY.poke(Shell, id)` + `record_bytes(Shell, id, chunk_len)` after every flush, so `shell://<id>/output` lanes see real PTY bytes (not just the 1 s force-flush keepalive tick).
 - **URI charset hardening.** `parse_uri` rejects ids outside `[A-Za-z0-9_-]+` (whitespace, unicode, control chars, dot-dot) with a new `ParseError::BadIdCharset`. UUIDv7 + legacy snake_case ids unaffected.
 - **`serial://` scheme** is now first-class on the `sub_open` URI parser (the legacy URI parser already supported it; the application-side parser was the only gap).
-- **MCP schema spec compliance.** `SerialListPortsArgs` / `SerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts (Claude Code) accept the full `tools/list` batch.
+- **MCP schema spec compliance.** `SerialListPortsArgs` / `SerialListOpenArgs` no longer derive `{"type":"null"}` (unit-struct schemars output). Empty named-fields structs derive the spec-mandated `{"type":"object","properties":{},"additionalProperties":false}` so strict MCP hosts accept the full `tools/list` batch.
 
 ### Quality
 
@@ -1055,7 +1055,7 @@ flowchart LR
 - **Subscribe-first architecture** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). `ResourceLifecycle` CAS state machine (`Owned → Observed → Releasing → Closed`) + per-session cascade refcount; grace timer arms when last subscriber detaches; new subscribes within the window cancel it; `release_when_no_subs = true` on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` opts in. Default preserves v4 semantics.
 - **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)). Cursor key shifts from `(PeerId, Uri)` to `(SubId, Uri)` (UUIDv7); each subscribe call gets its own bounded `mpsc::channel(N)`, `LagPolicy` (default `Snapshot`), filter pipeline, replay window, and `SubscriberStats` (8 atomics). `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy hosts get a synthesised `sub_id`.
 - **LLM UX overhaul** (Phase 3 — in flight; [ADR 0005](docs/adr/0005-llm-ux-priorities.md), [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md)). 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause`, `sub_resume`, `sub_filter`, `sub_replay`, `sub_list`, `sub_stats`, `sub_stats_all`); `HINT:` severity escalation (REQUIRED / RECOMMENDED / informational); 10-prompt catalog (5 carry-overs + 5 push-first); `SUB_LEAK_RISK` watcher (default `SSH_SUB_LEAK_RISK_WARN_S = 2 s`).
-- **NDJSON daemon binary** (Phase 4 — in flight; [ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), [docs/DAEMON.md](docs/DAEMON.md)). `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds in-process rmcp client + server across `tokio::io::duplex`; stdin NDJSON ops, stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable. For tier-2 / tier-3 hosts (Claude Desktop, Claude Code CLI, IDE integrations) that do not surface `notifications/resources/updated` to the model.
+- **NDJSON daemon binary** (Phase 4 — in flight; [ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), [docs/DAEMON.md](docs/DAEMON.md)). `ssh-mcp-tail` with three subcommands (`run`, `shell`, `daemon`). Embeds in-process rmcp client + server across `tokio::io::duplex`; stdin NDJSON ops, stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable. For tier-2 / tier-3 hosts (desktop apps, CLI harnesses, IDE integrations) that do not surface `notifications/resources/updated` to the model.
 - **38-code error taxonomy** ([ADR 0007](docs/adr/0007-error-taxonomy.md), [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook)). 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics; centralised one-sentence DETAIL phrasing.
 - **Lock-free invariants extended** ([docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants)). New atomics for lifecycle (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker) and lane / mux (per-lane mpsc, cursor, pause flag, 8 stats atomics, mux_waker). Loom coverage 8 → 16 (Phase 1 + Phase 2 each add 4). Production clippy gate stays exit-0.
 - **MSRV bumped to Rust 1.95** (Rust 2024 edition baseline + AFIT).
@@ -1255,7 +1255,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Changed
 
-- **Wire key rename: `AGENT:` → `AGENT_ID:` (narrow breaking change)** — 7 render sites: `ssh_connect`, `ssh_sessions` (per-row), `ssh_exec` (async), `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. CLAUDE.md required all IDs to end with `_ID` — this closes the last drift. Hosts walking key-value lines generically: no change. Hosts grepping `^AGENT:` literally: update to `^AGENT_ID:`.
+- **Wire key rename: `AGENT:` → `AGENT_ID:` (narrow breaking change)** — 7 render sites: `ssh_connect`, `ssh_sessions` (per-row), `ssh_exec` (async), `ssh_shell_open`, `ssh_upload` / `ssh_download`, `ssh_disconnect_agent`. AGENTS.md required all IDs to end with `_ID` — this closes the last drift. Hosts walking key-value lines generically: no change. Hosts grepping `^AGENT:` literally: update to `^AGENT_ID:`.
 - `ssh_connect` description trimmed for token efficiency where redundant; cost line preserves the existing tip bullets.
 
 ### Tests
@@ -1291,7 +1291,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 - **Per-tool `title` + `ToolAnnotations`** — every one of the 18 tools (or 17 without `port_forward`) now declares a human-readable `title` and the `read_only_hint` / `destructive_hint` / `idempotent_hint` annotations so MCP hosts can rank, filter, and warn before destructive use. Read-only tools: `ssh_sessions`, `ssh_exec_output`, `ssh_commands`, `ssh_shell_wait_for`, `ssh_transfer_progress`. Idempotent destructive: disconnect / cancel / shell_close. Open-world hint left unset (defaults to true).
 - **Few-shot `instructions` field** — replaces the previous one-liner with three canonical workflows (run command, interactive shell, upload) plus the v4.4 `EXPIRES_AT` / `HINT` / `agent_id` steering cues. Two flavours: `INSTRUCTIONS_WITH_FORWARD` (797 bytes) and `INSTRUCTIONS_WITHOUT_FORWARD` (785 bytes). The non-`port_forward` build advertises 17 tools and 4 streams.
 - **Schema documents per-key modifier policy** — `ssh_shell_press` `key` field now spells out the allowed modifier set per key class in its JsonSchema description (arrows / nav / F-keys accept any of `shift`/`alt`/`ctrl`; `tab` accepts only `shift`; control bytes reject every modifier). `ssh_shell_wait_for` `patterns` field documents the wire codes returned on validation failure.
-- **Doc surface** — `docs/LLM_GUIDE.md`, `docs/API.md`, `docs/ERRORS.md`, `docs/RESOURCES.md`, `docs/FLOWS.md`, `README.md`, and `CLAUDE.md` are now in sync with v4.5.0 behaviour. New LLM_GUIDE sections cover connection lifecycle (v4.4), granular error codes (v4.5), server identity (v4.5), and a smaller-LLM cookbook with three canonical workflows.
+- **Doc surface** — `docs/LLM_GUIDE.md`, `docs/API.md`, `docs/ERRORS.md`, `docs/RESOURCES.md`, `docs/FLOWS.md`, `README.md`, and `AGENTS.md` are now in sync with v4.5.0 behaviour. New LLM_GUIDE sections cover connection lifecycle (v4.4), granular error codes (v4.5), server identity (v4.5), and a smaller-LLM cookbook with three canonical workflows.
 
 ### Tests
 
@@ -1427,7 +1427,7 @@ Only the SFTP transfer path was affected; this fix is the only required change.
 
 ### Migration
 
-See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) for the v4.1 contributor note (foundational `mcp::*` paths gone — code now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` and `crate::adapters::subscription::legacy`). **No client-side migration is required** — v3 / v4.0 hosts work against v4.1 servers without any change.
+See [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4) for the v4.1 contributor note (foundational `mcp::*` paths gone — code now lives at `crate::adapters::{ssh,sftp,config,subscription}::internal::*` and `crate::adapters::subscription::legacy`). **No client-side migration is required** — v3 / v4.0 hosts work against v4.1 servers without any change.
 
 ### Etapa trail (v4.1 commits)
 
@@ -1514,7 +1514,7 @@ Shipped — see the [4.1.0] entry above for the H17.6 P1+P2+P3+P4 outcome (src/m
 
 ### Migration
 
-See [docs/MIGRATION_v3_to_v4.md](docs/MIGRATION_v3_to_v4.md) for the contributor migration guide. **No client-side migration is required** — v3 hosts work against v4 servers without any change.
+See [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4) for the contributor migration guide. **No client-side migration is required** — v3 hosts work against v4 servers without any change.
 
 ### Etapa trail (v4 commits)
 

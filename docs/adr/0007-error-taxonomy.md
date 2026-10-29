@@ -83,7 +83,7 @@ flowchart TD
     class CAT,REM active
 ```
 
-### Code list (38 v5.0 baseline; current shipped surface ≥ 43)
+### Code list (38 v5.0 baseline; current shipped surface ≥ 56)
 
 For brevity, only the new v5.0 codes are listed in this ADR; pre-existing v4 codes carry over with their existing semantics. The full list is in [docs/LLM_GUIDE.md → Error handbook](../LLM_GUIDE.md#error-handbook). v5.x added a handful of operational codes on top of the 38-code baseline (`PORT_IN_USE`, `TIMEOUT`, `EMPTY_PATTERNS`, `PATTERN_TOO_LONG`, `TOO_MANY_PATTERNS`, `MODIFIER_NOT_ALLOWED`); the full DETAIL lookup at `src/infra/mcp/error_detail.rs` is authoritative.
 

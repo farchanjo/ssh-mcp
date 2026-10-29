@@ -60,7 +60,7 @@ Breaking from a client perspective:
 - Response markdown is now block-only (one `KEY: value` per line); v2 mixed inline and block forms.
 - `ReusePolicy` and `CommandStatus` are typed enums; typos now produce a JSON-schema validation error.
 
-See [MIGRATION_v2_to_v3.md](../MIGRATION_v2_to_v3.md) for the full client upgrade guide.
+See [MIGRATION.md → v2 → v3](../MIGRATION.md#v2--v3) for the full client upgrade guide.
 
 ### Operational changes
 

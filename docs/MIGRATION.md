@@ -177,7 +177,7 @@ pub enum CommandStatus {
 
 ### Recommended upgrade path
 
-1. **Update your MCP host** to a release that supports the Streamable HTTP MCP transport (or compatible stdio). Anthropic Claude Desktop 0.7+, MCP Inspector 0.4+, and any rmcp-based host work out of the box.
+1. **Update your MCP host** to a release that supports the Streamable HTTP MCP transport (or compatible stdio). Any 2025+ host with Streamable HTTP (desktop apps, MCP Inspector 0.4+, rmcp-based hosts) works out of the box.
 2. **Switch tool argument deserialization** to typed enums for `ReusePolicy` and `CommandStatus` if your client validates schemas before sending.
 3. **Subscribe to `resources/*`** for realtime UX wins. On long-running shells the token spend drops by roughly 50% versus the v2 polling loop because deltas are pulled with `?cursor=auto` instead of full snapshots.
 4. **Drop your custom cancel-id handling** if you previously worked around the stdio quirks. rmcp follows the spec.
@@ -631,7 +631,7 @@ Every new tool emits the same dual channel as the v4 tools: a markdown body with
 
 `ssh-mcp-tail` is a single binary with three subcommands (`run`, `shell`, `daemon`). Its primary mode (`daemon`) reads NDJSON commands on stdin and emits NDJSON events on stdout. It embeds the same `composition::prod` adapters used by `ssh-mcp` and `ssh-mcp-stdio`, wired to itself via an in-process `tokio::io::duplex` MCP transport.
 
-The binary exists for hosts that **do not** surface `notifications/resources/updated` to the LLM (Claude Code CLI as of 2026-Q1, and several IDE integrations). Driving it from such a host gives the LLM real push delivery without any host-level subscribe support.
+The binary exists for hosts that **do not** surface `notifications/resources/updated` to the LLM (mainstream CLI harnesses as of 2026-Q1, and several IDE integrations). Driving it from such a host gives the LLM real push delivery without any host-level subscribe support.
 
 The full reference is at [DAEMON.md](./DAEMON.md).
 
@@ -700,7 +700,7 @@ The `release_when_no_subs = false` default means v5 hosts that do **not** add th
 
 The recipes below show the same workflow under v4.8 and under v5.0 push-first. Both are valid in v5.0 — the v4 path remains supported. The v5 path is recommended once your host's prompt and the LLM tooling expose `sub_open`.
 
-#### Open a shell + drain push (Claude Desktop, full-spec host)
+#### Open a shell + drain push (full-spec host)
 
 **v4.8 — wait + read polling fallback**
 
@@ -718,7 +718,7 @@ ssh_disconnect(session_id)
 **v5.0 — push-first**
 
 ```text
-ssh_connect(address, username, agent_id="my-claude-agent")
+ssh_connect(address, username, agent_id="my-agent")
   -> SESSION_ID
 ssh_shell_open(session_id, cols=80, rows=24, release_when_no_subs=true)
   -> SHELL_ID  (returns INITIAL_BUFFER if the prompt arrives within 100 ms)
@@ -729,7 +729,7 @@ ssh_shell_write(shell_id, bytes="ls -la\n")
 # ... events drain via notifications/resources/updated ...
 sub_close(sub_id)            # release_when_no_subs triggers grace timer
 # shell auto-closes after the per-call lifecycle grace window expires
-ssh_disconnect_agent(agent_id="my-claude-agent")
+ssh_disconnect_agent(agent_id="my-agent")
 ```
 
 #### Run a long command + sub + drain until completed
@@ -812,9 +812,9 @@ sub_replay(sub_id, from_cursor=last_seen)
 
 If the resource has `Closed` in the meantime (grace timer fired), `sub_open` returns `RESOURCE_GONE` with a `DETAIL: Resource closed (lifecycle Releasing/Closed); recreate via ssh_shell_open / ssh_exec / ssh_upload.` line. See [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook) for the full code-by-code retry policy.
 
-#### Daemon-mode equivalent (Claude Code CLI, no-subscribe host)
+#### Daemon-mode equivalent (no-subscribe host)
 
-When the host's LLM cannot consume `notifications/resources/updated`, a Claude Code shell can pipe NDJSON through `ssh-mcp-tail`:
+When the host's LLM cannot consume `notifications/resources/updated`, a host shell can pipe NDJSON through `ssh-mcp-tail`:
 
 ```bash
 ssh-mcp-tail run --host vm.example.com --user root -- "tail -f /var/log/app.log" \
@@ -1066,7 +1066,7 @@ pub struct SshRsyncStatsArgs  { pub rsync_id: String }
 - Tool catalogue: still 36 tools (35 without `port_forward`) for the v6.x carry-over surface. Three new tools land on top.
 - Resource URI schemes for v6.x: byte-identical — `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://` all unchanged.
 - Default behaviour: every existing knob (`release_when_no_subs`, lag policy, debouncer windows, broadcast caps, resume / verify) keeps its v6.1 value.
-- MSRV: still Rust 1.95.
+- MSRV: still Rust 1.99.
 
 #### Recommended upgrade path for hosts that want to opt into rsync
 
@@ -1391,7 +1391,7 @@ For **MCP host operators, contributors, and downstream automations** moving from
 - Cursor / SubId model: byte-identical.
 - Default behaviour: every existing knob (`release_when_no_subs`, lag policy, debouncer windows, broadcast caps, lifecycle bindings) keeps its v6.0 value.
 - Environment variables: **none added**. The resume primitive is purely runtime-flag-driven; see [CONFIGURATION.md → v6.1 / ADR 0010](./CONFIGURATION.md#v61--adr-0010--resume--verify-no-new-env-vars).
-- MSRV: still Rust 1.95.
+- MSRV: still Rust 1.99.
 
 ### Recommended upgrade path
 

@@ -3954,7 +3954,7 @@ where
 
 /// Build the rmcp [`Implementation`] descriptor advertised on the
 /// `initialize` handshake. Carries display title, free-form description,
-/// and a public landing page so modern MCP hosts (Claude mobile / remote
+/// and a public landing page so modern MCP hosts (mobile / remote
 /// clients) can render a humanised server card. Icons are intentionally
 /// omitted for now — flipping them on requires a stable hosted asset URL
 /// plus a tiny SVG.

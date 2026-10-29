@@ -483,12 +483,12 @@ mod tests {
 
     #[test]
     fn cleanup_agent_renders_disconnect_agent_call() {
-        let args = build_args(&[("agent_id", json!("claude-9"))]);
+        let args = build_args(&[("agent_id", json!("host-9"))]);
         let result = get_prompt("cleanup_agent", &args).expect("body");
         let PromptMessageContent::Text { text } = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_disconnect_agent(agent_id=claude-9)"));
+        assert!(text.contains("ssh_disconnect_agent(agent_id=host-9)"));
     }
 
     #[test]
