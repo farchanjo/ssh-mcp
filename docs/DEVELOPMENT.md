@@ -13,19 +13,18 @@ Cross references:
 Four gates must stay green on every commit:
 
 ```bash
-cargo build --release                              # All binaries (default + port_forward)
-cargo build --release --bin ssh-mcp                # HTTP server (axum 0.8 + rmcp 1.6)
-cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
-cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
-cargo build --release --no-default-features        # No port forwarding
-
-cargo test --lib --quiet                                   # 2101 lib tests
-cargo test --tests --features test-fixtures --quiet        # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10)
-cargo test --features test-fixtures                # Use cases vs deterministic adapters
-
-cargo fmt --all -- --check
-cargo clippy --release --all-features -- -D warnings   # Strict lint gate (production-only)
+sudo make all                                      # Gates + build + codesign + install + verify
+sudo make release                                  # Optimised, stripped + install to /usr/local/bin
+make dev                                           # Incremental debug build
+make test                                          # 2101 lib tests (nextest)
+make test-integration                              # 167 integration tests across 12 binaries
+make fmt                                           # cargo fmt --check
+make lint                                          # Strict lint gate (production-only)
 ```
+
+`JOBS` defaults to the CPU count and caps cargo and nextest parallelism
+(`JOBS=4 make test`); values above the core count clamp, non-integers abort. Raw cargo invocations still work; the wrappers only strip
+a stale `CARGO_INCREMENTAL` so the profiles decide.
 
 ### Clippy gate is production-only
 
@@ -35,7 +34,7 @@ Production code stays under the full strict baseline; test code is gated by `car
 
 ### MSRV
 
-Rust **1.95** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.95).
+Rust **1.99.1** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.99).
 
 ### Clippy configuration
 

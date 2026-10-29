@@ -1,0 +1,40 @@
+# cargo-nextest configuration: scheduling and isolation only. Compile-time
+# settings stay in `Cargo.toml`; the dev profiles there are what `nextest` uses.
+#
+# nextest runs every test in its own process, so a hung SSH/SFTP/rsync adapter
+# cannot wedge its neighbours and global statics stay isolated per test.
+
+[profile.default]
+# Each test is a process, not a thread. `--test-threads $(JOBS)` from the
+# Makefile wins; this is the fallback for a bare `cargo nextest run`.
+test-threads = "num-cpus"
+retries = 0
+fail-fast = false
+# Terminate a test after two 60 s periods, matching `pytest.ini`'s timeout.
+slow-timeout = { period = "60s", terminate-after = 2 }
+leak-timeout = "250ms"
+status-level = "pass"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+store-success-output = false
+store-failure-output = true
+
+# CI: retry flaky adapter races, stop the run on the first hard failure, keep
+# the JUnit report for the job summary.
+[profile.ci]
+retries = 2
+fail-fast = true
+slow-timeout = { period = "120s", terminate-after = 2 }
+failure-output = "immediate-final"
+success-output = "never"
+
+# JUnit needs a nextest built with the `junit` feature; the host binary here
+# lacks it, so the block is inert until a feature-enabled build is installed.
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"
+store-success-output = false
+store-failure-output = true

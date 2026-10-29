@@ -438,7 +438,7 @@ Total new test surface: ~165 unit + integration cases + 10 property strategies +
 | 9 | Wire-compat feature parity — attrs, hardlinks, sparse, exclude/include, --delete, dry-run, bwlimit. Catch up to agent feature set. | 3 wk | Property tests pass for both transports identically. |
 | 10 | Push lane — `rsync://<id>/progress` resource scheme; per-file + aggregate event emission; lane integration with channel-mux + lifecycle binding; ADR 0006 Amendment 1 byte-threshold. | 2 wk | Push events surface to subscribers; loom invariants hold. |
 | 11 | Tool router — `ssh_rsync`, `ssh_rsync_cancel`, `ssh_rsync_stats`. NDJSON daemon parser update. Block-markdown response, structured payload, HINT/NEXT lines. | 1 wk | MCP surface complete. |
-| 12 | Docs — ADR 0011 (this); `docs/API.md` (new section); `docs/LLM_GUIDE.md` ("Recursive sync with rsync"); `docs/RESOURCES.md` (rsync://); `docs/CONFIGURATION.md` (5 new env vars); `docs/MIGRATION.md` (v6 → v7); `CLAUDE.md` summary. | 1 wk | Docs reflect surface. |
+| 12 | Docs — ADR 0011 (this); `docs/API.md` (new section); `docs/LLM_GUIDE.md` ("Recursive sync with rsync"); `docs/RESOURCES.md` (rsync://); `docs/CONFIGURATION.md` (5 new env vars); `docs/MIGRATION.md` (v6 → v7); `AGENTS.md` summary. | 1 wk | Docs reflect surface. |
 | 13 | Loopback + property + wire-fixture tests + loom invariant additions. | 3 wk | ~180 net-new tests green; coverage >= 85 %. |
 | 14 | Beta release — RC1 on a feature flag (`feature = "rsync"` default-off); collect deployment feedback; harden. | 2 wk | RC1 → RC2 with bug fixes from real hosts. |
 | 15 | GA — flip default-on, ship v7.0.0. | 1 wk | crates.io release. |

@@ -21,14 +21,14 @@
 ### 2. Doc inconsistency sweep (28 MD files audited)
 
 Methodology:
-- 28 haiku dispatches (one per MD file) → extract every factual claim into flat YAML.
-- 3 sonnet:medium dispatches (top-level / docs/ / docs/adr) → cross-validate haiku findings vs ground truth + flag stuff haiku missed.
-- 1 sonnet:medium fix-pass → apply 35 edits across 11 files.
+- 28 small dispatches (one per MD file) → extract every factual claim into flat YAML.
+- 3 medium dispatches (top-level / docs/ / docs/adr) → cross-validate haiku findings vs ground truth + flag stuff haiku missed.
+- 1 medium fix-pass → apply 35 edits across 11 files.
 
 Result: 11 file-level commits (`5672919` and earlier sequence — see `git log --oneline -20`). Working tree clean.
 
 Critical drift fixed in living docs:
-- `CLAUDE.md` (project root, loaded into every session): tool counts `36/35 → 39/38`, push schemes `6 → 7`, error codes `40 → 46`, `RSYNC_PROTOCOL` prose `v31 → v32 (downgrades to v31)`, lib tests `1966 → 1986`, "six layered deltas" → "seven", header version `v7.0.0 → v7.0.1`.
+- `AGENTS.md` (project root, loaded into every session): tool counts `36/35 → 39/38`, push schemes `6 → 7`, error codes `40 → 46`, `RSYNC_PROTOCOL` prose `v31 → v32 (downgrades to v31)`, lib tests `1966 → 1986`, "six layered deltas" → "seven", header version `v7.0.0 → v7.0.1`.
 - `README.md`: rsync proto prose v31 → v32; lib tests 1966 → 1986.
 - `docs/ARCHITECTURE.md`: title `v7.0.0 → v7.0.1`; wire-proto prose v31 → v32; Mermaid handshake nodes `proto 27 → 31` → `proto 27 → 32` (push + pull pipelines); capabilities table `6 schemes → 7 schemes`.
 - `docs/adr/0011-rsync-hybrid-transport.md`: Status section + Test Coverage table updated. ALL other v31 mentions in ADRs are time-capsule plan narrative — left untouched.
@@ -55,7 +55,7 @@ ssh-mcp-tail   : exit=0   — version 7.0.1
 
 ### 5. Python integration test polish (3 commits)
 
-Validated by sonnet:medium against v7.0.1 surface. 7 files touched, 3 semantic commits:
+Validated by a medium-tier pass against v7.0.1 surface. 7 files touched, 3 semantic commits:
 
 - `5672919 fix(tests): tool-list count assertion {20,21} → {38,39} for v7.0.1` — hard-fail fix in `test_http.py` + `test_stdio.py`. Function renamed `*_v47_catalogue → *_v7_catalogue`.
 - `0ef02a0 docs(tests): refresh stale tool/error counts in v47/v5 docstrings` — module docstrings only (`test_v47_structured_content.py`, `test_v5_adversarial.py`). Bodies clean.
@@ -67,14 +67,14 @@ Validated by sonnet:medium against v7.0.1 surface. 7 files touched, 3 semantic c
 
 ### Immediate next step (where session pause happened)
 
-**Run pytest against v7.0.1**. Plan was 2-haiku parallel dispatch:
-- **FG haiku**: `pytest scripts/test_v7_rsync_vm.py -v --tb=short` (only file touching real `vm.services` rsync 3.2.7).
-- **BG haiku**: `pytest scripts/ --ignore=scripts/test_v7_rsync_vm.py -v --tb=line` (paramiko-fixture suite, ~22 files).
+**Run pytest against v7.0.1**. Plan was 2 parallel small dispatches:
+- **FG small**: `pytest scripts/test_v7_rsync_vm.py -v --tb=short` (only file touching real `vm.services` rsync 3.2.7).
+- **BG small**: `pytest scripts/ --ignore=scripts/test_v7_rsync_vm.py -v --tb=line` (paramiko-fixture suite, ~22 files).
 
 Brief should set `cd /Users/farchanjo/dev/ssh-mcp && source .venv/bin/activate` first. Default env vars match the VM (`SSH_MCP_E2E_HOST=vm.services` / `_USER=root` / `_PORT=22` / `_KEY_PATH=~/.ssh/id_rsa`). Bash timeout ≥ 600000ms (some tests run for minutes against paramiko fixtures).
 
 Expected outcome:
-- 19 passed + 2 xfailed for v7 rsync trio (per CLAUDE.md baseline) — the 2 xfails cover the deferred local-FS adapter for `RsyncSftpFsPort`. xfails strict=False so they show as `xfailed`, not `failed`.
+- 19 passed + 2 xfailed for v7 rsync trio (per AGENTS.md baseline) — the 2 xfails cover the deferred local-FS adapter for `RsyncSftpFsPort`. xfails strict=False so they show as `xfailed`, not `failed`.
 - `test_v7_rsync_vm.py` against rsync 3.2.7: should NOT surface `RSYNC_PROTOCOL_ERROR` for the wire path. Pre-cleanup tests had defensive elif accepting that error; v7.0.1 should hit the happy path. Defensive elif kept — if test goes through it, that's a regression worth investigating.
 
 vm.services already verified reachable: `ssh -l root vm.services 'rsync --version'` → `rsync 3.2.7 protocol version 31`.
@@ -83,7 +83,7 @@ vm.services already verified reachable: `ssh -l root vm.services 'rsync --versio
 
 - **`git push`**. Master + `v7.0.1` tag are local-only. Run `git push origin master v7.0.1` when ready.
 - **GitHub release notes**. `gh release create v7.0.1 --notes-file <(awk '/^## \[7.0.1\]/,/^## \[7.0.0\]/' CHANGELOG.md | sed '$d')`.
-- **Statusline caveman badge** (cosmetic, optional). Add to `~/.claude/settings.json`:
+- **Statusline caveman badge** (cosmetic, optional). Add to the host's settings file (shown here for a Claude-family host, `~/.claude/settings.json`):
   ```json
   "statusLine": {
     "type": "command",
@@ -103,7 +103,7 @@ vm.services already verified reachable: `ssh -l root vm.services 'rsync --versio
 | rsync_proto_advertised | 32 (downgrades to 31 against legacy via min(local,remote)) | src/adapters/rsync/wire/session.rs `RSYNC_PROTOCOL = 32` |
 | rsync_proto_min/max | 27 / 32 | RSYNC_PROTOCOL_MIN/MAX |
 | error_codes_total | 46 (38 base + 2 v6.1 + 6 v7.0) | ADR 0007 + 0010 + 0011 |
-| msrv | 1.95 | Cargo.toml |
+| msrv | 1.99 | Cargo.toml |
 | edition | 2024 | Cargo.toml |
 | ADRs | 11 (0001-0011) | docs/adr/ |
 | tools_with_port_forward | 39 | #[tool] count in src/infra/mcp/tool_router.rs |
@@ -122,13 +122,13 @@ vm.services already verified reachable: `ssh -l root vm.services 'rsync --versio
 ## Convention reminders
 
 - **Caveman mode**: full intensity active. Drop articles/filler/pleasantries. Fragments OK. Code/commits/security: full English.
-- **Haiku-fit gate** (per CLAUDE.md): single-file, zero judgment, fixed output shape, ≤200-word brief, bounded acceptance. Multi-file work goes to `sonnet:medium`.
-- **Dispatch labeling** (mandatory): `[haiku] <task>` (no effort tier) | `[sonnet:<low|medium|high|xhigh|max>] <task>` | `[opus:<effort>] <task>` (Opus FORBIDDEN unless `/opus` literal in current user prompt).
+- **Small-model fit gate** (per AGENTS.md): single-file, zero judgment, fixed output shape, ≤200-word brief, bounded acceptance. Multi-file work goes to a larger tier.
+- **Dispatch labeling** (mandatory): `[small] <task>` (no effort tier) | `[medium:<low|medium|high|xhigh|max>] <task>` | `[large:<effort>] <task>` (large tier only when `/opus` literal appears in the current user prompt).
 - **Concurrency guard**: cap=20 per turn. Always 1 FG + N BG. Pair every BG dispatch with notification awaiting; do NOT poll.
 - **Commit hygiene**: NEVER commit unless user asks. NEVER mass-commit — break into small contextual commits. Commits use Conventional Commits format (`type(scope): subject`). Subject ≤ 72 chars (project hook enforces).
 - **Tests + lint**: `cargo clippy --release --all-features -- -D warnings` + `cargo test --lib --quiet` must stay green after any code change.
-- **PMD config**: NEVER touch without explicit user permission (note: this repo is Rust, no PMD; rule lives in global CLAUDE.md as cross-project guard).
-- **CLAUDE.md global lock**: `/Users/farchanjo/.claude/CLAUDE.md` requires literal `/global-md` in current prompt to edit. Single-shot, 6h window.
+- **PMD config**: NEVER touch without explicit user permission (note: this repo is Rust, no PMD; rule lives in the machine-global instructions file as cross-project guard).
+- **Machine-global instructions lock**: the instructions file outside this repo requires the literal `/global-md` command in the current prompt to edit. Single-shot, 6h window.
 
 ## Quick-resume checklist
 
@@ -137,4 +137,4 @@ When resuming:
 2. `git status -s` — must be clean (working tree should be empty after this session).
 3. `git log --oneline -5` — verify top is `ebeb6ba docs(tests/v7-rsync): refresh slice-N narrative + xfail tags for v7.0.1`.
 4. Decide: run pytest now? push? GitHub release? something else?
-5. If running pytest: dispatch 2 parallel haikus per the plan above. Aggregate, report PASS/FAIL counts to user.
+5. If running pytest: dispatch 2 parallel small dispatches per the plan above. Aggregate, report PASS/FAIL counts to user.

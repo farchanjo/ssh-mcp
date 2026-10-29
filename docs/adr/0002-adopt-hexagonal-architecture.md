@@ -177,6 +177,6 @@ Rejected at the time. H17.6 (foundational decoupling — absorb the surviving `s
 ### Internal
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — full layer breakdown and module map.
-- [LOCKS.md](../LOCKS.md) — lock-free invariants under the new layout.
+- [DEVELOPMENT.md → Lock-free invariants](../DEVELOPMENT.md#lock-free-invariants) — lock-free invariants under the new layout.
 - [MIGRATION.md → v3 → v4](../MIGRATION.md#v3--v4) — contributor-facing migration guide.
 - [adr/0001-migrate-to-rmcp.md](./0001-migrate-to-rmcp.md) — v3 transport choice (still in force).

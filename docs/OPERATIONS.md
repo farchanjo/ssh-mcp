@@ -1,6 +1,6 @@
 # Operations Runbook
 
-Operator-facing reference for ssh-mcp v7.0. Symptom-to-cure decision tree, common failure shapes, the wire-format error envelope and per-tool error catalogue, and recovery sequence diagrams. Pairs with [LLM_GUIDE.md](./LLM_GUIDE.md) (the LLM-side handbook) and [DAEMON.md](./DAEMON.md) (the `ssh-mcp-tail` reference). For the full **46-code error taxonomy** (38 base + 2 v6.1 resume + 6 v7.0 rsync) with retry semantics, see [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
+Operator-facing reference for ssh-mcp v7.1.1. Symptom-to-cure decision tree, common failure shapes, the wire-format error envelope and per-tool error catalogue, and recovery sequence diagrams. Pairs with [LLM_GUIDE.md](./LLM_GUIDE.md) (the LLM-side handbook) and [DAEMON.md](./DAEMON.md) (the `ssh-mcp-tail` reference). For the full **56-code error taxonomy** (38 base + 2 v6.1 resume + 6 v7.0 rsync + 10 v7.1 inline push) with retry semantics, see [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook).
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
@@ -72,7 +72,7 @@ flowchart TD
 
 #### Causes
 
-1. **Host does not surface `notifications/resources/updated` to the LLM.** Claude Code CLI (as of 2026-Q1) and several IDE integrations accept the protocol but never deliver push notifications as conversation context to the model. The MCP server emits them; the host drops them.
+1. **Host does not surface `notifications/resources/updated` to the LLM.** Mainstream CLI harnesses (as of 2026-Q1) and several IDE integrations accept the protocol but never deliver push notifications as conversation context to the model. The MCP server emits them; the host drops them.
 2. **Subscription was closed by peer GC.** Peer-GC scans the subscription registry every `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed. Reconnecting client gets a fresh `PeerId`; the old `sub_id` is dead.
 3. **Lifecycle moved to `Releasing` without a re-subscribe inside the grace window.** When the last subscriber on a `release_when_no_subs=true` resource unsubscribed, the per-call grace timer started counting down (`LifecyclePolicy.grace_ms`, default 2000 ms). A new `subscribe` after grace expired returns `RESOURCE_GONE`.
 4. **Filter excludes everything.** The lane has a regex / level filter that rejects every event before it hits the mpsc.
@@ -947,7 +947,7 @@ Use this checklist verbatim when filing the issue at <https://github.com/farchan
 
 ## See also
 
-- [LLM_GUIDE.md](./LLM_GUIDE.md) — golden rules, anti-patterns, full 46-code error handbook (38 base + 2 v6.1 resume + 6 v7.0 rsync).
+- [LLM_GUIDE.md](./LLM_GUIDE.md) — golden rules, anti-patterns, full 56-code error handbook (38 base + 2 v6.1 resume + 6 v7.0 rsync + 10 v7.1 inline push).
 - [DAEMON.md](./DAEMON.md) — `ssh-mcp-tail` op + event schema.
 - [DEVELOPMENT.md](./DEVELOPMENT.md) — lock-free invariants, hot-path data flow.
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — hexagonal layout, v5/v6/v7 layers.

@@ -6,7 +6,7 @@ Accepted. Implemented in v5.0 (Phase 2 of the v5 roadmap, commit `30fbdd9`); car
 
 ## Context
 
-The v4 `MemoryRegistry` keys per-peer state on `(PeerId, Uri)`. Each peer has at most one logical subscription per URI, and the registry only tracks a byte cursor and a sequence ceiling. This is sufficient when the host is a single MCP client (Claude Desktop, mcp-inspector, …) consuming push notifications and reconciling via `resources/read?cursor=auto`.
+The v4 `MemoryRegistry` keys per-peer state on `(PeerId, Uri)`. Each peer has at most one logical subscription per URI, and the registry only tracks a byte cursor and a sequence ceiling. This is sufficient when the host is a single MCP client (desktop apps, inspectors, …) consuming push notifications and reconciling via `resources/read?cursor=auto`.
 
 Phase 4 of v5 introduces an embedded NDJSON daemon (`ssh-mcp-tail`) that runs an in-process MCP client + server pair across a `tokio::io::duplex` transport. Multiple consumers connect to the same daemon — a single peer fans events out to N independent NDJSON consumers, each with its own filter, lag policy, lifetime, and read cadence. The (PeerId, Uri) key collapses these N consumers into one channel, which means:
 

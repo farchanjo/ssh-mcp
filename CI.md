@@ -20,15 +20,15 @@ The following gates run on every pull request:
 
 | Job | Description | Toolchain | Features |
 | --- | --- | --- | --- |
-| Build | Compiles all three binaries on Linux + macOS | rust 1.95+ | `default,port_forward` |
-| Build (no-default) | Compiles without `port_forward` (38 tools, smaller binary) | rust 1.95+ | `--no-default-features` |
-| Fmt | `cargo fmt --all -- --check` | rust 1.95+ | n/a |
-| Clippy | Strict lint gate | rust 1.95+ | `--all-features --all-targets` |
-| Lib tests | 2101 unit tests | rust 1.95+ | default |
-| Integration tests | 167 integration tests across 12 binaries | rust 1.95+ | `test-fixtures` |
-| Property tests | proptest suites (`property` 32 + `property_rsync` 9) | rust 1.95+ | `test-fixtures` |
-| Chaos tests | Adversarial scheduler suites (`chaos` 41 + `chaos_rsync` 16) | rust 1.95+ | `test-fixtures` |
-| Loom invariants | Lock-free model checking (`tests/lockfree_invariants*.rs`, gated `#[cfg(loom)]`) | rust 1.95+ + `RUSTFLAGS="--cfg loom"` | `test-fixtures` |
+| Build | Compiles all three binaries on Linux + macOS | rust 1.99+ | `default,port_forward` |
+| Build (no-default) | Compiles without `port_forward` (38 tools, smaller binary) | rust 1.99+ | `--no-default-features` |
+| Fmt | `cargo fmt --all -- --check` | rust 1.99+ | n/a |
+| Clippy | Strict lint gate | rust 1.99+ | `--all-features --all-targets` |
+| Lib tests | 2101 unit tests | rust 1.99+ | default |
+| Integration tests | 167 integration tests across 12 binaries | rust 1.99+ | `test-fixtures` |
+| Property tests | proptest suites (`property` 32 + `property_rsync` 9) | rust 1.99+ | `test-fixtures` |
+| Chaos tests | Adversarial scheduler suites (`chaos` 41 + `chaos_rsync` 16) | rust 1.99+ | `test-fixtures` |
+| Loom invariants | Lock-free model checking (`tests/lockfree_invariants*.rs`, gated `#[cfg(loom)]`) | rust 1.99+ + `RUSTFLAGS="--cfg loom"` | `test-fixtures` |
 | Python integration | `pytest scripts/test_*.py` against running daemon / HTTP / VM | python 3.13 | n/a |
 
 ### Integration test matrix

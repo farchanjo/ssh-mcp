@@ -44,7 +44,7 @@ Per-call parameter overrides are documented per tool in [API.md](./API.md). The 
 |----------|------|---------|-------|-------------|
 | `SSH_MCP_STRUCTURED_CONTENT` | `bool` | `true` | — | Emit the v4.7 `structured_content` JSON twin alongside the markdown body. Set `false` to silence the JSON payload (markdown-only wire). Schema advertisement via `output_schema` is unchanged regardless. |
 
-Every MCP tool returns two parallel payloads: the legacy block-style markdown body in `content[0]` and a typed JSON object on `result.structured_content`. The JSON twin lets smaller LLMs (27B class) index by key without parsing prose, but some hosts (notably the Claude Code UI) render BOTH payloads, which clutters the human view.
+Every MCP tool returns two parallel payloads: the legacy block-style markdown body in `content[0]` and a typed JSON object on `result.structured_content`. The JSON twin lets smaller LLMs (27B class) index by key without parsing prose, but some hosts (notably some IDE hosts) render BOTH payloads, which clutters the human view.
 
 The default is `true` — preserves the v4.7 contract byte-identically. When set to `false` / `FALSE` / `0` (matching `SSH_COMPRESSION` semantics), both `ok_text_and_structured` and `error_text_and_structured` skip setting `structured_content`, so the wire becomes markdown-only. The text channel stays byte-identical regardless of this flag, and the `is_error` flag on error responses is preserved. The schema published per tool via `output_schema` on `#[tool]` describes the contract and is independent of this runtime gate.
 
@@ -97,12 +97,12 @@ If a future ADR introduces resume tuning knobs (chunk-size override, parallel ha
 
 ### v7.0 / ADR 0011 — rsync hybrid transport (3 env vars)
 
-Three knobs governing the v7.0 rsync hybrid transport. The agent-cache env vars from the original v7.0 plan (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped along with the agent path during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
+Three knobs declared for the v7.0 rsync hybrid transport. **All three are documented for forward compatibility: v7.1.1 reads `SSH_RSYNC_FILE_LIST_LIMIT`, while `SSH_RSYNC_PROBE_TIMEOUT_MS` and `SSH_RSYNC_BLOCK_SIZE` still resolve to the hardcoded defaults below.** The agent-cache env vars from the original v7.0 plan (`SSH_RSYNC_AGENT_CACHE_TTL_DAYS`, `SSH_RSYNC_AGENT_CACHE_DIR`) were dropped along with the agent path during the v7.0.0-alpha.2 architectural retrenchment — see [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `SSH_RSYNC_PROBE_TIMEOUT_MS` | `u64` (ms) | `2000` | Max wait for the `which rsync && rsync --version` probe before treating the host as having no rsync (Auto transport falls through to SFTP). |
-| `SSH_RSYNC_BLOCK_SIZE` | `u32` (bytes) | `0` (auto: `sqrt(file_size)` rounded to 1 KiB) | Override the rolling-checksum block size on the Wire transport's block-match path. Smaller blocks yield finer deltas at the cost of larger signature footprints. SFTP transport ignores this knob. |
+| `SSH_RSYNC_PROBE_TIMEOUT_MS` | `u64` (ms) | `2000` (hardcoded) | Max wait for the `which rsync && rsync --version` probe before treating the host as having no rsync (Auto transport falls through to SFTP). |
+| `SSH_RSYNC_BLOCK_SIZE` | `u32` (bytes) | `0` (hardcoded auto: `sqrt(file_size)` rounded to 1 KiB) | Override the rolling-checksum block size on the Wire transport's block-match path. Smaller blocks yield finer deltas at the cost of larger signature footprints. SFTP transport ignores this knob. |
 | `SSH_RSYNC_FILE_LIST_LIMIT` | `u64` (entries) | `1_000_000` | Max file-list size; both transports refuse with `RSYNC_FILE_LIST_TOO_LARGE` above this cap. Cure: tighten `opts.exclude` (`.git/`, `node_modules/`, `target/`, large generated trees) or raise this limit if the workload genuinely needs it. |
 
 ## Subscribe layer

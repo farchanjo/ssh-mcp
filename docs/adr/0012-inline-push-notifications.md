@@ -830,7 +830,7 @@ Every new field is `#[serde(default)]` on the request side and gated by a non-de
 | 6 | Initialize handshake — `experimental.ssh_inline_push` advertisement; client-echo recording into `CapabilityRegistry`. | Medium. Touches `Implementation.capabilities` + `initialize` handler. |
 | 7 | Daemon — extend NDJSON parser; new `inline_push` event type; `SSH_INLINE_PUSH_DAEMON_RELAY` gate. | Low. |
 | 8 | Tests — adapter, use case, loopback, property, chaos, loom invariants, snapshot extensions, daemon. | Medium. |
-| 9 | Docs — `docs/API.md`, `docs/LLM_GUIDE.md` (new "Inline push delivery" section), `docs/RESOURCES.md`, `docs/CONFIGURATION.md` (three new env vars), `docs/ARCHITECTURE.md` (subscribe-pipeline diagram refresh), `CLAUDE.md` summary, `docs/MIGRATION.md` v7.0 → v7.1 addendum. | Low. |
+| 9 | Docs — `docs/API.md`, `docs/LLM_GUIDE.md` (new "Inline push delivery" section), `docs/RESOURCES.md`, `docs/CONFIGURATION.md` (three new env vars), `docs/ARCHITECTURE.md` (subscribe-pipeline diagram refresh), `AGENTS.md` summary, `docs/MIGRATION.md` v7.0 → v7.1 addendum. | Low. |
 | 10 | Migration note — `docs/MIGRATION.md` v7.0 → v7.1: capability handshake, opt-in flag, no breaking change. | Low. |
 
 Sequenced in order. Phases 1–6 are the load-bearing slice; phases 7–10 layer additively on top. v7.1.0 ship requires phases 1–8 + 10; phase 9 doc polish can land in a follow-up patch.

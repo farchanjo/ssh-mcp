@@ -18,6 +18,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Runners are cold and the sccache wrapper is a shell script (not directly
+  # executable on Windows runners), so CI disables both. Profiles still pick
+  # the right optimisation level per build.
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: ""
 
 jobs:
   # ---------------------------------------------------------------------
@@ -34,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.99.1)
         shell: bash
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -78,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.99.1)
         shell: bash
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -179,7 +184,7 @@ jobs:
             exit 1
           fi
 
-      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.95)
+      - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.99.1)
         shell: bash
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 

@@ -834,7 +834,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_id_propagates_to_entity_and_secondary_index() {
         let (uc, _ssh, repo, _clock) = build_use_case();
-        let agent = AgentId::new("claude-instance-42".to_string());
+        let agent = AgentId::new("host-instance-42".to_string());
         let mut req = base_request();
         req.agent_id = Some(agent.clone());
         let outcome = uc.execute(req).await.expect("connect");

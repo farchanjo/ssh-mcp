@@ -8,7 +8,7 @@ The binary is shipped (Phase 4 merged into v5.x; carried forward unchanged into 
 
 Pick `ssh-mcp-tail` over `ssh-mcp-stdio` or `ssh-mcp` (HTTP) in any of the following scenarios:
 
-- **Hosts without `resources/subscribe` support reaching the LLM.** Claude Code CLI (as of 2026-Q1) accepts the protocol but does not deliver `notifications/resources/updated` to the LLM as conversation context. Driving `ssh-mcp-tail` as a subprocess inside a Claude Code shell gives the LLM real push delivery via stdout NDJSON, bypassing the host's missing surface.
+- **Hosts without `resources/subscribe` support reaching the LLM.** Mainstream CLI harnesses (as of 2026-Q1) accept the protocol but does not deliver `notifications/resources/updated` to the LLM as conversation context. Driving `ssh-mcp-tail` as a subprocess inside a host shell gives the LLM real push delivery via stdout NDJSON, bypassing the host's missing surface.
 - **Composable Unix pipelines.** `jq` filters, `tee` audit logs, `vector` / `fluentbit` / `logstash` shipping, browser-side bridges. The NDJSON format is purpose-built for line-oriented tools.
 - **In-process audit log / monitoring.** A long-running process can spawn `ssh-mcp-tail daemon` as a child, write ops to its stdin, and pipe events into a metrics or audit pipeline without implementing MCP itself.
 - **Integration tests.** Reuses `composition::embed::wire()` so the same adapters that power production binaries also power tests, browser bridges, and any in-process consumer.
@@ -530,7 +530,7 @@ The state machine (Owned -> Observed -> Releasing -> Closed) and its CAS edges a
 
 ## Error codes
 
-The daemon's `err` events use the same wire taxonomy as the MCP server (46 codes, 7 categories, action-oriented `DETAIL` lines). The complete reference is at [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook). The categories are summarised in [ADR 0007](./adr/0007-error-taxonomy.md):
+The daemon's `err` events use the same wire taxonomy as the MCP server (56 codes, 7 categories, action-oriented `DETAIL` lines). The complete reference is at [LLM_GUIDE.md → Error handbook](./LLM_GUIDE.md#error-handbook). The categories are summarised in [ADR 0007](./adr/0007-error-taxonomy.md):
 
 | Category | Retry semantics |
 |---|---|

@@ -1,6 +1,6 @@
 # LLM Guide
 
-Single canonical reference for LLM hosts driving ssh-mcp v7.0. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full **46-code error handbook** (38 base + 2 v6.1 resume + 6 v7.0 rsync). Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md), [ADR 0009](./adr/0009-serial-transport.md), [ADR 0010](./adr/0010-sftp-resume.md), [ADR 0011](./adr/0011-rsync-hybrid-transport.md).
+Single canonical reference for LLM hosts driving ssh-mcp v7.1.1. Combines the five golden rules, the 27B / 70B root prompts, the prompts catalogue, the ten anti-patterns, and the full **56-code error handbook** (38 base + 2 v6.1 resume + 6 v7.0 rsync + 10 v7.1 inline push). Sources: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0004](./adr/0004-channel-mux-fairness.md), [ADR 0005](./adr/0005-llm-ux-priorities.md), [ADR 0006](./adr/0006-backpressure-policies.md), [ADR 0007](./adr/0007-error-taxonomy.md), [ADR 0008](./adr/0008-ndjson-daemon-protocol.md), [ADR 0009](./adr/0009-serial-transport.md), [ADR 0010](./adr/0010-sftp-resume.md), [ADR 0011](./adr/0011-rsync-hybrid-transport.md).
 
 Cross references:
 
@@ -580,7 +580,7 @@ SSH_CONNECT: OK
 SESSION_ID: s-abc
 HOST: example.com:22
 USERNAME: alice
-AGENT_ID: claude-code-1
+AGENT_ID: host-1
 RETRY: 0
 PERSISTENT: false
 EXPIRES_AT: 2026-05-03T18:30:00+00:00
@@ -642,7 +642,7 @@ Every tool response carries BOTH the existing block-style Markdown (`content[].t
   "host": "example.com",
   "port": 22,
   "username": "alice",
-  "agent_id": "claude-code-1",
+  "agent_id": "host-1",
   "next": ["ssh_exec(session_id=a3f2b1d7-..., command=...)",
            "ssh_shell_open(session_id=a3f2b1d7-...)",
            "ssh_disconnect(session_id=a3f2b1d7-...)"]

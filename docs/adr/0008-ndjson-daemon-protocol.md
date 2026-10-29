@@ -9,8 +9,8 @@ Accepted. Implemented in v5.x (Phase 4 of the v5 roadmap) and shipped as the `ss
 The MCP protocol spec defines `resources/subscribe` + `notifications/resources/updated` as the standard push channel. Empirically, real-world MCP hosts split into three tiers:
 
 1. **Full-spec hosts** (mcp-inspector, custom rmcp clients, Goose CLI, Cline): subscribe support, push delivered to the LLM, end-to-end push works.
-2. **Partial hosts** (Claude Desktop, some IDE integrations): subscribe accepted on the protocol but push notifications are not surfaced to the LLM as conversation context. The LLM sees tool calls and resource reads only.
-3. **No-subscribe hosts** (Claude Code CLI as of 2026-Q1): no `resources/subscribe` exposed to the LLM at all; only `tools/call` and one-shot `resources/read`.
+2. **Partial hosts** (desktop apps, some IDE integrations): subscribe accepted on the protocol but push notifications are not surfaced to the LLM as conversation context. The LLM sees tool calls and resource reads only.
+3. **No-subscribe hosts** (mainstream CLI harnesses as of 2026-Q1): no `resources/subscribe` exposed to the LLM at all; only `tools/call` and one-shot `resources/read`.
 
 For tier 2 and 3, the server-side push pipeline is still useful for in-process consumers (audit logs, distributed monitoring, browser-side bridges) but cannot be reached through the standard MCP path. The v4 architecture has no story for this.
 
@@ -188,7 +188,7 @@ RUST_LOG=ssh_mcp=info,ssh_mcp_tail=debug ssh-mcp-tail daemon
 
 - **One binary, one process, no IPC.** Runs anywhere `ssh-mcp-stdio` runs. systemd-friendly.
 - **Composable Unix surface.** `jq`, `tee`, `grep`, fluentbit, vector all work out of the box.
-- **Real push for tier-2 / tier-3 hosts.** A Claude Code shell can `bash -c 'ssh-mcp-tail run --host vm.example.com --user root -- "tail -f /var/log/app.log"' | grep ERROR` and get genuine push (50 ms debounced) without implementing MCP subscribe.
+- **Real push for tier-2 / tier-3 hosts.** A host shell can `bash -c 'ssh-mcp-tail run --host vm.example.com --user root -- "tail -f /var/log/app.log"' | grep ERROR` and get genuine push (50 ms debounced) without implementing MCP subscribe.
 - **Reuse across phases.** The same `composition::embed::wire()` powers integration tests, future browser bridges, and any in-process consumer.
 
 ### Negative
@@ -210,4 +210,4 @@ RUST_LOG=ssh_mcp=info,ssh_mcp_tail=debug ssh-mcp-tail daemon
 - [ADR 0006 — Backpressure Policies](./0006-backpressure-policies.md) — daemon lag handling.
 - [ADR 0007 — Error Taxonomy](./0007-error-taxonomy.md) — daemon NDJSON error envelope.
 - [docs/DAEMON.md](../DAEMON.md).
-- [docs/api/ssh-mcp-ndjson.schema.json](../api/ssh-mcp-ndjson.schema.json) (forthcoming).
+- `docs/api/ssh-mcp-ndjson.schema.json` (forthcoming; no file in-tree yet).

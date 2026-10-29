@@ -758,7 +758,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn outcome_echoes_requested_agent_id() {
         let h = build_harness();
-        let agent = AgentId::new("claude-instance-7".to_string());
+        let agent = AgentId::new("host-instance-7".to_string());
         let outcome = h.uc.execute(req(&agent)).await.expect("execute");
         assert_eq!(outcome.agent_id, agent);
     }
