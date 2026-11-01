@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ssh_connect` arguments survive hosts that drop `$defs` from tool schemas.** The advertised input schema now inlines every subschema (`inline_subschemas`) instead of referencing `#/$defs/ReusePolicy`, so hosts that forward only `type`/`properties`/`required` no longer hand the model a dangling `$ref`. In that state `reuse` lost its enum branches, the model emitted the value unquoted (`"reuse": auto`), the client failed to parse the arguments and dispatched `{}`, and the server answered `missing field 'address'`. A regression test (`ssh_connect_schema_is_self_contained`) pins the schema to zero `$ref`/`$defs` and to the three documented `reuse` values (`src/infra/mcp/args/connection.rs`, `src/infra/mcp/tool_router.rs`).
+
 ## [7.1.1] — 2026-07-03
 
 Patch release. A multi-agent bug hunt across the hexagonal core surfaced **27 confirmed defects** (each adversarially verified before fixing) spanning the shell/command output buffers, subscription lanes, lifecycle refcount, rsync SFTP + wire transports, SFTP file transfer, serial transport, the MCP infra layer, and the NDJSON daemon. **Fully backwards compatible with `[7.1.0]`** — no tool string, env-var default, response envelope, or structured-content key changed; every fix is a correctness/leak repair on an existing surface. The `[Cargo.toml]` package version is bumped from `7.1.0` to `7.1.1`; `[Cargo.lock]` is refreshed in lockstep.
