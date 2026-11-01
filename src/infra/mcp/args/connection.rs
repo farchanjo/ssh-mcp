@@ -3,8 +3,15 @@
 //! Mirrors v3 `src/mcp/tools/connection.rs::Ssh*Args` exactly so existing
 //! MCP clients see the same JSON schema after the v4 swap.
 
+use std::sync::Arc;
+
 use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// JSON object shape the MCP tool descriptor expects.
+type JsonObject = serde_json::Map<String, Value>;
 
 use crate::domain::policy::ReusePolicy as DomainReusePolicy;
 
@@ -168,6 +175,29 @@ pub struct SshConnectArgs {
     pub reuse: Option<ReusePolicy>,
 }
 
+/// Tool-input schema for `ssh_connect` with every subschema inlined.
+///
+/// Hosts that project MCP schemas onto a narrower dialect may forward only
+/// `type`/`properties`/`required` and drop `$defs`. A `$ref` then dangles, the
+/// model loses the enum branch and emits the value unquoted (`"reuse": auto`),
+/// and hosts that cannot parse the arguments fall back to `{}`.
+#[must_use]
+pub fn ssh_connect_input_schema() -> Arc<JsonObject> {
+    let settings =
+        SchemaSettings::draft2020_12().with(|settings| settings.inline_subschemas = true);
+    let schema = settings
+        .into_generator()
+        .into_root_schema_for::<SshConnectArgs>();
+    let object = match serde_json::to_value(schema) {
+        Ok(Value::Object(object)) => object,
+        Ok(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
+        )
+        | Err(_) => JsonObject::new(),
+    };
+    Arc::new(object)
+}
+
 /// Arguments for the `ssh_disconnect` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SshDisconnectArgs {
@@ -288,6 +318,40 @@ mod tests {
         );
         assert!(property_default(&schema_json, "name").is_none());
         assert!(property_default(&schema_json, "agent_id").is_none());
+    }
+
+    /// MCP hosts that project tool schemas onto a narrower dialect may forward
+    /// only `type`/`properties`/`required`. A `$ref` into `$defs` then dangles,
+    /// the model loses the enum values, and hosts that fail to parse the
+    /// emitted arguments fall back to an empty object.
+    #[test]
+    fn ssh_connect_schema_is_self_contained() {
+        let schema_json = Value::Object((*super::ssh_connect_input_schema()).clone());
+        let rendered = schema_json.to_string();
+        assert!(
+            !rendered.contains("$ref"),
+            "ssh_connect schema must not $ref; full schema = {schema_json}"
+        );
+        assert!(
+            !rendered.contains("$defs"),
+            "ssh_connect schema must not carry $defs; full schema = {schema_json}"
+        );
+
+        let reuse = schema_json
+            .get("properties")
+            .and_then(|properties| properties.get("reuse"))
+            .expect("reuse property present");
+        let variants = reuse
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .expect("reuse keeps its null branch");
+        let enum_values: Vec<&str> = variants
+            .iter()
+            .filter_map(|variant| variant.get("oneOf"))
+            .flat_map(|branches| branches.as_array().into_iter().flatten())
+            .filter_map(|branch| branch.get("const").and_then(Value::as_str))
+            .collect();
+        assert_eq!(enum_values, ["suggest", "auto", "force_new"]);
     }
 
     #[test]
