@@ -133,7 +133,7 @@ use crate::ports::transfer_repo::TransferRepository;
 
 use super::args::connection::{
     SshConnectArgs, SshDisconnectAgentArgs, SshDisconnectArgs, SshDisconnectManyArgs,
-    SshSessionsArgs,
+    SshSessionsArgs, ssh_connect_input_schema,
 };
 use super::args::execute::{
     SshCommandsArgs, SshExecArgs, SshExecBatchArgs, SshExecCancelArgs, SshExecOutputArgs,
@@ -1564,6 +1564,7 @@ where
             idempotent_hint = true
         ),
         description = "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_exec, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward. ALSO subscribe via `sub_open uri=session://<SESSION_ID>/health` for live transport health pushes (PREFERRED over polling ssh_sessions).\n- `AGENT_ID`: optional grouping; passed to ssh_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_exec `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retried calls within the v4.7-step5 cache TTL.",
+        input_schema = ssh_connect_input_schema(),
         output_schema = schema_for_type::<SshConnectResult>()
     )]
     async fn ssh_connect(
