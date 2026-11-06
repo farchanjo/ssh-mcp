@@ -9,6 +9,11 @@
 # Shared compilation cache, wrapped because sccache 0.19 aborts on an exported
 # `CARGO_INCREMENTAL`. Registry dependencies stay cacheable; workspace crates
 # compile incrementally and pass through the cache by design.
+#
+# Precedence warning: an exported `RUSTC_WRAPPER` outranks this key, so a host
+# that exports `RUSTC_WRAPPER=sccache` skips the wrapper and loses the
+# `CARGO_INCREMENTAL` unset. The Makefile pins `RUSTC_WRAPPER` to the wrapper
+# for that reason; this key only covers a bare `cargo` invocation.
 rustc-wrapper = "scripts/sccache-rustc.sh"
 
 [env]

@@ -33,6 +33,8 @@ flowchart TD
 |---|---|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Hexagonal layout, v5/v6/v7 layers (lifecycle / mux / LLM UX / daemon / serial / resume / rsync hybrid), per-module map, sequence diagrams. |
 | [API.md](./API.md) | All 39 MCP tools (38 without `port_forward`) — inputs, outputs, structured content, error codes. |
+| [TOOL_CATALOG.md](./TOOL_CATALOG.md) | Generated catalogue of the live `tools/list` surface — every tool, title, annotation, and parameter descriptor. Regenerate with `make tools-export`. |
+| [TOOL_SURFACE_AUDIT.md](./TOOL_SURFACE_AUDIT.md) | Why a host can fail to surface the tool list and why a model mis-selects tools — evidence, root causes, prioritised fixes. |
 | [RESOURCES.md](./RESOURCES.md) | Seven push schemes (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), cursor + sequence semantics, `_meta` envelope, `resources/templates/list`. |
 | [CONFIGURATION.md](./CONFIGURATION.md) | Full env-var table with floors, caps, and tuning profiles (verbose shells, many subscribers, low-RAM, real-time UX, rsync probe). |
 | [LLM_GUIDE.md](./LLM_GUIDE.md) | Single canonical LLM doc — golden rules, 27B / 70B root prompts, prompts catalogue, anti-patterns, full 56-code error handbook. |

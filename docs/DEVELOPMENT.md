@@ -26,6 +26,20 @@ make lint                                          # Strict lint gate (productio
 (`JOBS=4 make test`); values above the core count clamp, non-integers abort. Raw cargo invocations still work; the wrappers only strip
 a stale `CARGO_INCREMENTAL` so the profiles decide.
 
+The dev and test profiles are incremental (`codegen-units = 256`, `opt-level =
+0`); release is not (`incremental = false`, `opt-level = 3`, fat LTO, one codegen
+unit, `panic = "abort"`, stripped). `NATIVE=1 make release` adds `-C
+target-cpu=native`, trading portability for speed and forcing a full rebuild.
+
+`RUSTC_WRAPPER` is pinned to `scripts/sccache-rustc.sh`. An exported
+`RUSTC_WRAPPER` outranks `.cargo/config.toml`, so without the pin a host that
+exports `RUSTC_WRAPPER=sccache` skips the wrapper and any exported
+`CARGO_INCREMENTAL=1` aborts the build. Scope of the cache, so no one expects
+more than sccache 0.19 can do: `-C incremental` crates (mozilla/sccache#236)
+and `--crate-type bin` are never cached, so a single-package workspace only
+caches third-party rlib dependencies. That is the intended trade — the dev loop
+keeps incremental, release drops it and becomes cacheable.
+
 ### Clippy gate is production-only
 
 The canonical command `cargo clippy --release --all-features -- -D warnings` must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453).

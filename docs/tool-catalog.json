@@ -1,0 +1,1685 @@
+{
+  "server": {
+    "name": "ssh-mcp",
+    "version": "7.1.2"
+  },
+  "tools": [
+    {
+      "name": "serial_active",
+      "title": "List currently open serial ports",
+      "description": "Snapshot every serial port currently held by this process. Returns SERIAL_ID, path, baud_rate, optional label, and the subscribe URI (`serial://<SERIAL_ID>/output`) for each. No state mutation.\n\nWhen to use:\n- Inventory before reconnect / cleanup decisions.\n- Pair with sub_list to correlate active ports with their subscription lanes.\n- Detect SUB_LEAK_RISK candidates (active port without a corresponding lane in sub_list).\n\nWorkflow:\n1. serial_active (no args; pure registry snapshot).\n2. Cross-reference returned SERIAL_IDs with sub_list to find leaked ports.\n3. serial_close per SERIAL_ID for cleanup.\n\nOverlap guidance:\n- Prefer serial_active for in-process port inventory. For OS-level discovery (paths not yet opened), use serial_scan.\n- For sub-lane status across all schemes, use sub_list.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over the per-process registry.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 1108
+    },
+    {
+      "name": "serial_close",
+      "title": "Close a serial port",
+      "description": "Cancel reader / writer tasks for the given SERIAL_ID, drop the lock-free buffers, release the OS handle, and remove the registry entry. Cascades to any open serial:// subscription lanes (they emit a final `closed` event before unsubscribing).\n\nWhen to use:\n- Releasing a UART / TTY / COM port allocated by serial_open.\n- Idempotent \u2014 a second call returns NOOP.\n\nWorkflow:\n1. Optional: sub_close any serial://<SERIAL_ID>/output lanes first (or rely on cascade).\n2. serial_close serial_id=...\n3. Open lanes emit a final `closed` event before unsubscribing.\n\nOverlap guidance:\n- Prefer serial_close to release a single port. For an inventory-driven cleanup, iterate serial_active and call serial_close on each SERIAL_ID.\n- A second serial_close returns NOOP \u2014 safe to call defensively.\n\nStatus values: OK, NOOP.\n\nErrors: SERIAL_NOT_FOUND (tolerate \u2014 already closed).\n\nCost: O(1) + 1 OS close().\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "serial_id",
+          "type": "string",
+          "required": true,
+          "description": "`SERIAL_ID` returned by `serial_open`."
+        }
+      ],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 509
+    },
+    {
+      "name": "serial_open",
+      "title": "Open a serial port",
+      "description": "Open a UART / TTY / COM serial port and start its lock-free reader / writer tasks. The returned SERIAL_ID can be passed to sub_open uri=serial://<SERIAL_ID>/output for push delivery (same debouncer + 64 KiB byte-threshold flush as shell:// / command://).\n\nWhen to use:\n- Driving an embedded board, GPS, RS-485 sensor, modem, or debug UART from an LLM host.\n- Streaming bursty serial output without polling.\n\nFull configuration: path, baud_rate (default 115200), data_bits (5..=8, default 8), stop_bits (1|2, default 1), parity (none|odd|even, default none), flow_control (none|software|hardware, default none), read_timeout_ms (default 100), max_buffer_size (0 = adapter default 1 MiB), initial_dtr / initial_rts (None = driver default), label.\n\nWorkflow:\n1. Optional: serial_scan to discover available paths.\n2. serial_open path=... baud_rate=... (returns SERIAL_ID).\n3. sub_open uri=serial://<SERIAL_ID>/output (PREFERRED \u2014 push delivery).\n4. Drive with serial_write / serial_press; await pushes; drain via cursor.\n5. serial_close + sub_close on completion.\n\nOverlap guidance:\n- Prefer serial_open for direct local UART/TTY/COM. To talk to a remote host's USB-serial, use ssh_connect + ssh_exec on a remote `cu` / `screen` / `picocom` instead \u2014 serial_open is local-only.\n- For port discovery before opening, run serial_scan.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (bad data_bits / parity / flow_control / stop_bits), SERIAL_ERROR (device busy / missing / permission denied / kernel control-line refusal).\n\nCost: 1 open() + 2 spawned tasks (reader + writer); typically <10 ms.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "baud_rate",
+          "type": "integer",
+          "required": false,
+          "description": "Baud rate (default `115_200`). Common values: 9600, 19200,\n38400, 57600, 115200, 230400, 460800, 921600.",
+          "default": 115200,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "data_bits",
+          "type": "integer",
+          "required": false,
+          "description": "Data bits (`5`, `6`, `7`, `8`). Default `8`.",
+          "default": 8,
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        {
+          "name": "flow_control",
+          "type": "string",
+          "required": false,
+          "description": "Flow control \u2014 accepts `\"none\"`, `\"software\"`/`\"xon/xoff\"`,\n`\"hardware\"`/`\"rts/cts\"`. Default `\"none\"`.",
+          "default": "none"
+        },
+        {
+          "name": "initial_dtr",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Initial DTR (Data Terminal Ready) line. `None` leaves the\ndriver default; `Some(true)` raises, `Some(false)` lowers.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: null (driver default).",
+          "default": null
+        },
+        {
+          "name": "initial_rts",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Initial RTS (Request To Send) line. Same semantics as\n`initial_dtr`.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: null (driver default).",
+          "default": null
+        },
+        {
+          "name": "label",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional human label (e.g. `\"GPS-1\"`) surfaced on\n`serial_active`.",
+          "default": null
+        },
+        {
+          "name": "max_buffer_size",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum history buffer (bytes). `0` falls back to the\nadapter default (1 MiB). Default `0`.",
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "parity",
+          "type": "string",
+          "required": false,
+          "description": "Parity \u2014 accepts `\"none\"`/`\"N\"`, `\"odd\"`/`\"O\"`, `\"even\"`/`\"E\"`. Default `\"none\"`.",
+          "default": "none"
+        },
+        {
+          "name": "path",
+          "type": "string",
+          "required": true,
+          "description": "OS device path. Linux: `/dev/ttyUSB0` / `/dev/ttyACM0`.\nmacOS: `/dev/tty.usbserial-XXXX`. Windows: `COM3`."
+        },
+        {
+          "name": "read_timeout_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Per-read timeout in milliseconds. Default `100`.",
+          "default": 100,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "stop_bits",
+          "type": "string",
+          "required": false,
+          "description": "Stop bits \u2014 accepts `\"1\"` or `\"2\"`. Default `\"1\"`.",
+          "default": "1"
+        }
+      ],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 1276
+    },
+    {
+      "name": "serial_press",
+      "title": "Send a named keystroke to a serial port",
+      "description": "Send a named control keystroke without crafting the bytes manually. Accepted: `enter`/`cr` (\\r), `lf` (\\n), `crlf` (\\r\\n), `esc` (\\x1b), `tab` (\\t), `backspace` (\\x08), `ctrl_c` (\\x03), `ctrl_d` (\\x04), `ctrl_z` (\\x1a). Optional `repeat` 1..=64.\n\nWhen to use:\n- Sending control keys to an interactive UART program (Ctrl+C to abort, Esc/Tab navigation, Enter to submit).\n- Repeating a keystroke (e.g. `repeat=4` to send Backspace four times).\n- Prefer serial_press over crafting raw byte sequences with serial_write.\n\nWorkflow:\n1. serial_open path=... baud_rate=... (returns SERIAL_ID).\n2. sub_open uri=serial://<SERIAL_ID>/output (PREFERRED \u2014 push delivery).\n3. serial_press serial_id=... key=enter (or any accepted name).\n4. Await `notifications/resources/updated` push; drain via `resources/read?cursor=auto`.\n5. serial_close on completion.\n\nOverlap guidance:\n- Prefer serial_press for named keystrokes \u2014 typed UART command sequences belong in serial_write.\n- For multi-byte sequences not in the accepted-key list, use serial_write bytes_base64=... instead.\n\nAfter the keystroke \u2014 DO NOT poll. The response arrives via push on the existing `sub_open uri=serial://<SERIAL_ID>/output` subscription. If you have not subscribed yet, call `sub_open` FIRST. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (unknown key), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE.\n\nCost: O(repeat).",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "key",
+          "type": "string",
+          "required": true,
+          "description": "Key name. Accepted: `\"enter\"` / `\"cr\"` (`\\r`), `\"lf\"` (`\\n`),\n`\"crlf\"` (`\\r\\n`), `\"esc\"` (`\\x1b`), `\"tab\"` (`\\t`),\n`\"backspace\"` (`\\x08`), `\"ctrl_c\"` (`\\x03`), `\"ctrl_d\"` (`\\x04`),\n`\"ctrl_z\"` (`\\x1a`)."
+        },
+        {
+          "name": "repeat",
+          "type": "integer",
+          "required": false,
+          "description": "Repeat count. `1..=64`. Default `1`.",
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "serial_id",
+          "type": "string",
+          "required": true,
+          "description": "`SERIAL_ID` returned by `serial_open`."
+        }
+      ],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 753
+    },
+    {
+      "name": "serial_scan",
+      "title": "List OS-visible serial devices",
+      "description": "Snapshot the OS-visible serial devices. Returns `path` strings the caller can pass to serial_open. No state mutation.\n\nWhen to use:\n- Discover available UART / TTY / COM ports before serial_open.\n- Diagnose missing-device cases (USB-serial unplugged, permission denied at the kernel layer).\n\nPath format by OS:\n- Linux: `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*`.\n- macOS: `/dev/tty.usbserial-*`, `/dev/tty.usbmodem*`, `/dev/cu.*` (callout side preferred for clients).\n- Windows: `COM1`, `COM2`, ...\n\nWorkflow:\n1. serial_scan (no args; pure OS enumeration).\n2. Pick a path; serial_open path=... baud_rate=...\n\nOverlap guidance:\n- Prefer serial_scan for discovery (OS-level). For an inventory of ports already opened by this process, use serial_active.\n- serial_scan is read-only; safe to call repeatedly.\n\nStatus values: OK.\n\nErrors: SERIAL_ERROR (rare \u2014 OS enumeration failed).\n\nCost: 1 OS enumeration (typically <5 ms).",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 611
+    },
+    {
+      "name": "serial_write",
+      "title": "Write to a serial port",
+      "description": "Enqueue bytes for transmission on a SERIAL_ID. Pass either `text` (UTF-8) OR `bytes_base64` (RFC 4648, for binary protocols). Newlines are NOT auto-appended; use serial_press for `enter`/`cr`/`lf`/`crlf`.\n\nWhen to use:\n- Submitting a typed command or text payload to a UART / TTY / COM device.\n- Sending raw bytes (binary protocols) via `bytes_base64`.\n- Prefer serial_press for named keystrokes (Ctrl+C, Enter, Esc, arrow keys) \u2014 saves crafting escape sequences.\n\nWorkflow:\n1. serial_open path=... baud_rate=... (returns SERIAL_ID).\n2. sub_open uri=serial://<SERIAL_ID>/output (PREFERRED \u2014 push delivery).\n3. serial_write text=... (or bytes_base64=...).\n4. Await `notifications/resources/updated` push; drain via `resources/read?cursor=auto`.\n5. serial_close on completion.\n\nOverlap guidance:\n- Prefer serial_write for human-readable input + arbitrary bytes. Use serial_press for control keys (Ctrl+C, Enter alone, arrow keys).\n- Pass exactly one of `text` / `bytes_base64` \u2014 both supplied is INVALID_ARGUMENT.\n\nAfter the write \u2014 DO NOT poll. The response arrives via push on the existing `sub_open uri=serial://<SERIAL_ID>/output` subscription. If you have not subscribed yet, call `sub_open` FIRST. Wait for `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (no payload OR both supplied OR malformed base64), SERIAL_NOT_FOUND, SERIAL_BACKPRESSURE (write queue full \u2014 local sleep + retry).\n\nCost: O(input.len). Sub-ms typical.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "bytes_base64",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Base64-encoded raw bytes (binary protocols, packed frames).",
+          "default": null
+        },
+        {
+          "name": "serial_id",
+          "type": "string",
+          "required": true,
+          "description": "`SERIAL_ID` returned by `serial_open`."
+        },
+        {
+          "name": "text",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "UTF-8 text payload. Newlines are NOT auto-appended; pass `\"foo\\n\"`\nor use `serial_press` for `enter` / `cr` / `lf`.",
+          "default": null
+        }
+      ],
+      "additionalProperties": false,
+      "defs": [],
+      "outputSchemaBytes": 586
+    },
+    {
+      "name": "ssh_commands",
+      "title": "List async commands",
+      "description": "List asynchronous commands tracked on the server.\n\nWhen to use:\n- One-shot inventory of every command (optionally filtered by session and/or status).\n- For RUNNING entries the response NEXT line steers you to `sub_open uri=command://<COMMAND_ID>/output` \u2014 strictly preferred over chained ssh_exec_output(wait=true) polling.\n\nWorkflow:\n1. Optional `session_id` to narrow to one session.\n2. Optional `status` filter (`running`, `completed`, `cancelled`, `failed`).\n3. Optional `max_items` cap (default 500).\n4. For each running command_id, open a push lane via sub_open before consuming output.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over async commands. Cheap.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "max_items",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum entries returned. Default: 500. Cap: 10000. Env:\n`SSH_MCP_LIST_MAX_ITEMS` / `SSH_MCP_LIST_MAX_ITEMS_CAP`.",
+          "default": 500,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "session_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "`SESSION_ID` returned from `ssh_connect`. Optional filter; when\nomitted returns commands across all sessions."
+        },
+        {
+          "name": "status",
+          "type": "CommandStatus (via $ref) | null",
+          "required": false,
+          "description": "Filter by command status. Values: `running`, `completed`,\n`cancelled`, `failed`. When omitted returns every status.",
+          "resolvedValues": [
+            "running",
+            "completed",
+            "cancelled",
+            "failed"
+          ]
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [
+        "CommandStatus"
+      ],
+      "outputSchemaBytes": 1514
+    },
+    {
+      "name": "ssh_connect",
+      "title": "Connect to SSH server",
+      "description": "Connect to an SSH server and store the session.\n\nWhen to use:\n- Establishing a new SSH connection to run commands, open shells, or transfer files.\n- Reusing an already-connected session by passing its `session_id`.\n\nImportant identifiers in response:\n- `SESSION_ID`: passed to ssh_exec, ssh_shell_open, ssh_upload, ssh_download, ssh_disconnect, ssh_forward. ALSO subscribe via `sub_open uri=session://<SESSION_ID>/health` for live transport health pushes (PREFERRED over polling ssh_sessions).\n- `AGENT_ID`: optional grouping; passed to ssh_sessions (filter) and ssh_disconnect_agent (cleanup).\n- `EXPIRES_AT`: RFC3339 deadline when the session is auto-reaped by the inactivity sweeper. Ping (e.g. ssh_exec `: ` or any cheap call) before this fires to keep the session alive. Replaced by `PERSISTENT: true` when the caller opted out.\n\nWorkflow:\n1. Call ssh_connect once per remote host.\n2. Use the returned SESSION_ID for subsequent tool calls.\n3. Call ssh_disconnect (or ssh_disconnect_agent) when done.\n\nTip: pass `reuse=auto` to let the server pick the most recent healthy match in a single round-trip. Use `reuse=suggest` (default) when you want to inspect matches before reusing. Use `reuse=force_new` to bypass identity matching entirely.\nTip: pass `agent_id` so subsequent sessions are grouped and you can bulk-cleanup with `ssh_disconnect_agent`. When `agent_id` is set, `reuse=auto`/`reuse=suggest` rank sessions owned by the same agent first.\n\nStatus values: OK, REUSED, SUGGESTED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED.\n\nCost: 1 SSH handshake (typical 200-2000ms). Cheap to retry with reuse=auto.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retried calls within the v4.7-step5 cache TTL.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "address",
+          "type": "string",
+          "required": true,
+          "description": "SSH server address in the form `host:port` (e.g. `192.168.1.1:22`,\n`example.com:2222`). Port defaults to 22 when omitted."
+        },
+        {
+          "name": "agent_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional `AGENT_ID` for grouping sessions\n(e.g. `host-instance-abc123`). Use `ssh_disconnect_agent`\nto bulk-disconnect all sessions for an agent."
+        },
+        {
+          "name": "compress",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Enable zlib compression for the SSH transport. Default: true.\nEnv: `SSH_COMPRESSION`.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: true.",
+          "default": true
+        },
+        {
+          "name": "key_path",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Path to a private key file for key-based authentication. Optional.\nAuthentication chain order: key -> password -> agent."
+        },
+        {
+          "name": "max_retries",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum retry attempts for transient connection failures.\nDefault: 3. Env: `SSH_MAX_RETRIES`.",
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "name",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional human-readable name for the session (e.g. `production-db`,\n`staging-server`). Surfaces in `ssh_sessions` to help\ndisambiguate identical hosts."
+        },
+        {
+          "name": "password",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Password for password-based authentication. Optional when\n`key_path` or an SSH agent (env `SSH_AUTH_SOCK`) is available."
+        },
+        {
+          "name": "persistent",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Keep the session open indefinitely (disables inactivity timeout).\nDefault: false. Set true for long-lived backends or daemons.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "retry_delay_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Initial delay between retries in milliseconds (exponential\nbackoff, capped at 10s). Default: 1000. Env: `SSH_RETRY_DELAY_MS`.",
+          "default": 1000,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "reuse",
+          "type": "\"suggest\" | \"auto\" | \"force_new\" | null",
+          "required": false,
+          "description": "Reuse policy applied when an existing session matches the\n`(host, port, username)` identity triple. Values: `suggest`\n(default), `auto`, `force_new`.",
+          "resolvedValues": [
+            "suggest",
+            "auto",
+            "force_new"
+          ]
+        },
+        {
+          "name": "session_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional `SESSION_ID` returned by a previous `ssh_connect`. When\nprovided and the session is still alive (health-check `echo 1`),\nshort-circuits reuse evaluation and returns it as `REUSED`."
+        },
+        {
+          "name": "timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Connection timeout in seconds. Default: 30. Env:\n`SSH_CONNECT_TIMEOUT`.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "username",
+          "type": "string",
+          "required": true,
+          "description": "SSH username for authentication."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 3914
+    },
+    {
+      "name": "ssh_disconnect",
+      "title": "Disconnect SSH session",
+      "description": "Disconnect an SSH session. Cancels every async command, closes every PTY, aborts every in-flight SFTP transfer, tears down every port-forward listener, and decrements the SessionLifecycle refcount per ADR 0003 cascade.\n\nWhen to use:\n- Tearing down a single SSH session previously opened with ssh_connect.\n- For BULK cleanup of an agent's sessions, prefer ssh_disconnect_agent (one call per agent_id).\n- For multiple unrelated sessions, prefer ssh_disconnect_many (batched).\n\nWorkflow:\n1. Pass the `session_id` returned from ssh_connect.\n2. Subsequent tool calls against that id return SESSION_NOT_FOUND.\n3. Open subscription lanes on child resources (shell://, command://) emit a final `closed` event before unsubscribing.\n\nLifecycle interaction: SessionLifecycle.active_refs is decremented once per child resource closed during teardown. The session reaper consults active_refs > 0 before honouring the inactivity TTL \u2014 refcount supersedes TTL.\n\nStatus values: OK, NOOP (already closed by reaper).\n\nErrors: SESSION_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(N) over child resources. Always succeeds locally; TRANSPORT_ERROR only on dead-transport teardown races.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 999
+    },
+    {
+      "name": "ssh_disconnect_agent",
+      "title": "Disconnect all agent sessions",
+      "description": "Disconnect every session bound to a given agent.\n\nWhen to use:\n- Bulk-cleanup of every SSH session tagged with a given AGENT_ID.\n- Cancels async commands, closes shells, and aborts transfers per disconnected session.\n\nOverlap guidance:\n- Sessions share an AGENT_ID (group cleanup): use this tool \u2014 single round-trip filter.\n- Ad-hoc list of unrelated SESSION_IDs: prefer ssh_disconnect_many (up to 64 explicit ids).\n- Single session: prefer ssh_disconnect.\n\nWorkflow:\n1. Pass the AGENT_ID returned from a previous ssh_connect.\n2. Sessions owned by other agents are not affected.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over agent sessions. Tens of ms typical.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true,
+          "description": "`AGENT_ID` returned from `ssh_connect`. All sessions owned by\nthis agent are disconnected; sessions owned by other agents are\nnot affected."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1091
+    },
+    {
+      "name": "ssh_disconnect_many",
+      "title": "Disconnect multiple SSH sessions",
+      "description": "Best-effort bulk disconnect of up to 64 sessions in a single call.\n\nWhen to use:\n- Cleaning up a fan-out of unrelated SESSION_IDs (no shared AGENT_ID).\n- Per-id failures are reported in the response and do not abort the remaining disconnects.\n\nOverlap guidance:\n- Sessions share an AGENT_ID: prefer ssh_disconnect_agent \u2014 server-side filter, no id list needed.\n- Single session: prefer ssh_disconnect.\n- This tool: ad-hoc explicit list (mixed agents or no agent_id).\n\nWorkflow:\n1. Pass the list of SESSION_IDs returned from prior ssh_connect calls.\n2. Inspect the per-id `results` array for any `error` entries.\n\nStatus values: OK.\n\nErrors: INVALID_ARGUMENT (empty / >64 ids).\n\nCost: O(N) disconnect calls. Best-effort: per-id failures do not abort the batch.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "session_ids",
+          "type": "array",
+          "required": true,
+          "description": "1..=64 `SESSION_ID`s to disconnect. Per-id failures are\nreported in the response and do not abort the remaining\ndisconnects."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1446
+    },
+    {
+      "name": "ssh_download",
+      "title": "Download file via SFTP",
+      "description": "Download a remote file via SFTP.\n\nWhen to use:\n- Streaming a remote file to the local host in 32 KiB chunks.\n- IMMEDIATELY after download start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes \u2014 strictly preferred over polling ssh_transfer_progress(wait=true).\n- Set `resume=true` (ADR 0010) to retry an interrupted download from the first non-overlapping byte; `RESUMED_FROM:` in the response reports the offset.\n- Pair `resume=true` with `verify=true` to guard against silent prefix corruption.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED \u2014 push delivery).\n- `RESUMED_FROM`: byte offset the transfer resumed from (`0` for fresh transfers).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_download session_id=... remote_path=... local_path=... [resume=...] [verify=...].\n3. sub_open uri=transfer://<TRANSFER_ID>/progress (PREFERRED \u2014 push delivery).\n4. Drain progress events via `notifications/resources/updated`; final event is terminal.\n5. sub_close on completion.\n\nOverlap guidance:\n- Prefer ssh_download for a single file. For >5 files or directory-tree mirrors, prefer ssh_rsync (pull direction inferred from src=remote / dest=local).\n- For polling fallback only, ssh_transfer_progress wait=true blocks until terminal.\n- Pair resume=true + verify=true on flaky links to guard against silent prefix corruption.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR, RESUME_OVERSHOOT, RESUME_MISMATCH.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "grace_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 grace window in ms before auto-release fires.\nDefault: 2000.",
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "local_path",
+          "type": "string",
+          "required": true,
+          "description": "Local destination path. Relative paths resolve against the home\ndirectory."
+        },
+        {
+          "name": "release_when_no_subs",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 auto-release when the transfer resource has zero\nsubscribers. Default: false (legacy v4 behaviour).\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "remote_path",
+          "type": "string",
+          "required": true,
+          "description": "Remote file path to download from the SSH server."
+        },
+        {
+          "name": "resume",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "ADR 0010 \u2014 opt-in resume from the local tail. See\n[`SshUploadArgs::resume`] for the full contract.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "verify",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "ADR 0010 \u2014 when `resume=true`, hash the resume prefix on both\nsides and abort with `RESUME_MISMATCH` on divergence. See\n[`SshUploadArgs::verify`] for the cost trade-off.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1135
+    },
+    {
+      "name": "ssh_exec",
+      "title": "Run remote command",
+      "description": "Spawn an asynchronous command on an SSH session.\n\nWhen to use:\n- Starting a command and observing its output. Prefer subscribing to `command://<COMMAND_ID>/output` over polling (see sub_open).\n- Set `pty=true` for commands requiring a controlling terminal (e.g. sudo).\n\nImportant identifiers in response:\n- `COMMAND_ID`: target of sub_open `command://<COMMAND_ID>/output` (push, preferred) or ssh_exec_output (poll fallback). Also accepted by ssh_exec_cancel.\n\nWorkflow (push-first, recommended):\n1. Call ssh_exec with the SESSION_ID and command line.\n2. sub_open uri=command://<COMMAND_ID>/output to stream stdout/stderr without polling.\n3. sub_close sub_id=... when the command terminates (or set release_when_no_subs=true).\n4. Optional ssh_exec_cancel to interrupt.\n\nWorkflow (poll fallback):\n1. ssh_exec, then ssh_exec_output wait=true in a loop.\n\nOverlap guidance:\n- For atomic short commands, STILL prefer ssh_exec on a session opened with ssh_connect(reuse=auto). Avoid ssh_run unless you will never touch this host again \u2014 it pays a fresh handshake every call.\n- For >=3 sequential commands on the same session, prefer ssh_exec_batch (saves ~70% wire vs N x ssh_exec).\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel open. Returns immediately when wait=false (default async).",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "command",
+          "type": "string",
+          "required": true,
+          "description": "Shell command to execute on the remote host."
+        },
+        {
+          "name": "grace_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 grace window in ms before auto-release fires.\nDefault: 2000.",
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "pty",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Allocate a pseudo-terminal (PTY) for the command. Default: false.\nUse for commands that require a controlling terminal (e.g. `sudo`,\n`top`). All output is merged into stdout in PTY mode (no stderr\nseparation).\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "release_when_no_subs",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 auto-release when the command resource has zero\nsubscribers. Default: false (legacy v4 behaviour).\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Command timeout in seconds. Default: 180. Env:\n`SSH_COMMAND_TIMEOUT`.",
+          "default": 180,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 771
+    },
+    {
+      "name": "ssh_exec_batch",
+      "title": "Execute a batch of commands on one session",
+      "description": "Run up to 16 commands sequentially against a single session, with stop-on-failure semantics.\n\nWhen to use:\n- A small linear pipeline (`mkdir /tmp/foo`, `tar -xzf bundle.tgz -C /tmp/foo`, `chown -R svc /tmp/foo`).\n- Short bursts where the round-trip cost of one ssh_exec per command dominates. Saves ~70% wire vs N x ssh_exec when N>=3.\n\nOverlap guidance:\n- Atomic single command on a host you will not revisit: ssh_run is the only justification, and even then only N=1. For any reuse, do ssh_connect(reuse=auto) + ssh_exec.\n- Long-running streaming command: prefer ssh_exec + sub_open `command://<id>/output`.\n- Truly parallel commands: open multiple ssh_exec (this batch is serial by design).\n\nWorkflow:\n1. Each command runs synchronously with the per-command `timeout_secs_per_command` budget.\n2. With `stop_on_failure=true` (default) the loop halts on the first non-zero exit code; remaining slots surface as `skipped`.\n3. Each entry carries its own command_id, exit_code, stdout/stderr blocks.\n\nStatus values: OK, HALTED.\n\nErrors: SESSION_NOT_FOUND, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH channel per command. Stops early on first non-zero exit by default.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "commands",
+          "type": "array",
+          "required": true,
+          "description": "Commands to execute, in order. 1..=16 entries."
+        },
+        {
+          "name": "max_output_bytes_per_command",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Per-command max bytes shown in stdout/stderr. Default: 16384.\nCap: 1048576.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "pty",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Allocate a PTY for each command. Default: false.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "stop_on_failure",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Halt the loop on the first non-zero exit code. Default: true.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: true.",
+          "default": true
+        },
+        {
+          "name": "timeout_secs_per_command",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Per-command wait timeout in seconds. Default: 30. Cap: 300.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2819
+    },
+    {
+      "name": "ssh_exec_cancel",
+      "title": "Cancel running command",
+      "description": "Cancel an asynchronous command. Sends SIGINT (or closes the channel for non-PTY) and marks the command Cancelled.\n\nWhen to use:\n- Interrupting a long-running command spawned with ssh_exec.\n- Returns the partial stdout/stderr captured so far at the time of cancel.\n\nPush interaction: if a `command://<COMMAND_ID>/output` lane is open, the lane drains the partial buffer and emits a final `cancelled` status event before unsubscribing. The cursor at cancel is preserved for sub_replay.\n\nWorkflow:\n1. ssh_exec_cancel command_id=<COMMAND_ID>.\n2. Drain remaining lane events via the existing subscription (no extra polling needed).\n3. sub_close when done.\n\nStatus values: CANCELLED, NOOP (already finished \u2014 terminal status preserved).\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(1). Always succeeds (NOOP for already-finished commands).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "command_id",
+          "type": "string",
+          "required": true,
+          "description": "`COMMAND_ID` returned from `ssh_exec`."
+        },
+        {
+          "name": "max_output_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum bytes shown in stdout/stderr. Default: 16384. Cap:\n1048576. Content head-truncated; tail (most recent output)\npreserved. Env: `SSH_MCP_OUTPUT_DEFAULT_BYTES` /\n`SSH_MCP_OUTPUT_MAX_BYTES_CAP`.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1691
+    },
+    {
+      "name": "ssh_exec_output",
+      "title": "Get command output",
+      "description": "Fetch the current output of an asynchronous command. Polling fallback path; prefer sub_open `command://<COMMAND_ID>/output` for streaming output without poll loops.\n\nWhen to use:\n- One-shot status check on a spawned command without opening a subscription.\n- Hosts that lack `resources/subscribe` capability (subscribe is the canonical path otherwise).\n- Optionally blocking until the command completes (`wait=true`).\n\nWorkflow:\n1. Pass the COMMAND_ID returned from ssh_exec.\n2. Set `wait=true` to block; capped at `wait_timeout_secs` (default 30, max 300).\n3. `max_output_bytes` head-truncates very large outputs (default 16384).\n\nStatus values: RUNNING, COMPLETED, TIMEOUT, CANCELLED, FAILED.\n\nErrors: COMMAND_NOT_FOUND.\n\nCost: O(buffer). Cheap with wait=false. With wait=true blocks up to wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s with the running stdout byte count (best-effort).",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "command_id",
+          "type": "string",
+          "required": true,
+          "description": "`COMMAND_ID` returned from `ssh_exec`."
+        },
+        {
+          "name": "max_output_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum bytes shown in stdout/stderr. Default: 16384. Cap:\n1048576. Content head-truncated; tail (most recent output)\npreserved. Env: `SSH_MCP_OUTPUT_DEFAULT_BYTES` /\n`SSH_MCP_OUTPUT_MAX_BYTES_CAP`.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "wait",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Block until completion or `wait_timeout_secs` expires. Default:\nfalse.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "wait_timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum seconds to block when `wait=true`. Default: 30. Cap: 300.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1839
+    },
+    {
+      "name": "ssh_forward",
+      "title": "Forward TCP port",
+      "description": "Set up a TCP port forwarder backed by an SSH session.\n\nWhen to use:\n- Tunnelling local TCP traffic over the SSH transport to a remote host:port.\n- Available only when the `port_forward` Cargo feature is enabled.\n- IMMEDIATELY after the forwarder is up, call `sub_open uri=forward://<FORWARD_ID>/events` for live accept/connect/close pushes \u2014 strictly preferred over polling resources/read.\n\nImportant identifiers in response:\n- `FORWARD_ID`: target of `sub_open uri=forward://<FORWARD_ID>/events` (PREFERRED \u2014 push event log).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_forward session_id=... local_port=... remote_address=... remote_port=...\n3. sub_open uri=forward://<FORWARD_ID>/events (PREFERRED \u2014 push lifecycle events).\n4. Connect local clients to localhost:<local_port>; observe accept/connect/close events on the lane.\n5. ssh_disconnect (cascades to forwarder teardown) or close session \u2014 sub_close lane.\n\nOverlap guidance:\n- Prefer ssh_forward for tunnelled TCP. For ad-hoc port use, prefer the underlying ssh_exec + remote daemon if you control both endpoints.\n- Cascading teardown via ssh_disconnect is simpler than tracking individual FORWARD_IDs in long-running agents.\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, PORT_IN_USE.\n\nCost: 1 listener bind + SSH tcpip-forward.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "local_port",
+          "type": "integer",
+          "required": true,
+          "description": "Local TCP port to listen on (e.g. `8080`).",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        {
+          "name": "remote_address",
+          "type": "string",
+          "required": true,
+          "description": "Remote host on the server side to forward to (e.g. `localhost`\nor `10.0.0.1`)."
+        },
+        {
+          "name": "remote_port",
+          "type": "integer",
+          "required": true,
+          "description": "Remote TCP port to forward to (e.g. `3306` for `MySQL`).",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1226
+    },
+    {
+      "name": "ssh_rsync",
+      "title": "Sync a directory tree over SSH (rsync)",
+      "description": "Drives a recursive sync over an existing SSH session. Both transports are LIVE: Wire (rsync v32 wire-compat, downgrades to v31 \u2014 openrsync-faithful port, byte-identical against rsync 3.2.x and 3.4.x) drives delta-sync via remote `rsync --server`; Sftp (universal fallback) walks plain SFTP for hosts without rsync v3.2+.\n\nTransport selection:\n- `transport=auto` (default) \u2014 probe the remote; rsync v31+ routes to the Wire transport (local advertises v32, downgrades to v31 against legacy servers), otherwise routes to the SFTP fallback.\n- `transport=wire` \u2014 force the wire-compat client (advertises v32, downgrades to v31); returns `RSYNC_VERSION_TOO_OLD` if the remote rsync is missing or older than v3.2.0.\n- `transport=sftp` \u2014 universal fallback; drives plain SFTP `readdir` + `stat` + `read` + `write` + `setstat` against any host with a working SFTP subsystem.\n\nWhen to use:\n- Recursive directory mirror over SSH (with `--delete`, `--exclude`, `--bwlimit`, attribute preservation).\n- Delta-syncing large append-only files (logs, dumps, container layers) \u2014 only changed blocks cross the wire (Wire transport only).\n\nOverlap guidance:\n- Prefer ssh_rsync over chained ssh_upload calls when transferring >5 files or syncing a directory tree \u2014 single SSH channel + delta-sync (Wire) or capability-probed SFTP batch (Sftp).\n- For a single file, ssh_upload is simpler (no transport probe, no per-file lane events).\n- Cancel mid-flight via ssh_rsync_cancel; snapshot progress via ssh_rsync_stats (or PREFERRED \u2014 subscribe to `rsync://<RSYNC_ID>/progress`).\n\nIdentifiers:\n- `RSYNC_ID`: pass to ssh_rsync_stats (snapshot) and ssh_rsync_cancel (terminal cancel). ALSO subscribe via `sub_open uri=rsync://<RSYNC_ID>/progress` for live per-file + aggregate push events (PREFERRED over polling stats).\n\nWorkflow:\n1. ssh_connect.\n2. ssh_rsync (returns STARTED + RSYNC_ID).\n3. sub_open uri=rsync://<RSYNC_ID>/progress.\n4. Drain `notifications/resources/updated` events.\n5. sub_close + ssh_rsync_cancel (or wait for `SyncCompleted`).\n\nStatus values: STARTED.\n\nErrors: RSYNC_NOT_FOUND, RSYNC_VERSION_TOO_OLD, RSYNC_PROTOCOL_ERROR, RSYNC_FILE_LIST_TOO_LARGE, RSYNC_PARTIAL_TRANSFER, SFTP_FEATURE_MISSING, SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED.\n\nCost: O(N) over file count + delta bytes. Idempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "dst",
+          "type": "string",
+          "required": true,
+          "description": "See `src`. Exactly one of `src` / `dst` must be remote."
+        },
+        {
+          "name": "opts",
+          "type": "RsyncOptsArg (via $ref)",
+          "required": false,
+          "description": "Rsync feature flags. Default mirrors `rsync -a` minus `-D` /\n`-H` (see [`PreserveFlagsArg::default`]).",
+          "default": {
+            "archive": false,
+            "bwlimit_kbps": null,
+            "compress": false,
+            "delete": false,
+            "dry_run": false,
+            "exclude": [],
+            "include": [],
+            "partial": false,
+            "preserve": {
+              "devices": false,
+              "group": true,
+              "hardlinks": false,
+              "links": true,
+              "mtime": true,
+              "owner": true,
+              "perms": true,
+              "sparse": false
+            },
+            "recursive": false,
+            "verify_checksum": false
+          }
+        },
+        {
+          "name": "release_when_no_subs",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "ADR 0003 lifecycle binding \u2014 auto-release the rsync session\nwhen the last subscriber detaches. Default `false` preserves\nv6.1 manual-close semantics.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "src",
+          "type": "string",
+          "required": true,
+          "description": "Local path or remote path. Direction inferred from which side\nhas the `host:` prefix \u2014 exactly one of `src` / `dst` must be\nremote."
+        },
+        {
+          "name": "transport",
+          "type": "RsyncTransportArg (via $ref)",
+          "required": false,
+          "description": "Transport selection. Default `Auto` (probe; prefer\nwire-compat).",
+          "default": "auto",
+          "resolvedValues": [
+            "auto",
+            "wire",
+            "sftp"
+          ]
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [
+        "PreserveFlagsArg",
+        "RsyncOptsArg",
+        "RsyncTransportArg"
+      ],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "ssh_rsync_cancel",
+      "title": "Cancel an in-flight rsync session",
+      "description": "Cancel a running rsync session by RSYNC_ID. Flips the session aggregate to `Cancelled` and tears down the russh channel + reader/writer task pair. Idempotent: cancelling a missing or already-terminal session returns OK.\n\nWhen to use:\n- Operator-driven abort (subscribed lane shows runaway file list).\n- Cleanup before ssh_disconnect.\n\nOverlap guidance:\n- Prefer ssh_rsync_cancel for operator-driven abort. For natural completion, await the `SyncCompleted` event on the rsync://<RSYNC_ID>/progress lane instead.\n- Cancelling a session that already finished is a no-op (returns OK) \u2014 safe to call defensively.\n\nWorkflow:\n1. Look up RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_cancel.\n3. Drain any final lane events; sub_close.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND.\n\nCost: O(1) \u2014 flips status atom + drops russh channel handle. Always succeeds locally.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "rsync_id",
+          "type": "string",
+          "required": true,
+          "description": "`RSYNC_ID` returned from `ssh_rsync`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "ssh_rsync_stats",
+      "title": "Get rsync session stats",
+      "description": "Snapshot stats for an in-flight or completed rsync session. Returns the live `RsyncStats` aggregate (files_total, files_done, files_deleted, files_failed, bytes_total, bytes_transferred, bytes_skipped) plus the current session status (pending / probing / running / completed / failed / cancelled).\n\nWhen to use:\n- Polling caller without a subscription lane.\n- Aggregate snapshot after `SyncCompleted` event for final summary.\n\nPush: subscribe to `rsync://<RSYNC_ID>/progress` instead of polling \u2014 same data flows through the lane debouncer at 200ms granularity.\n\nOverlap guidance:\n- Prefer sub_open uri=rsync://<RSYNC_ID>/progress over polling ssh_rsync_stats \u2014 the lane carries the same RsyncStats aggregate plus per-file events.\n- Use ssh_rsync_stats for one-shot final summary after `SyncCompleted` (or when no subscription lane is desired).\n\nWorkflow:\n1. Capture RSYNC_ID from ssh_rsync's STARTED response.\n2. Call ssh_rsync_stats.\n3. Inspect status field; loop or move on based on terminal vs running state.\n\nStatus values: OK.\n\nErrors: RSYNC_NOT_FOUND.\n\nCost: O(1) atomic loads \u2014 no network I/O.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "rsync_id",
+          "type": "string",
+          "required": true,
+          "description": "`RSYNC_ID` returned from `ssh_rsync`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "ssh_run",
+      "title": "Run remote command (one-shot)",
+      "description": "PENALIZED FALLBACK \u2014 connect, execute one command, disconnect, all in one call. Pays a full SSH handshake (200-2000 ms) and tears down the session on every call. Use ONLY when you genuinely cannot keep state across calls.\n\nDO NOT USE WHEN:\n- You will touch the same host more than once. Open a session with ssh_connect (reuse=auto) and reuse it.\n- You expect any follow-up: tail logs, retry, run a sibling command, open a shell. Re-handshaking throws away cwd, env, agent forwarding, multiplexed channels, and any subscription you might want next.\n- The command emits more than a few KiB of output. Stream via ssh_exec + sub_open `command://<id>/output` instead.\n\nPreferred path (use this 95 %% of the time):\n1. ssh_connect address username [agent_id] reuse=auto  -> SESSION_ID\n2. ssh_exec SESSION_ID command  -> COMMAND_ID\n3. sub_open uri=command://<COMMAND_ID>/output  -> stream stdout/stderr\n4. sub_close sub_id=...  (or release_when_no_subs=true on step 2)\n5. Keep SESSION_ID for the next call. ssh_disconnect only at the end of the workload.\n\nWhen ssh_run is acceptable:\n- A truly one-shot probe from a context that will never touch this host again (e.g. capability sniffing across many distinct hosts, with N=1 command per host).\n- A test harness asserting end-to-end happy path in a single call.\n\nCost: 1 SSH handshake (200-2000 ms) + 1 channel + (optional) full session teardown. Multiply this by every call you make. Two ssh_run calls to the same host cost as much as one ssh_connect + two ssh_exec calls.\n\nWorkflow (if you must):\n1. ssh_run mints (or with reuse=auto, reuses) a session.\n2. Spawns the command and blocks until completion or `timeout_secs` fires.\n3. With `disconnect_after=true` (default) tears the session down \u2014 this is the expensive bit.\n\nStatus values: COMPLETED, TIMEOUT, FAILED, CANCELLED.\n\nErrors: CONNECTION_FAILED, AUTH_FAILED, MAX_COMMANDS_EXCEEDED, TRANSPORT_ERROR.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "address",
+          "type": "string",
+          "required": true,
+          "description": "SSH server address in the form `host:port` (e.g.\n`192.168.1.1:22`, `example.com:2222`). Port defaults to 22."
+        },
+        {
+          "name": "agent_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional `AGENT_ID` for grouping the underlying session."
+        },
+        {
+          "name": "command",
+          "type": "string",
+          "required": true,
+          "description": "Command to run on the remote host."
+        },
+        {
+          "name": "disconnect_after",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Disconnect the session after the command finishes. Default:\ntrue (one-shot mode). Set false to keep the session open and\nreuse it for subsequent `ssh_exec` calls.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: true.",
+          "default": true
+        },
+        {
+          "name": "key_path",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Path to a private key file. Optional. Auth chain: key ->\npassword -> agent (`SSH_AUTH_SOCK`)."
+        },
+        {
+          "name": "max_output_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum bytes shown in stdout/stderr. Default: 16384. Cap:\n1048576.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "password",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Password for password-based authentication. Optional."
+        },
+        {
+          "name": "pty",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Allocate a pseudo-terminal for the command. Default: false.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum seconds to wait for the command to complete. Default:\n30. Capped at 300 by the inbound adapter.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "username",
+          "type": "string",
+          "required": true,
+          "description": "SSH login username."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2122
+    },
+    {
+      "name": "ssh_sessions",
+      "title": "List SSH sessions",
+      "description": "List active SSH sessions on the server.\n\nWhen to use:\n- One-shot inventory of sessions known to this server (optionally narrowed to one agent).\n- For LIVE health observation prefer `sub_open uri=session://<SESSION_ID>/health` per session \u2014 push delivers HealthEvent ticks without poll loops.\n\nWorkflow:\n1. Optional `agent_id` filter to scope the list to sessions tagged with that AGENT_ID.\n2. Optional `max_items` cap (default 500, env `SSH_MCP_LIST_MAX_ITEMS`).\n3. Each session id can be wrapped in `sub_open uri=session://<id>/health` for live monitoring; cancel via sub_close when done.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over current sessions. Cheap to call repeatedly.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "agent_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "`AGENT_ID` returned from `ssh_connect`. Optional filter; when\nomitted returns sessions from every agent on this server."
+        },
+        {
+          "name": "max_items",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum entries returned. Default: 500. Cap: 10000. Env:\n`SSH_MCP_LIST_MAX_ITEMS` / `SSH_MCP_LIST_MAX_ITEMS_CAP`.",
+          "default": 500,
+          "format": "uint",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2698
+    },
+    {
+      "name": "ssh_shell_close",
+      "title": "Close PTY shell",
+      "description": "Close a PTY shell and free its resources. Cancels the russh channel, drops the per-shell registry entry, and cascades to any open shell:// subscription lanes.\n\nWhen to use:\n- Tearing down a PTY allocated by ssh_shell_open.\n- Aborting an interactive program stuck on a prompt.\n\nLifecycle interaction: when the shell was opened with `release_when_no_subs=true`, ssh_shell_close fires before the grace window \u2014 open lanes transition straight to Closed. Otherwise, lanes survive the close and emit a final `closed` event before unsubscribing.\n\nWorkflow:\n1. Capture SHELL_ID from ssh_shell_open's response.\n2. ssh_shell_close shell_id=...\n3. Open shell:// lanes emit a final `closed` event; sub_close on each.\n\nOverlap guidance:\n- Prefer ssh_shell_close to free a single PTY. For bulk teardown, ssh_disconnect (full session) cascades to every shell on that session.\n\nStatus values: OK, NOOP (already closed).\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(1). Always succeeds locally; TRANSPORT_ERROR only if russh teardown races a dead transport.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "shell_id",
+          "type": "string",
+          "required": true,
+          "description": "`SHELL_ID` returned from `ssh_shell_open`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 457
+    },
+    {
+      "name": "ssh_shell_open",
+      "title": "Open PTY shell",
+      "description": "Open an interactive PTY shell on an SSH session.\n\nWhen to use:\n- Driving an interactive program (vim, htop, REPL, sudo prompt) that needs a TTY.\n- IMMEDIATELY after open, call `sub_open uri=shell://<SHELL_ID>/output` for push delivery \u2014 strictly preferred over polling ssh_shell_read. Push fires on whichever fires first: ~200 ms debounce window OR 64 KiB byte-threshold.\n\nImportant identifiers in response:\n- `SHELL_ID`: passed to ssh_shell_write, ssh_shell_press, ssh_shell_read, ssh_shell_wait_for, ssh_shell_close. ALSO the target of `sub_open uri=shell://<SHELL_ID>/output` (PREFERRED for streaming output).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_shell_open session_id=... (returns SHELL_ID; INITIAL_BUFFER may include the prompt if it arrived within 100ms).\n3. sub_open uri=shell://<SHELL_ID>/output (REQUIRED \u2014 push delivery).\n4. Drive with ssh_shell_write / ssh_shell_press; await `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n5. ssh_shell_close + sub_close on completion.\n\nOverlap guidance:\n- Prefer ssh_shell_open for interactive (TTY-needing) workloads. For non-interactive commands, use ssh_exec \u2014 its own channel, no PTY allocation cost, parallelism bound by `MaxSessions`.\n- For one-shot commands across many distinct hosts, ssh_run is a PENALIZED fallback (full handshake teardown).\n\nStatus values: OK.\n\nErrors: SESSION_NOT_FOUND, MAX_SHELLS_EXCEEDED, TRANSPORT_ERROR.\n\nCost: 1 SSH PTY allocation (typical 50-500ms). One PTY per shell_id.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "cols",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Terminal width in columns. Default: 80.",
+          "default": 80,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "grace_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 grace window in ms before auto-release fires.\nDefault: 2000.",
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "inactivity_ttl",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Inactivity TTL in seconds. Shell auto-closes if no read or write\nhappens within this window. Default: 600. Env:\n`SSH_SHELL_INACTIVITY_TTL`.",
+          "default": 600,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "max_buffer_size",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Maximum output buffer size. Accepts human sizes like `512k`,\n`10m`, `1g`, `1t`. Default: `10m`. Env: `SSH_SHELL_MAX_BUFFER_SIZE`.\nOldest bytes dropped first when full.",
+          "default": "10m"
+        },
+        {
+          "name": "release_when_no_subs",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 auto-release when the resource has zero\nsubscribers. Default: false (legacy v4 behaviour).\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "rows",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Terminal height in rows. Default: 24.",
+          "default": 24,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "term",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Terminal type. Default: `xterm`. Use `vt100` or `ansi` for\nSOL/IPMI/serial consoles.",
+          "default": "xterm"
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1324
+    },
+    {
+      "name": "ssh_shell_press",
+      "title": "Send keystroke to PTY",
+      "description": "Send a named keystroke (with optional modifiers) to a PTY shell.\n\nWhen to use:\n- Sending arrows, function keys, control codes, navigation keys without crafting the bytes manually.\n- Optional Shift / Alt / Ctrl modifiers; optional `repeat` (1..=64).\n\nWorkflow:\n1. ssh_shell_open returned SHELL_ID and a shell://<SHELL_ID>/output lane is open via sub_open.\n2. ssh_shell_press shell_id=... key=<name> [modifiers=...] [repeat=...].\n3. AWAIT `notifications/resources/updated` push on the lane (DO NOT chain ssh_shell_wait_for).\n4. Drain via `resources/read shell://<SHELL_ID>/output?cursor=auto`.\n\nOverlap guidance:\n- Prefer ssh_shell_press for named keystrokes (Ctrl+C, arrow keys, Tab, Esc). Use ssh_shell_write for typed text or arbitrary byte sequences.\n- For programmatic control codes, ssh_shell_write input_base64=... is sometimes simpler than chaining ssh_shell_press.\n\nPush-first:\n- After ssh_shell_write/press, AWAIT a `notifications/resources/updated` push on the shell://<SHELL_ID>/output lane already opened via sub_open. Do NOT chain ssh_shell_wait_for \u2014 that's a poll-loop fallback.\n\nAfter the keystroke \u2014 DO NOT chain ssh_shell_wait_for back-to-back. The response arrives via push on the existing shell://<id>/output subscription. Wait for `notifications/resources/updated` and then drain with `resources/read shell://<id>/output?cursor=auto`. If you have not subscribed yet, call sub_open first; ssh_shell_wait_for is reserved for explicit regex prompt-gating.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT (bad repeat / modifier combination), TRANSPORT_ERROR.\n\nCost: O(repeat). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "alt",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Apply Alt modifier. Default: false. Valid on: arrows, navigation\nkeys, and F1-F12. See the `key` field for the full per-key policy.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "ctrl",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Apply Ctrl modifier. Default: false. Valid on: arrows, navigation\nkeys, and F1-F12. Cannot be combined with `ctrl_*` keys (already a\ncomplete control byte). See the `key` field for the full per-key\npolicy.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "key",
+          "type": "ShellKey (via $ref)",
+          "required": true,
+          "description": "Named keystroke to send.\n\nPer-key modifier policy (modifiers beyond the listed set return\nerror code `MODIFIER_NOT_ALLOWED`):\n\n- Arrow keys (`arrow_up`, `arrow_down`, `arrow_left`, `arrow_right`)\n  accept any of `shift` / `alt` / `ctrl`.\n- Navigation (`home`, `end`, `page_up`, `page_down`, `insert`,\n  `delete`) accept any of `shift` / `alt` / `ctrl`.\n- Function keys `f1`-`f12` accept any of `shift` / `alt` / `ctrl`.\n- `tab` accepts only `shift` (back-tab); rejects `alt` / `ctrl`.\n- All other keys (`ctrl_c`, `ctrl_d`, `ctrl_z`, `ctrl_l`,\n  `ctrl_r`, `ctrl_w`, `ctrl_u`, `enter`, `escape`, `backspace`,\n  `space`) reject every modifier \u2014 the keystroke is already a\n  complete control byte.\n\nExamples: `ctrl_c`, `arrow_up`, `f5`, `enter`, `tab`.",
+          "resolvedValues": [
+            "ctrl_a",
+            "ctrl_c",
+            "ctrl_d",
+            "ctrl_e",
+            "ctrl_k",
+            "ctrl_l",
+            "ctrl_r",
+            "ctrl_u",
+            "ctrl_w",
+            "ctrl_z",
+            "enter",
+            "tab",
+            "escape",
+            "backspace",
+            "space",
+            "delete",
+            "arrow_up",
+            "arrow_down",
+            "arrow_left",
+            "arrow_right",
+            "home",
+            "end",
+            "page_up",
+            "page_down",
+            "insert",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "f5",
+            "f6",
+            "f7",
+            "f8",
+            "f9",
+            "f10",
+            "f11",
+            "f12"
+          ]
+        },
+        {
+          "name": "repeat",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Repeat the keystroke N times. Default: 1. Range: 1..=64. Values\noutside this range return error code `INVALID_REPEAT`.",
+          "default": 1,
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        {
+          "name": "shell_id",
+          "type": "string",
+          "required": true,
+          "description": "`SHELL_ID` returned from `ssh_shell_open`."
+        },
+        {
+          "name": "shift",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Apply Shift modifier. Default: false. Valid on: arrows,\nnavigation keys, F1-F12, and `tab` (back-tab). See the `key` field\nfor the full per-key policy.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [
+        "ShellKey"
+      ],
+      "outputSchemaBytes": 1253
+    },
+    {
+      "name": "ssh_shell_read",
+      "title": "Read PTY buffer",
+      "description": "Read the buffered output of a PTY shell. POLLING FALLBACK \u2014 strictly cheaper to use `sub_open uri=shell://<shell_id>/output` (push delivery, no round-trip per delta).\n\nWhen to use:\n- ONLY when the host genuinely cannot consume `notifications/resources/updated` push events. Every other situation, prefer `sub_open uri=shell://<shell_id>/output` + `resources/read?cursor=auto` on each push.\n- `clear=true` (default) drains the rendered head; `clear=false` keeps the buffer for re-inspection.\n- Optional long-poll via `wait=true` (`min_bytes` / `wait_timeout_secs`).\n\nWorkflow:\n1. ssh_shell_open returned SHELL_ID.\n2. ssh_shell_read shell_id=... [clear=...] [wait=...].\n3. Decide based on STATUS (OPEN / CLOSED / TIMEOUT).\n\nOverlap guidance:\n- Prefer sub_open uri=shell://<SHELL_ID>/output over ssh_shell_read for any workflow with >1 expected delta \u2014 push is one tool call total, ssh_shell_read is one per delta.\n- For one-shot buffer inspection (no future deltas), ssh_shell_read clear=false is acceptable.\n\nPush-first:\n- After ssh_shell_write/press, AWAIT a `notifications/resources/updated` push on the shell://<SHELL_ID>/output lane already opened via sub_open. Do NOT chain ssh_shell_wait_for \u2014 that's a poll-loop fallback.\n\nStatus values: OPEN, CLOSED, TIMEOUT.\n\nErrors: SHELL_NOT_FOUND.\n\nCost: O(buffer) per call + 1 tool round-trip. Subscribe is one tool call total per shell \u2014 strictly cheaper for any workflow with >1 expected response.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "clear",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Drain the bytes that were rendered (head-based pagination).\nDefault: true. With false the buffer is preserved (peek mode) for\ninspecting the same window multiple times.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: true.",
+          "default": true
+        },
+        {
+          "name": "max_output_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum bytes shown in data block. Default: 16384. Cap: 1048576.\nOutput rendered as the tail (most recent bytes). Env:\n`SSH_MCP_OUTPUT_DEFAULT_BYTES` / `SSH_MCP_OUTPUT_MAX_BYTES_CAP`.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "min_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Minimum new bytes to wait for before returning (only with\n`wait=true`). Default: 1 (any new byte returns). Capped at the\nresolved `max_output_bytes`. Floor: 1.",
+          "default": 1,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "shell_id",
+          "type": "string",
+          "required": true,
+          "description": "`SHELL_ID` returned from `ssh_shell_open`."
+        },
+        {
+          "name": "wait",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "FALLBACK long-poll. Block until `min_bytes` of new output arrive,\nthe shell closes, or `wait_timeout_secs` expires. Default: false.\nPrefer `resources/subscribe shell://<shell_id>/output` (realtime\npush) over polling.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "wait_timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum seconds to block when `wait=true`. Default: 30. Cap: 300.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1296
+    },
+    {
+      "name": "ssh_shell_wait_for",
+      "title": "Wait for shell pattern",
+      "description": "Block until a substring pattern appears in the shell output. PREFER sub_open (with optional filter regex) over this tool \u2014 wait_for is a single-shot regex GATE, not a 'wait for output' primitive.\n\nDO NOT USE WHEN:\n- You just called ssh_shell_write or ssh_shell_press and want the response. The response arrives via push on shell://<id>/output. Wait for `notifications/resources/updated` and drain with `resources/read?cursor=auto`. Chaining wait_for after every drive call is the most common 27B-class anti-pattern.\n- You want any output at all (no specific prompt). sub_open is strictly cheaper.\n- You want repeated pattern matches. sub_open with `filter=<regex>` pushes every match without a tool call per gate.\n\nWhen to use (rare, explicit):\n- One-time synchronization on a known prompt before issuing the next command (e.g. wait for `\"$ \"` after sudo).\n- Up to 16 patterns (\u22641024 bytes each); first match wins.\n\nPreferred path (use this 95 %% of the time):\n1. sub_open uri=shell://<shell_id>/output [filter=<regex>] -> SUB_ID\n2. Wait for `notifications/resources/updated` (push).\n3. resources/read shell://<shell_id>/output?cursor=auto -> drain delta.\n\nStatus values: MATCHED, TIMEOUT, CLOSED.\n\nErrors: SHELL_NOT_FOUND, INVALID_ARGUMENT.\n\nCost: blocks up to timeout_secs. One tool call per gate. Subscribe is one tool call total per shell \u2014 strictly cheaper for any workflow with >1 expected response.\n\nProgress: when `_meta.progressToken` is set, emits `notifications/progress` once per second carrying `(elapsed_secs, timeout_secs)` while the loop runs (best-effort).",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "clear",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Drain matched output from the shell history (head) after\nreturning so subsequent reads start fresh. Default: true.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: true.",
+          "default": true
+        },
+        {
+          "name": "max_output_bytes",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum bytes shown when matched. Default: 16384. Cap: 1048576.\nEnv: `SSH_MCP_OUTPUT_DEFAULT_BYTES` /\n`SSH_MCP_OUTPUT_MAX_BYTES_CAP`.",
+          "default": 16384,
+          "format": "uint",
+          "minimum": 0
+        },
+        {
+          "name": "patterns",
+          "type": "array",
+          "required": true,
+          "description": "1..=16 substring patterns. First match returns immediately as\n`MATCHED_PATTERN`. Each pattern up to 1024 bytes. Prefer\n`resources/subscribe shell://<shell_id>/output` (realtime push)\nover polling \u2014 use this for single-shot prompt gating.\n\nErrors: empty list returns code `EMPTY_PATTERNS`. List with more\nthan 16 entries returns `TOO_MANY_PATTERNS`. Any single pattern\nover 1024 bytes returns `PATTERN_TOO_LONG`."
+        },
+        {
+          "name": "shell_id",
+          "type": "string",
+          "required": true,
+          "description": "`SHELL_ID` returned from `ssh_shell_open`."
+        },
+        {
+          "name": "timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum seconds to wait. Default: 30. Cap: 300.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1083
+    },
+    {
+      "name": "ssh_shell_write",
+      "title": "Write to PTY shell",
+      "description": "Write raw bytes to a PTY shell.\n\nWhen to use:\n- Submitting a typed command (append `\\n`).\n- Sending raw control sequences (e.g. `\\x03` for Ctrl+C, `\\x1b[A` for arrow up).\n- Prefer ssh_shell_press for named keystrokes.\n\nWorkflow:\n1. ssh_shell_open returned SHELL_ID and you have already opened a shell://<SHELL_ID>/output subscription.\n2. ssh_shell_write shell_id=... text=\"command\\n\" (or input_base64=... for raw bytes).\n3. AWAIT `notifications/resources/updated` push on the lane (DO NOT chain ssh_shell_wait_for).\n4. Drain via `resources/read shell://<SHELL_ID>/output?cursor=auto`.\n\nOverlap guidance:\n- Prefer ssh_shell_write for human-readable input. Use ssh_shell_press for control keys (Ctrl+C, arrow keys, Enter alone).\n- For commands you don't need to interact with mid-run, prefer ssh_exec \u2014 opens its own channel, parallelism is bound by `MaxSessions` not the shell PTY.\n\nPush-first:\n- After ssh_shell_write/press, AWAIT a `notifications/resources/updated` push on the shell://<SHELL_ID>/output lane already opened via sub_open. Do NOT chain ssh_shell_wait_for \u2014 that's a poll-loop fallback.\n\nAfter the write \u2014 DO NOT chain ssh_shell_wait_for back-to-back. The response arrives via push on the existing shell://<id>/output subscription. Wait for `notifications/resources/updated` and then drain with `resources/read shell://<id>/output?cursor=auto`. If you have not subscribed yet, call sub_open first; ssh_shell_wait_for is reserved for explicit regex prompt-gating, not a generic 'now wait for output' primitive.\n\nStatus values: OK.\n\nErrors: SHELL_NOT_FOUND, TRANSPORT_ERROR.\n\nCost: O(input.len). Sub-ms typical. Subscribe to shell://<id>/output for response.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "input",
+          "type": "string",
+          "required": true,
+          "description": "Bytes to send to the PTY. Append `\\n` to submit a typed command.\nUse control sequences directly (e.g. `\\x03` for Ctrl+C, `\\x1b[A`\nfor arrow up). Prefer `ssh_shell_press` for named keystrokes."
+        },
+        {
+          "name": "shell_id",
+          "type": "string",
+          "required": true,
+          "description": "`SHELL_ID` returned from `ssh_shell_open`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 718
+    },
+    {
+      "name": "ssh_transfer_progress",
+      "title": "Get transfer progress",
+      "description": "Snapshot the progress of an SFTP transfer. Polling fallback path; prefer sub_open `transfer://<TRANSFER_ID>/progress` for live progress events.\n\nWhen to use:\n- One-shot status check on an upload/download without opening a subscription.\n- Hosts that lack `resources/subscribe` capability.\n- Optional `wait=true` blocks until the transfer reaches a terminal state.\n\nWorkflow:\n1. Capture TRANSFER_ID from ssh_upload / ssh_download's STARTED response.\n2. ssh_transfer_progress transfer_id=... [wait=true] [wait_timeout_secs=...].\n3. Inspect status; loop or move on.\n\nOverlap guidance:\n- Prefer sub_open uri=transfer://<TRANSFER_ID>/progress over ssh_transfer_progress for any workflow with >1 expected progress event.\n- For one-shot terminal-state polling (no streaming), ssh_transfer_progress wait=true is a single tool call.\n\nStatus values: RUNNING, COMPLETED, FAILED, CANCELLED.\n\nErrors: TRANSFER_NOT_FOUND.\n\nCost: O(1). Cheap with wait=false. With wait=true blocks until done or wait_timeout_secs. Subscribe is cheaper for streams >1 update.\n\nProgress: when `wait=true` and `_meta.progressToken` is set, mid-flight `notifications/progress` updates fire every ~5s carrying `(bytes_transferred, total_bytes)` (best-effort).",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "transfer_id",
+          "type": "string",
+          "required": true,
+          "description": "`TRANSFER_ID` returned from `ssh_upload` or `ssh_download`."
+        },
+        {
+          "name": "wait",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "Block until completion or `wait_timeout_secs` expires. Default:\nfalse.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "wait_timeout_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Maximum seconds to block when `wait=true`. Default: 30. Cap: 300.",
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1307
+    },
+    {
+      "name": "ssh_upload",
+      "title": "Upload file via SFTP",
+      "description": "Upload a local file to the remote host via SFTP.\n\nWhen to use:\n- Streaming a local file to the remote host in 32 KiB chunks.\n- IMMEDIATELY after upload start, call `sub_open uri=transfer://<TRANSFER_ID>/progress` for live byte-counter pushes \u2014 strictly preferred over polling ssh_transfer_progress(wait=true).\n- Set `resume=true` (ADR 0010) to retry an interrupted upload from the first non-overlapping byte; `RESUMED_FROM:` in the response reports the offset.\n- Pair `resume=true` with `verify=true` to guard against silent prefix corruption \u2014 costs one extra ssh_exec round-trip plus O(offset) bytes hashed remotely.\n\nImportant identifiers in response:\n- `TRANSFER_ID`: passed to ssh_transfer_progress (poll fallback) AND to `sub_open uri=transfer://<TRANSFER_ID>/progress` (PREFERRED \u2014 push delivery).\n- `RESUMED_FROM`: byte offset the transfer resumed from (`0` for fresh transfers).\n\nWorkflow:\n1. ssh_connect (returns SESSION_ID).\n2. ssh_upload session_id=... local_path=... remote_path=... [resume=...] [verify=...].\n3. sub_open uri=transfer://<TRANSFER_ID>/progress (PREFERRED \u2014 push delivery).\n4. Drain progress events via `notifications/resources/updated`; final event is terminal.\n5. sub_close on completion.\n\nOverlap guidance:\n- Prefer ssh_upload for a single file. For >5 files or directory-tree mirrors, prefer ssh_rsync (transport=auto picks Wire delta-sync or SFTP fallback) \u2014 single SSH session, batched walk.\n- For polling fallback only, ssh_transfer_progress wait=true blocks until terminal.\n- Pair resume=true + verify=true on flaky links to guard against silent prefix corruption.\n\nStatus values: STARTED.\n\nErrors: SESSION_NOT_FOUND, MAX_TRANSFERS_EXCEEDED, SFTP_ERROR, RESUME_OVERSHOOT, RESUME_MISMATCH.\n\nCost: O(file.size). Returns immediately, transfer runs async.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "grace_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 grace window in ms before auto-release fires.\nDefault: 2000.",
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "local_path",
+          "type": "string",
+          "required": true,
+          "description": "Local file path to upload. Relative paths resolve against the\nhome directory."
+        },
+        {
+          "name": "release_when_no_subs",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "v5 Phase 3 \u2014 auto-release when the transfer resource has zero\nsubscribers. Default: false (legacy v4 behaviour).\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "remote_path",
+          "type": "string",
+          "required": true,
+          "description": "Remote destination path on the SSH server."
+        },
+        {
+          "name": "resume",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "ADR 0010 \u2014 opt-in resume from the remote tail. When `true`, the\nadapter pre-flights the remote file size and resumes from the\nfirst non-overlapping byte. When `false` (default), every upload\ntruncates the destination and starts from byte zero (v6.0\nsemantics). Set together with `verify=true` for a stronger\nguarantee that the remote prefix matches the local prefix.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "required": true,
+          "description": "`SESSION_ID` returned from `ssh_connect`."
+        },
+        {
+          "name": "verify",
+          "type": "['boolean', 'null']",
+          "required": false,
+          "description": "ADR 0010 \u2014 when `resume=true`, hash the resume prefix on both\nsides and abort with `RESUME_MISMATCH` if the hashes diverge.\nDefault `false` trusts the prefix verbatim. The hash compare\ncosts one extra `ssh_exec` round-trip plus O(offset) bytes\nhashed remotely; only worth enabling if mid-transfer corruption\nhas been observed in deployment.\n\nType: boolean (JSON `true` or `false` \u2014 NOT the strings `\"true\"`/`\"false\"`). Default: false.",
+          "default": false
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 1123
+    },
+    {
+      "name": "sub_close",
+      "title": "Unsubscribe from a resource lane",
+      "description": "Close a Channel Mux lane previously opened with sub_open. Detaches the SubId, drops the mpsc, releases the per-resource subscriber refcount, and (if last subscriber) arms the resource grace timer per ADR 0003.\n\nWhen to use:\n- Cleanup after subscription work completes.\n- This IS the cleanup tool \u2014 call it for every SUB_ID you obtained.\n\nLifecycle interaction: when the resource was opened with `release_when_no_subs=true`, the last sub_close transitions Observed \u2192 Releasing and starts the grace window. A new sub_open for the same URI within the window cancels the timer (Releasing \u2192 Observed).\n\nWorkflow:\n1. Capture SUB_ID from sub_open's response.\n2. Drain remaining lane events (optional \u2014 final events fire on close).\n3. sub_close sub_id=...\n4. The lane refcount drops; resource may transition Observed \u2192 Releasing if last subscriber.\n\nOverlap guidance:\n- Prefer sub_close (manual cleanup) for deterministic teardown. Use lifetime=auto_close at sub_open if you want grace_ms-driven auto-cleanup.\n- For temporary suppression without dropping the lane state, prefer sub_pause + sub_resume.\n\nStatus values: OK, NOOP (already closed).\n\nErrors: SUB_NOT_FOUND \u2014 tolerate silently; lifetime auto_close / lease may have closed the lane already.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: tolerate `SUB_NOT_FOUND`; never re-open the same URI without first unsubscribing.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open`."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_filter",
+      "title": "Hot-reload a subscription filter",
+      "description": "Replace the lane regex filter without re-opening the lane. Empty regex clears the filter (forward all events).\n\nWhen to use:\n- Mutate match criteria mid-stream (e.g. tighten a tail to ERROR-only after seeing the boot phase).\n- Strictly cheaper than sub_close + sub_open + sub_replay.\n\nSyntax: Rust `regex` crate (RE2-style; no lookaround / backref). Compiled at call time and atomically swapped \u2014 events in flight before the swap may still match the previous filter.\n\nWorkflow:\n1. Capture SUB_ID from sub_open's response.\n2. sub_filter sub_id=... regex=<new pattern> (or empty to clear).\n3. Continue draining via the existing notification channel \u2014 filter applies to subsequent events.\n\nOverlap guidance:\n- Prefer sub_filter (compile-time regex on the lane) over post-receive client-side filter. Saves wire bandwidth + LLM tokens.\n- For full-rebuild after pattern change, sub_filter mutates in place \u2014 no need to sub_close + sub_open.\n- For temporary suppression without dropping the regex, prefer sub_pause + sub_resume.\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND, SUB_INVALID_FILTER (regex compile).\n\nCost: 1 regex compile + atomic swap.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "regex",
+          "type": "string",
+          "required": true,
+          "description": "New regex filter. Empty string clears the filter (forward all\nevents)."
+        },
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open` \u2014 the lane whose filter is\nbeing updated."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_list",
+      "title": "List active subscription lanes",
+      "description": "Snapshot the per-`SubId` lane registry. Returns sub_id, uri, lag_policy, lifetime, filter (if any), state (active/paused), creation_at, last_push_at.\n\nWhen to use:\n- Discover SubIds on reconnect / debugging.\n- Audit pre-cleanup before sub_close batches.\n- Pair with sub_stats / sub_stats_all for live counters.\n\nOptional `uri_prefix` filter narrows the result (e.g. `shell://` for PTY lanes only).\n\nWorkflow:\n1. sub_list [uri_prefix=<scheme>://] (cheap snapshot, no mutation).\n2. Iterate the response and call sub_close on each leaked SUB_ID.\n3. Pair with sub_stats per-SubId for queue / lag counters.\n\nOverlap guidance:\n- Prefer sub_list for an inventory snapshot. For aggregate counters across all lanes, use sub_stats_all (single tool call, no per-lane fan-out).\n- For per-lane drop / queue diagnostics, use sub_stats sub_id=<id>.\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over open lanes. Cheap.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "peer_id",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional peer-id filter. Currently a placeholder \u2014 lanes are\nnot peer-keyed today; reserved for future peer-aware filtering."
+        },
+        {
+          "name": "uri_prefix",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional URI prefix filter. Returns only subs whose canonical\nURI starts with this prefix."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_open",
+      "title": "Subscribe to a resource lane",
+      "description": "Open a Channel Mux lane for an ssh-mcp resource URI.\n\nWhen to use:\n- Push-first observation of `shell://`, `command://`, `transfer://`, `session://`, `forward://`, `serial://`, `rsync://` without polling.\n- Strictly preferred over polling tools (ssh_shell_read, ssh_exec_output, ssh_transfer_progress, ssh_rsync_stats) for any stream with >1 expected delta.\n\nLag policies (decision matrix):\n- `snapshot` (default) \u2014 drop lane backlog, rebuild from per-resource ring buffer on next push. Zero loss while ring covers the gap; emits `LAG_DETECTED` otherwise. Pick for general observation.\n- `drop_oldest` \u2014 FIFO rotation when lane mpsc full. Marks `lagged`. Pick for tail logs / monitoring with gap tolerance.\n- `drop_newest` \u2014 drop new event when full. Pick when start-of-stream matters more than current.\n- `block_slow` \u2014 producer awaits drain. Zero loss, latency cost. Pick for audit / every-event-matters workloads.\n\nLifetime knobs:\n- `manual` (default) \u2014 close via sub_close.\n- `auto_close` \u2014 closes after `grace_ms` of consumer inactivity (default 2000).\n- `lease` \u2014 hard cap via `ttl_secs`.\n\nFilter:\n- Optional Rust-regex compiled at subscribe time; mutate live via sub_filter without re-opening.\n\nReplay:\n- sub_replay re-emits from `from_cursor` within the per-resource ring window. Independent of what the lane already dropped.\n\nPush: events fan out to the lane peer via `notifications/resources/updated` on stdio/HTTP transports; the channel-mux outbound sink is the drain target for the `ssh-mcp-tail` NDJSON daemon.\n\nWorkflow:\n1. Open the source resource (ssh_shell_open / ssh_exec / ssh_upload / ssh_rsync / serial_open / ssh_forward).\n2. sub_open uri=<scheme>://<id>/<lane> (returns SUB_ID).\n3. Await `notifications/resources/updated` and drain via `resources/read?cursor=auto`.\n4. sub_close sub_id=... (REQUIRED \u2014 leaks become SUB_LEAK_RISK).\n\nSuccessor tools:\n- sub_filter \u2014 mutate lane regex without re-subscribing\n- sub_pause / sub_resume \u2014 temporary throttle without dropping the lane\n- sub_replay \u2014 recover events dropped by lag_policy\n- sub_stats \u2014 diagnose drops + queue pressure\n- sub_close \u2014 cleanup (REQUIRED \u2014 leaks become SUB_LEAK_RISK)\n\nStatus values: OK.\n\nErrors: SUB_INVALID_FILTER (regex compile), SUB_LIMIT_EXCEEDED, RESOURCE_NOT_FOUND.\n\nCleanup: sub_close sub_id=... when done. Skip and the lane becomes a zombie (watcher emits SUB_LEAK_RISK).\n\nCost: O(1) lane open + per-event mpsc.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.\n\nHygiene: hold the SUB_ID; never re-open the same URI without first unsubscribing.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "parameters": [
+        {
+          "name": "filter",
+          "type": "['string', 'null']",
+          "required": false,
+          "description": "Optional regex filter compiled at subscribe time. Empty / absent\nmeans no filter."
+        },
+        {
+          "name": "grace_ms",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Grace window in ms \u2014 only honoured when `lifetime=auto_close`.\nDefault: 2000.",
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "inline_push",
+          "type": "boolean",
+          "required": false,
+          "description": "ADR 0012 phase 5 -- request inline-push delivery.\n\nWhen `true` AND the client advertised the\n`experimental.ssh_inline_push` capability at `initialize`, the\nserver delivers coalesced bytes inline via the custom\n`notifications/ssh/output` method ON TOP OF the legacy\n`notifications/resources/updated` debouncer cadence.\n\nDefault `false` -- every v7.0.x host sees byte-identical wires.\nWhen `true` but the capability was not echoed, the server\ndowngrades the lane silently and emits a\n`HINT: RECOMMENDED:` line on the `sub_open` response.",
+          "default": false
+        },
+        {
+          "name": "lag_policy",
+          "type": "LagPolicy (via $ref) | null",
+          "required": false,
+          "description": "Lag policy applied when the lane mpsc fills. Default: `snapshot`.",
+          "default": "snapshot",
+          "resolvedValues": [
+            "block_slow",
+            "drop_oldest",
+            "drop_newest",
+            "snapshot"
+          ]
+        },
+        {
+          "name": "lifetime",
+          "type": "LifetimeKind (via $ref) | null",
+          "required": false,
+          "description": "Lifetime kind. Default: `manual`.",
+          "default": "manual",
+          "resolvedValues": [
+            "manual",
+            "auto_close",
+            "lease"
+          ]
+        },
+        {
+          "name": "ttl_secs",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "TTL in seconds \u2014 only honoured when `lifetime=lease`.",
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "name": "uri",
+          "type": "string",
+          "required": true,
+          "description": "Resource URI (e.g. `shell://<id>/output`, `command://<id>/output`)."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [
+        "LagPolicy",
+        "LifetimeKind"
+      ],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_pause",
+      "title": "Pause a subscription lane",
+      "description": "Suspend lane drain. Subsequent events accumulate in the lane mpsc until sub_resume; lag_policy still applies \u2014 `drop_oldest` rotates the queue while paused.\n\nWhen to use:\n- Pause delivery to a slow consumer without losing the SubId / cursor / filter / lifetime state.\n- Combine with sub_resume to gate batched processing.\n\nInteraction: pause does NOT freeze the producer; events still hit the lane and get queued (or rotated, per lag_policy). High-frequency streams may exhaust the mpsc \u2014 monitor via sub_stats.\n\nWorkflow:\n1. sub_open returned SUB_ID and the lane is delivering pushes.\n2. sub_pause sub_id=... (atomic flag flip).\n3. Process accumulated work; monitor mpsc pressure via sub_stats if needed.\n4. sub_resume to flush queued events in order.\n\nOverlap guidance:\n- Prefer sub_pause + sub_resume for transient throttling \u2014 preserves SUB_ID, cursor, filter, lifetime. sub_close + sub_open re-mints the SubId and loses cursor state.\n- For permanent filter changes, prefer sub_filter (no need to pause first).\n\nStatus values: OK, NOOP (already paused).\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1) atomic flag flip.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open` \u2014 the lane to pause."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_replay",
+      "title": "Replay a subscription lane from cursor",
+      "description": "Re-emit lane events from `from_cursor` (byte offset) within the per-resource ring-buffer window. Independent of `lag_policy` \u2014 sources from the ring, not the lane mpsc.\n\nWhen to use:\n- Recover events dropped by `drop_oldest` / `drop_newest` / `snapshot` policies.\n- Resume from a known cursor after consumer restart.\n- `from_cursor=0` (default) replays from the start of the available window.\n\nWindow size is per-resource (see RESOURCES.md). Cursors past the window head return whatever the ring still holds.\n\nWorkflow:\n1. sub_stats reports `lagged_snapshot > 0` (or consumer noticed a gap in the cursor sequence).\n2. sub_replay sub_id=... [from_cursor=N] (defaults to 0 \u2014 start of window).\n3. Drain replayed events via the existing push channel.\n\nOverlap guidance:\n- Prefer sub_replay over re-subscribing when the consumer dropped events (lag_policy=drop_oldest/drop_newest/snapshot triggered) \u2014 sources from the per-resource ring buffer, not the lane mpsc.\n- For window-cursor recovery use from_cursor=N (byte offset).\n- For a fresh subscription that ignores history, use sub_close + sub_open.\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND, RESOURCE_GONE.\n\nCost: O(window-bytes) snapshot rebuild + N push deliveries.\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "from_cursor",
+          "type": "['integer', 'null']",
+          "required": false,
+          "description": "Cursor (byte offset) to replay from. Default: 0 \u2014 replays from\nthe start of the available ring-buffer window.",
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open` \u2014 the lane to replay."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_resume",
+      "title": "Resume a subscription lane",
+      "description": "Resume lane drain after a previous sub_pause. Queued events flush in order, subject to lag_policy.\n\nWhen to use:\n- Re-enable push delivery on a paused lane.\n\nInteraction: if `lag_policy=snapshot` and the ring buffer rotated past the lane cursor during pause, the next push emits `LAG_DETECTED`. Inspect via sub_stats.\n\nWorkflow:\n1. sub_pause put the lane in Paused state.\n2. sub_resume sub_id=... flushes queued events in order.\n3. Inspect sub_stats \u2014 if `lagged_snapshot > 0`, follow with sub_replay from_cursor=N to recover.\n\nOverlap guidance:\n- Prefer sub_resume for unpause. To recover events that the lag_policy dropped during pause, follow with sub_replay (sources from the per-resource ring, not the lane mpsc).\n- For an immediate fresh stream from now (drop backlog), pair sub_close + sub_open instead.\n\nStatus values: OK, NOOP (not paused).\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1).\n\nIdempotency: pass `_meta.idempotency_key` to dedup retries.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open` \u2014 the lane to resume."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_stats",
+      "title": "Snapshot subscription lane stats",
+      "description": "Per-lane atomic counter snapshot \u2014 `events_sent`, `bytes_sent`, `lagged_snapshot`, `lagged_drop_oldest`, `lagged_drop_newest`, `lagged_block`, `queue_depth`, `queue_high_watermark`, `replay_count`.\n\nWhen to use:\n- Diagnose drops (compare lagged_* counters against the lag_policy chosen at sub_open).\n- Detect mpsc pressure (queue_high_watermark approaching channel size = consumer too slow \u2192 consider drop_oldest or block_slow).\n- Validate filter efficacy (events_sent vs source rate).\n\nWorkflow:\n1. Capture SUB_ID from sub_open's response.\n2. sub_stats sub_id=... \u2014 read atomic counters.\n3. Decide: high lagged_* \u2192 sub_replay or change lag_policy via sub_close + sub_open with new policy.\n\nOverlap guidance:\n- Prefer sub_stats for per-lane diagnostics. For daemon-wide aggregate (sum + max), use sub_stats_all (single call, no SUB_ID needed).\n- For a structural inventory (uri / state / filter / lifetime), use sub_list \u2014 it omits counters but lists every active lane.\n\nStatus values: OK.\n\nErrors: SUB_NOT_FOUND.\n\nCost: O(1) atomic loads.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [
+        {
+          "name": "sub_id",
+          "type": "string",
+          "required": true,
+          "description": "`SUB_ID` returned from `sub_open` \u2014 the lane to inspect."
+        }
+      ],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    },
+    {
+      "name": "sub_stats_all",
+      "title": "Aggregate daemon-wide subscription stats",
+      "description": "Aggregate snapshot across every open lane in the channel mux. Returns sum (events_sent, bytes_sent, lagged_*) and max (queue_depth, queue_high_watermark) plus open lane count.\n\nWhen to use:\n- Cluster-wide health check before scaling decisions.\n- SUB_LEAK_RISK investigation (lane count drifting up over time).\n- Compare with sub_stats per-lane to find outliers.\n\nWorkflow:\n1. sub_stats_all (no args required \u2014 daemon-wide).\n2. Inspect open_lane_count + sum(lagged_*) for early warning.\n3. Drill down with sub_list to find offending SUB_IDs; then sub_stats per-id.\n\nOverlap guidance:\n- Prefer sub_stats_all for cheap aggregate health. For per-lane breakdown, follow with sub_list + sub_stats per SUB_ID.\n- If the goal is just to detect leaks, sub_list with no filter is also enough (counts entries).\n\nStatus values: OK.\n\nErrors: STORAGE_ERROR.\n\nCost: O(N) over open lanes.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "parameters": [],
+      "additionalProperties": null,
+      "defs": [],
+      "outputSchemaBytes": 2
+    }
+  ]
+}
