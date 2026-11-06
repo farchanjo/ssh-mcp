@@ -25,7 +25,9 @@ BINARIES := ssh-mcp ssh-mcp-stdio ssh-mcp-tail
 UNAME_S ?= $(shell uname -s 2>/dev/null || echo unknown)
 CODESIGN ?= codesign
 CODESIGN_IDENTITY ?= -
-CORES := $(shell nproc 2>/dev/null || echo 1)
+# `nproc` is coreutils, absent from a stock macOS; fall back to sysctl there so
+# the cap still means something. Both missing means one job.
+CORES := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 JOBS ?= $(CORES)
 RUSTC_WRAPPER = $(CURDIR)/scripts/sccache-rustc.sh
 
