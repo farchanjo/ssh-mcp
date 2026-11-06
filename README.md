@@ -196,6 +196,8 @@ See the [changelog](CHANGELOG.md).
 - [MCP Documentation](https://modelcontextprotocol.io/)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — hexagonal layer map, lifecycle adapter, channel mux
 - [docs/API.md](docs/API.md) — every MCP tool, schema, response shape
+- [docs/TOOL_CATALOG.md](docs/TOOL_CATALOG.md) — generated `tools/list` export with every parameter descriptor (`make tools-export`)
+- [docs/TOOL_SURFACE_AUDIT.md](docs/TOOL_SURFACE_AUDIT.md) — tool-surface audit: unresolved `$ref` sites, description bloat, overlapping tools
 - [docs/RESOURCES.md](docs/RESOURCES.md) — push resource contracts and cursor semantics
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — full env-var matrix (52 settings)
 - [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) — push-first prompts, error handbook, hint escalation
