@@ -18,7 +18,7 @@ laptop. Tests that require a live SSH path are marked with
 
 How to run::
 
-    cargo build --release --bin ssh-mcp-stdio
+    cargo build --bin ssh-mcp-stdio
     .venv/bin/python -m pytest scripts/test_v5_adversarial.py -v --tb=short -x
 
 Skip when the binary or paramiko is unavailable: each fixture skips
@@ -56,6 +56,7 @@ from typing import Any
 
 import pytest
 
+from helpers import paths
 from helpers.fixtures import STDIO_BIN
 from helpers.local_sshd import LocalSshdFixture
 from helpers.mcp_client import (
@@ -70,6 +71,10 @@ from helpers.parse_block import parse_block
 # ---------------------------------------------------------------------------
 # Helpers shared by the adversarial classes.
 # ---------------------------------------------------------------------------
+
+
+# Body prefix rmcp uses for a `tools/call` result that failed to deserialize.
+DESERIALIZE_PREFIX = "failed to deserialize parameters"
 
 
 @dataclass
@@ -105,6 +110,29 @@ class ParsedResponse:
             return None
         match = re.match(r"^\[([A-Z_]+)\]", reason)
         return match.group(1) if match else None
+
+    @property
+    def rejection_message(self) -> str | None:
+        """Message when the server refused the call before dispatch.
+
+        A schema rejection reaches the client in one of two shapes: a
+        JSON-RPC error object, or — since rmcp serves tools through the
+        `tools/call` result — an ordinary result carrying `isError: true`
+        whose body reads ``failed to deserialize parameters: <serde
+        message>``. Adversarial tests care about the refusal and its message,
+        not about which envelope carried it, so both fold into one accessor.
+        Returns ``None`` when the call reached the handler.
+        """
+        if self.rpc_error is not None:
+            return str(self.rpc_error.get("message") or "")
+        if self.text.startswith(DESERIALIZE_PREFIX):
+            return self.text[len(DESERIALIZE_PREFIX):].lstrip(": ").strip()
+        return None
+
+    @property
+    def rejected_at_schema(self) -> bool:
+        """True when the request never reached the tool handler."""
+        return self.rejection_message is not None
 
 
 def call(client: McpClient, name: str, args: dict, *, timeout: float = 15.0,
@@ -181,7 +209,7 @@ def local_fx() -> Iterator[LocalSshdFixture]:
 
 @pytest.fixture
 def ssh_mcp_stdio_bin() -> Path:
-    """Resolve to ``target/release/ssh-mcp-stdio``; skip if missing.
+    """Resolve to the active profile's ``ssh-mcp-stdio``; skip if missing.
 
     Inlined here (rather than placed in conftest.py) so the v5 adversarial
     suite is self-contained. ``stdio_client`` (in helpers/fixtures.py) keeps
@@ -194,12 +222,12 @@ def ssh_mcp_stdio_bin() -> Path:
 
 @pytest.fixture
 def ssh_mcp_tail_bin() -> Path:
-    """Resolve to ``target/release/ssh-mcp-tail``; skip if missing.
+    """Resolve to the active profile's ``ssh-mcp-tail``; skip if missing.
 
     Reserved for daemon-side adversarial coverage that drives the NDJSON
     tail surface directly.
     """
-    tail = STDIO_BIN.parent / "ssh-mcp-tail"
+    tail = paths.tail_bin()
     if not tail.exists():
         pytest.skip(f"tail binary not built: {tail}")
     return tail
@@ -216,6 +244,20 @@ def adv_client(ssh_mcp_stdio_bin: Path) -> Iterator[McpClient]:
             client.close()
         except Exception:
             pass
+
+
+@pytest.fixture
+def forward_client(adv_client: McpClient) -> McpClient:
+    """``adv_client`` plus a skip when the build lacks ``port_forward``.
+
+    The 38-tool surface does not register ``ssh_forward`` at all, and a call
+    to an unregistered tool is refused by the router before validation — so
+    the forward assertions would be vacuous rather than failing. Skipping
+    keeps that surface honest instead of green for the wrong reason.
+    """
+    if not any(tool["name"] == "ssh_forward" for tool in adv_client.list_tools()):
+        pytest.skip("ssh_forward is not registered on this build (no port_forward)")
+    return adv_client
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +297,8 @@ class TestSshConnectAdversarial:
     def test_connect_missing_required_username(self, adv_client: McpClient) -> None:
         """Missing ``username`` falls through to JSON-RPC schema rejection."""
         rsp = call(adv_client, "ssh_connect", {"address": "127.0.0.1:22"})
-        assert rsp.rpc_error is not None
-        assert "username" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "username" in (rsp.rejection_message or "")
 
     def test_connect_invalid_reuse_policy_string(self, adv_client: McpClient) -> None:
         """Unknown ``reuse`` value rejected by the strict enum schema."""
@@ -265,8 +307,8 @@ class TestSshConnectAdversarial:
             "ssh_connect",
             {"address": "127.0.0.1:22", "username": "u", "reuse": "no-such-policy"},
         )
-        assert rsp.rpc_error is not None
-        assert "force_new" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "force_new" in (rsp.rejection_message or "")
 
     def test_connect_with_invalid_key_path_fails_auth(
         self, adv_client: McpClient, local_fx: LocalSshdFixture
@@ -284,10 +326,15 @@ class TestSshConnectAdversarial:
             timeout=15,
         )
         # Auth chain ran -> AUTH_FAILED; or the key adapter rejected the
-        # path with INVALID_ARGUMENT. Both are acceptable adversarial
-        # outcomes.
+        # path with INVALID_ARGUMENT. A host with no SSH_AUTH_SOCK reaches
+        # the missing agent before the key chain and reports
+        # CONNECTION_FAILED, so that code is accepted too — the adversarial
+        # property is that the bad path yields a categorised failure rather
+        # than a silent success.
         assert rsp.status == "ERROR", rsp.text
-        assert rsp.reason_code in {"AUTH_FAILED", "AUTH_KEY_PARSE", "INVALID_ARGUMENT"}, rsp.text
+        assert rsp.reason_code in {
+            "AUTH_FAILED", "AUTH_KEY_PARSE", "INVALID_ARGUMENT", "CONNECTION_FAILED",
+        }, rsp.text
 
     def test_connect_max_sessions_exceeded_with_low_cap(
         self, ssh_mcp_stdio_bin: Path, local_fx: LocalSshdFixture
@@ -362,8 +409,8 @@ class TestSshExecuteAdversarial:
     def test_execute_missing_command_field(self, adv_client: McpClient) -> None:
         """Required ``command`` field rejected by deserializer."""
         rsp = call(adv_client, "ssh_exec", {"session_id": "any"})
-        assert rsp.rpc_error is not None
-        assert "command" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "command" in (rsp.rejection_message or "")
 
     def test_execute_batch_empty_commands_array_invalid(
         self, adv_client: McpClient
@@ -402,7 +449,12 @@ class TestSshExecuteAdversarial:
     def test_run_with_empty_username_returns_auth_failed(
         self, adv_client: McpClient, local_fx: LocalSshdFixture
     ) -> None:
-        """``ssh_run`` with empty username falls through to AUTH_FAILED."""
+        """``ssh_run`` with empty username must fail with a categorised error.
+
+        AUTH_FAILED / INVALID_ARGUMENT on a host whose auth chain reaches the
+        credential check; CONNECTION_FAILED on a host with no ssh-agent in the
+        environment, where the agent probe fails first.
+        """
         rsp = call(
             adv_client,
             "ssh_run",
@@ -415,7 +467,9 @@ class TestSshExecuteAdversarial:
             timeout=15,
         )
         assert rsp.status == "ERROR"
-        assert rsp.reason_code in {"AUTH_FAILED", "INVALID_ARGUMENT"}
+        assert rsp.reason_code in {
+            "AUTH_FAILED", "INVALID_ARGUMENT", "CONNECTION_FAILED",
+        }
 
     def test_execute_then_cancel_race_no_panic(
         self, adv_client: McpClient, local_fx: LocalSshdFixture
@@ -505,8 +559,8 @@ class TestSshShellAdversarial:
         """Unknown semantic key name rejected by deserializer."""
         rsp = call(adv_client, "ssh_shell_press",
                    {"shell_id": "ghost", "key": "no_such_key"})
-        assert rsp.rpc_error is not None
-        assert "expected" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "expected" in (rsp.rejection_message or "")
 
     def test_wait_for_empty_patterns(self, adv_client: McpClient) -> None:
         """Empty ``patterns`` array -> ``EMPTY_PATTERNS``."""
@@ -593,15 +647,15 @@ class TestSshSubscribeAdversarial:
         """Unknown ``lifetime`` value rejected at deserialize."""
         rsp = call(adv_client, "sub_open",
                    {"uri": "shell://x/output", "lifetime": "forever"})
-        assert rsp.rpc_error is not None
-        msg = rsp.rpc_error.get("message", "") if rsp.rpc_error else ""
+        assert rsp.rejected_at_schema, rsp.text
+        msg = rsp.rejection_message or ""
         assert "manual" in msg or "lifetime" in msg
 
     def test_subscribe_invalid_lag_policy(self, adv_client: McpClient) -> None:
         """Unknown ``lag_policy`` rejected at deserialize."""
         rsp = call(adv_client, "sub_open",
                    {"uri": "shell://x/output", "lag_policy": "BlockSlow"})
-        assert rsp.rpc_error is not None
+        assert rsp.rejected_at_schema, rsp.text
 
     def test_subscribe_invalid_filter_regex(self, adv_client: McpClient) -> None:
         """Malformed regex compiled at subscribe time -> ``INVALID_ARGUMENT``."""
@@ -613,8 +667,8 @@ class TestSshSubscribeAdversarial:
     def test_subscribe_missing_required_uri(self, adv_client: McpClient) -> None:
         """Missing ``uri`` rejected at deserialize."""
         rsp = call(adv_client, "sub_open", {})
-        assert rsp.rpc_error is not None
-        assert "uri" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "uri" in (rsp.rejection_message or "")
 
     def test_unsubscribe_unknown_sub_id(self, adv_client: McpClient) -> None:
         """Unknown ``sub_id`` -> ``SUB_NOT_FOUND``."""
@@ -646,13 +700,13 @@ class TestSshSubscribeAdversarial:
     ) -> None:
         """Missing ``sub_id`` rejected at deserialize for pause."""
         rsp = call(adv_client, "sub_pause", {})
-        assert rsp.rpc_error is not None
+        assert rsp.rejected_at_schema, rsp.text
 
     def test_sub_filter_missing_required_regex(self, adv_client: McpClient) -> None:
         """``ssh_sub_filter`` requires both ``sub_id`` and ``regex``."""
         rsp = call(adv_client, "sub_filter", {"sub_id": "ghost"})
-        assert rsp.rpc_error is not None
-        assert "regex" in (rsp.rpc_error.get("message") or "")
+        assert rsp.rejected_at_schema, rsp.text
+        assert "regex" in (rsp.rejection_message or "")
 
     def test_sub_replay_negative_cursor_rejected(
         self, adv_client: McpClient
@@ -660,7 +714,7 @@ class TestSshSubscribeAdversarial:
         """``from_cursor`` is u64; -1 rejected at deserialize."""
         rsp = call(adv_client, "sub_replay",
                    {"sub_id": "ghost", "from_cursor": -1})
-        assert rsp.rpc_error is not None
+        assert rsp.rejected_at_schema, rsp.text
 
     def test_max_subs_per_uri_exceeded_with_low_cap(
         self, ssh_mcp_stdio_bin: Path
@@ -825,7 +879,7 @@ class TestSftpAdversarial:
     def test_upload_missing_required_fields(self, adv_client: McpClient) -> None:
         """``local_path`` and ``remote_path`` are required."""
         rsp = call(adv_client, "ssh_upload", {"session_id": "x"})
-        assert rsp.rpc_error is not None
+        assert rsp.rejected_at_schema, rsp.text
 
 
 # ---------------------------------------------------------------------------
@@ -836,42 +890,49 @@ class TestSftpAdversarial:
 class TestForwardAdversarial:
     """Adversarial coverage for ``ssh_forward`` (only registered with `port_forward`)."""
 
-    def test_forward_unknown_session(self, adv_client: McpClient) -> None:
-        """Unknown session -> ``SESSION_NOT_FOUND`` or ``FEATURE_DISABLED`` when the build lacks the feature."""
-        rsp = call(adv_client, "ssh_forward",
+    def test_forward_unknown_session(self, forward_client: McpClient) -> None:
+        """Unknown session -> ``SESSION_NOT_FOUND``."""
+        rsp = call(forward_client, "ssh_forward",
                    {
                        "session_id": "ghost",
                        "local_port": 0,
-                       "remote_address": "127.0.0.1:80",
+                       "remote_address": "127.0.0.1",
+                       "remote_port": 80,
                        "persistent": False,
                    })
-        # Either dispatched and hit SESSION_NOT_FOUND, or the build
-        # lacks the port_forward feature.
-        if rsp.rpc_error is not None:
-            # Unknown tool -> RPC code
-            return
-        assert rsp.status == "ERROR"
+        assert rsp.status == "ERROR", rsp.text
         assert rsp.reason_code in {
             "SESSION_NOT_FOUND", "FEATURE_DISABLED", "INVALID_ARGUMENT",
         }, rsp.text
 
     def test_forward_negative_local_port_rejected(
-        self, adv_client: McpClient
+        self, forward_client: McpClient
     ) -> None:
         """``local_port`` is u16; negative rejected at deserialize."""
-        rsp = call(adv_client, "ssh_forward",
+        rsp = call(forward_client, "ssh_forward",
                    {"session_id": "ghost", "local_port": -1,
-                    "remote_address": "127.0.0.1:80", "persistent": False})
-        assert rsp.rpc_error is not None
+                    "remote_address": "127.0.0.1", "remote_port": 80,
+                    "persistent": False})
+        assert rsp.rejected_at_schema, rsp.text
+        assert "expected u16" in (rsp.rejection_message or ""), rsp.text
 
-    def test_forward_invalid_remote_address(self, adv_client: McpClient) -> None:
-        """Malformed remote address -> ``INVALID_ARGUMENT``."""
-        rsp = call(adv_client, "ssh_forward",
+    def test_forward_missing_remote_port_rejected(
+        self, forward_client: McpClient
+    ) -> None:
+        """``remote_address`` is a bare host: the port is its own required field."""
+        rsp = call(forward_client, "ssh_forward",
                    {"session_id": "ghost", "local_port": 0,
-                    "remote_address": "not-an-address", "persistent": False})
-        if rsp.rpc_error is not None:
-            return
-        assert rsp.status == "ERROR"
+                    "remote_address": "127.0.0.1", "persistent": False})
+        assert rsp.rejected_at_schema, rsp.text
+        assert "remote_port" in (rsp.rejection_message or ""), rsp.text
+
+    def test_forward_invalid_remote_address(self, forward_client: McpClient) -> None:
+        """Malformed remote address -> ``INVALID_ARGUMENT``."""
+        rsp = call(forward_client, "ssh_forward",
+                   {"session_id": "ghost", "local_port": 0,
+                    "remote_address": "not-an-address", "remote_port": 80,
+                    "persistent": False})
+        assert rsp.status == "ERROR", rsp.text
         assert rsp.reason_code in {
             "SESSION_NOT_FOUND", "INVALID_ARGUMENT", "FEATURE_DISABLED",
         }, rsp.text

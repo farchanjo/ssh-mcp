@@ -12,7 +12,7 @@ This suite spawns 10..100 concurrent client threads against a single
 
 How to run::
 
-    cargo build --release --bin ssh-mcp-stdio
+    cargo build --bin ssh-mcp-stdio
     .venv/bin/python -m pytest scripts/chaos_v5_subscribe.py -v --tb=short -x
 
 Each scenario is a top-level ``test_chaos_*`` pytest function so the

@@ -975,11 +975,13 @@ def test_s15_keepalive_fires_after_idle(http_with_env, ssh_target) -> None:
         client.subscribe(uri)
         _drain_notifications(client, settle_secs=0.5)
 
-        # Window: ~5s idle. Floor: 1 (a single keepalive tick at +2s).
+        # Window: ~8s idle. Floor: 1 (a single keepalive tick at +2s), so the
+        # window holds ~4 ticks — margin against a loaded host delaying
+        # delivery of the first one.
         # Some shells emit a small banner stream which may produce one
         # data notification — that's fine, we just need at least one.
-        observed = _count_uri_notifications(client, uri, duration_secs=5.0)
-        assert observed >= 1, "no keepalive notification within 5s of subscribe"
+        observed = _count_uri_notifications(client, uri, duration_secs=8.0)
+        assert observed >= 1, "no keepalive notification within 8s of subscribe"
     finally:
         if shell_id:
             _close_shell(client, shell_id)

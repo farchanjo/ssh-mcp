@@ -51,6 +51,15 @@ from paramiko.sftp_si import SFTPServerInterface
 from struct import error as struct_error
 
 
+# Transport failures a waiter must treat as "the channel is gone" rather than
+# dying on. `EOFError` is the odd one out: paramiko raises it from
+# `Packetizer.write_all` when a send returns 0 bytes, which happens under a
+# flooding child long before `Channel.closed` flips. Leaving it uncaught killed
+# the `_pty_to_channel` pump silently, after which nothing drained the PTY and
+# the shell blocked on a full output buffer.
+_TRANSPORT_ERRORS = (OSError, EOFError, paramiko.SSHException)
+
+
 def _free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -89,14 +98,27 @@ def _generate_ed25519_keypair(target_dir: Path) -> tuple[Path, Path]:
     return priv_path, pub_path
 
 
-def _generate_host_key(target_dir: Path) -> Path:
-    """Generate an RSA 2048 host key (ed25519 paramiko host keys are
-    available but the helper kept it simple — RSA is universally accepted)."""
-    target_dir.mkdir(parents=True, exist_ok=True)
-    host_key_path = target_dir / "ssh_host_rsa_key"
-    key = paramiko.RSAKey.generate(2048)
-    key.write_private_key_file(str(host_key_path))
-    return host_key_path
+_HOST_KEY_LOCK = threading.Lock()
+_HOST_KEY: paramiko.RSAKey | None = None
+
+
+def _shared_host_key() -> paramiko.RSAKey:
+    """Return the process-wide host key, generating it on first use.
+
+    Every fixture in a process must present the *same* identity. The kernel
+    recycles ephemeral ports, so a fixture that binds a port a previous
+    fixture used would offer a different key for the same
+    ``[127.0.0.1]:<port>`` entry in known_hosts and the connect would be
+    refused with ``Unknown server key``. One key per process removes that
+    failure mode — and RSA keygen is slow enough that sharing it is worth it
+    on its own.
+    """
+    global _HOST_KEY
+    with _HOST_KEY_LOCK:
+        if _HOST_KEY is None:
+            # RSA is universally accepted; ed25519 host keys would work too.
+            _HOST_KEY = paramiko.RSAKey.generate(2048)
+        return _HOST_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +359,11 @@ def _drive_exec_channel(channel, command: bytes) -> None:
     finally:
         try:
             channel.shutdown_write()
-        except (OSError, paramiko.SSHException):
+        except _TRANSPORT_ERRORS:
             pass
         try:
             channel.close()
-        except (OSError, paramiko.SSHException):
+        except _TRANSPORT_ERRORS:
             pass
 
 
@@ -395,7 +417,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
     if banner_after_open:
         try:
             channel.sendall(banner_after_open)
-        except (OSError, paramiko.SSHException):
+        except _TRANSPORT_ERRORS:
             pass
 
     def _pty_to_channel():
@@ -418,7 +440,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
                     return
                 try:
                     channel.sendall(buf)
-                except (OSError, paramiko.SSHException):
+                except _TRANSPORT_ERRORS:
                     return
         except (OSError, ValueError):
             return
@@ -436,7 +458,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
                 continue
             try:
                 data = channel.recv(4096)
-            except (OSError, paramiko.SSHException):
+            except _TRANSPORT_ERRORS:
                 return
             if not data:
                 return
@@ -454,7 +476,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
                     break
                 try:
                     channel.sendall(buf)
-                except (OSError, paramiko.SSHException):
+                except _TRANSPORT_ERRORS:
                     return
         except (OSError, ValueError):
             return
@@ -472,7 +494,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
                 continue
             try:
                 data = channel.recv(4096)
-            except (OSError, paramiko.SSHException):
+            except _TRANSPORT_ERRORS:
                 return
             if not data:
                 return
@@ -515,7 +537,7 @@ def _drive_shell_channel(channel, banner_after_open: bytes | None) -> None:
         pass
     try:
         channel.close()
-    except (OSError, paramiko.SSHException):
+    except _TRANSPORT_ERRORS:
         pass
 
 
@@ -601,7 +623,7 @@ def _handle_client(
         if transport is not None:
             try:
                 transport.close()
-            except (OSError, paramiko.SSHException):
+            except _TRANSPORT_ERRORS:
                 pass
         try:
             client_sock.close()
@@ -632,8 +654,7 @@ class LocalSshdFixture:
         self._private_key_path, self._public_key_path = _generate_ed25519_keypair(
             self._tmp_path / "client_keys"
         )
-        host_key_path = _generate_host_key(self._tmp_path / "host_keys")
-        self._host_key = paramiko.RSAKey(filename=str(host_key_path))
+        self._host_key = _shared_host_key()
         # Pre-load the public key blob for paramiko key-auth comparison.
         client_key = paramiko.Ed25519Key.from_private_key_file(str(self._private_key_path))
         self._public_key_blob = client_key.asbytes()

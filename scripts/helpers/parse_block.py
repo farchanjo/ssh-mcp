@@ -51,6 +51,8 @@ _INT_KEYS = frozenset(
         "sessions_disconnected",
         "sessions_closed",
         "commands_cancelled",
+        "shells_closed",
+        "transfers_aborted",
         "replaced",
         "bytes_sent",
         "bytes",

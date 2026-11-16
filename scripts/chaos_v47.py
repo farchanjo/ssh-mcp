@@ -34,6 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from helpers import paths  # noqa: E402
 from helpers.chaos import (  # noqa: E402
     chaos_session,
     write_event,
@@ -48,8 +49,8 @@ from helpers.mcp_client import (  # noqa: E402
 from helpers.parse_block import parse_block  # noqa: E402
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-STDIO_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp-stdio"
+REPO_ROOT = paths.REPO_ROOT
+STDIO_BIN = paths.stdio_bin()
 
 
 # ---------------------------------------------------------------------------

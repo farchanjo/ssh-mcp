@@ -36,16 +36,20 @@ from typing import Iterator
 
 CRATE_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(CRATE_ROOT / "scripts"))
+
+from helpers import paths  # noqa: E402
+
 
 def build_daemon() -> Path:
-    """Build the daemon binary in release mode."""
+    """Build the daemon binary in the active profile and return its path."""
     subprocess.run(
-        ["cargo", "build", "--release", "--bin", "ssh-mcp-tail"],
+        ["cargo", "build", "--bin", "ssh-mcp-tail"],
         cwd=CRATE_ROOT,
         check=True,
         stdout=subprocess.DEVNULL,
     )
-    binary = CRATE_ROOT / "target" / "release" / "ssh-mcp-tail"
+    binary = paths.tail_bin()
     if not binary.exists():
         raise RuntimeError(f"daemon binary not found: {binary}")
     return binary
