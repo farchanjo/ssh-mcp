@@ -47,9 +47,11 @@
 
 use std::sync::Arc;
 
+use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::ids::{AgentId, SessionId};
 use crate::domain::subscription::SubId;
+use crate::domain::transfer::TransferStatus;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
@@ -67,8 +69,12 @@ pub struct DisconnectAgentRequest {
     pub agent_id: AgentId,
 }
 
-/// Outbound DTO surfacing the cleanup tally. Counts are exact
-/// (non-aggregated): each successfully removed entity contributes one.
+/// Outbound DTO surfacing the cleanup tally.
+///
+/// `commands_cancelled` / `transfers_aborted` count only resources that
+/// were still running; terminal rows are removed but already finished, so
+/// they would overstate the interruption. `shells_closed` counts every
+/// removed shell (shell rows do not outlive their close).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectAgentOutcome {
     /// Echo of the requested agent id so the inbound adapter can render
@@ -229,9 +235,12 @@ where
         }
     }
 
-    /// Cancel every command attached to `session_id`. Already-finished
-    /// commands surface `CommandNotFound` from the SSH port; that is
-    /// expected and intentionally swallowed.
+    /// Cancel every running command attached to `session_id` and drop
+    /// every command row. Terminal rows are removed too but do not
+    /// increment the tally — `commands_cancelled` reports work that was
+    /// actually interrupted. Already-finished commands surface
+    /// `CommandNotFound` from the SSH port; that is expected and
+    /// intentionally swallowed.
     async fn cancel_commands(&self, session_id: &SessionId) -> usize {
         let listed = self
             .commands
@@ -240,16 +249,17 @@ where
             .unwrap_or_default();
         let mut count = 0_usize;
         for entity in listed {
-            let _ = self.ssh.cancel(&entity.id).await;
+            if entity.status == CommandStatus::Running {
+                let _ = self.ssh.cancel(&entity.id).await;
+                count = count.saturating_add(1);
+            }
             let cancelled = entity.clone().cancel();
             let _ = self.commands.update(cancelled).await;
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Command, entity.id.as_str());
             }
             self.close_lanes_for_resource(entity.id.as_str()).await;
-            if matches!(self.commands.remove(&entity.id).await, Ok(Some(_))) {
-                count = count.saturating_add(1);
-            }
+            let _ = self.commands.remove(&entity.id).await;
         }
         count
     }
@@ -278,8 +288,10 @@ where
         count
     }
 
-    /// Mark every transfer attached to `session_id` as cancelled and
-    /// drop the snapshot.
+    /// Mark every running transfer attached to `session_id` as cancelled
+    /// and drop every transfer row. Terminal rows are removed too but do
+    /// not increment the tally — `transfers_aborted` reports work that
+    /// was actually interrupted.
     async fn abort_transfers(&self, session_id: &SessionId) -> usize {
         let listed = self
             .transfers
@@ -288,15 +300,16 @@ where
             .unwrap_or_default();
         let mut count = 0_usize;
         for entity in listed {
+            if entity.status == TransferStatus::Running {
+                count = count.saturating_add(1);
+            }
             let cancelled = entity.clone().cancel();
             let _ = self.transfers.update(cancelled).await;
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Transfer, entity.id.as_str());
             }
             self.close_lanes_for_resource(entity.id.as_str()).await;
-            if matches!(self.transfers.remove(&entity.id).await, Ok(Some(_))) {
-                count = count.saturating_add(1);
-            }
+            let _ = self.transfers.remove(&entity.id).await;
         }
         count
     }
@@ -649,6 +662,62 @@ mod tests {
                 .await
                 .expect("get")
                 .is_some()
+        );
+    }
+
+    // --- Scenario 5b ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_commands_and_transfers_are_removed_but_not_counted() {
+        let h = build_harness();
+        let agent = AgentId::new("alpha".to_string());
+        seed_session(&h.sessions, "s-1", Some(&agent)).await;
+        seed_command(&h.commands, "c-live", "s-1").await;
+        seed_transfer(&h.transfers, "t-live", "s-1").await;
+        let done_cmd = CommandEntity::new(
+            CommandId::new("c-done".to_string()),
+            SessionId::new("s-1".to_string()),
+            "done".to_string(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        )
+        .complete(0, false);
+        h.commands
+            .insert(done_cmd)
+            .await
+            .expect("insert done command");
+        let done_xfer = TransferEntity::new(
+            TransferId::new("t-done".to_string()),
+            SessionId::new("s-1".to_string()),
+            TransferDirection::Upload,
+            "/tmp/done".to_string(),
+            "/r/done".to_string(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            1,
+        )
+        .complete(1);
+        h.transfers
+            .insert(done_xfer)
+            .await
+            .expect("insert done transfer");
+
+        let outcome = h.uc.execute(req(&agent)).await.expect("execute");
+        assert_eq!(outcome.commands_cancelled, 1);
+        assert_eq!(outcome.transfers_aborted, 1);
+        assert!(
+            h.commands
+                .list_filtered(Some(&SessionId::new("s-1".to_string())), None)
+                .await
+                .expect("list commands")
+                .is_empty(),
+            "terminal command rows must be removed"
+        );
+        assert!(
+            h.transfers
+                .list_filtered(Some(&SessionId::new("s-1".to_string())))
+                .await
+                .expect("list transfers")
+                .is_empty(),
+            "terminal transfer rows must be removed"
         );
     }
 
