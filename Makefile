@@ -1,9 +1,17 @@
 # Dev entry points — the single path for building and testing this repo.
 #
 # Everything runs through here so the knobs stay in one place:
-#   * JOBS defaults to the CPU count; exported as CARGO_BUILD_JOBS and passed
-#     to nextest as --test-threads. Override per run to cap cores: `JOBS=4 make test`.
-#     A value above the CPU count is clamped to it; a non-integer is an error.
+#   * JOBS is pinned to 4 for every cargo invocation, dev and release alike.
+#     It is exported as CARGO_BUILD_JOBS and passed to nextest as
+#     --test-threads; `.cargo/config.toml` sets the same 4 for a bare cargo
+#     call. An unset JOBS would mean "all cores" — pinning keeps wall-clock
+#     predictable and leaves headroom for the rest of the machine. A value
+#     above the core count is clamped to it; a non-integer is an error.
+#     Override per run: `JOBS=8 make test`.
+#   * Dev and test are the default path: incremental, opt-level 0, sccache,
+#     4 jobs. nextest is the only test runner (one process per test).
+#   * Release is the owner's path: every codegen optimisation, no incremental
+#     artifacts. Agents never run it — see AGENTS.md → Working agreement.
 #   * CARGO_INCREMENTAL is stripped because it outranks every profile;
 #     `Cargo.toml` decides instead (dev/test incremental, release not).
 #   * sccache is pinned to the repository wrapper. A host-exported
@@ -17,7 +25,8 @@
 #   * `NATIVE=1` appends `-C target-cpu=native` for the release path only.
 #   * On macOS the release binaries are ad-hoc codesigned before install. Pass
 #     a Developer ID to sign properly: `CODESIGN_IDENTITY="Developer ID ..."`.
-#   * `make all` is the whole pipeline: gates + release + install + verify.
+#   * `make all` is the owner's whole pipeline: gates + release + install +
+#     verify. Sessions stop at `make gates`.
 CARGO ?= cargo
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
@@ -28,7 +37,9 @@ CODESIGN_IDENTITY ?= -
 # `nproc` is coreutils, absent from a stock macOS; fall back to sysctl there so
 # the cap still means something. Both missing means one job.
 CORES := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
-JOBS ?= $(CORES)
+# Deliberately not $(CORES): the repo pins 4 everywhere so timings are stable
+# and the machine stays usable during a build. Raise it per run if needed.
+JOBS ?= 4
 RUSTC_WRAPPER = $(CURDIR)/scripts/sccache-rustc.sh
 
 # `NATIVE=1 make release` adds `-C target-cpu=native` on top of the release
@@ -54,13 +65,14 @@ export CARGO_BUILD_JOBS := $(JOBS)
 RUN := env -u CARGO_INCREMENTAL -u CARGO_BUILD_INCREMENTAL -u MAKEFLAGS -u MFLAGS \
 	RUSTC_WRAPPER=$(RUSTC_WRAPPER) $(CARGO)
 
-.PHONY: info dev check all release release-min sign install verify test test-integration ci-test fmt lint doc tools-export tools-export-check clean
+.PHONY: info dev check gates all release release-min sign install verify test test-integration ci-test fmt lint lint-dev doc tools-export tools-export-check clean
 
 # Show the effective knobs before a long run.
 info:
-	@echo "jobs=$(JOBS)/$(CORES) cargo=$(CARGO) bindir=$(BINDIR) identity=$(CODESIGN_IDENTITY) wrapper=$(RUSTC_WRAPPER) native=$(NATIVE) incremental=dev/test-on release-off"
+	@echo "jobs=$(JOBS) (pinned; $(CORES) cores available) cargo=$(CARGO) bindir=$(BINDIR) identity=$(CODESIGN_IDENTITY) wrapper=$(RUSTC_WRAPPER) native=$(NATIVE) incremental=dev/test-on release-off runner=nextest"
 
-# Full pipeline: gates, release build, codesign, install, verify.
+# Full owner pipeline: gates, release build, codesign, install, verify.
+# Agents stop at `make gates` — the release half belongs to the owner.
 all:
 	$(MAKE) --no-print-directory fmt
 	$(MAKE) --no-print-directory lint
@@ -68,16 +80,25 @@ all:
 	$(MAKE) --no-print-directory release
 	$(MAKE) --no-print-directory verify
 
-# Incremental, unoptimised build.
+# Incremental, unoptimised build — the default loop (sccache + 4 jobs).
 dev:
 	$(RUN) build
 
 check:
 	$(RUN) check --all-targets --features test-fixtures
 
-# Optimised build (fat LTO, one codegen unit, abort on panic, stripped) and
-# install of the three binaries into $(BINDIR). No incremental artifacts: the
-# profile turns them off and `RUN` strips the env var.
+# Dev-only pipeline: format, dev-profile clippy, both nextest suites. No
+# release build, no install — this is the agent and contributor path.
+gates:
+	$(MAKE) --no-print-directory fmt
+	$(MAKE) --no-print-directory lint-dev
+	$(MAKE) --no-print-directory test
+	$(MAKE) --no-print-directory test-integration
+
+# Owner-only. Optimised build (fat LTO, one codegen unit, abort on panic,
+# stripped) and install of the three binaries into $(BINDIR). No incremental
+# artifacts: the profile turns them off and `RUN` strips the env var.
+# sccache and the pinned 4 jobs still apply, exactly as in dev.
 release:
 	$(RUN) build --release
 	$(MAKE) install
@@ -129,15 +150,23 @@ ci-test:
 fmt:
 	$(RUN) fmt --all -- --check
 
+# Canonical clippy gate, owned by CI. It compiles for the release profile, so
+# a cold target dir makes it the slowest step in the loop.
 lint:
 	$(RUN) clippy --release --all-features -- -D warnings
+
+# The same lint set compiled for the dev profile — the fast local variant.
+# Use this while iterating; CI still runs `lint`.
+lint-dev:
+	$(RUN) clippy --all-features -- -D warnings
 
 doc:
 	$(RUN) doc --no-deps --all-features
 
 # Regenerate docs/TOOL_CATALOG.md + docs/tool-catalog.json from a live
 # tools/list handshake. `tools-export-check` exits 1 when the committed
-# export drifted from the binary in target/release.
+# export drifted from the binary in target/debug (the script follows
+# SSH_MCP_BUILD_PROFILE and per-binary SSH_MCP_*_BIN overrides).
 tools-export:
 	python3 scripts/export_tool_catalog.py
 

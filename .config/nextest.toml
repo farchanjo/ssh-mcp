@@ -5,9 +5,10 @@
 # cannot wedge its neighbours and global statics stay isolated per test.
 
 [profile.default]
-# Each test is a process, not a thread. `--test-threads $(JOBS)` from the
-# Makefile wins; this is the fallback for a bare `cargo nextest run`.
-test-threads = "num-cpus"
+# Each test is a process, not a thread. The repo pins 4 everywhere, so this
+# matches the Makefile's `--test-threads $(JOBS)` and keeps a bare
+# `cargo nextest run` on the same footing.
+test-threads = 4
 retries = 0
 fail-fast = false
 # Terminate a test after two 60 s periods, matching `pytest.ini`'s timeout.

@@ -42,7 +42,7 @@ name = "ssh_mcp"
 path = "src/lib.rs"
 
 # Loom-based concurrency invariant tests. The test functions are gated
-# `#[cfg(loom)]` so the default `cargo test` skips them.
+# `#[cfg(loom)]` so a default nextest run skips them.
 #
 # NOTE: full loom mode (`RUSTFLAGS="--cfg loom"`) currently fails to build the
 # wider workspace because russh / axum reach for `tokio::net::TcpStream`,
@@ -259,8 +259,10 @@ opt-level = 0
 opt-level = 0
 
 # Release: every codegen optimisation, no incremental artifacts, stripped
-# symbols. `panic = "abort"` drops landing pads; cargo keeps `unwind` for test
-# targets on its own, so `cargo test --release` still reports panics normally.
+# symbols. sccache and the pinned 4 jobs apply here exactly as in dev — only
+# the codegen knobs differ. `panic = "abort"` drops landing pads; cargo keeps
+# `unwind` for test targets on its own, so a release-profile test run still
+# reports panics normally.
 [profile.release]
 incremental = false
 opt-level = 3
