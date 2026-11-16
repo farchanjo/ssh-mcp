@@ -1529,8 +1529,8 @@ Retry only after changing the operative policy (lag, capacity, cleanup state). T
 #### [MAX_TRANSFERS_EXCEEDED] Per-session SFTP transfer cap reached
 
 - **Category:** POLICY
-- **Retryable:** conditional (after a transfer finishes)
-- **When:** `ssh_upload` / `ssh_download` would exceed `SSH_MAX_TRANSFERS_PER_SESSION`.
+- **Retryable:** conditional (after a running transfer finishes)
+- **When:** `ssh_upload` / `ssh_download` would exceed the per-session **running** transfer cap. Completed and failed transfers keep their snapshot but do not hold a slot.
 - **Why:** Transfer concurrency limit hit.
 - **Cure:** Wait for in-flight transfers to complete; retry.
 - **Prevention:** Serialise transfers when the workload tolerates it.

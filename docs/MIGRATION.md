@@ -1115,7 +1115,7 @@ The SFTP transport body landed in v7.0.0-alpha.4. `transport=Sftp` now drives a 
 SSH_MCP_E2E_HOST=vm.services \
 SSH_MCP_E2E_USER=root \
 SSH_MCP_E2E_KEY_PATH=~/.ssh/id_rsa \
-cargo test --features e2e-vm v7_rsync_e2e_vm -- --ignored --nocapture
+cargo nextest run --features e2e-vm v7_rsync_e2e_vm --run-ignored ignored-only --no-capture
 ```
 
 Defaults to `root@vm.services` with `~/.ssh/id_rsa`. The test pre-creates a synthetic source tree on the remote via `ssh_exec` (10 files, 2 nested dirs, 1 symlink, varied modes), drives `SftpRsyncTransport::start_session`, drains the `RsyncProgressEvent` lane to `SyncCompleted`, then verifies every file landed byte-identical (`sha256sum`), modes match (`stat -c '%a'`), and the symlink target resolved correctly (`readlink`).

@@ -13,18 +13,30 @@ Cross references:
 Four gates must stay green on every commit:
 
 ```bash
-sudo make all                                      # Gates + build + codesign + install + verify
-sudo make release                                  # Optimised, stripped + install to /usr/local/bin
+make gates                                         # Dev pipeline: fmt + dev clippy + both suites
 make dev                                           # Incremental debug build
-make test                                          # 2101 lib tests (nextest)
+make test                                          # 2103 lib tests (nextest)
 make test-integration                              # 167 integration tests across 12 binaries
 make fmt                                           # cargo fmt --check
-make lint                                          # Strict lint gate (production-only)
+make lint-dev                                      # Strict lint gate, dev profile (fast)
+make lint                                          # Strict lint gate, release profile (CI's)
+sudo make all                                      # OWNER ONLY: gates + release + codesign + install + verify
+sudo make release                                  # OWNER ONLY: optimised, stripped + install
 ```
 
-`JOBS` defaults to the CPU count and caps cargo and nextest parallelism
-(`JOBS=4 make test`); values above the core count clamp, non-integers abort. Raw cargo invocations still work; the wrappers only strip
-a stale `CARGO_INCREMENTAL` so the profiles decide.
+Builds are dev-profile by default. A release build costs minutes of fat LTO
+with one codegen unit and exists for the maintainer's install path — sessions
+and contributor loops stop at `make gates`.
+
+`JOBS` is pinned to **4** for cargo and nextest alike, in dev and release
+(`JOBS=8 make test` overrides); values above the core count clamp, non-integers
+abort. The same 4 is set in `.cargo/config.toml` (`[build] jobs`) and
+`.config/nextest.toml` (`test-threads`), so a bare `cargo build` or
+`cargo nextest run` gets it too. Unset would mean "all cores" — the pin keeps
+timings comparable and the host responsive. Raw cargo invocations still work;
+the wrappers only strip a stale `CARGO_INCREMENTAL` so the profiles decide.
+nextest is the only test runner in the loop: one process per test, so a hung
+SSH/SFTP/rsync adapter cannot wedge its neighbours.
 
 The dev and test profiles are incremental (`codegen-units = 256`, `opt-level =
 0`); release is not (`incremental = false`, `opt-level = 3`, fat LTO, one codegen
@@ -44,7 +56,7 @@ keeps incremental, release drops it and becomes cacheable.
 
 The canonical command `cargo clippy --release --all-features -- -D warnings` must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453).
 
-Production code stays under the full strict baseline; test code is gated by `cargo test --lib` (must keep green) plus `cargo build --release --all-targets` (must stay warning-free). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
+Production code stays under the full strict baseline; test code is gated by `cargo nextest run --lib` (must keep green) plus `cargo build --all-targets --features test-fixtures` (must stay warning-free — the fixture modules do not exist without the feature). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
 
 ### MSRV
 
@@ -75,8 +87,8 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 
 | Layer | Path | What it covers | Cost |
 |---|---|---|---|
-| Lib unit tests | `src/**/{mod,*}.rs::tests` | 2101 tests across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
-| `test-fixtures` | gated by `cargo test --features test-fixtures` | Use cases against deterministic adapters (`FakeClock`, `DeterministicIdGen`) for reproducible bug bisection. | seconds |
+| Lib unit tests | `src/**/{mod,*}.rs::tests` | 2103 tests across domain, application, adapters, infra. Use cases run against in-memory fakes when feasible. | seconds |
+| `test-fixtures` | gated by `cargo nextest run --features test-fixtures` | Use cases against deterministic adapters (`FakeClock`, `DeterministicIdGen`) for reproducible bug bisection. | seconds |
 | Integration tests | `tests/*.rs` | 167 active tests across 12 binaries: `v4_smoke` (2, wire-compat snapshot), `v5_smoke` (12), `v5_daemon_smoke` (7, against `ssh-mcp-tail daemon`), `v6_resume_smoke` (12, ADR 0010 SFTP resume), `v7_rsync_smoke` (9, ADR 0011 rsync hybrid), `chaos` (41, ADR-driven failure-mode coverage), `chaos_inline_push` (9, ADR 0012 inline push), `chaos_rsync` (16, ADR 0011 chaos), `property` (32, lifecycle / mux / lane invariants), `property_inline_push` (11, ADR 0012 ordering), `property_resume` (6, ADR 0010 resume arithmetic), `property_rsync` (10, ADR 0011 property). Most need `--features test-fixtures`. e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6) are gated `--features e2e-vm`. | tens of seconds |
 | Loom invariants | `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` + `tests/lockfree_invariants_inline_push.rs` (all `#[cfg(loom)]`) | 32 interleavings total: 20 in `lockfree_invariants` (v4 baseline + Phase 1 lifecycle + Phase 2 mux) + 7 in `lockfree_invariants_rsync` (RsyncSession state, rsync lane pause/resume, file-list ordering, sparse-file handling) + 5 in `lockfree_invariants_inline_push` (ADR 0012 inline-push atomics). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
 | Python integration | `scripts/test_*.py` | `requires_sshd` end-to-end suites against a real OpenSSH server. | minutes |
@@ -87,7 +99,7 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 `tests/lockfree_invariants.rs` is gated behind `#[cfg(loom)]`. To run:
 
 ```bash
-RUSTFLAGS="--cfg loom" cargo test --test lockfree_invariants --release
+RUSTFLAGS="--cfg loom" cargo nextest run --test lockfree_invariants
 ```
 
 The tests permute concurrent interleavings on:

@@ -15,11 +15,16 @@ Thanks for your interest in ssh-mcp. This guide is for contributors sending patc
 The four canonical gates that every PR must pass locally before review. CI runs the same set; failing any of them blocks merge.
 
 ```bash
-make release
-make fmt
-make lint
-make test
+make gates
 ```
+
+`make gates` is the dev pipeline — `fmt`, dev-profile clippy, then both nextest
+suites. Run the pieces individually when iterating (`make fmt`, `make lint-dev`,
+`make test`, `make test-integration`). Nextest is the only test runner, and every
+cargo invocation is pinned to 4 jobs. Release builds (`make release`,
+`make release-min`, `make all`) belong to the maintainer's install path and are
+not part of the contributor loop; CI covers the release-profile clippy gate with
+`make lint`.
 
 The `-D warnings` flag is non-negotiable: see the strict lint baseline declared in [`Cargo.toml`](Cargo.toml) and summarised in [AGENTS.md](AGENTS.md). Never silence a lint with `#[allow(...)]` to make CI green; fix the code instead. Every legitimate `#[allow(...)]` carries a `reason = "..."` (enforced by `clippy::allow_attributes_without_reason`).
 
@@ -73,11 +78,16 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 
 | Command | Scope | Notes |
 |---|---|---|
-| `make test` | 2101 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop; nextest runs one process per test. |
-| `make test-integration` | 167 integration tests including the v4 smoke (`tests/v4_smoke.rs`) | Snapshot-checks the markdown wire shape. |
+| `make test` (`cargo nextest run --lib`) | 2103 unit tests across `domain`, `application`, `adapters`, `infra` | Default fast loop; nextest runs one process per test. |
+| `make test-integration` (`cargo nextest run --tests --features test-fixtures`) | 167 integration tests including the v4 smoke (`tests/v4_smoke.rs`) | Snapshot-checks the markdown wire shape. |
 | `make check` (`--features test-fixtures`) | Compiles every target incl. use cases against deterministic in-memory adapters | Add this when authoring application-layer tests. |
-| `cargo test --features port_forward` (make `test` + cargo) | Toggles the `ssh_forward` tool and `forward://` resource | Keep parity for both feature combinations. |
-| `cargo +nightly test --cfg loom` (gated) | Loom invariants in `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` | Currently blocked by upstream tokio/loom incompatibility — see the test file header. |
+| `cargo nextest run --features port_forward` | Toggles the `ssh_forward` tool and `forward://` resource | Keep parity for both feature combinations. |
+| `RUSTFLAGS="--cfg loom" cargo nextest run --test lockfree_invariants` (gated) | Loom invariants in `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` | Currently blocked by upstream tokio/loom incompatibility — see the test file header. |
+
+Every cargo invocation is pinned to **4** jobs (`.cargo/config.toml`,
+`CARGO_BUILD_JOBS`, nextest's `test-threads`), and dev/test are incremental with
+sccache. Builds are dev-profile by default; a release build is the maintainer's
+call, not part of the contributor loop.
 
 Python integration suites under `scripts/test_*.py` and stress scripts under `scripts/stress_*.py` are optional locally but run on release branches. Ad-hoc developer workflow lives in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 

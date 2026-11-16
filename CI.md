@@ -10,9 +10,14 @@ Local + GitHub Actions gates run the same canonical command set. The gates that 
 | --- | --- | --- |
 | Build | `cargo build --release --all-features` | All three binaries (`ssh-mcp`, `ssh-mcp-stdio`, `ssh-mcp-tail`) compile clean with `port_forward` enabled |
 | Format | `cargo fmt --all -- --check` | Source tree matches `rustfmt` (Rust 2024 edition style) |
-| Lint | `cargo clippy --release --all-features --all-targets --workspace -- -D warnings` | Strict baseline: forbid (`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_*`) + deny (`pedantic`, `nursery`, `cargo`, lock-free invariants `await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_*`) |
-| Lib tests | `cargo test --lib --quiet` | 2101 unit tests against use cases, ports, adapters, domain entities |
-| Integration tests | `cargo test --tests --features test-fixtures --quiet` | 167 integration tests across 12 binaries (see matrix below) |
+| Lint | `cargo clippy --release --all-features -- -D warnings` | Strict baseline: forbid (`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_*`) + deny (`pedantic`, `nursery`, `cargo`, lock-free invariants `await_holding_lock`, `mutex_atomic`, `mutex_integer`, `significant_drop_*`). The `--all-targets` variant is **informational only** (`continue-on-error`): `forbid(unwrap_used/expect_used)` is incompatible with `#[tokio::test]` expansion and fails with E0453 in test targets. |
+| Lib tests | `cargo nextest run --lib` | 2103 unit tests against use cases, ports, adapters, domain entities |
+| Integration tests | `cargo nextest run --tests --features test-fixtures` | 167 integration tests across 12 binaries (see matrix below) |
+
+nextest is the only test runner — locally and in CI. `Cargo.toml` schedules
+(`--test-threads`, retries, timeouts) live in `.config/nextest.toml`; the job
+count is pinned to 4 everywhere (`CARGO_BUILD_JOBS`, `[build] jobs`,
+`test-threads`), so CI wall-clock tracks the local loop.
 
 ### PR Testing Workflows
 
@@ -23,8 +28,8 @@ The following gates run on every pull request:
 | Build | Compiles all three binaries on Linux + macOS | rust 1.99+ | `default,port_forward` |
 | Build (no-default) | Compiles without `port_forward` (38 tools, smaller binary) | rust 1.99+ | `--no-default-features` |
 | Fmt | `cargo fmt --all -- --check` | rust 1.99+ | n/a |
-| Clippy | Strict lint gate | rust 1.99+ | `--all-features --all-targets` |
-| Lib tests | 2101 unit tests | rust 1.99+ | default |
+| Clippy | Strict lint gate (`--all-features`; `--all-targets` informational) | rust 1.99+ | `--all-features` |
+| Lib tests | 2103 unit tests, nextest `ci` profile | rust 1.99+ | default |
 | Integration tests | 167 integration tests across 12 binaries | rust 1.99+ | `test-fixtures` |
 | Property tests | proptest suites (`property` 32 + `property_rsync` 9) | rust 1.99+ | `test-fixtures` |
 | Chaos tests | Adversarial scheduler suites (`chaos` 41 + `chaos_rsync` 16) | rust 1.99+ | `test-fixtures` |
@@ -90,11 +95,14 @@ Optional load profiles — not part of the PR gate, used for performance regress
 The full PR gate can be reproduced locally in one command:
 
 ```bash
-cargo build --release --all-features                                      \
- && cargo fmt --all -- --check                                            \
- && cargo clippy --release --all-features --all-targets --workspace -- -D warnings \
- && cargo test --lib --quiet                                              \
- && cargo test --tests --features test-fixtures --quiet
+cargo build --release --all-features                          \
+ && cargo fmt --all -- --check                                \
+ && cargo clippy --release --all-features -- -D warnings      \
+ && cargo nextest run --lib                                   \
+ && cargo nextest run --tests --features test-fixtures
 ```
+
+`make gates` is the same set without the release-profile halves — format, dev
+clippy and both nextest suites — and is the path to use while iterating.
 
 If any step fails, fix the code — never disable a lint to silence a warning, and never bypass a failing test with `#[ignore]` without an issue link.
