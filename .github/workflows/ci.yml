@@ -23,6 +23,9 @@ env:
   # the right optimisation level per build.
   CARGO_INCREMENTAL: "0"
   RUSTC_WRAPPER: ""
+  # Same pin as `.cargo/config.toml` / the Makefile: 4 everywhere, so CI
+  # wall-clock matches the local loop instead of scaling with runner size.
+  CARGO_BUILD_JOBS: "4"
 
 jobs:
   # ---------------------------------------------------------------------
@@ -80,6 +83,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [Linux, Windows, macOS]
+    env:
+      # The Python suites must drive the artifact this job builds and stages
+      # (release), not the debug tree nextest happens to leave behind.
+      SSH_MCP_BUILD_PROFILE: release
     steps:
       - uses: actions/checkout@v4
 
@@ -90,16 +97,25 @@ jobs:
       - name: Build release binaries
         run: cargo build --release
 
+      - name: Ensure cargo-nextest
+        shell: bash
+        run: |
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            cargo nextest --version
+          else
+            cargo install cargo-nextest --locked
+          fi
+
       - name: Lib tests
-        run: cargo test --lib --quiet
+        run: cargo nextest run --profile ci --lib
 
       - name: Integration tests (test-fixtures)
-        run: cargo test --tests --features test-fixtures --quiet
+        run: cargo nextest run --profile ci --tests --features test-fixtures
 
       - name: Loom invariants (informational — upstream russh/axum block full loom)
         continue-on-error: true
         shell: bash
-        run: RUSTFLAGS="--cfg loom" cargo test --tests --features test-fixtures --quiet
+        run: RUSTFLAGS="--cfg loom" cargo nextest run --tests --features test-fixtures
 
       - name: Set up Python venv
         shell: bash
@@ -114,14 +130,6 @@ jobs:
       - name: Install Python test deps
         shell: bash
         run: '$VPY -m pip install --quiet --upgrade pip pytest pytest-timeout paramiko requests'
-
-      - name: Expose extension-less binaries (fixtures hardcode target/release/ssh-mcp)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          for b in ssh-mcp ssh-mcp-stdio ssh-mcp-tail; do
-            cp "target/release/$b.exe" "target/release/$b"
-          done
 
       - name: Python MCP integration tests
         shell: bash
@@ -191,8 +199,17 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Ensure cargo-nextest
+        shell: bash
+        run: |
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            cargo nextest --version
+          else
+            cargo install cargo-nextest --locked
+          fi
+
       - name: Smoke (lib tests)
-        run: cargo test --lib --quiet
+        run: cargo nextest run --lib
 
       - name: Stage and package
         shell: bash
