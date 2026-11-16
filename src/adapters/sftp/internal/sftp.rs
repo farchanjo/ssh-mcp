@@ -35,6 +35,7 @@ use tracing::{error, info};
 
 use super::transfer::{CHUNK_SIZE, TransferStatus};
 use super::types::ProgressEvent;
+use crate::adapters::ssh::internal::client::open_session_with_retry;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
 
@@ -669,13 +670,18 @@ pub(super) fn decide_download_plan(
 ///
 /// Opens a new session channel, requests the "sftp" subsystem, and
 /// creates an `SftpSession` from the channel stream.
+///
+/// The channel open goes through
+/// [`open_session_with_retry`], so a transient `MaxSessions` /
+/// `RESOURCE_SHORTAGE` refusal — normal when transfers, shells, commands
+/// and rsync compete for OpenSSH's per-connection channel budget — backs
+/// off instead of surfacing as a permanent SFTP failure.
 pub async fn open_sftp_session(
     handle: &Arc<client::Handle<SshClientHandler>>,
 ) -> Result<SftpSession, String> {
-    let channel = handle
-        .channel_open_session()
+    let channel = open_session_with_retry(handle)
         .await
-        .map_err(|e| classify_transfer_error("open SFTP channel", &e.to_string()))?;
+        .map_err(|e| classify_transfer_error("open SFTP channel", &e))?;
 
     channel
         .request_subsystem(true, "sftp")

@@ -508,7 +508,11 @@ async fn open_and_exec_command(
 /// `execute + cancel` channel churn. Mirrors [`open_async_channel`] (the
 /// async path) so synchronous `ssh_exec` / `health_check` calls survive
 /// the same bursts instead of failing hard on a transient shortage.
-async fn open_session_with_retry(
+///
+/// Shared with the SFTP transfer path (`open_sftp_session`): transfers
+/// compete with shells, commands and rsync for the same per-connection
+/// `MaxSessions` budget, so a slot shortage there is just as transient.
+pub async fn open_session_with_retry(
     handle_arc: &Arc<client::Handle<SshClientHandler>>,
 ) -> Result<Channel<client::Msg>, String> {
     const MAX_ATTEMPTS: u32 = 25;
@@ -681,9 +685,12 @@ async fn handle_open_error(
 fn is_transient_open_error(msg: &str) -> bool {
     // OpenSSH surfaces `MaxSessions` exhaustion as `ConnectFailed` /
     // `Administratively prohibited`. `RESOURCE_SHORTAGE` is the RFC label.
-    msg.contains("ConnectFailed")
-        || msg.contains("RESOURCE_SHORTAGE")
-        || msg.contains("Administratively")
+    // Matching is case-insensitive: russh renders the variants with
+    // different capitalisation depending on the error path.
+    let lower = msg.to_lowercase();
+    lower.contains("connectfailed")
+        || lower.contains("resource_shortage")
+        || lower.contains("administratively")
 }
 
 /// Sleep the exponential backoff for `attempt`, or return `true` if cancelled.
@@ -1377,6 +1384,43 @@ mod tests {
         fn test_with_password_and_key() {
             let chain = build_auth_chain(Some("pass"), Some("/tmp/key"));
             assert!(!chain.is_empty());
+        }
+    }
+
+    mod transient_open_errors {
+        use super::*;
+
+        #[test]
+        fn max_sessions_and_resource_shortage_are_transient() {
+            // The three spellings OpenSSH / russh use when the per-connection
+            // channel budget is exhausted. Transfers share this retry path
+            // through `open_sftp_session`.
+            assert!(is_transient_open_error(
+                "ConnectFailed: channel open failure"
+            ));
+            assert!(is_transient_open_error(
+                "Channel open failure: RESOURCE_SHORTAGE"
+            ));
+            assert!(is_transient_open_error(
+                "Channel open failure: administratively prohibited: open failed"
+            ));
+        }
+
+        #[test]
+        fn non_exhaustion_errors_are_not_transient() {
+            assert!(!is_transient_open_error(
+                "Channel open failure: connection refused"
+            ));
+            assert!(!is_transient_open_error("EOF"));
+        }
+
+        #[test]
+        fn backoff_starts_at_100ms_and_caps_at_one_second() {
+            assert_eq!(open_backoff_ms(1), 100);
+            assert_eq!(open_backoff_ms(2), 200);
+            assert_eq!(open_backoff_ms(4), 800);
+            assert_eq!(open_backoff_ms(5), 1_000);
+            assert_eq!(open_backoff_ms(u32::MAX), 1_000);
         }
     }
 }
