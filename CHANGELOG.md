@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ssh_shell_open` no longer reports `INTERNAL_ERROR: shell <id> already exists` under load.** The use case inserts the new shell row while `RusshAdapter::open_shell`'s detached registration sink writes the same row concurrently; whichever landed second met `Entry::Occupied` and failed the open. The use case now treats an occupied row as success, overwrites it with its own entity (which carries the call's overrides), and propagates only genuine write failures (`src/application/open_shell.rs`, scenario 13 regression test).
+- **The transfer and rsync per-session caps now count running work, not history.** `MAX_TRANSFERS_EXCEEDED` fired on the 11th upload/download of a long-lived session (and on the 5th rsync) even with nothing in flight, because terminal rows stayed in the repository and were counted. Terminal rows are still preserved for `ssh_transfer_progress` / `ssh_rsync_stats` readers; `count_running_by_session` / `count_active_by_session` and the `insert_if_under_cap` guards now skip them.
+- **SFTP channel opens retry transient `MaxSessions` / `RESOURCE_SHORTAGE` refusals.** `open_sftp_session` now shares `open_session_with_retry` with the exec/shell path instead of failing the transfer on the first refusal, which is common when transfers compete with shells and commands for OpenSSH's per-connection channel budget.
+- **`ssh_disconnect` / `ssh_disconnect_agent` no longer report finished work as interrupted.** `TRANSFERS_ABORTED` and `COMMANDS_CANCELLED` counted every removed row, so a session whose ten uploads had completed reported `TRANSFERS_ABORTED: 10`. Terminal rows are still purged, but only running resources increment the counters.
+
+### Changed
+
+- **The dev loop is dev-profile only.** `make gates` runs format, dev-profile clippy and both nextest suites, and `make lint-dev` is the fast local lint; release builds (`make release`, `make all`) belong to the maintainer's install path. Every cargo invocation is pinned to 4 jobs (`.cargo/config.toml`, `CARGO_BUILD_JOBS`, nextest `test-threads`), and CI runs both suites through nextest.
+- **The Python suites resolve binaries through `scripts/helpers/paths.py`.** The dev profile is the default; `SSH_MCP_BUILD_PROFILE=release` or the per-binary `SSH_MCP_*_BIN` overrides retarget them. `run_all.sh` builds the 38-tool surface into its own target dir so it cannot overwrite the full binary, and the paramiko fixture reuses one process-wide host key so a recycled port never trips `known_hosts`.
+
 ## [7.1.2] — 2026-11-06
 
 Patch release. Nine tools advertised a JSON Schema the host could not resolve,

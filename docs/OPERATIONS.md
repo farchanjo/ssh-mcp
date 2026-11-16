@@ -551,7 +551,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/upload_file.rs::execute` | Reconnect via `ssh_connect`. |
-| `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap (10) reached. `DETAIL: limit=10`. | `src/application/upload_file.rs::execute` | Wait for an in-flight transfer or cancel one via session disconnect. |
+| `MAX_TRANSFERS_EXCEEDED` | Per-session **running** transfer cap (10) reached. `DETAIL: limit=10`. Completed transfers keep their snapshot but do not hold a slot. | `src/application/upload_file.rs::execute` | Wait for an in-flight transfer or cancel one via session disconnect. |
 | `LOCAL_FILE_ERROR` | `fs::metadata` failed on `local_path` (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `stat`) | Inspect `REASON`; verify path, permissions, and that the file is reachable locally. |
 | `LOCAL_NOT_FILE` | `local_path` resolved but is not a regular file (directory, symlink loop, special file). | `src/application/upload_file.rs::UploadFileUseCase::guard_local_path_is_file` | Pass an actual regular-file path. |
 | `RESUME_OVERSHOOT` *(v6.1)* | Destination is **larger** than the source — corrupted partial file or wrong target. STATE, no retry. | `src/application/upload_file.rs::UploadFileUseCase::resume_preflight` | Re-run with `resume=false` to overwrite, or pick the correct target path. |
@@ -565,7 +565,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/download_file.rs::execute` | Reconnect via `ssh_connect`. |
-| `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap (10) reached. `DETAIL: limit=10`. | `src/application/download_file.rs::execute` | Wait for an in-flight transfer. |
+| `MAX_TRANSFERS_EXCEEDED` | Per-session **running** transfer cap (10) reached. `DETAIL: limit=10`. Completed transfers keep their snapshot but do not hold a slot. | `src/application/download_file.rs::execute` | Wait for an in-flight transfer. |
 | `SFTP_OPEN_FAILED` | Failed to open the SFTP subsystem on the SSH session (tagged SFTP via `sftp_error_tag`). | `src/adapters/sftp/russh_sftp_adapter.rs::sftp_error_tag` (operation `open`) | Verify the remote host has SFTP enabled (`Subsystem sftp`); fall back to `ssh_exec` + manual `cat`. |
 | `REMOTE_METADATA_ERROR` | Remote `stat` failed during download — file missing, permission denied, transport blip mid-stat. | `src/adapters/sftp/russh_sftp_adapter.rs::stat_remote_size` | Inspect `REASON`; verify the remote path and the download user's permissions. |
 | `RESUME_OVERSHOOT` *(v6.1)* | Local destination is **larger** than the remote source. STATE, no retry. | `src/application/download_file.rs::DownloadFileUseCase::resume_preflight` | Re-run with `resume=false` to overwrite, or pick the correct target path. |
@@ -596,7 +596,7 @@ Modifier rules (enforced in `src/domain/keys.rs`):
 | Code | Trigger | Emitted from | Recommended action |
 |---|---|---|---|
 | `SESSION_NOT_FOUND` | No session with the given `SESSION_ID`. | `src/application/rsync_sync.rs::execute` | Reconnect via `ssh_connect`. |
-| `MAX_TRANSFERS_EXCEEDED` | Per-session transfer cap reached. | `src/application/rsync_sync.rs::execute` | Wait for an in-flight rsync session or cancel one via `ssh_rsync_cancel`. |
+| `MAX_TRANSFERS_EXCEEDED` | Per-session **active** rsync cap reached. Terminal sessions keep their snapshot but do not hold a slot. | `src/application/rsync_sync.rs::execute` | Wait for an in-flight rsync session or cancel one via `ssh_rsync_cancel`. |
 | `RSYNC_NOT_FOUND` | Remote `which rsync` failed AND `transport=Wire` was forced. RESOURCE, no retry on the same host. | `src/adapters/rsync/wire/probe.rs::probe_rsync` | Install `rsync >= 3.2.0` on the remote, or set `transport=Sftp` (or `transport=Auto` to fall through automatically). |
 | `RSYNC_VERSION_TOO_OLD` | Remote rsync protocol < v31 AND `transport=Wire` was forced. POLICY, conditional retry. | `src/adapters/rsync/wire/probe.rs::probe_rsync` | Upgrade remote rsync to >= 3.2.0, or set `transport=Sftp`. |
 | `RSYNC_PROTOCOL_ERROR` | Wire-compat negotiation failed mid-handshake (server rejected greeting / multiplex frame). TRANSPORT, retryable. | `src/adapters/rsync/wire/wire_transport.rs` | Inspect remote `rsync --server` stderr; retry, or fall back to `transport=Sftp`. |
@@ -916,7 +916,7 @@ The reference MCP client. Use it to diff what the server emits against what your
 
 Useful for diagnosing hung tasks (high CPU, daemon shutdown stalls). Compile with the appropriate feature; connect locally; identify the busy task.
 
-### `cargo test --features test-fixtures`
+### `cargo nextest run --features test-fixtures`
 
 Runs the use-case tests against deterministic in-memory adapters (`FakeClock`, `DeterministicIdGen`). When a production bug looks lifecycle-shaped, replicate it under the fixtures to bisect.
 

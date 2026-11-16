@@ -9,17 +9,21 @@ Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 ## Build commands
 
 ```bash
-cargo build --release                              # All binaries (default + port_forward)
-cargo build --release --bin ssh-mcp                # HTTP server (axum 0.8 + rmcp 1.6)
-cargo build --release --bin ssh-mcp-stdio          # Stdio MCP transport
-cargo build --release --bin ssh-mcp-tail           # NDJSON daemon
-cargo build --release --no-default-features        # No port forwarding
-cargo test --lib --quiet                           # 2101 lib tests
-cargo test --tests --features test-fixtures --quiet  # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10) + 32 loom invariants across lockfree_invariants + lockfree_invariants_rsync + lockfree_invariants_inline_push (gated #[cfg(loom)]) + 8 e2e VM tests (v7_rsync_e2e_vm 2 + v7_rsync_wire_e2e_vm 6, gated e2e-vm) + 24 Python integration tests in scripts/test_v7_rsync_*.py (22 passed + 2 xfailed; xfails cover deferred local-FS adapter for RsyncSftpFsPort)
-cargo test --features test-fixtures                # Use cases vs deterministic adapters
+cargo build                                        # Dev profile: incremental, sccache, 4 jobs
+cargo build --bin ssh-mcp                          # HTTP server (axum 0.8 + rmcp 1.6)
+cargo build --bin ssh-mcp-stdio                    # Stdio MCP transport
+cargo build --bin ssh-mcp-tail                     # NDJSON daemon
+cargo build --no-default-features --target-dir target/no-default-features  # 38-tool surface, separate tree
+cargo nextest run --lib                            # 2103 lib tests
+cargo nextest run --tests --features test-fixtures # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10) + 32 loom invariants across lockfree_invariants + lockfree_invariants_rsync + lockfree_invariants_inline_push (gated #[cfg(loom)]) + 8 e2e VM tests (v7_rsync_e2e_vm 2 + v7_rsync_wire_e2e_vm 6, gated e2e-vm) + 24 Python integration tests in scripts/test_v7_rsync_*.py (22 passed + 2 xfailed; xfails cover deferred local-FS adapter for RsyncSftpFsPort)
 cargo fmt --all -- --check
-cargo clippy --release --all-features -- -D warnings   # Strict lint gate (production-only)
+cargo clippy --all-features -- -D warnings         # Dev-profile lint — fast local loop
+cargo clippy --release --all-features -- -D warnings   # Canonical lint gate (owned by CI)
 ```
+
+nextest is the only test runner. `cargo test` (libtest) still compiles the same
+targets, but nothing in the loop calls it: nextest runs one process per test, so
+a hung SSH/SFTP/rsync adapter cannot wedge its neighbours.
 
 ### Fast dev loop
 
@@ -31,26 +35,47 @@ unit, `panic = "abort"`, stripped symbols. On macOS `make release` ad-hoc
 codesigns before install; `CODESIGN_IDENTITY` overrides the identity.
 
 ```bash
-sudo make all                                  # gates + build + sign + install + verify
+make gates                                     # dev pipeline: fmt + dev clippy + both suites
 make dev                                       # incremental debug build
 make test                                      # lib tests via nextest
 make test-integration                          # integration suite via nextest
 make ci-test                                   # same, `ci` profile + JUnit
-sudo make release                              # optimised build + install to /usr/local/bin
-make fmt lint check                            # gates
+make fmt lint-dev check                        # individual gates
+sudo make all                                  # OWNER ONLY: gates + release + sign + install + verify
+sudo make release                              # OWNER ONLY: optimised build + install to /usr/local/bin
 ```
 
-`JOBS` defaults to the CPU count and is exported as `CARGO_BUILD_JOBS`; cap
-cores per run with `JOBS=4 make dev`. Values above the core count clamp to it;
-non-integers abort before any work starts. The recipes strip a shell-exported
+`JOBS` is pinned to **4** for every cargo invocation — dev and release alike —
+and is exported as `CARGO_BUILD_JOBS`; `.cargo/config.toml` sets the same 4 for
+a bare `cargo build`, and `.config/nextest.toml` pins `test-threads = 4`. An
+unset `JOBS` would mean "all cores"; the pin keeps wall-clock comparable across
+machines and leaves the host usable during a build. Override per run with
+`JOBS=8 make dev` — values above the core count clamp to it, and non-integers
+abort before any work starts. The recipes strip a shell-exported
 `CARGO_INCREMENTAL` so the profiles decide instead, and pin `RUSTC_WRAPPER` to
 `scripts/sccache-rustc.sh` because an exported `RUSTC_WRAPPER` outranks
 `.cargo/config.toml`. `NATIVE=1 make release` adds `-C target-cpu=native` at
-the cost of portability and a full rebuild. `cargo test` (libtest) still works,
-but nextest is preferred: it runs one process per test, so a hung SSH/SFTP/rsync
-adapter cannot wedge its neighbours. Schedules live in `.config/nextest.toml` —
-`default` locally, `ci` with 2 retries and a JUnit report (needs a
-`junit`-feature nextest build).
+the cost of portability and a full rebuild. Schedules live in
+`.config/nextest.toml` — `default` locally, `ci` with 2 retries and a JUnit
+report (needs a `junit`-feature nextest build).
+
+### Working agreement — dev only
+
+**Agents work in the dev profile. Release builds are the owner's alone.**
+
+- Run `make dev`, `make gates`, `make test`, `make test-integration`,
+  `make fmt`, `make lint-dev`, `make check`. These are incremental, unoptimised
+  and the fastest path to a verified change.
+- **Never run `make release`, `make release-min`, `make all`, `make install`,
+  `make sign`, or any `cargo build --release`.** Fat LTO with one codegen unit
+  costs minutes per run and produces artifacts only the owner installs. If a
+  change seems to need a release build to verify, say so and stop there.
+- `make lint` (`clippy --release`) is the canonical CI gate and is also
+  release-profile; during a session use `make lint-dev`, which applies the
+  identical lint set under the dev profile.
+- CI is not covered by this rule: the `quality`, `build-test` and `release`
+  jobs in `.github/workflows/ci.yml` build release on every push and tag. That
+  is the owner's pipeline, not a session command.
 
 sccache 0.19 caches neither `-C incremental` crates (mozilla/sccache#236) nor
 `--crate-type bin`, so for this single-package workspace it only serves
@@ -264,7 +289,7 @@ Strict enforcement via `Cargo.toml` `[lints.clippy]`. Lock-free invariants are t
 
 All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disable a lint to silence a warning — fix the code instead.
 
-**Clippy gate is production-only.** The canonical command is `cargo clippy --release --all-features -- -D warnings` and must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453). Production code stays under the full strict baseline; test code is gated by `cargo test --lib` (must keep green) plus `cargo build --release --all-targets` (must stay warning-free). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
+**Clippy gate is production-only.** The canonical command is `cargo clippy --release --all-features -- -D warnings` and must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453). Production code stays under the full strict baseline; test code is gated by `cargo nextest run --lib` (must keep green) plus `cargo build --all-targets --features test-fixtures` (must stay warning-free — the feature is required, the fixture modules do not exist without it). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
 
 Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecycle adapter atomics, lane mpsc, mux fairness, cascade refcount): [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants).
 
@@ -275,7 +300,7 @@ Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecy
 - Use cases stay generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT; the dyn-safe slices (`LaneAdmin`) live alongside the async slice for cold-path operations.
 - Match exhaustively (no `_ =>` for closed enums; `wildcard_enum_match_arm = "deny"`).
 - `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 2101 ssh-mcp lib tests + 167 integration tests across 12 binaries (`v4_smoke` 2, `v5_smoke` 12, `v5_daemon_smoke` 7, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41, `chaos_inline_push` 9, `chaos_rsync` 16, `property` 32, `property_inline_push` 11, `property_resume` 6, `property_rsync` 10) + 32 loom invariants across 3 files (`tests/lockfree_invariants.rs` 20 + `tests/lockfree_invariants_rsync.rs` 7 + `tests/lockfree_invariants_inline_push.rs` 5, all gated `#[cfg(loom)]`) + 8 e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6, gated `e2e-vm`) + Python integration suites (`scripts/test_*.py`, including `scripts/test_v7_rsync_{http,stdio,vm}.py` 24 tests / 22 passed + 2 xfailed for the v7.0 `ssh_rsync` MCP surface) + 5 stress scripts (`scripts/stress_*.py`).
+- 2103 ssh-mcp lib tests + 167 integration tests across 12 binaries (`v4_smoke` 2, `v5_smoke` 12, `v5_daemon_smoke` 7, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41, `chaos_inline_push` 9, `chaos_rsync` 16, `property` 32, `property_inline_push` 11, `property_resume` 6, `property_rsync` 10) + 32 loom invariants across 3 files (`tests/lockfree_invariants.rs` 20 + `tests/lockfree_invariants_rsync.rs` 7 + `tests/lockfree_invariants_inline_push.rs` 5, all gated `#[cfg(loom)]`) + 8 e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6, gated `e2e-vm`) + Python integration suites (`scripts/test_*.py`, including `scripts/test_v7_rsync_{http,stdio,vm}.py` 24 tests / 22 passed + 2 xfailed for the v7.0 `ssh_rsync` MCP surface) + 5 stress scripts (`scripts/stress_*.py`).
 - Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
 - Loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`); 20 `#[test]` annotations covering lifecycle CAS race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity, mux fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, cursor advance under contention. Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum.
 

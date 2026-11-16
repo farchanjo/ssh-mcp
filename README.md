@@ -105,7 +105,7 @@ Scheme | Channel | Producer
 
 This server is tested using a layered local + CI gate. To learn more about testing, refer to [CI.md](CI.md).
 
-Quick numbers — **2101 lib tests** + **167 integration tests** across 12 binaries + **32 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **24 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
+Quick numbers — **2103 lib tests** + **167 integration tests** across 12 binaries + **32 loom invariants** + **8 e2e VM tests** (gated `e2e-vm`) + **24 Python integration tests** for the v7.0 `ssh_rsync` MCP surface (`scripts/test_v7_rsync_*.py`).
 
 ## Installation
 
