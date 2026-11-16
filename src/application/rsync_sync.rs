@@ -585,9 +585,13 @@ where
         }
     }
 
+    /// Reject the request when the per-session rsync cap is reached.
+    ///
+    /// Only active rows count. Completed / failed / cancelled rows stay
+    /// queryable through `ssh_rsync_stats`, but no longer hold a slot.
     async fn guard_session_cap(&self, session_id: &SessionId) -> Result<(), DomainError> {
         let cap = self.config.max_rsync_per_session();
-        let count = self.rsync_repo.count_by_session(session_id).await?;
+        let count = self.rsync_repo.count_active_by_session(session_id).await?;
         if count >= cap {
             Err(DomainError::MaxTransfersExceeded { limit: cap })
         } else {
@@ -870,6 +874,7 @@ mod tests {
     use crate::domain::error::DomainError;
     use crate::domain::identity::Address;
     use crate::domain::ids::SessionId;
+    use crate::domain::rsync::RsyncSession;
     use crate::domain::rsync_ids::RsyncId;
     use crate::domain::session::SessionEntity;
     use crate::ports::rsync_repo::RsyncRepository;
@@ -1139,15 +1144,21 @@ mod tests {
 
     #[tokio::test]
     async fn cap_enforces_max_rsync_per_session() {
-        // EnvConfig default for max_rsync_per_session is 4. Drive 4
-        // successful inserts then expect MaxTransfersExceeded on the 5th.
-        let (uc, _wire, sftp, _sftp_fs, _ssh, _repo, session_id) = fixture().await;
+        // EnvConfig default for max_rsync_per_session is 4. Seed four
+        // active sessions directly — driving them through `execute` would
+        // let the spawned progress pump race every session to a terminal
+        // state — then expect MaxTransfersExceeded on the fifth.
+        let (uc, _wire, sftp, _sftp_fs, _ssh, repo, session_id) = fixture().await;
         for i in 0..4 {
-            sftp.queue_start_ok(RsyncId::new(format!("rs-{i}")), false);
-            uc.execute(req(&session_id, RsyncTransportSelection::Sftp))
+            let seeded = Arc::new(RsyncSession::new(
+                RsyncId::new(format!("rs-active-{i}")),
+                session_id.clone(),
+            ));
+            repo.insert_if_under_cap(seeded, 4)
                 .await
-                .expect("ok");
+                .expect("under cap");
         }
+        sftp.queue_start_ok(RsyncId::new("rs-overflow".to_string()), false);
         let err = uc
             .execute(req(&session_id, RsyncTransportSelection::Sftp))
             .await
@@ -1156,6 +1167,40 @@ mod tests {
             DomainError::MaxTransfersExceeded { limit } => assert_eq!(limit, 4),
             other => panic!("expected cap error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_rsync_sessions_do_not_consume_the_cap() {
+        // Four terminal sessions fill the bucket; a live one must still
+        // start. The spawned pump may or may not have flipped the new
+        // session terminal by the time we assert, so only the upper bound
+        // is pinned here.
+        let (uc, _wire, sftp, _sftp_fs, _ssh, repo, session_id) = fixture().await;
+        for i in 0..4 {
+            let seeded = Arc::new(RsyncSession::new(
+                RsyncId::new(format!("rs-done-{i}")),
+                session_id.clone(),
+            ));
+            seeded.fail();
+            repo.insert_if_under_cap(seeded, 4)
+                .await
+                .expect("terminal insert");
+        }
+        sftp.queue_start_ok(RsyncId::new("rs-live".to_string()), false);
+        uc.execute(req(&session_id, RsyncTransportSelection::Sftp))
+            .await
+            .expect("terminal sessions must not block a new rsync");
+        assert!(
+            repo.count_active_by_session(&session_id)
+                .await
+                .expect("count active")
+                <= 1
+        );
+        assert_eq!(
+            repo.count_by_session(&session_id).await.expect("count all"),
+            5,
+            "terminal sessions must be preserved"
+        );
     }
 
     #[tokio::test]

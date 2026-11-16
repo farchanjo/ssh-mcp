@@ -34,8 +34,9 @@ pub trait LocalRsyncRepository: Sync {
     async fn insert(&self, entity: Arc<RsyncSession>) -> Result<(), DomainError>;
 
     /// Atomic check-and-insert: insert `entity` only if the count of
-    /// rsync sessions owned by `entity.session_id()` is strictly
-    /// below `cap`. Closes the same TOCTOU race
+    /// **active** rsync sessions owned by `entity.session_id()` is
+    /// strictly below `cap`. Terminal sessions are ignored — see
+    /// [`Self::count_active_by_session`]. Closes the same TOCTOU race
     /// [`crate::ports::transfer_repo::TransferRepository::insert_if_under_cap`]
     /// closes for transfers.
     ///
@@ -65,12 +66,25 @@ pub trait LocalRsyncRepository: Sync {
     /// Returns [`DomainError::Storage`] on backend failure.
     async fn remove(&self, id: &RsyncId) -> Result<Option<Arc<RsyncSession>>, DomainError>;
 
-    /// Count rsync sessions owned by `session_id`.
+    /// Count rsync sessions owned by `session_id`, terminal rows
+    /// included.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::Storage`] on backend failure.
     async fn count_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError>;
+
+    /// Count rsync sessions owned by `session_id` that have not reached a
+    /// terminal state.
+    ///
+    /// Terminal sessions stay queryable through [`Self::list_filtered`]
+    /// and `ssh_rsync_stats`, but must not keep consuming the per-session
+    /// concurrency budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Storage`] on backend failure.
+    async fn count_active_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError>;
 
     /// List rsync sessions filtered by optional session id.
     ///

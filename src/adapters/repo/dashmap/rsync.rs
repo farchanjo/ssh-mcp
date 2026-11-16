@@ -45,6 +45,22 @@ impl DashMapRsyncRepo {
             .insert(rsync_id.clone());
     }
 
+    /// `true` when `id` resolves to a session that has not reached a
+    /// terminal state. A missing row counts as not active.
+    fn is_active(&self, id: &RsyncId) -> bool {
+        self.by_id
+            .get(id)
+            .is_some_and(|entry| !entry.value().status().is_terminal())
+    }
+
+    /// Count the active rows referenced by a session bucket.
+    ///
+    /// The caller holds the bucket's shard guard; `by_id` is a different
+    /// map, so taking it here opens no nested-guard window.
+    fn count_active_in_bucket(&self, bucket: &HashSet<RsyncId>) -> usize {
+        bucket.iter().filter(|id| self.is_active(id)).count()
+    }
+
     /// Detach an rsync id from its session bucket and drop the bucket
     /// when it becomes empty.
     fn deindex_session(&self, session_id: &SessionId, rsync_id: &RsyncId) {
@@ -90,7 +106,7 @@ impl RsyncRepository for DashMapRsyncRepo {
         // the membership update happen atomically against any other
         // `insert_if_under_cap` racing on the same session.
         let mut bucket = self.by_session.entry(session_id).or_default();
-        if bucket.len() >= cap {
+        if self.count_active_in_bucket(&bucket) >= cap {
             return Err(DomainError::MaxTransfersExceeded { limit: cap });
         }
         let result = match self.by_id.entry(id.clone()) {
@@ -124,6 +140,17 @@ impl RsyncRepository for DashMapRsyncRepo {
             .by_session
             .get(session_id)
             .map_or(0, |bucket| bucket.len()))
+    }
+
+    async fn count_active_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError> {
+        // Clone the ids out before touching `by_id` so no bucket guard is
+        // held while the per-row shard lookups run.
+        let ids: Vec<RsyncId> = self
+            .by_session
+            .get(session_id)
+            .map(|bucket| bucket.iter().cloned().collect())
+            .unwrap_or_default();
+        Ok(ids.iter().filter(|id| self.is_active(id)).count())
     }
 
     async fn list_filtered(
@@ -274,6 +301,35 @@ mod tests {
             DomainError::MaxTransfersExceeded { limit } => assert_eq!(limit, cap),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn insert_if_under_cap_ignores_terminal_rows() {
+        // Terminal sessions stay queryable but must release their slot.
+        let repo = DashMapRsyncRepo::new();
+        let cap = 2_usize;
+        for i in 0..cap {
+            let done = fresh(&format!("rs-done-{i}"), "s-cap");
+            done.complete();
+            repo.insert_if_under_cap(done, cap)
+                .await
+                .expect("terminal insert");
+        }
+        repo.insert_if_under_cap(fresh("rs-live", "s-cap"), cap)
+            .await
+            .expect("terminal rows must not consume the cap");
+        let session = SessionId::new("s-cap".to_string());
+        assert_eq!(
+            repo.count_by_session(&session).await.expect("count all"),
+            3,
+            "terminal rows must be preserved"
+        );
+        assert_eq!(
+            repo.count_active_by_session(&session)
+                .await
+                .expect("count active"),
+            1
+        );
     }
 
     #[tokio::test]
