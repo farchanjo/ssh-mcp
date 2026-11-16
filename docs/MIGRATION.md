@@ -864,6 +864,18 @@ Operational follow-on:
 - [RESOURCES.md](./RESOURCES.md) — resource scheme contract.
 - [CONFIGURATION.md](./CONFIGURATION.md) — full env var table.
 
+## v7.1.2 → v7.1.3 (bug-fix patch)
+
+For **everyone** on v7.1.2. **Nothing to do** — no tool string, response envelope, structured-content key, error code, or env-var default changed; a v7.1.2 client is byte-identical against a v7.1.3 server. Upgrade is a binary swap with no config, wire, or on-disk migration.
+
+Behaviour deltas worth knowing:
+
+- The per-session transfer cap (10) and rsync cap (4) now count **running** work. Terminal rows stay observable through `ssh_transfer_progress` / `ssh_rsync_stats` but release the slot, so a long-lived session no longer fails on the 11th upload/download or the 5th rsync.
+- `open_sftp_session` retries transient `MaxSessions` / `RESOURCE_SHORTAGE` refusals (25 attempts, 100 ms → 1 s backoff), matching the exec and shell paths.
+- `TRANSFERS_ABORTED` / `COMMANDS_CANCELLED` on `ssh_disconnect` / `ssh_disconnect_agent` count only resources that were still running; terminal rows are still purged.
+
+Contributor-side: the dev loop is dev-profile only (`make gates`, `make lint-dev`), every cargo invocation is pinned to 4 jobs, nextest is the only test runner, and the Python suites resolve binaries through `scripts/helpers/paths.py` (`SSH_MCP_BUILD_PROFILE=release` retargets them).
+
 ## v7.1.0 → v7.1.1 (bug-fix patch)
 
 For **everyone** on v7.1.0. Pure correctness/leak patch — **nothing to do**. No tool string, response envelope, structured-content key, error code, or env-var default changed; a v7.1.0 client is byte-identical against a v7.1.1 server. Upgrade is a binary swap with no config, wire, or on-disk migration.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.3] — 2026-11-16
+
+Patch release. Two session-limit traps (the shell-open row race and the
+cumulative transfer/rsync caps), a transient `MaxSessions` refusal on the SFTP
+open path, and disconnect counters that reported finished work as interrupted.
+**Fully backwards compatible with `[7.1.2]`** — no tool string, env-var
+default, response envelope, or structured-content key changed. The
+`[Cargo.toml]` package version is bumped from `7.1.2` to `7.1.3`;
+`[Cargo.lock]` is refreshed in lockstep.
+
 ### Fixed
 
 - **`ssh_shell_open` no longer reports `INTERNAL_ERROR: shell <id> already exists` under load.** The use case inserts the new shell row while `RusshAdapter::open_shell`'s detached registration sink writes the same row concurrently; whichever landed second met `Entry::Occupied` and failed the open. The use case now treats an occupied row as success, overwrites it with its own entity (which carries the call's overrides), and propagates only genuine write failures (`src/application/open_shell.rs`, scenario 13 regression test).

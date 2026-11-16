@@ -1,9 +1,9 @@
-# Session resume — ssh-mcp v7.1.2 shell-open race + dev-loop hardening
+# Session resume — ssh-mcp v7.1.3 session-limit patch + dev-loop hardening
 
 **Last touched:** 2026-11-16
 **Repo:** `/root/dev/ssh-mcp`
 **Branch:** `master` (in sync with `origin/master` at session start)
-**Latest tag:** `v7.1.2`
+**Latest tag:** `v7.1.3`
 
 ## What is in flight (uncommitted, verified)
 
@@ -108,19 +108,18 @@ dev-only loop; CHANGELOG `[Unreleased]` entry added.
 
 ## Open items
 
-1. Commit the series as contextual commits (fix / build / ci / scripts / fixtures / docs / session).
-2. `git push origin master`.
-3. Owner decision: cut `v7.1.3` (version bump + tag + release notes) or leave the
-   fix under `[Unreleased]`.
-4. Optional carry-over: `clap` `--version` / `--help` on `ssh-mcp` and
+1. ~~Commit the series as contextual commits.~~ Done (11 commits, `d632611..2dd916a`).
+2. ~~Cut `v7.1.3`.~~ Done — bump, release build, install, tag and push in this
+   session (owner-authorised).
+3. Optional carry-over: `clap` `--version` / `--help` on `ssh-mcp` and
    `ssh-mcp-stdio` so deploy validation has a clean `exit 0` path.
 
 ## Ground truth (for any agent dispatched next session)
 
 | key | value | source |
 |---|---|---|
-| version | 7.1.2 | Cargo.toml |
-| lib_tests_passed | 2103 | `cargo nextest run --lib` |
+| version | 7.1.3 | Cargo.toml |
+| lib_tests_passed | 2114 | `cargo nextest run --lib` |
 | integration_tests | 167 across 12 binaries | tests/ |
 | loom_invariants | 32 across 3 files | tests/lockfree_invariants*.rs |
 | rsync_proto_advertised | 32 (downgrades to 31 via min(local, remote)) | src/adapters/rsync/wire/session.rs |
