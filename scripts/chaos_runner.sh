@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v5 Phase 5 — chaos test orchestration.
 #
-# Wraps `cargo test --features test-fixtures --test chaos` with a
+# Wraps `cargo nextest run --features test-fixtures --test chaos` with a
 # summary report. Optional `--release` flag runs the suite under
 # release optimisations.
 #
@@ -30,32 +30,33 @@ trap cleanup EXIT
 
 echo "chaos_runner: profile=${PROFILE_FLAG:-debug} filter='${FILTER}'" >&2
 
-# Shellcheck appeases on the array vs string `$FILTER` expansion.
-if [[ -n "$FILTER" ]]; then
-    cargo test ${PROFILE_FLAG} \
-        --features test-fixtures \
-        --test chaos \
-        -- "$FILTER" --nocapture \
-        2>&1 | tee "$LOG_FILE"
-else
-    cargo test ${PROFILE_FLAG} \
-        --features test-fixtures \
-        --test chaos \
-        -- --nocapture \
-        2>&1 | tee "$LOG_FILE"
-fi
+# A failing run must still reach the summary, so the pipeline runs with `set +e`
+# and the runner's exit status is captured from PIPESTATUS instead.
+# shellcheck disable=SC2086  # PROFILE_FLAG and FILTER are intentionally word-split.
+set +e
+cargo nextest run ${PROFILE_FLAG} \
+    --features test-fixtures \
+    --test chaos \
+    --no-capture \
+    ${FILTER} \
+    2>&1 | tee "$LOG_FILE"
+RUN_STATUS=${PIPESTATUS[0]}
+set -e
 
-PASS=$(grep -c "^test .* \.\.\. ok$" "$LOG_FILE" || true)
-FAIL=$(grep -c "^test .* \.\.\. FAILED$" "$LOG_FILE" || true)
-SKIP=$(grep -c "^test .* \.\.\. ignored$" "$LOG_FILE" || true)
+# nextest's closing line reads "N tests run: P passed, F failed, S skipped";
+# the `failed` segment is omitted on a clean run.
+SUMMARY="$(grep -E 'Summary \[' "$LOG_FILE" | tail -1 || true)"
+PASS=$(grep -oE '[0-9]+ passed' <<<"$SUMMARY" | grep -oE '[0-9]+' || true)
+FAIL=$(grep -oE '[0-9]+ failed' <<<"$SUMMARY" | grep -oE '[0-9]+' || true)
+SKIP=$(grep -oE '[0-9]+ skipped' <<<"$SUMMARY" | grep -oE '[0-9]+' || true)
 
 echo "" >&2
 echo "chaos_runner summary:" >&2
-echo "  passed:  ${PASS}" >&2
-echo "  failed:  ${FAIL}" >&2
-echo "  skipped: ${SKIP}" >&2
+echo "  passed:  ${PASS:-0}" >&2
+echo "  failed:  ${FAIL:-0}" >&2
+echo "  skipped: ${SKIP:-0}" >&2
 
-if [[ "$FAIL" -gt 0 ]]; then
+if [[ "${FAIL:-0}" -gt 0 || "$RUN_STATUS" -ne 0 ]]; then
     exit 1
 fi
 exit 0

@@ -36,9 +36,14 @@ cd "$CRATE_ROOT"
 
 echo "soak_24h: duration ${DURATION_S}s sample ${SAMPLE_INTERVAL_S}s csv=${METRICS_CSV}" >&2
 
-# Build the daemon binary first so the runtime cost doesn't taint
-# the first sample.
-cargo build --release --bin ssh-mcp-tail >/dev/null
+# Build the daemon binary first so the runtime cost doesn't taint the first
+# sample. The build follows SSH_MCP_BUILD_PROFILE so the binary the soak runs
+# is always the one this step produced; SOAK_BIN still wins as an override.
+PROFILE_DIR="${SSH_MCP_BUILD_PROFILE:-debug}"
+SOAK_BIN="${SOAK_BIN:-$CRATE_ROOT/target/$PROFILE_DIR/ssh-mcp-tail}"
+BUILD_FLAG=""
+[ "$PROFILE_DIR" = release ] && BUILD_FLAG="--release"
+cargo build $BUILD_FLAG --bin ssh-mcp-tail >/dev/null
 
 # Spawn a background dummy daemon. To prevent the daemon from
 # observing EOF on stdin (which triggers a graceful shutdown), we
@@ -63,7 +68,7 @@ trap cleanup EXIT INT TERM
 # the configured duration plus a 30s buffer so the daemon never sees
 # EOF on stdin.
 SLEEP_DURATION=$((DURATION_S + 30))
-( sleep "$SLEEP_DURATION" ) | ./target/release/ssh-mcp-tail daemon >>"$LOG_FILE" 2>&1 &
+( sleep "$SLEEP_DURATION" ) | "$SOAK_BIN" daemon >>"$LOG_FILE" 2>&1 &
 DAEMON_PID=$!
 sleep 1
 

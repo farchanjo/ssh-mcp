@@ -2,7 +2,7 @@
 # Smoke + stress + chaos runner for ssh-mcp v4.3 Python integration tests.
 #
 # Workflow:
-# 1. Build the release binaries (default features + no-default-features).
+# 1. Build the dev binaries (default features + no-default-features).
 # 2. Run pytest across all `scripts/test_*.py` files.
 # 3. Run the four stress scripts (each prints JSON to stdout for grep-ability).
 # 4. Run the four chaos scripts (per-event JSON lines + final summary).
@@ -17,13 +17,26 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "=== build release binaries ==="
-cargo build --release --bins
-cargo build --release --bins --no-default-features
+echo "=== build dev binaries ==="
+cargo build --bins
+# The 38-tool surface gets its own target dir. Building it in the main tree
+# overwrites target/<profile>/ssh-mcp with the reduced catalogue, and every
+# fixture that resolves a binary by profile then drives the wrong server
+# without saying so — which is what the old release-last ordering did.
+cargo build --bins --no-default-features --target-dir target/no-default-features
 
-export PATH="$REPO_ROOT/target/release:$PATH"
-export SSH_MCP_BIN="$REPO_ROOT/target/release/ssh-mcp"
-export SSH_MCP_STDIO_BIN="$REPO_ROOT/target/release/ssh-mcp-stdio"
+# Dev profile is the default for the whole Python suite; the fixtures resolve
+# target/debug unless SSH_MCP_BUILD_PROFILE says otherwise. A caller-supplied
+# per-binary override wins over the profile directory.
+BIN_DIR="$REPO_ROOT/target/${SSH_MCP_BUILD_PROFILE:-debug}"
+EXT=""
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) EXT=".exe" ;;
+esac
+export PATH="$BIN_DIR:$PATH"
+export SSH_MCP_BIN="${SSH_MCP_BIN:-$BIN_DIR/ssh-mcp$EXT}"
+export SSH_MCP_STDIO_BIN="${SSH_MCP_STDIO_BIN:-$BIN_DIR/ssh-mcp-stdio$EXT}"
+export SSH_MCP_TAIL_BIN="${SSH_MCP_TAIL_BIN:-$BIN_DIR/ssh-mcp-tail$EXT}"
 
 echo
 echo "=== pytest suite ==="

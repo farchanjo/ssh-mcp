@@ -1,7 +1,9 @@
 """Shared pytest fixtures for ssh-mcp v3 integration tests.
 
-The HTTP fixture spawns ``target/release/ssh-mcp`` on a free port; the stdio
-fixture spawns ``target/release/ssh-mcp-stdio`` directly.
+The HTTP fixture spawns ``target/debug/ssh-mcp`` on a free port; the stdio
+fixture spawns ``target/debug/ssh-mcp-stdio`` directly. Set
+``SSH_MCP_BUILD_PROFILE=release`` (or a per-binary ``SSH_MCP_*_BIN`` override)
+to drive the other tree — see :mod:`helpers.paths`.
 
 Tests that exercise real SSH connectivity must be marked with
 ``@pytest.mark.requires_sshd`` and read the target endpoint from the
@@ -23,12 +25,15 @@ from typing import Iterator
 
 import pytest
 
+from . import paths
 from .mcp_client import HttpTransport, McpClient, StdioTransport
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-HTTP_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp"
-STDIO_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp-stdio"
+HTTP_BIN = paths.http_bin()
+STDIO_BIN = paths.stdio_bin()
+TAIL_BIN = paths.tail_bin()
+REPO_ROOT = paths.REPO_ROOT
+BIN_DIR = paths.bin_dir()
 
 
 def stress_transport_mode() -> str:

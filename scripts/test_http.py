@@ -1,6 +1,7 @@
 """Integration tests for ssh-mcp v3 HTTP transport (rmcp 1.6 streamable-http).
 
-Every test runs against a freshly spawned ``target/release/ssh-mcp`` bound to
+Every test runs against a freshly spawned ``ssh-mcp`` from the active cargo
+profile (``target/debug`` by default — see :mod:`helpers.paths`) bound to
 a free port. SSH-touching tests are gated by the ``@pytest.mark.requires_sshd``
 marker and skipped automatically when ``SSH_MCP_TEST_TARGET`` is unset.
 """
@@ -12,7 +13,12 @@ import time
 
 import pytest
 
-from helpers.mcp_client import McpClient, call_tool_text, make_session_id
+from helpers.mcp_client import (
+    McpClient,
+    call_tool_pair,
+    call_tool_text,
+    make_session_id,
+)
 from helpers.parse_block import parse_block
 
 
@@ -246,12 +252,22 @@ def test_shell_open_write_read_close(http_client: McpClient, ssh_target) -> None
 
 
 @pytest.mark.requires_sshd
-def test_shell_send_key_ctrl_c_breaks_yes(http_client: McpClient, ssh_target) -> None:
-    """Send Ctrl+C to a shell running ``yes`` and verify the shell stays alive.
+def test_shell_send_key_ctrl_c_breaks_runaway_loop(
+    http_client: McpClient, ssh_target
+) -> None:
+    """Send Ctrl+C to a shell running a runaway loop; the shell must survive.
 
     Requires a real PTY at the SSH server side (the local paramiko fixture
     in ``helpers.local_sshd`` wires ``/bin/sh -i`` through ``pty.openpty()``
     so signal-bearing keystrokes propagate as SIGINT).
+
+    The loop is throttled on purpose. A bare ``yes`` outruns the fixture's
+    transport socket — the PTY producer writes far faster than paramiko can
+    frame — and the shell stalls on a full output buffer before the behaviour
+    under test is observable. The contract is unchanged: the keystroke must
+    reach the foreground process as SIGINT, and the shell must stay usable.
+    A surviving shell proves the signal landed, because ``sh`` only reads the
+    next command once the foreground loop has exited.
     """
     text = call_tool_text(
         http_client, "ssh_connect", ssh_target.connect_args(agent_id="http-key")
@@ -264,12 +280,20 @@ def test_shell_send_key_ctrl_c_breaks_yes(http_client: McpClient, ssh_target) ->
     ).get("shell_id")
     assert shell_id
 
-    call_tool_text(http_client, "ssh_shell_write", {"shell_id": shell_id, "input": "yes\n"})
+    call_tool_text(
+        http_client,
+        "ssh_shell_write",
+        {"shell_id": shell_id, "input": "while :; do echo y; sleep 0.01; done\n"},
+    )
     time.sleep(0.5)
     text = call_tool_text(http_client, "ssh_shell_press", {"shell_id": shell_id, "key": "ctrl_c"})
     parsed = parse_block(text)
     assert parsed.get("__status") == "OK"
     assert parsed.get("key") == "ctrl_c"
+
+    # Advance the read cursor past whatever the loop emitted before the signal
+    # landed, so the next read window is not dominated by it.
+    call_tool_text(http_client, "ssh_shell_read", {"shell_id": shell_id, "wait": False})
 
     # Shell should still be alive — verify by reading something simple.
     call_tool_text(http_client, "ssh_shell_write", {"shell_id": shell_id, "input": "echo POST_CTRL_C\n"})
@@ -380,6 +404,72 @@ def test_upload_download_progress(http_client: McpClient, ssh_target, tmp_path) 
     assert dst.exists() and dst.read_bytes() == payload
 
     call_tool_text(http_client, "ssh_disconnect", {"session_id": sid})
+
+
+@pytest.mark.requires_sshd
+def test_more_than_ten_sequential_uploads_on_one_session(
+    http_client: McpClient, ssh_target, tmp_path
+) -> None:
+    """Twelve sequential uploads on a single session must all start.
+
+    The per-session cap (10) counts *running* transfers, not history.
+    Before the fix the 11th upload failed with ``MAX_TRANSFERS_EXCEEDED``
+    even though nothing was in flight, because terminal rows were never
+    purged from the repository.
+    """
+    payload = b"cap-regression " * 16
+    src = tmp_path / "small.bin"
+    src.write_bytes(payload)
+    remote_dir = f"/tmp/ssh-mcp-http-cap-{os.getpid()}"
+
+    text = call_tool_text(
+        http_client, "ssh_connect", ssh_target.connect_args(agent_id="http-cap")
+    )
+    sid = parse_block(text).get("session_id")
+    assert sid
+
+    cid = parse_block(
+        call_tool_text(
+            http_client,
+            "ssh_exec",
+            {"session_id": sid, "command": f"mkdir -p {remote_dir}"},
+        )
+    ).get("command_id")
+    call_tool_text(
+        http_client, "ssh_exec_output", {"command_id": cid, "wait": True}, timeout=15
+    )
+
+    for index in range(12):
+        response = call_tool_text(
+            http_client,
+            "ssh_upload",
+            {
+                "session_id": sid,
+                "local_path": str(src),
+                "remote_path": f"{remote_dir}/f{index}.bin",
+            },
+        )
+        parsed = parse_block(response)
+        assert parsed.get("__status") == "STARTED", f"upload {index} failed: {response}"
+        transfer_id = parsed.get("transfer_id")
+        assert transfer_id
+        finished = parse_block(
+            call_tool_text(
+                http_client,
+                "ssh_transfer_progress",
+                {"transfer_id": transfer_id, "wait": True, "wait_timeout_secs": 60},
+                timeout=90,
+            )
+        )
+        assert finished.get("__status") == "COMPLETED", response
+
+    # Counts are structured-content only (the markdown twin stays
+    # v3-compatible). Every transfer already finished, so none was
+    # interrupted even though all twelve rows are purged.
+    text, structured, _ = call_tool_pair(http_client, "ssh_disconnect", {"session_id": sid})
+    assert structured is not None, text
+    assert structured.get("transfers_aborted") == 0, text
+    assert structured.get("commands_cancelled") == 0, text
 
 
 @pytest.mark.requires_sshd

@@ -40,6 +40,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 
+sys.path.insert(0, str(ROOT))
+
+from helpers import paths  # noqa: E402
+
 # (suite_name, script, label, kind) where kind is one of:
 #   "stdio_pytest" — pytest module (test_stdio.py)
 #   "stress"       — stress_*.py (one JSON line summary on stdout)
@@ -144,12 +148,10 @@ def main() -> int:
     args = parser.parse_args()
 
     env = os.environ.copy()
-    env.setdefault("PATH", f"{REPO_ROOT / 'target' / 'release'}:{env.get('PATH', '')}")
-    env.setdefault("SSH_MCP_BIN", str(REPO_ROOT / "target" / "release" / "ssh-mcp"))
-    env.setdefault(
-        "SSH_MCP_STDIO_BIN",
-        str(REPO_ROOT / "target" / "release" / "ssh-mcp-stdio"),
-    )
+    env.setdefault("PATH", f"{paths.bin_dir()}:{env.get('PATH', '')}")
+    env.setdefault("SSH_MCP_BIN", str(paths.http_bin()))
+    env.setdefault("SSH_MCP_STDIO_BIN", str(paths.stdio_bin()))
+    env.setdefault("SSH_MCP_TAIL_BIN", str(paths.tail_bin()))
 
     results: list[tuple[str, str, float]] = []
     overall_ok = True

@@ -1,7 +1,8 @@
 """Integration tests for ssh-mcp v3 stdio transport (rmcp 1.6 line-delimited JSON-RPC).
 
 Same coverage as ``test_http.py`` but driven over stdio against a freshly
-spawned ``target/release/ssh-mcp-stdio``. SSH-touching tests are gated by the
+spawned ``ssh-mcp-stdio`` from the active cargo profile (``target/debug`` by
+default — see :mod:`helpers.paths`). SSH-touching tests are gated by the
 ``@pytest.mark.requires_sshd`` marker.
 """
 

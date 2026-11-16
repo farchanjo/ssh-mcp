@@ -29,7 +29,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_BINARY = ROOT / "target" / "release" / "ssh-mcp-stdio"
+
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from helpers import paths  # noqa: E402
+
+DEFAULT_BINARY = paths.stdio_bin()
 FALLBACK_BINARY = Path("/usr/local/bin/ssh-mcp-stdio")
 PROTOCOL_VERSION = "2025-06-18"
 HANDSHAKE_TIMEOUT_S = 60.0

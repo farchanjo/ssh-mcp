@@ -30,14 +30,16 @@ sys.path.insert(0, str(ROOT))
 
 from dataclasses import dataclass  # noqa: E402
 
+from helpers import paths  # noqa: E402
 from helpers.mcp_client import McpClient, StdioTransport  # noqa: E402
 
-# Resolve binary paths directly so this module never pulls in `pytest`
-# (which `helpers.fixtures` imports). Chaos scripts are CLI tools, not
-# pytest collectors.
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-STDIO_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp-stdio"
-HTTP_BIN = REPO_ROOT / "target" / "release" / "ssh-mcp"
+# Resolve binary paths through `helpers.paths`, which imports neither `pytest`
+# nor `helpers.fixtures`. Chaos scripts are CLI tools, not pytest collectors, so
+# pulling the pytest collector machinery in here would be wrong.
+REPO_ROOT = paths.REPO_ROOT
+STDIO_BIN = paths.stdio_bin()
+HTTP_BIN = paths.http_bin()
+TAIL_BIN = paths.tail_bin()
 
 
 # ---------------------------------------------------------------------------
