@@ -41,10 +41,12 @@
 
 use std::sync::Arc;
 
+use crate::domain::command::CommandStatus;
 use crate::domain::error::DomainError;
 use crate::domain::ids::SessionId;
 use crate::domain::session::SessionEntity;
 use crate::domain::subscription::SubId;
+use crate::domain::transfer::TransferStatus;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::session_repo::SessionRepository;
@@ -68,11 +70,15 @@ pub struct DisconnectRequest {
 /// lines for operator visibility — the v3 wrapper logs equivalent counts via
 /// `tracing::info!`, but emitting them as part of the outcome lets clients
 /// reason about the cleanup without scraping logs.
+///
+/// `commands_cancelled` / `transfers_aborted` count only resources that
+/// were still running. Terminal rows are removed alongside but had
+/// already finished, so counting them would overstate the interruption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectOutcome {
     /// Session that was torn down.
     pub session_id: SessionId,
-    /// Number of async commands cancelled by the orchestration.
+    /// Number of running async commands cancelled by the orchestration.
     pub commands_cancelled: usize,
     /// Number of interactive shells closed by the orchestration.
     pub shells_closed: usize,
@@ -215,14 +221,20 @@ where
         })
     }
 
-    /// Cancel every async command owned by `session_id`. Cancellation
-    /// failures on the SSH side are tolerated (the channel may already be
-    /// dead) but repository removal failures are surfaced.
+    /// Cancel every running async command owned by `session_id` and drop
+    /// every command row. Terminal rows are removed too but do not
+    /// increment the returned count — `commands_cancelled` reports work
+    /// that was actually interrupted. Cancellation failures on the SSH
+    /// side are tolerated (the channel may already be dead) but
+    /// repository removal failures are surfaced.
     async fn cancel_session_commands(&self, session_id: &SessionId) -> Result<usize, DomainError> {
         let commands = self.commands.list_filtered(Some(session_id), None).await?;
-        let count = commands.len();
+        let mut cancelled = 0_usize;
         for cmd in &commands {
-            let _ = self.ssh.cancel(&cmd.id).await;
+            if cmd.status == CommandStatus::Running {
+                let _ = self.ssh.cancel(&cmd.id).await;
+                cancelled = cancelled.saturating_add(1);
+            }
         }
         for cmd in commands {
             if let Some(lifecycle) = self.lifecycle.as_ref() {
@@ -231,7 +243,7 @@ where
             self.close_lanes_for_resource(cmd.id.as_str()).await;
             self.commands.remove(&cmd.id).await?;
         }
-        Ok(count)
+        Ok(cancelled)
     }
 
     /// Close every interactive shell owned by `session_id`. The russh PTY is
@@ -250,19 +262,25 @@ where
         Ok(count)
     }
 
-    /// Abort every in-flight transfer owned by `session_id`. Same reasoning
-    /// as [`Self::close_session_shells`] for the SFTP channel cleanup.
+    /// Abort every in-flight transfer owned by `session_id` and drop every
+    /// transfer row. Terminal rows are removed too but do not increment
+    /// the returned count — `transfers_aborted` reports work that was
+    /// actually interrupted. Same reasoning as
+    /// [`Self::close_session_shells`] for the SFTP channel cleanup.
     async fn abort_session_transfers(&self, session_id: &SessionId) -> Result<usize, DomainError> {
         let transfers = self.transfers.list_filtered(Some(session_id)).await?;
-        let count = transfers.len();
+        let mut aborted = 0_usize;
         for xfer in transfers {
+            if xfer.status == TransferStatus::Running {
+                aborted = aborted.saturating_add(1);
+            }
             if let Some(lifecycle) = self.lifecycle.as_ref() {
                 let _ = lifecycle.force_close(ResourceKind::Transfer, xfer.id.as_str());
             }
             self.close_lanes_for_resource(xfer.id.as_str()).await;
             self.transfers.remove(&xfer.id).await?;
         }
-        Ok(count)
+        Ok(aborted)
     }
 
     /// Remove the session from the repository and unregister it from the
@@ -562,6 +580,74 @@ mod tests {
         assert_eq!(outcome.shells_closed, 3);
         assert_eq!(outcome.transfers_aborted, 4);
         assert!(wired.sessions.get(&seeded.id).await.expect("get").is_none());
+    }
+
+    // --- Scenario 5b ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_commands_and_transfers_are_removed_but_not_counted() {
+        // A harness that finished ten uploads and disconnects used to see
+        // `TRANSFERS_ABORTED: 10` although none was in flight. Terminal
+        // rows must still be purged, but only running work counts.
+        let wired = build_wired();
+        let seeded = seed_session(&wired.sessions, "sess-terminal", None);
+        seed_commands(&wired.commands, &seeded.id, 1);
+        seed_transfers(&wired.transfers, &seeded.id, 1);
+        let done_cmd = CommandEntity::new(
+            CommandId::new("c-done".to_string()),
+            seeded.id.clone(),
+            "done".to_string(),
+            Utc::now(),
+        )
+        .complete(0, false);
+        wired
+            .commands
+            .insert(done_cmd)
+            .await
+            .expect("insert done command");
+        let done_xfer = TransferEntity::new(
+            TransferId::new("t-done".to_string()),
+            seeded.id.clone(),
+            TransferDirection::Upload,
+            "/tmp/done".to_string(),
+            "/r/done".to_string(),
+            Utc::now(),
+            1,
+        )
+        .complete(1);
+        wired
+            .transfers
+            .insert(done_xfer)
+            .await
+            .expect("insert done transfer");
+
+        let outcome = wired
+            .uc
+            .execute(DisconnectRequest {
+                session_id: seeded.id.clone(),
+            })
+            .await
+            .expect("disconnect");
+        assert_eq!(outcome.commands_cancelled, 1);
+        assert_eq!(outcome.transfers_aborted, 1);
+        assert!(
+            wired
+                .commands
+                .list_filtered(Some(&seeded.id), None)
+                .await
+                .expect("list commands")
+                .is_empty(),
+            "terminal command rows must be removed"
+        );
+        assert!(
+            wired
+                .transfers
+                .list_filtered(Some(&seeded.id))
+                .await
+                .expect("list transfers")
+                .is_empty(),
+            "terminal transfer rows must be removed"
+        );
     }
 
     // --- Scenario 6 -----------------------------------------------------
