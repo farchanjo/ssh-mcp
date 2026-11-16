@@ -189,7 +189,7 @@ where
             .open_shell_entity(&req.session_id, terminal, &shell_id, req.max_buffer_size)
             .await?;
         let entity = apply_overrides(entity, &req);
-        self.shells.insert(entity.clone()).await?;
+        self.persist_shell(&entity).await?;
         // v5 lifecycle binding: register the freshly opened shell. The
         // policy comes from the inbound DTO when set (Phase 3
         // release_when_no_subs / grace_ms knobs); `None` falls back to
@@ -206,6 +206,38 @@ where
             session_id: req.session_id,
             agent_id: session.agent_id,
         })
+    }
+
+    /// Persist the freshly opened shell row.
+    ///
+    /// Two writers touch this row on the open path: this use case and the
+    /// adapter's registration sink, which `RusshAdapter::open_shell` spawns
+    /// as a detached task. The sink probes with `get` before inserting, so
+    /// the two can still interleave and whichever lands second meets
+    /// `Entry::Occupied`. Losing that race is not a failure — both copies
+    /// describe the same shell — so it is treated as success and only a
+    /// genuine write failure propagates. Without this, a sink that won the
+    /// race surfaced `INTERNAL_ERROR: shell <id> already exists` to the
+    /// caller of `ssh_shell_open`.
+    ///
+    /// The occupying row is then overwritten with `entity`: the adapter
+    /// builds its copy before
+    /// [`apply_overrides`] runs, so a sink-won row would otherwise persist
+    /// the configured inactivity TTL instead of the caller's
+    /// `inactivity_ttl_secs` — and disagree with the outcome returned to
+    /// the caller.
+    async fn persist_shell(&self, entity: &ShellEntity) -> Result<(), DomainError> {
+        match self.shells.insert(entity.clone()).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if self.shells.get(&entity.id).await?.is_some() {
+                    // The row exists; make this call's entity authoritative.
+                    self.shells.update(entity.clone()).await
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     /// Reject the request when the per-session shell cap is reached.
@@ -283,7 +315,7 @@ mod tests {
     use crate::domain::identity::Address;
     use crate::domain::ids::{AgentId, SessionId, ShellId};
     use crate::domain::session::SessionEntity;
-    use crate::domain::shell::ShellStatus;
+    use crate::domain::shell::{ShellEntity, ShellStatus, ShellTerminal};
     use crate::ports::lifecycle_policy::LifecyclePolicyPort;
     use crate::ports::session_repo::SessionRepository;
     use crate::ports::shell_repo::ShellRepository;
@@ -645,6 +677,53 @@ mod tests {
                 .expect("count"),
             2
         );
+    }
+
+    // --- Scenario 13 ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_already_written_by_registration_sink_is_not_a_conflict() {
+        // `RusshAdapter::open_shell` spawns its registration sink on this very
+        // path, and the sink writes the same row from a detached task. When it
+        // lands first, the use case's insert meets `Entry::Occupied`; the open
+        // must still succeed rather than surface the v7.1.2
+        // `INTERNAL_ERROR: shell <id> already exists` seen under load.
+        let wired = build_wired();
+        let seeded = seed_session(&wired.sessions, "sess-race", None);
+        // The fake mints `<session>-shell-1` for the first open, so seeding
+        // that id is exactly the interleaving the sink produces. The sink
+        // row's TTL and buffer deliberately differ from what the open
+        // persists: the adapter builds its entity before `apply_overrides`
+        // runs, and it never sees `inactivity_ttl_secs`, so a conflict that
+        // merely kept the sink row would leave the configured default behind.
+        let sink_row = ShellEntity::new(
+            ShellId::new("sess-race-shell-1".to_string()),
+            seeded.id.clone(),
+            ShellTerminal::new("xterm".to_string(), 80, 24),
+            Utc::now(),
+            Duration::from_secs(86_400),
+            1024,
+        );
+        wired.shells.insert(sink_row).await.expect("seed sink row");
+
+        let mut req = base_request(seeded.id.clone());
+        req.inactivity_ttl_secs = Some(42);
+        let outcome = wired
+            .uc
+            .execute(req)
+            .await
+            .expect("a row already holding this shell must not fail the open");
+        assert_eq!(outcome.shell.id.as_str(), "sess-race-shell-1");
+        // The use-case entity is authoritative: its overrides reach the row
+        // instead of the sink's pre-override copy.
+        let stored = wired
+            .shells
+            .get(&outcome.shell.id)
+            .await
+            .expect("get")
+            .expect("entity");
+        assert_eq!(stored, outcome.shell);
+        assert_eq!(stored.inactivity_ttl, Duration::from_secs(42));
     }
 
     // --- Scenario 12 ----------------------------------------------------
