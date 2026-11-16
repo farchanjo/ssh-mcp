@@ -98,6 +98,10 @@ dev-only loop; CHANGELOG `[Unreleased]` entry added.
   a non-matching filter exits 1.
 - `bash -n` clean on the three modified shell scripts (shellcheck absent).
 - CI workflow parses as YAML (ruby) and the pin lands on the `build-test` job.
+- macOS cross-compile against `/opt/sdk/MacOSX26.1.sdk` (via `macosx_run`):
+  `cargo check --all-features --all-targets` and `cargo build --bins` pass for
+  `aarch64-apple-darwin` and `x86_64-apple-darwin`; all six Mach-O binaries
+  link. Dev profile only — release stays the owner's path.
 - Full modern suite (`pytest scripts/ --ignore=_legacy_v2`) → RUNNING at session pause; see the note below.
 - `scripts/_legacy_v2/test_http_v2.py` performs a live handshake at import time and
   needs a server on `:8000`; run it separately from a harness that provides one.
