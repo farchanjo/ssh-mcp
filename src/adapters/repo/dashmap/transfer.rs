@@ -36,7 +36,7 @@ use dashmap::mapref::entry::Entry;
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{SessionId, TransferId};
-use crate::domain::transfer::TransferEntity;
+use crate::domain::transfer::{TransferEntity, TransferStatus};
 use crate::ports::transfer_repo::TransferRepository;
 
 /// In-process [`TransferRepository`] backed by [`DashMap`].
@@ -59,6 +59,22 @@ impl DashMapTransferRepo {
             .entry(session_id.clone())
             .or_default()
             .insert(transfer_id.clone());
+    }
+
+    /// `true` when `id` resolves to a row still in
+    /// [`TransferStatus::Running`]. A missing row counts as not running.
+    fn is_running(&self, id: &TransferId) -> bool {
+        self.by_id
+            .get(id)
+            .is_some_and(|entry| matches!(entry.value().status, TransferStatus::Running))
+    }
+
+    /// Count the running rows referenced by a session bucket.
+    ///
+    /// The caller holds the bucket's shard guard; the `by_id` shard is a
+    /// different map, so taking it here opens no nested-guard window.
+    fn count_running_in_bucket(&self, bucket: &HashSet<TransferId>) -> usize {
+        bucket.iter().filter(|id| self.is_running(id)).count()
     }
 
     /// Detach a transfer id from its session bucket and drop the bucket
@@ -116,7 +132,7 @@ impl TransferRepository for DashMapTransferRepo {
         // calls on the same key — exactly the TOCTOU window we are
         // closing here.
         let mut bucket = self.by_session.entry(session_id).or_default();
-        if bucket.len() >= cap {
+        if self.count_running_in_bucket(&bucket) >= cap {
             // The shard guard drops at end of scope; nothing else changed.
             return Err(DomainError::MaxTransfersExceeded { limit: cap });
         }
@@ -180,6 +196,17 @@ impl TransferRepository for DashMapTransferRepo {
             .by_session
             .get(session_id)
             .map_or(0, |bucket| bucket.len()))
+    }
+
+    async fn count_running_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError> {
+        // Clone the ids out before touching `by_id` so no bucket guard is
+        // held while the per-row shard lookups run.
+        let ids: Vec<TransferId> = self
+            .by_session
+            .get(session_id)
+            .map(|bucket| bucket.iter().cloned().collect())
+            .unwrap_or_default();
+        Ok(ids.iter().filter(|id| self.is_running(id)).count())
     }
 
     async fn list_filtered(
@@ -488,6 +515,71 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, cap, "exactly cap rows must persist");
+    }
+
+    #[tokio::test]
+    async fn insert_if_under_cap_ignores_terminal_rows() {
+        // Terminal rows stay in the repository for progress readers, so a
+        // session that already ran `cap` transfers must still accept a new
+        // one. Before the fix the bucket length was used and the 11th
+        // transfer on a long-lived session failed with
+        // `MaxTransfersExceeded` while nothing was running.
+        let repo = DashMapTransferRepo::new();
+        let cap = 2_usize;
+        for i in 0..cap {
+            let done =
+                entity(&format!("t-done-{i}"), "s-cap", TransferDirection::Upload).complete(1024);
+            repo.insert_if_under_cap(done, cap)
+                .await
+                .expect("terminal insert");
+        }
+        repo.insert_if_under_cap(entity("t-live", "s-cap", TransferDirection::Upload), cap)
+            .await
+            .expect("terminal rows must not consume the cap");
+        let session = SessionId::new("s-cap".to_string());
+        assert_eq!(
+            repo.count_by_session(&session).await.expect("count all"),
+            3,
+            "terminal rows must be preserved"
+        );
+        assert_eq!(
+            repo.count_running_by_session(&session)
+                .await
+                .expect("count running"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn count_running_by_session_excludes_every_terminal_status() {
+        let repo = DashMapTransferRepo::new();
+        for (id, direction) in [
+            ("t-live", TransferDirection::Upload),
+            ("t-done", TransferDirection::Upload),
+            ("t-failed", TransferDirection::Download),
+            ("t-cancelled", TransferDirection::Download),
+        ] {
+            repo.insert(entity(id, "s-mixed", direction))
+                .await
+                .expect("insert");
+        }
+        repo.update(entity("t-done", "s-mixed", TransferDirection::Upload).complete(9))
+            .await
+            .expect("complete");
+        repo.update(entity("t-failed", "s-mixed", TransferDirection::Download).fail("boom".into()))
+            .await
+            .expect("fail");
+        repo.update(entity("t-cancelled", "s-mixed", TransferDirection::Download).cancel())
+            .await
+            .expect("cancel");
+        let session = SessionId::new("s-mixed".to_string());
+        assert_eq!(
+            repo.count_running_by_session(&session)
+                .await
+                .expect("count running"),
+            1
+        );
+        assert_eq!(repo.count_by_session(&session).await.expect("count all"), 4);
     }
 
     #[tokio::test]

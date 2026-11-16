@@ -12,9 +12,10 @@
 //!    inbound adapter can render the canonical
 //!    `SSH_DOWNLOAD: ERROR / REASON: [SESSION_NOT_FOUND]` block.
 //! 2. Guard the per-session transfer cap via
-//!    [`TransferRepository::count_by_session`] +
+//!    [`TransferRepository::count_running_by_session`] +
 //!    [`ConfigPort::max_transfers_per_session`]. A breach short-circuits with
-//!    [`DomainError::MaxTransfersExceeded`].
+//!    [`DomainError::MaxTransfersExceeded`]. Only running rows count —
+//!    terminal rows stay for progress readers but release the slot.
 //! 3. Mint a fresh [`TransferId`] via [`IdGeneratorPort::new_transfer_id`].
 //! 4. Hand the work to [`SftpClientPort::download`] — the adapter spawns the
 //!    streaming task internally, opens the SFTP session, and returns a
@@ -281,9 +282,12 @@ where
     }
 
     /// Reject the request when the per-session transfer cap is reached.
+    ///
+    /// Only running rows count. Completed / failed / cancelled rows stay
+    /// in the repository for progress readers, but no longer hold a slot.
     async fn guard_transfer_cap(&self, session_id: &SessionId) -> Result<(), DomainError> {
         let limit = self.config.max_transfers_per_session();
-        let running = self.transfers.count_by_session(session_id).await?;
+        let running = self.transfers.count_running_by_session(session_id).await?;
         if running >= limit {
             return Err(DomainError::MaxTransfersExceeded { limit });
         }
@@ -606,6 +610,64 @@ mod tests {
             wired.sftp.call_count(),
             0,
             "cap breach must short-circuit before SFTP"
+        );
+    }
+
+    // --- Scenario 3b ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_transfers_do_not_consume_the_cap() {
+        // Mirror of the upload scenario: completed / failed rows keep the
+        // progress snapshot but release the per-session slot.
+        let cfg = MapConfig::default_v3().with_max_transfers_per_session(2);
+        let wired = build_wired_with(cfg);
+        let seeded = seed_session(&wired.sessions, "sess-cap-done", None);
+        let failed = seed_transfer(
+            &wired.transfers,
+            "t-failed",
+            "sess-cap-done",
+            TransferDirection::Upload,
+        );
+        wired
+            .transfers
+            .update(failed.fail("boom".to_string()))
+            .await
+            .expect("fail seeded transfer");
+        let cancelled = seed_transfer(
+            &wired.transfers,
+            "t-cancelled",
+            "sess-cap-done",
+            TransferDirection::Download,
+        );
+        wired
+            .transfers
+            .update(cancelled.cancel())
+            .await
+            .expect("cancel seeded transfer");
+        wired.sftp.queue_download_ok(512);
+
+        let outcome = wired
+            .uc
+            .execute(base_request(seeded.id.clone()))
+            .await
+            .expect("terminal rows must not block a new download");
+        assert_eq!(outcome.session_id.as_str(), "sess-cap-done");
+        assert_eq!(
+            wired
+                .transfers
+                .count_running_by_session(&seeded.id)
+                .await
+                .expect("count running"),
+            1
+        );
+        assert_eq!(
+            wired
+                .transfers
+                .count_by_session(&seeded.id)
+                .await
+                .expect("count all"),
+            3,
+            "terminal rows must be preserved"
         );
     }
 

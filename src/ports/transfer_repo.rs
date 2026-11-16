@@ -15,7 +15,9 @@ pub trait LocalTransferRepository: Sync {
     async fn insert(&self, entity: TransferEntity) -> Result<(), DomainError>;
 
     /// Atomic check-and-insert: insert `entity` only if the count of
-    /// transfers owned by `entity.session_id` is strictly below `cap`.
+    /// **running** transfers owned by `entity.session_id` is strictly
+    /// below `cap`. Terminal rows are ignored — see
+    /// [`Self::count_running_by_session`].
     ///
     /// This closes the TOCTOU race observed in
     /// [`crate::application::upload_file`] /
@@ -33,7 +35,7 @@ pub trait LocalTransferRepository: Sync {
     /// # Errors
     ///
     /// - [`DomainError::MaxTransfersExceeded`] when the session bucket
-    ///   already holds `cap` entries.
+    ///   already holds `cap` running entries.
     /// - [`DomainError::Internal`] when the id collides with an existing
     ///   row (matches the [`Self::insert`] contract).
     /// - [`DomainError::Storage`] on backend failure.
@@ -65,12 +67,26 @@ pub trait LocalTransferRepository: Sync {
     /// Returns `DomainError::Storage` on backend failure.
     async fn remove(&self, id: &TransferId) -> Result<Option<TransferEntity>, DomainError>;
 
-    /// Count transfers owned by `session_id`.
+    /// Count transfers owned by `session_id`, terminal rows included.
     ///
     /// # Errors
     ///
     /// Returns `DomainError::Storage` on backend failure.
     async fn count_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError>;
+
+    /// Count transfers owned by `session_id` that are still
+    /// [`crate::domain::transfer::TransferStatus::Running`].
+    ///
+    /// Terminal rows deliberately survive in the repository so
+    /// `ssh_transfer_progress` and `transfer://<id>/progress` readers can
+    /// observe the final snapshot. They must not keep consuming the
+    /// per-session concurrency budget, so the cap guards use this method
+    /// rather than [`Self::count_by_session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::Storage` on backend failure.
+    async fn count_running_by_session(&self, session_id: &SessionId) -> Result<usize, DomainError>;
 
     /// List transfers filtered by optional session id.
     ///
