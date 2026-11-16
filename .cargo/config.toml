@@ -3,6 +3,12 @@
 # loop; release tuning lives in `Cargo.toml` under `[profile.release]`.
 
 [build]
+# Pin the parallel job count for a bare `cargo build` too, not just the
+# Makefile path. An unset `jobs` means "all cores"; the repo wants 4
+# everywhere so build timings stay comparable and the machine stays
+# responsive. `CARGO_BUILD_JOBS` (exported by the Makefile) outranks this key,
+# so `JOBS=8 make dev` still wins.
+jobs = 4
 # No `incremental` key here: `build.incremental` outranks `[profile.*]`, so
 # setting it would also force release incremental. The profiles in `Cargo.toml`
 # own that switch (dev/test on, release off).
