@@ -1,140 +1,139 @@
-# Session resume — ssh-mcp v7.0.1 release + doc/test polish
+# Session resume — ssh-mcp v7.1.2 shell-open race + dev-loop hardening
 
-**Last touched:** 2026-05-10
-**Repo:** `/Users/farchanjo/dev/ssh-mcp`
-**Branch:** `master` (local-only — NOT pushed)
-**Latest tag:** `v7.0.1` → `9ecf939 chore(release): 7.0.1`
+**Last touched:** 2026-11-16
+**Repo:** `/root/dev/ssh-mcp`
+**Branch:** `master` (in sync with `origin/master` at session start)
+**Latest tag:** `v7.1.2`
 
-## What was shipped this session
+## What is in flight (uncommitted, verified)
 
-### 1. v7.0.1 release (wire-additive patch on top of v7.0.0)
+Patch series in the working tree. Gates and the touched Python files are green;
+see "Verification run" below.
 
-- `Cargo.toml` version `7.0.0 → 7.0.1`; `Cargo.lock` refreshed in lockstep.
-- Headline change: `RSYNC_PROTOCOL` lifted from `31 → 32` (`src/adapters/rsync/wire/session.rs`). Wire-format identical to v31; rsync 3.4.0 incremented the protocol number as administrative signal for CVE-2024-12084..12088 + 12747 fixes (zero new wire branches). `min(local, remote)` downgrades cleanly to 31 against legacy rsync 3.2.x servers.
-- Other commits-since-v7.0.0 covered by the tag:
-  - `feat(mcp): env-gate v4.7 structured_content via SSH_MCP_STRUCTURED_CONTENT` (default `true`)
-  - `chore(config): bump SSH_NOTIFY_DEBOUNCE_MS 200→1000 ms`, `SSH_NOTIFY_FORCE_FLUSH_MS 1→5 s`
-  - `docs(mcp): mark bool args/results as JSON boolean` (preventive against `-32602 invalid type: string "true", expected a boolean` from string-quoted bool callers)
-- `CHANGELOG.md` got `[7.0.1]` entry; lib tests `1966 → 1986`; clippy clean; `cargo build --release --all-features` OK.
-- Tag `v7.0.1` ancorada em `9ecf939`. Doc polish commits que vieram depois NÃO foram dobrados na tag (deliberadamente — opção 3 escolhida pelo user; doc fixes vivem em master como polish pós-release).
+### 1. Shell-open race fix (functional)
 
-### 2. Doc inconsistency sweep (28 MD files audited)
+`OpenShellUseCase::execute` and `RusshAdapter::open_shell`'s detached registration
+sink both write the shell row. Whichever landed second met `Entry::Occupied`, and
+`ssh_shell_open` surfaced `INTERNAL_ERROR: shell <id> already exists` under load.
+The new `persist_shell` helper treats an occupied row as success and overwrites it
+with the use-case entity (the adapter builds its copy before `apply_overrides`, so
+keeping the sink row would persist the default TTL instead of the caller's
+override), re-raising only genuine write failures. Scenario 13
+(`row_already_written_by_registration_sink_is_not_a_conflict`) pins both halves —
+id coexistence and override authority — and fails with the original
+`Internal("... already exists")` when the helper is reverted.
 
-Methodology:
-- 28 small dispatches (one per MD file) → extract every factual claim into flat YAML.
-- 3 medium dispatches (top-level / docs/ / docs/adr) → cross-validate haiku findings vs ground truth + flag stuff haiku missed.
-- 1 medium fix-pass → apply 35 edits across 11 files.
+### 2. Dev-loop / CI hardening
 
-Result: 11 file-level commits (`5672919` and earlier sequence — see `git log --oneline -20`). Working tree clean.
+- `JOBS` pinned to 4 everywhere (Makefile default, `.cargo/config.toml` `[build] jobs`,
+  `.config/nextest.toml` `test-threads`, CI `CARGO_BUILD_JOBS`). Every cargo
+  invocation is pinned; unset would mean "all cores".
+- `make gates` (fmt + dev clippy + both nextest suites) and `make lint-dev` added.
+  Release builds belong to the owner — see AGENTS.md → Working agreement.
+- CI runs lib/integration through `cargo nextest` (`ci` profile, JUnit) and
+  installs nextest when absent.
+- The Python suites resolve binaries via the new `scripts/helpers/paths.py` (dev
+  profile default; `SSH_MCP_BUILD_PROFILE` / `SSH_MCP_*_BIN` overrides).
+  `run_all.sh` builds the 38-tool surface into `target/no-default-features` so it
+  can no longer overwrite the full binary.
+- `helpers/local_sshd.py`: one process-wide host key (port recycling no longer
+  trips `known_hosts`), `EOFError` added to the tolerated transport errors, and
+  the `_pty_to_channel` pump no longer dies silently under a flooding child.
+- `test_http.py` ctrl-C case drives a throttled loop instead of `yes`.
+- `test_v5_adversarial.py`: `rejected_at_schema` helper plus a `forward_client`
+  fixture that skips on 38-tool builds; forward tests use the split
+  `remote_address` / `remote_port` arguments; the tail fixture resolves through
+  `helpers.paths` so the Windows `.exe` is found.
+- CI `build-test` pins `SSH_MCP_BUILD_PROFILE=release`, matching its release
+  build and the `helpers.paths` docstring instead of silently testing the debug
+  tree nextest leaves behind.
 
-Critical drift fixed in living docs:
-- `AGENTS.md` (project root, loaded into every session): tool counts `36/35 → 39/38`, push schemes `6 → 7`, error codes `40 → 46`, `RSYNC_PROTOCOL` prose `v31 → v32 (downgrades to v31)`, lib tests `1966 → 1986`, "six layered deltas" → "seven", header version `v7.0.0 → v7.0.1`.
-- `README.md`: rsync proto prose v31 → v32; lib tests 1966 → 1986.
-- `docs/ARCHITECTURE.md`: title `v7.0.0 → v7.0.1`; wire-proto prose v31 → v32; Mermaid handshake nodes `proto 27 → 31` → `proto 27 → 32` (push + pull pipelines); capabilities table `6 schemes → 7 schemes`.
-- `docs/adr/0011-rsync-hybrid-transport.md`: Status section + Test Coverage table updated. ALL other v31 mentions in ADRs are time-capsule plan narrative — left untouched.
-- `docs/MIGRATION.md`: only L869 (current-state v6.1→v7.0 paragraph) updated. ALL slice narratives under `### v7.0.0-alpha.X` headers preserved as historical record.
-- Plus refreshes in CI.md, REVIEW_CHECKLIST.md, CONTRIBUTING.md (added `tests/lockfree_invariants_rsync.rs` reference), DAEMON.md, DEVELOPMENT.md, LLM_GUIDE.md.
+### 3. File-transfer session-limit fixes
 
-### 3. Binary install + codesign
+- Per-session caps now count **running** work instead of history. Terminal
+  transfer rows stay in the repository for `ssh_transfer_progress` /
+  `transfer://<id>/progress` readers, but release the slot; the same applies to
+  rsync via `count_active_by_session`. Before this, the 11th upload/download on
+  a long-lived session (5th rsync) failed with `MAX_TRANSFERS_EXCEEDED` while
+  nothing was in flight. New port methods `count_running_by_session` /
+  `count_active_by_session`, and `insert_if_under_cap` ignores terminal rows.
+- `open_sftp_session` now uses the shared `open_session_with_retry`, so a
+  transient `MaxSessions` / `RESOURCE_SHORTAGE` refusal backs off (100 ms → 1 s,
+  25 attempts) instead of failing the transfer. `is_transient_open_error` is now
+  case-insensitive.
+- Regression coverage: repo-level tests for both adapters, use-case tests for
+  upload/download/rsync, classifier/backoff unit tests, and an HTTP integration
+  test that drives 12 sequential uploads on one session
+  (`test_more_than_ten_sequential_uploads_on_one_session`).
 
-- `cargo build --release --all-features` OK.
-- `sudo cp target/release/{ssh-mcp,ssh-mcp-stdio,ssh-mcp-tail} /usr/local/bin/`
-- `sudo codesign --sign - --force --options runtime` — ad-hoc sign with hardened runtime on each binary.
-- `codesign --verify --verbose=4` — clean across all 3.
-- Mach-O thin arm64. `Format=Mach-O thin (arm64)`, `Signature=adhoc`, owner `root:wheel`.
+### 4. Disconnect counters stop reporting finished work as interrupted
 
-### 4. Smoke test (target/release binaries)
+- `ssh_disconnect` / `ssh_disconnect_agent` counted every removed row, so a
+  session whose ten uploads had completed answered `TRANSFERS_ABORTED: 10`
+  (and a session with sixteen finished execs answered `COMMANDS_CANCELLED: 16`).
+  Terminal rows are still purged; only running resources increment the
+  counters. Verified by mutation: forcing the unconditional increment makes the
+  live test report `transfers_aborted: 12`.
 
-```
-ssh-mcp        : exit=124 (HTTP server up — addr=0.0.0.0:8000, peer GC spawned)
-ssh-mcp-stdio  : exit=1   (stdio transport up, ConnectionClosed esperado — sem cliente MCP)
-ssh-mcp-tail   : exit=0   — version 7.0.1
-```
+### 5. Docs
 
-`ssh-mcp` and `ssh-mcp-stdio` lack `--version` / `--help` flags (they jump straight into runtime). Optional follow-up: add `clap` `Parser` to those two for deploy validation.
+AGENTS.md, CI.md, CONTRIBUTING.md, README.md, docs/DEVELOPMENT.md,
+docs/MIGRATION.md, docs/OPERATIONS.md and the script docstrings aligned with the
+dev-only loop; CHANGELOG `[Unreleased]` entry added.
 
-### 5. Python integration test polish (3 commits)
+## Verification run
 
-Validated by a medium-tier pass against v7.0.1 surface. 7 files touched, 3 semantic commits:
+- `make gates` → green on every run: fmt, dev clippy, 2114 lib + 167
+  integration tests (2281 total), 0 failed.
+- Transfer-cap mutation checks: reverting `count_running_in_bucket` makes the
+  unit tests fail, and the live 12-upload test fails at upload 11 with
+  `REASON: [MAX_TRANSFERS_EXCEEDED]`; restored implementation passes.
+- Disconnect-counter mutation check: forcing the unconditional increment makes
+  the live test read `transfers_aborted: 12` instead of 0.
+- Mutation check: with `persist_shell` reverted to a bare `insert`, scenario 13
+  fails with `Internal("shell sess-race-shell-1 already exists; ...")`.
+- `make tools-export-check` → `unchanged` for both catalogue files.
+- `pytest scripts/test_http.py scripts/test_v5_adversarial.py scripts/test_v47_subscriptions.py` → 98 passed.
+- `CHAOS_FILTER=chaos05 scripts/chaos_runner.sh` → summary parses, exit 0;
+  a non-matching filter exits 1.
+- `bash -n` clean on the three modified shell scripts (shellcheck absent).
+- CI workflow parses as YAML (ruby) and the pin lands on the `build-test` job.
+- Full modern suite (`pytest scripts/ --ignore=_legacy_v2`) → RUNNING at session pause; see the note below.
+- `scripts/_legacy_v2/test_http_v2.py` performs a live handshake at import time and
+  needs a server on `:8000`; run it separately from a harness that provides one.
 
-- `5672919 fix(tests): tool-list count assertion {20,21} → {38,39} for v7.0.1` — hard-fail fix in `test_http.py` + `test_stdio.py`. Function renamed `*_v47_catalogue → *_v7_catalogue`.
-- `0ef02a0 docs(tests): refresh stale tool/error counts in v47/v5 docstrings` — module docstrings only (`test_v47_structured_content.py`, `test_v5_adversarial.py`). Bodies clean.
-- `ebeb6ba docs(tests/v7-rsync): refresh slice-N narrative + xfail tags for v7.0.1` — `test_v7_rsync_vm.py`, `test_v7_rsync_http.py`, `helpers/rsync_client.py`. Inverted comment at `test_v7_rsync_vm.py:385-386` corrected. xfail reasons bumped `v7.0.0-alpha.8 → v7.0.1`. Defensive `_wait_terminal_or_files` helper kept; commentary clarifies `status="completed"` is the v7.0.1 happy path.
+## Open items
 
-`pytest --collect-only` clean. `python -m py_compile` on all 7 modified files OK.
+1. Commit the series as contextual commits (fix / build / ci / scripts / fixtures / docs / session).
+2. `git push origin master`.
+3. Owner decision: cut `v7.1.3` (version bump + tag + release notes) or leave the
+   fix under `[Unreleased]`.
+4. Optional carry-over: `clap` `--version` / `--help` on `ssh-mcp` and
+   `ssh-mcp-stdio` so deploy validation has a clean `exit 0` path.
 
-## What is OPEN / pending
-
-### Immediate next step (where session pause happened)
-
-**Run pytest against v7.0.1**. Plan was 2 parallel small dispatches:
-- **FG small**: `pytest scripts/test_v7_rsync_vm.py -v --tb=short` (only file touching real `vm.services` rsync 3.2.7).
-- **BG small**: `pytest scripts/ --ignore=scripts/test_v7_rsync_vm.py -v --tb=line` (paramiko-fixture suite, ~22 files).
-
-Brief should set `cd /Users/farchanjo/dev/ssh-mcp && source .venv/bin/activate` first. Default env vars match the VM (`SSH_MCP_E2E_HOST=vm.services` / `_USER=root` / `_PORT=22` / `_KEY_PATH=~/.ssh/id_rsa`). Bash timeout ≥ 600000ms (some tests run for minutes against paramiko fixtures).
-
-Expected outcome:
-- 19 passed + 2 xfailed for v7 rsync trio (per AGENTS.md baseline) — the 2 xfails cover the deferred local-FS adapter for `RsyncSftpFsPort`. xfails strict=False so they show as `xfailed`, not `failed`.
-- `test_v7_rsync_vm.py` against rsync 3.2.7: should NOT surface `RSYNC_PROTOCOL_ERROR` for the wire path. Pre-cleanup tests had defensive elif accepting that error; v7.0.1 should hit the happy path. Defensive elif kept — if test goes through it, that's a regression worth investigating.
-
-vm.services already verified reachable: `ssh -l root vm.services 'rsync --version'` → `rsync 3.2.7 protocol version 31`.
-
-### Other open threads
-
-- **`git push`**. Master + `v7.0.1` tag are local-only. Run `git push origin master v7.0.1` when ready.
-- **GitHub release notes**. `gh release create v7.0.1 --notes-file <(awk '/^## \[7.0.1\]/,/^## \[7.0.0\]/' CHANGELOG.md | sed '$d')`.
-- **Statusline caveman badge** (cosmetic, optional). Add to the host's settings file (shown here for a Claude-family host, `~/.claude/settings.json`):
-  ```json
-  "statusLine": {
-    "type": "command",
-    "command": "bash \"/Users/farchanjo/.claude/plugins/cache/caveman/caveman/84cc3c14fa1e/hooks/caveman-statusline.sh\""
-  }
-  ```
-- **Optional follow-up**: add `clap` `--version` / `--help` flag handlers to `ssh-mcp` and `ssh-mcp-stdio` binaries so deploy validation has a clean `exit 0` path.
-
-## Ground-truth table (for any agent dispatched in next session)
+## Ground truth (for any agent dispatched next session)
 
 | key | value | source |
 |---|---|---|
-| version | 7.0.1 | Cargo.toml + git tag v7.0.1 |
-| lib_tests_passed | 1986 | `cargo test --lib --quiet` |
-| integration_tests | 134 across 9 binaries | tests/ |
-| loom_invariants | 27 (20 + 7 across 2 files) | tests/lockfree_invariants*.rs |
-| rsync_proto_advertised | 32 (downgrades to 31 against legacy via min(local,remote)) | src/adapters/rsync/wire/session.rs `RSYNC_PROTOCOL = 32` |
-| rsync_proto_min/max | 27 / 32 | RSYNC_PROTOCOL_MIN/MAX |
-| error_codes_total | 46 (38 base + 2 v6.1 + 6 v7.0) | ADR 0007 + 0010 + 0011 |
+| version | 7.1.2 | Cargo.toml |
+| lib_tests_passed | 2103 | `cargo nextest run --lib` |
+| integration_tests | 167 across 12 binaries | tests/ |
+| loom_invariants | 32 across 3 files | tests/lockfree_invariants*.rs |
+| rsync_proto_advertised | 32 (downgrades to 31 via min(local, remote)) | src/adapters/rsync/wire/session.rs |
+| error_codes_total | 56 | ADR 0007 + 0010 + 0011 |
 | msrv | 1.99 | Cargo.toml |
 | edition | 2024 | Cargo.toml |
-| ADRs | 11 (0001-0011) | docs/adr/ |
-| tools_with_port_forward | 39 | #[tool] count in src/infra/mcp/tool_router.rs |
-| tools_without_port_forward | 38 |  |
-| ssh_tools | 24 | `ssh_*` |
-| sub_tools | 9 | `sub_*` |
-| serial_tools | 6 | `serial_*` |
-| push_schemes | 7 (shell, command, transfer, session, forward, serial, rsync) |  |
-| notify_debounce_default | 1000 ms | SSH_NOTIFY_DEBOUNCE_MS |
-| notify_force_flush_default | 5000 ms | SSH_NOTIFY_FORCE_FLUSH_MS |
-| MCP protocolVersion | 2025-06-18 |  |
-| structured_content | env-gated by `SSH_MCP_STRUCTURED_CONTENT` (default `true`) |  |
-| `release_when_no_subs` | bool arg — JSON `true`/`false` only, NEVER string `"true"` | rmcp/serde rejects with `-32602 invalid type: string "true", expected a boolean` |
-| vm.services | rsync 3.2.7 / protocol 31 — root@vm.services:22 with `~/.ssh/id_rsa` |  |
+| ADRs | 12 (0001-0012) | docs/adr/ |
+| tools_with_port_forward | 39 | `#[tool]` count in src/infra/mcp/tool_router.rs |
+| tools_without_port_forward | 38 | |
+| `release_when_no_subs` | bool arg — JSON `true`/`false` only | rmcp/serde rejects strings with `-32602` |
+| build profile default | `debug` (`SSH_MCP_BUILD_PROFILE=release` retargets) | scripts/helpers/paths.py |
+| jobs pin | 4 | Makefile, `.cargo/config.toml`, `.config/nextest.toml`, ci.yml |
 
 ## Convention reminders
 
-- **Caveman mode**: full intensity active. Drop articles/filler/pleasantries. Fragments OK. Code/commits/security: full English.
-- **Small-model fit gate** (per AGENTS.md): single-file, zero judgment, fixed output shape, ≤200-word brief, bounded acceptance. Multi-file work goes to a larger tier.
-- **Dispatch labeling** (mandatory): `[small] <task>` (no effort tier) | `[medium:<low|medium|high|xhigh|max>] <task>` | `[large:<effort>] <task>` (large tier only when `/opus` literal appears in the current user prompt).
-- **Concurrency guard**: cap=20 per turn. Always 1 FG + N BG. Pair every BG dispatch with notification awaiting; do NOT poll.
-- **Commit hygiene**: NEVER commit unless user asks. NEVER mass-commit — break into small contextual commits. Commits use Conventional Commits format (`type(scope): subject`). Subject ≤ 72 chars (project hook enforces).
-- **Tests + lint**: `cargo clippy --release --all-features -- -D warnings` + `cargo test --lib --quiet` must stay green after any code change.
-- **PMD config**: NEVER touch without explicit user permission (note: this repo is Rust, no PMD; rule lives in the machine-global instructions file as cross-project guard).
-- **Machine-global instructions lock**: the instructions file outside this repo requires the literal `/global-md` command in the current prompt to edit. Single-shot, 6h window.
-
-## Quick-resume checklist
-
-When resuming:
-1. `cd /Users/farchanjo/dev/ssh-mcp`
-2. `git status -s` — must be clean (working tree should be empty after this session).
-3. `git log --oneline -5` — verify top is `ebeb6ba docs(tests/v7-rsync): refresh slice-N narrative + xfail tags for v7.0.1`.
-4. Decide: run pytest now? push? GitHub release? something else?
-5. If running pytest: dispatch 2 parallel small dispatches per the plan above. Aggregate, report PASS/FAIL counts to user.
+- Conventional Commits, subject ≤ 72 chars, one context per commit. Never commit
+  unless the owner asks.
+- `make gates` must stay green after any code change. CI owns the release-profile
+  clippy gate; never run a release build from a session.
+- En-US on disk; chat follows the conversation language.
