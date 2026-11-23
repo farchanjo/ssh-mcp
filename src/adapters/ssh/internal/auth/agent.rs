@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use crate::adapters::ssh::internal::session::SshClientHandler;
 
-use super::traits::AuthStrategy;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
 
 /// OpenSSH's well-known agent pipe on Windows.
 #[cfg(windows)]

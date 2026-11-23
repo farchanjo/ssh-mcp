@@ -10,7 +10,24 @@ Cross references:
 
 ## Build gates
 
-Four gates must stay green on every commit:
+Four gates must stay green on every commit.
+
+Raw cargo commands, for the cases the `Makefile` does not cover:
+
+```bash
+cargo build                                        # Dev profile: incremental, sccache, 4 jobs
+cargo build --bin ssh-mcp                          # HTTP server (axum 0.8 + rmcp 3.11)
+cargo build --bin ssh-mcp-stdio                    # Stdio MCP transport
+cargo build --bin ssh-mcp-tail                     # NDJSON daemon
+cargo build --no-default-features --target-dir target/no-default-features  # 38-tool surface, separate tree
+cargo nextest run --lib                            # Lib tests (nextest)
+cargo nextest run --tests --features test-fixtures # 167 integration tests across 12 binaries
+cargo fmt --all -- --check
+cargo clippy --all-features -- -D warnings         # Dev-profile lint — fast local loop
+cargo clippy --release --all-features -- -D warnings   # Canonical lint gate (owned by CI)
+```
+
+The canonical path goes through the `Makefile`:
 
 ```bash
 make gates                                         # Dev pipeline: fmt + dev clippy + both suites
@@ -61,6 +78,33 @@ Production code stays under the full strict baseline; test code is gated by `car
 ### MSRV
 
 Rust **1.99.1** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.99).
+The manifest floor is `rust-version = "1.99"` (`Cargo.toml`).
+
+### Working agreement — dev only
+
+**Agents work in the dev profile. Release builds are the owner's alone.**
+
+- Run `make dev`, `make gates`, `make test`, `make test-integration`,
+  `make fmt`, `make lint-dev`, `make check`. These are incremental, unoptimised
+  and the fastest path to a verified change.
+- **Never run `make release`, `make release-min`, `make all`, `make install`,
+  `make sign`, or any `cargo build --release`.** Fat LTO with one codegen unit
+  costs minutes per run and produces artifacts only the owner installs. If a
+  change seems to need a release build to verify, say so and stop there.
+- `make lint` (`clippy --release`) is the canonical CI gate and is also
+  release-profile; during a session use `make lint-dev`, which applies the
+  identical lint set under the dev profile.
+- CI is not covered by this rule: the `quality`, `build-test` and `release`
+  jobs in `.github/workflows/ci.yml` build release on every push and tag. That
+  is the owner's pipeline, not a session command.
+
+### Test policy
+
+Test modules may call `unwrap` / `expect` under an
+`#[allow(..., reason = "…")]` on the module; production code never may —
+`forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structural.
+The `reason` string points back to this agreement, which is why the generated
+`AGENTS.md` notes block carries it too.
 
 ### Clippy configuration
 
@@ -93,6 +137,28 @@ All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disabl
 | Loom invariants | `tests/lockfree_invariants.rs` + `tests/lockfree_invariants_rsync.rs` + `tests/lockfree_invariants_inline_push.rs` (all `#[cfg(loom)]`) | 32 interleavings total: 20 in `lockfree_invariants` (v4 baseline + Phase 1 lifecycle + Phase 2 mux) + 7 in `lockfree_invariants_rsync` (RsyncSession state, rsync lane pause/resume, file-list ordering, sparse-file handling) + 5 in `lockfree_invariants_inline_push` (ADR 0012 inline-push atomics). Compiles to empty when loom not enabled. | minutes (full mode currently blocked by upstream) |
 | Python integration | `scripts/test_*.py` | `requires_sshd` end-to-end suites against a real OpenSSH server. | minutes |
 | Stress | `scripts/stress_*.py` | 5 stress scripts (concurrent writes, lagged sub, locks, multi-host, subscribe). | varies |
+
+Integration binaries in full, with the count of each: `v4_smoke` 2 (server
+name, `tools` + `resources` capabilities, and every core tool name with a
+non-empty description — it asserts no response body), `v5_smoke` 12,
+`v5_daemon_smoke` 7, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41,
+`chaos_inline_push` 9, `chaos_rsync` 16, `property` 32, `property_inline_push`
+11, `property_resume` 6, `property_rsync` 10. The Python suite
+(`scripts/test_v7_rsync_http.py`, `scripts/test_v7_rsync_stdio.py`,
+`scripts/test_v7_rsync_vm.py`) runs 24 tests / 22 passed + 2 xfailed; the two
+xfails cover the deferred local-FS adapter for `RsyncSftpFsPort` — the SFTP
+transport walks both `src` and `dst` through a single port, so an end-to-end
+push from a local source needs a bridge that lands in a follow-up slice.
+
+### Binaries
+
+Three binary targets are built from one package: `ssh-mcp` (`src/main.rs`,
+HTTP), `ssh-mcp-stdio` (`src/bin/ssh_mcp_stdio.rs`, stdio MCP) and
+`ssh-mcp-tail` (`src/bin/ssh_mcp_tail.rs`, NDJSON daemon). The
+`--no-default-features` build drops `port_forward` and yields the 38-tool
+surface instead of 39; `scripts/run_all.sh` builds it into
+`target/no-default-features`, a separate tree, so it can no longer overwrite
+the full binary in `target/debug`.
 
 ### Loom invariants (20 total)
 

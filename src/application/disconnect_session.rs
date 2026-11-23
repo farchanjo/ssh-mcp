@@ -321,6 +321,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::adapters::clock::system::SystemClock;
+    use crate::adapters::id_generator::uuid::UuidIds;
+    use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+    use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
+    use crate::adapters::subscription::fake::StubNotifier;
+    use crate::adapters::subscription::lane_bridge::install_lane_lifetime;
+    use crate::adapters::subscription::memory_registry::MemoryRegistry;
+    use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+    use crate::ports::notifier::DebouncerActivator;
+    use crate::ports::subscriber_lane::{
+        LaneAdmin, LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
+    };
+    use crate::ports::subscriber_registry::ResourceKind;
+
     type UseCaseUnderTest = DisconnectSessionUseCase<
         FakeSshClient,
         DashMapSessionRepo,
@@ -838,5 +853,50 @@ mod tests {
             .await
             .expect("disconnect");
         assert_eq!(outcome.session_id, seeded.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_cascade_stops_child_debouncers_and_spares_the_health_one() {
+        let ssh = Arc::new(FakeSshClient::new());
+        ssh.queue_disconnect_ok();
+        let sessions = Arc::new(DashMapSessionRepo::new());
+        let seeded = seed_session(&sessions, "sess-r", None);
+        let shells = Arc::new(DashMapShellRepo::new());
+        seed_shells(&shells, &seeded.id, 1);
+        let commands = Arc::new(DashMapCommandRepo::new());
+        let transfers = Arc::new(DashMapTransferRepo::new());
+        let notifier = Arc::new(StubNotifier);
+        let reg = MemoryRegistry::new(notifier);
+        let lanes = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 16, 64);
+        install_lane_lifetime(&reg, &lanes, |_| {});
+        for (uri, kind, id) in [
+            ("shell://sh-0/output", ResourceKind::Shell, "sh-0"),
+            ("session://sess-r/health", ResourceKind::Session, "sess-r"),
+        ] {
+            lanes
+                .open_lane(uri.to_string(), kind, id.to_string(), LanePolicy::default())
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        }
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            RefcountedLifecycleAdapter::new(CascadeCoordinator::new(), Arc::new(SystemClock));
+        let uc = DisconnectSessionUseCase::with_lifecycle(
+            ssh,
+            Arc::clone(&sessions),
+            commands,
+            shells,
+            transfers,
+            lifecycle,
+            Arc::clone(&lanes) as Arc<dyn LaneAdmin>,
+        );
+        uc.execute(DisconnectRequest {
+            session_id: seeded.id,
+        })
+        .await
+        .unwrap();
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "sh-0"));
+        assert!(reg.has_debouncer(ResourceKind::Session, "sess-r"));
+        assert_eq!(lanes.list_subs().len(), 1);
     }
 }

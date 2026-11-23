@@ -11,7 +11,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{CommandId, SessionId};
+use crate::domain::ids::{CommandId, SessionId};
 
 /// Lifecycle states of an async command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

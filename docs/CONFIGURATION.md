@@ -136,7 +136,7 @@ Per-resource debouncer behaviour. The same task drives all three timers via `tok
 
 | Variable | Type | Default | Floor | Cap | Description |
 |----------|------|---------|-------|-----|-------------|
-| `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans the subscription registry for peers whose rmcp transport has closed. rmcp 1.6 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
+| `SSH_MCP_PEER_GC_INTERVAL_S` | `u64` (s) | `30` | `5` | `300` | Interval at which each binary scans the subscription registry for peers whose rmcp transport has closed. rmcp 3.11 does not raise a callback on disconnect, so this scan is the only way to reclaim subscription state. |
 
 ### Subscriber lanes (v5 — ADR 0004 / 0006)
 
@@ -146,8 +146,8 @@ Per-`SubId` lane / `ChannelMux` / backpressure / replay tunables. Wired by the `
 |----------|------|---------|-------|-----|-------------|
 | `SSH_LANE_BUFFER` | `usize` | `1024` | `16` | `65536` | Per-`SubId` lane mpsc capacity. Each `sub_open` mints one lane with this many slots; the producer falls back to the lag policy when the lane fills. |
 | `SSH_MUX_BUFFER` | `usize` | `8192` | `64` | `1048576` | `ChannelMux` outbound mpsc capacity (drained by the daemon writer / lane fanout bridge). |
-| `SSH_MAX_SUBS_PER_URI` | `u16` | `16` | `1` | `u16::MAX` | Hard cap on lanes per resource URI. Returns `LANE_LIMIT_PER_URI` once exhausted. |
-| `SSH_MAX_SUBS_TOTAL` | `u16` | `1024` | `1` | `u16::MAX` | Hard cap on lanes server-wide. Returns `LANE_LIMIT_TOTAL` once exhausted. |
+| `SSH_MAX_SUBS_PER_URI` | `u16` | `16` | `1` | `u16::MAX` | Hard cap on lanes per resource URI. Returns `MAX_SUBS_PER_URI_EXCEEDED` once exhausted. |
+| `SSH_MAX_SUBS_TOTAL` | `u16` | `1024` | `1` | `u16::MAX` | Hard cap on lanes server-wide. Returns `MAX_SUBS_TOTAL_EXCEEDED` once exhausted. |
 | `SSH_LAG_POLICY_DEFAULT` | enum (`block_slow` / `drop_oldest` / `drop_newest` / `snapshot`) | `snapshot` | — | — | Default lag policy applied by `sub_open` when the call omits `lag_policy`. |
 | `SSH_BP_BLOCK_TIMEOUT_MS` | `u64` (ms) | `5000` | `100` | `600000` | Maximum time the producer waits on `BlockSlow` before giving up and falling through to `Snapshot`. |
 | `SSH_FILTER_REGEX_MAX` | `usize` (chars) | `1024` | `16` | `65536` | Maximum compiled regex length accepted by `sub_open.filter` / `sub_filter`. Returns `FILTER_INVALID` past the cap. |

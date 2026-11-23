@@ -93,6 +93,8 @@ Backpressure default: `Snapshot` (matches v5 default for any push resource); swi
 | `serial://{serial_id}/output{?cursor}`        | Serial UART/TTY output stream      | `text/plain`         | yes (`{?cursor}`)            | always          |
 | `forward://{forward_id}/events{?cursor}`      | Port-forward event log             | `application/json`   | yes (`{?cursor}`)            | `port_forward`  |
 
+`sub_open` refuses a missing `shell`, `command`, `transfer` or `session` id with its per-kind `*_NOT_FOUND` code; `forward`, `serial` and `rsync` may be opened before the producer publishes.
+
 Builds without `port_forward` advertise five templates (`shell`, `command`, `transfer`, `session`, `serial`); builds with the feature advertise six. Order is stable across builds — clients can index into the list without name-matching.
 
 The v7.0 `rsync://<rsync_id>/progress` lane is intentionally **omitted from `resources/templates/list`**: rsync sessions are short-lived and the lane closes deterministically after `SyncCompleted` / `SessionFailed`, so a parameterised template adds no value over the `RSYNC_ID` returned synchronously by `ssh_rsync`. Subscribe directly via `sub_open uri=rsync://<RSYNC_ID>/progress` immediately after the tool returns.
@@ -263,13 +265,17 @@ sequenceDiagram
     participant Reg as SubscriptionRegistry
     participant Deb as Debouncer task
 
-    Peer->>Server: sub_open uri=shell://abc/output (or resources/subscribe)
-    Server->>Reg: ensure_debouncer(kind, id) + subscribe / register lane
+    Peer->>Server: sub_open uri=shell://abc/output
+    Server->>Reg: lane_admin.open(uri, kind, id) (register lane)
+    Server->>Reg: ensure_debouncer(kind, id) (DebouncerActivator)
+    Server-->>Peer: ack (SUB_ID)
+
+    Peer->>Server: resources/subscribe uri=shell://abc/output
+    Server->>Reg: subscribe(kind, id, uri, peer)
     alt First subscriber on (kind, id)
         Reg->>Deb: spawn debouncer_task<br/>(waker + flush_now + bytes_counter)
     end
-    Reg-->>Server: ok
-    Server-->>Peer: ack (SUB_ID)
+    Server-->>Peer: empty result (no SUB_ID)
 
     loop Producer activity
         Note over Server: shell / command / transfer / session / forward / serial producer pokes the registry.
@@ -288,8 +294,10 @@ sequenceDiagram
     Note over Deb: Keepalive ticker fires every SSH_NOTIFY_KEEPALIVE_S (default 30 s).
     Note over Deb: Byte-threshold flush bypasses the debounce window when bytes_counter crosses SSH_NOTIFY_FLUSH_BYTES (default 64 KiB).
 
-    Peer->>Server: sub_close sub_id=... (or resources/unsubscribe)
-    Server->>Reg: unsubscribe / lane_admin.close(sub_id)
+    Peer->>Server: sub_close sub_id=...
+    Server->>Reg: lane_admin.close(sub_id)
+    Peer->>Server: resources/unsubscribe
+    Server->>Reg: unsubscribe(peer_id, uri)
     alt Last subscriber leaves
         Reg->>Deb: abort()
     end

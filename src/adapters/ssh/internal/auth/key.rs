@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::adapters::sftp::internal::sftp::expand_tilde;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 
-use super::traits::AuthStrategy;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
 
 /// Private key file authentication strategy.
 ///

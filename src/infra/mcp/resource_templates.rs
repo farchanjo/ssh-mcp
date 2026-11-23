@@ -24,7 +24,7 @@
 //! expansion (`{?cursor}`); the path-segment parameters use the simple
 //! variable expansion form (`{shell_id}`).
 
-use rmcp::model::{AnnotateAble, RawResourceTemplate, ResourceTemplate};
+use rmcp::model::ResourceTemplate;
 
 /// Build the canonical list of [`ResourceTemplate`] entries advertised
 /// by `resources/templates/list`.
@@ -55,7 +55,7 @@ pub fn build_list() -> Vec<ResourceTemplate> {
 /// Shell PTY output stream — byte-stream resource with a cursor surface so
 /// callers can fetch only the new bytes after each `notifications/resources/updated`.
 fn shell_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "shell://{shell_id}/output{?cursor}",
         "Shell PTY output stream",
     )
@@ -66,13 +66,12 @@ fn shell_template() -> ResourceTemplate {
              new bytes since the last read; omit to start from the head of the buffer.",
     )
     .with_mime_type("text/plain")
-    .no_annotation()
 }
 
 /// Async command stdout/stderr stream — block-shaped payload with a cursor
 /// matching the shell stream semantics.
 fn command_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "command://{command_id}/output{?cursor}",
         "Async command output stream",
     )
@@ -83,12 +82,11 @@ fn command_template() -> ResourceTemplate {
          bytes since the last read; omit to start from the head of the buffer.",
     )
     .with_mime_type("text/plain")
-    .no_annotation()
 }
 
 /// SFTP transfer progress snapshot — point-in-time JSON payload, no cursor.
 fn transfer_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "transfer://{transfer_id}/progress",
         "SFTP transfer progress snapshot",
     )
@@ -99,12 +97,11 @@ fn transfer_template() -> ResourceTemplate {
          Each subscription update fires a fresh snapshot; no cursor pagination.",
     )
     .with_mime_type("application/json")
-    .no_annotation()
 }
 
 /// SSH session health snapshot — point-in-time JSON payload, no cursor.
 fn session_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "session://{session_id}/health",
         "SSH session health snapshot",
     )
@@ -115,14 +112,13 @@ fn session_template() -> ResourceTemplate {
          Each subscription update fires a fresh snapshot; no cursor pagination.",
     )
     .with_mime_type("application/json")
-    .no_annotation()
 }
 
 /// Native UART / TTY / COM byte stream — cursor-paginated text payload.
 /// ADR 0009 (v5.2). Always advertised — local serial transport is not
 /// gated by `port_forward`.
 fn serial_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "serial://{serial_id}/output{?cursor}",
         "Native UART/TTY/COM byte stream",
     )
@@ -133,14 +129,13 @@ fn serial_template() -> ResourceTemplate {
          since the last read; omit to start from the head of the buffer.",
     )
     .with_mime_type("text/plain")
-    .no_annotation()
 }
 
 /// Port-forward event log — cursor-paginated JSON event stream. Feature-gated
 /// so the no-forward build does not advertise a stream it cannot serve.
 #[cfg(feature = "port_forward")]
 fn forward_template() -> ResourceTemplate {
-    RawResourceTemplate::new(
+    ResourceTemplate::new(
         "forward://{forward_id}/events{?cursor}",
         "Port-forward event log",
     )
@@ -152,7 +147,6 @@ fn forward_template() -> ResourceTemplate {
          since the last read; omit to start from the head of the log.",
     )
     .with_mime_type("application/json")
-    .no_annotation()
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ jobs:
       matrix:
         os: [Linux, Windows, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.99.1)
         shell: bash
@@ -88,7 +88,7 @@ jobs:
       # (release), not the debug tree nextest happens to leave behind.
       SSH_MCP_BUILD_PROFILE: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Prefer rustup-managed toolchain (rust-toolchain.toml pins 1.99.1)
         shell: bash
@@ -152,7 +152,7 @@ jobs:
         run: tar czf "ssh-mcp-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz" -C dist .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ssh-mcp-${{ runner.os }}-${{ runner.arch }}
           path: |
@@ -180,7 +180,7 @@ jobs:
       matrix:
         os: [Linux, Windows, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Version guard (tag must match Cargo.toml)
         shell: bash
@@ -226,7 +226,7 @@ jobs:
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             ${{ env.ARCHIVE }}

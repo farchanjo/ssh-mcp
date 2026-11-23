@@ -697,8 +697,9 @@ fn loom_lane_pause_resume_no_loss() {
             for _ in 0_u32..3 {
                 p_attempted.fetch_add(1, Ordering::AcqRel);
                 while p_paused.load(Ordering::Acquire) {
-                    // Spin-wait — production code uses
-                    // `Notify::notified().await`.
+                    // Spin-wait — production gates delivery on the same
+                    // `Acquire` load in `LaneFanoutBridge`; the resume
+                    // catch-up is a notification, not a wake of this loop.
                     loom::thread::yield_now();
                 }
                 p_delivered.fetch_add(1, Ordering::AcqRel);

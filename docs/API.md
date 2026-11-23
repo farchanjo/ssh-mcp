@@ -1,6 +1,6 @@
 # SSH MCP API Reference (v7.0)
 
-Complete API reference for the **39 MCP tools** (or 38 without `port_forward`) split across three semantic eixos — **`ssh_*`** (24), **`sub_*`** (9), **`serial_*`** (6) — the **7 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v7.0 ssh-mcp server (rmcp 1.6, protocol `V_2025_06_18`). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x / v6.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), v6.0 renamed tool strings, v6.1 added `resume` + `verify` to `ssh_upload` / `ssh_download` ([ADR 0010](./adr/0010-sftp-resume.md)), and **v7.0 adds 3 net-new rsync tools** (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`) plus the `rsync://` push lane ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)). Resource URIs / push narrative / structured-content payloads / env vars carry forward byte-identical from v6.0 except for the additive `rsync://` scheme and 8 new error codes (2 v6.1 resume codes + 6 v7.0 rsync codes). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x / v7.0 extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
+Complete API reference for the **39 MCP tools** (or 38 without `port_forward`) split across three semantic eixos — **`ssh_*`** (24), **`sub_*`** (9), **`serial_*`** (6) — the **7 resource subscribe schemes** (`shell` · `command` · `transfer` · `session` · `forward` · `serial` · `rsync`), and the v4.7 inter-tool conversation surface (`structured_content` JSON channel, `resources/templates/list`, `notifications/progress`, `prompts/*` catalog, idempotency cache, NOT_FOUND closest-match suggestions, `INITIAL_BUFFER` line) exposed by the v7.0 ssh-mcp server (rmcp 3.11, protocol `V_2025_11_25` ceiling). Text channel is byte-compatible with v3.0.0 / v4.x / v5.x / v6.x on every legacy tool; v5.0 added 9 net-new `sub_*` tools, v5.2 added 6 native `serial_*` tools ([ADR 0009](./adr/0009-serial-transport.md)), v6.0 renamed tool strings, v6.1 added `resume` + `verify` to `ssh_upload` / `ssh_download` ([ADR 0010](./adr/0010-sftp-resume.md)), and **v7.0 adds 3 net-new rsync tools** (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`) plus the `rsync://` push lane ([ADR 0011](./adr/0011-rsync-hybrid-transport.md)). Resource URIs / push narrative / structured-content payloads / env vars carry forward byte-identical from v6.0 except for the additive `rsync://` scheme and 8 new error codes (2 v6.1 resume codes + 6 v7.0 rsync codes). v4.8 lifted typed `output_schema` advertisement to all carry-over tools; v5.x / v7.0 extends it to every new tool. See [ARCHITECTURE.md](./ARCHITECTURE.md) and [MIGRATION.md → v6.1 → v7.0](./MIGRATION.md#v61--v70).
 
 > **v7.0 — wire-additive on tool name strings.** Resource URI schemes (now 7 with `rsync://`), `_meta` envelope, structured-content schemas, error taxonomy (56 codes total — 38 base + 2 v6.1 + 6 v7.0 + 10 v7.1), and env vars are byte-identical to v6.x except for the additive deltas. Existing v6.0 / v6.1 hosts work unchanged; opt into rsync by calling the new `ssh_rsync*` tools.
 
@@ -1081,7 +1081,7 @@ Open a Channel Mux lane for a resource URI. Returns `SUB_ID` (UUIDv7) + the boun
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `uri` | string | — | Resource URI (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events`, `serial://<id>/output`). |
+| `uri` | string | — | Resource URI (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events`, `serial://<id>/output`). A missing `shell`, `command`, `transfer` or `session` id is refused; `forward`, `serial` and `rsync` attach before the producer and are not checked. |
 | `lifetime` | enum (`manual` / `auto_close` / `lease`) | `manual` | `manual` keeps the lane until explicit `sub_close`; `auto_close` releases after `grace_ms` of consumer inactivity; `lease` enforces a hard `ttl_secs` cap regardless of activity. |
 | `grace_ms` | `u32?` | `2000` | Honoured only when `lifetime=auto_close`. Grace window after consumer inactivity before the lane releases. |
 | `ttl_secs` | `u32?` | — | Honoured only when `lifetime=lease`. Hard TTL on the lane regardless of activity. |
@@ -1103,7 +1103,7 @@ NEXT: sub_close sub_id=<uuidv7> | sub_stats sub_id=<uuidv7>
 
 `INLINE_PUSH_HONORED: no` means the request was either off (`inline_push=false`), the peer never advertised the experimental capability, or the URI is on a binary scheme (`transfer://`, `session://`, `forward://`, `rsync://`).
 
-**Errors**: `RESOURCE_GONE`, `LANE_LIMIT_PER_URI`, `LANE_LIMIT_TOTAL`, `FILTER_INVALID`, `INLINE_PUSH_BAD_PARAMS`, `INVALID_ARGUMENT`.
+**Errors**: `SHELL_NOT_FOUND`, `COMMAND_NOT_FOUND`, `TRANSFER_NOT_FOUND`, `SESSION_NOT_FOUND`, `MAX_SUBS_PER_URI_EXCEEDED`, `MAX_SUBS_TOTAL_EXCEEDED`, `INVALID_ARGUMENT`. `RESOURCE_GONE` is not returned here: the path does not touch the lifecycle, so a resource whose lifecycle is `Closed` while its repository row still exists is accepted.
 
 **Cost**: O(1) lane open + per-event mpsc thereafter. **Idempotency**: `_meta.idempotency_key` supported.
 
@@ -1123,7 +1123,9 @@ Close a lane by `SUB_ID`. Triggers grace timer if last subscriber and `release_w
 
 ### sub_pause
 
-Suspend the lane drain loop. Producer keeps emitting; the mpsc fills under the lane's lag policy.
+Suspend delivery for the lane. The producer and the resource ring keep running; the consumer reads the missed range from its cursor at resume.
+
+Gates the lanes opened by `sub_open`. `resources/subscribe` opens no lane, so its delivery is the per-peer fan-out and it has no pause target.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1133,7 +1135,9 @@ Suspend the lane drain loop. Producer keeps emitting; the mpsc fills under the l
 
 ### sub_resume
 
-Resume the drain loop after `sub_pause`.
+Resume delivery after `sub_pause` and emit one catch-up `notifications/resources/updated` for the lane.
+
+On a lane with `inline_push`, the next `notifications/ssh/output` fragment's `cursor_after` jumps over the paused bytes and its `seq` skips the dropped fragments; read the gap with `resources/read?cursor=<last cursor_after>` before consuming the inline stream again.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1150,7 +1154,7 @@ Hot-reload the lane's regex filter. Empty string clears the filter (forwards eve
 | `sub_id` | string | Target lane. |
 | `regex` | string | New regex pattern. Empty string clears the filter. Char cap: `SSH_FILTER_REGEX_MAX` (default 1024). |
 
-**Response**: `SUB_FILTER: OK`. **Errors**: `SUB_NOT_FOUND`, `FILTER_INVALID`.
+**Response**: `SUB_FILTER: OK`. **Errors**: `SUB_NOT_FOUND`, `INVALID_ARGUMENT` (regex compile).
 
 ### sub_replay
 

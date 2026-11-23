@@ -33,8 +33,8 @@ use tokio::sync::{Notify, OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use super::transfer::{CHUNK_SIZE, TransferStatus};
-use super::types::ProgressEvent;
+use crate::adapters::sftp::internal::transfer::{CHUNK_SIZE, TransferStatus};
+use crate::adapters::sftp::internal::types::ProgressEvent;
 use crate::adapters::ssh::internal::client::open_session_with_retry;
 use crate::adapters::ssh::internal::session::SshClientHandler;
 use crate::adapters::subscription::legacy::{ResourceKind, SUBSCRIPTION_REGISTRY};
@@ -1547,6 +1547,30 @@ mod tests {
                 hex,
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             );
+        }
+
+        #[tokio::test]
+        async fn sha256_local_prefix_hashes_only_the_prefix()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let directory = tempfile::tempdir()?;
+            let file = directory.path().join("prefix.bin");
+            tokio::fs::write(&file, b"abcdef").await?;
+
+            // Offset 3 hashes `abc`, not the whole file.
+            let abc = sha256_local_prefix(&file, 3).await?;
+            assert_eq!(
+                hex_encode(&abc),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+
+            // Offset 0 hashes nothing.
+            let empty = sha256_local_prefix(&file, 0).await?;
+            assert_eq!(
+                hex_encode(&empty),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            );
+
+            Ok(())
         }
     }
 

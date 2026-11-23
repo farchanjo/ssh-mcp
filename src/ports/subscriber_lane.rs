@@ -130,7 +130,11 @@ pub trait LaneAdmin: fmt::Debug + Send + Sync + 'static {
     fn pause<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
 
     /// Resume drain on `sub_id`.
-    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>>;
+    ///
+    /// Returns `true` when the lane was paused and this call flipped it,
+    /// `false` when it was already running. The caller sends the catch-up
+    /// notification on `true`.
+    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<bool, DomainError>>;
 
     /// Hot-reload the lane filter.
     fn set_filter<'a>(
@@ -208,10 +212,13 @@ pub trait LocalSubscriberLaneAsync: Sync {
 
     /// Resume drain on `sub_id`.
     ///
+    /// Returns `true` when the lane was paused and this call flipped it,
+    /// `false` when it was already running.
+    ///
     /// # Errors
     ///
     /// Returns [`DomainError::SubNotFound`] for unknown lanes.
-    async fn resume_lane(&self, sub_id: &SubId) -> Result<(), DomainError>;
+    async fn resume_lane(&self, sub_id: &SubId) -> Result<bool, DomainError>;
 
     /// Hot-reload the lane filter.
     ///

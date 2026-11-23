@@ -22,9 +22,7 @@ use std::sync::Arc;
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
-use crate::domain::subscription::SubId;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
-use crate::ports::subscriber_lane::LaneAdmin;
 use crate::ports::subscriber_registry::SubscriberRegistryAsync;
 
 /// Inbound DTO.
@@ -34,11 +32,6 @@ pub struct UnsubscribeResourceRequest {
     pub uri: String,
     /// Peer id (must match the id used at subscribe time).
     pub peer_id: PeerId,
-    /// Optional v5 Phase 2 [`SubId`] — when present the use case
-    /// also closes the matching [`LaneAdmin`] entry (best-effort:
-    /// the lane may already be gone if Phase 3 lifetime auto-close
-    /// fired first).
-    pub sub_id: Option<SubId>,
 }
 
 /// Outbound DTO surfacing the canonical URI.
@@ -56,12 +49,6 @@ where
 {
     subscribers: Arc<Sub>,
     lifecycle: Arc<dyn LifecyclePolicyPort>,
-    /// v5 Phase 2 — optional [`LaneAdmin`] handle. When wired, the
-    /// use case closes the matching lane before the legacy registry
-    /// unsubscribe so the
-    /// [`crate::ports::lifecycle_policy::LifecyclePolicyPort::on_unsubscribe`]
-    /// cascade observes the cleanup in the right order.
-    lane: Option<Arc<dyn LaneAdmin>>,
 }
 
 impl<Sub> UnsubscribeResourceUseCase<Sub>
@@ -74,15 +61,7 @@ where
         Self {
             subscribers,
             lifecycle,
-            lane: None,
         }
-    }
-
-    /// Install the v5 Phase 2 [`LaneAdmin`] handle.
-    #[must_use]
-    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
-        self.lane = Some(lane);
-        self
     }
 
     /// Drive the unsubscribe orchestration. See module-level docs.
@@ -99,18 +78,6 @@ where
         let parsed =
             parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
-        // v5 Phase 2: close the lane first so its lifecycle hook
-        // fires before the registry releases the (peer, uri) cursor.
-        // SubNotFound is tolerated — Phase 3 lifetime auto-close may
-        // have already torn the lane down.
-        if let Some(lane) = self.lane.as_ref()
-            && let Some(sub_id) = req.sub_id.as_ref()
-        {
-            match lane.close(sub_id).await {
-                Ok(()) | Err(DomainError::SubNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
         let was_subscribed = self.subscribers.unsubscribe(&req.peer_id, &canonical).await;
         // v5 lifecycle: debit the resource refcount ONLY when the
         // registry actually removed an entry. Calling on_unsubscribe
@@ -137,14 +104,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::{UnsubscribeResourceRequest, UnsubscribeResourceUseCase};
+    use crate::adapters::id_generator::uuid::UuidIds;
+    use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
+    use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
+    use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
+    use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
+    use crate::adapters::subscription::memory_registry::MemoryRegistry;
+    use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use crate::application::subscribe_resource::{
+        SubscribeResourceRequest, SubscribeResourceUseCase,
+    };
     use crate::domain::error::DomainError;
-    use crate::domain::ids::PeerId;
-    use crate::ports::notifier::PeerHandle;
+    use crate::domain::ids::{PeerId, SessionId, ShellId};
+    use crate::domain::lifecycle::LifecyclePolicy;
+    use crate::domain::shell::{ShellEntity, ShellTerminal};
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+    use crate::ports::notifier::{NotifierPort, PeerHandle};
+    use crate::ports::shell_repo::ShellRepository;
+    use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync, SubscriberLanePort};
     use crate::ports::subscriber_registry::{
         ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,
     };
+    use chrono::{TimeZone, Utc};
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Debug, Default)]
     struct RecordingRegistry {
@@ -190,8 +174,8 @@ mod tests {
             _resource_id: String,
             _uri: String,
             _peer: Arc<dyn PeerHandle>,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::ports::subscriber_registry::SubscribeDisposition, DomainError> {
+            Ok(crate::ports::subscriber_registry::SubscribeDisposition::Created)
         }
         async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) -> bool {
             if let Ok(mut g) = self.unsubs.lock() {
@@ -225,7 +209,6 @@ mod tests {
         UnsubscribeResourceRequest {
             uri: uri.to_string(),
             peer_id: PeerId::new(peer.to_string()),
-            sub_id: None,
         }
     }
 
@@ -316,83 +299,6 @@ mod tests {
         assert_eq!(calls[0].0.as_str(), "peer-9");
     }
 
-    // --- v5 Phase 2 lane wiring ------------------------------------
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn unsubscribe_with_lane_closes_matching_sub_id() {
-        use crate::adapters::id_generator::uuid::UuidIds;
-        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
-        use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync};
-
-        let registry = Arc::new(RecordingRegistry::default());
-        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
-        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
-        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
-            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
-        let lane_adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
-        let sub_id = lane_adapter
-            .open_lane(
-                "shell://x/output".to_string(),
-                ResourceKind::Shell,
-                "x".to_string(),
-                LanePolicy::default(),
-            )
-            .await
-            .expect("open");
-
-        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> =
-            Arc::clone(&lane_adapter) as Arc<dyn crate::ports::subscriber_lane::LaneAdmin>;
-        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle)
-            .with_subscriber_lane(lane);
-
-        let _ = uc
-            .execute(UnsubscribeResourceRequest {
-                uri: "shell://x/output".to_string(),
-                peer_id: PeerId::new("peer-1".to_string()),
-                sub_id: Some(sub_id.clone()),
-            })
-            .await
-            .expect("execute");
-
-        // Lane has been closed.
-        assert!(
-            crate::ports::subscriber_lane::SubscriberLanePort::stats_snapshot(
-                &*lane_adapter,
-                &sub_id
-            )
-            .is_none()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn unsubscribe_tolerates_unknown_sub_id_when_lane_wired() {
-        use crate::adapters::id_generator::uuid::UuidIds;
-        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
-        use crate::domain::subscription::SubId;
-
-        let registry = Arc::new(RecordingRegistry::default());
-        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
-        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
-        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
-            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
-        let lane_adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
-        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> = lane_adapter;
-        let uc = UnsubscribeResourceUseCase::new(Arc::clone(&registry), lifecycle)
-            .with_subscriber_lane(lane);
-
-        // SubId never opened — close should still succeed (tolerated
-        // via SubNotFound -> Ok(()) mapping).
-        let outcome = uc
-            .execute(UnsubscribeResourceRequest {
-                uri: "shell://x/output".to_string(),
-                peer_id: PeerId::new("peer-1".to_string()),
-                sub_id: Some(SubId::new("ghost".to_string())),
-            })
-            .await
-            .expect("execute should tolerate unknown sub_id");
-        assert_eq!(outcome.uri, "shell://x/output");
-    }
-
     // --- BUG #5: grace timer armed on the production unsubscribe path ---
 
     #[tokio::test(flavor = "multi_thread")]
@@ -436,7 +342,6 @@ mod tests {
         uc.execute(UnsubscribeResourceRequest {
             uri: "shell://sh-1/output".to_string(),
             peer_id: PeerId::new("peer-1".to_string()),
-            sub_id: None,
         })
         .await
         .expect("execute");
@@ -466,5 +371,178 @@ mod tests {
             0,
             "cascade must debit the session refcount once the resource closes"
         );
+    }
+
+    const UNSUB_URI: &str = "shell://sh-unsub/output";
+
+    #[derive(Debug, Default)]
+    struct UnsubNotifier;
+
+    impl NotifierPort for UnsubNotifier {
+        async fn notify_resource_updated(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _uri: &str,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _payload: crate::domain::inline_payload::InlinePayload,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubPeer {
+        id: PeerId,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StubPeer {
+        fn new(id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: PeerId::new(id.to_string()),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl PeerHandle for StubPeer {
+        fn id(&self) -> PeerId {
+            self.id.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    struct UnsubHarness {
+        subscribe: SubscribeResourceUseCase<
+            DashMapShellRepo,
+            DashMapCommandRepo,
+            DashMapTransferRepo,
+            DashMapSessionRepo,
+            MemoryRegistry<UnsubNotifier>,
+        >,
+        unsubscribe: UnsubscribeResourceUseCase<MemoryRegistry<UnsubNotifier>>,
+        registry: Arc<MemoryRegistry<UnsubNotifier>>,
+        lanes: Arc<SubscriberLaneAdapter<UuidIds>>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+        shells: Arc<DashMapShellRepo>,
+    }
+
+    fn unsub_harness() -> UnsubHarness {
+        let shells = Arc::new(DashMapShellRepo::new());
+        let commands = Arc::new(DashMapCommandRepo::new());
+        let transfers = Arc::new(DashMapTransferRepo::new());
+        let sessions = Arc::new(DashMapSessionRepo::new());
+        let registry = MemoryRegistry::new(Arc::new(UnsubNotifier));
+        let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
+        let clock = Arc::new(crate::adapters::clock::system::SystemClock);
+        let lifecycle_concrete =
+            crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            Arc::clone(&lifecycle_concrete) as Arc<dyn LifecyclePolicyPort>;
+        let lanes = SubscriberLaneAdapter::new(Arc::new(UuidIds), 1, 16, 64);
+        let subscribe = SubscribeResourceUseCase::new(
+            Arc::clone(&shells),
+            Arc::clone(&commands),
+            Arc::clone(&transfers),
+            Arc::clone(&sessions),
+            Arc::clone(&registry),
+            Arc::clone(&lifecycle),
+        );
+        let unsubscribe =
+            UnsubscribeResourceUseCase::new(Arc::clone(&registry), Arc::clone(&lifecycle));
+        UnsubHarness {
+            subscribe,
+            unsubscribe,
+            registry,
+            lanes,
+            lifecycle,
+            shells,
+        }
+    }
+
+    async fn seed_unsub_shell(h: &UnsubHarness) {
+        h.shells
+            .insert(ShellEntity::new(
+                ShellId::new("sh-unsub".to_string()),
+                SessionId::new("s".to_string()),
+                ShellTerminal::new("xterm".to_string(), 80, 24),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Duration::from_secs(60),
+                10 * 1024 * 1024,
+            ))
+            .await
+            .unwrap();
+        h.lifecycle.track_resource(
+            ResourceKind::Shell,
+            "sh-unsub",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_unsubscribe_removes_the_registry_entry() {
+        let h = unsub_harness();
+        seed_unsub_shell(&h).await;
+        h.subscribe
+            .execute(SubscribeResourceRequest {
+                uri: UNSUB_URI.to_string(),
+                peer: StubPeer::new("peer-unsub") as Arc<dyn PeerHandle>,
+            })
+            .await
+            .unwrap();
+        h.unsubscribe
+            .execute(UnsubscribeResourceRequest {
+                uri: UNSUB_URI.to_string(),
+                peer_id: PeerId::new("peer-unsub".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(h.registry.snapshot_subscribers(UNSUB_URI).is_empty());
+        h.unsubscribe
+            .execute(UnsubscribeResourceRequest {
+                uri: UNSUB_URI.to_string(),
+                peer_id: PeerId::new("peer-unsub".to_string()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_unsubscribe_leaves_a_sub_open_lane_open() {
+        let h = unsub_harness();
+        seed_unsub_shell(&h).await;
+        let sub_id = h
+            .lanes
+            .open_lane(
+                UNSUB_URI.to_string(),
+                ResourceKind::Shell,
+                "sh-unsub".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        h.subscribe
+            .execute(SubscribeResourceRequest {
+                uri: UNSUB_URI.to_string(),
+                peer: StubPeer::new("peer-keep") as Arc<dyn PeerHandle>,
+            })
+            .await
+            .unwrap();
+        h.unsubscribe
+            .execute(UnsubscribeResourceRequest {
+                uri: UNSUB_URI.to_string(),
+                peer_id: PeerId::new("peer-keep".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(h.lanes.stats_snapshot(&sub_id).is_some());
     }
 }

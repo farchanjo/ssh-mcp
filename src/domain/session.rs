@@ -10,8 +10,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::identity::Address;
-use super::ids::{AgentId, SessionId};
+use crate::domain::identity::Address;
+use crate::domain::ids::{AgentId, SessionId};
 
 /// Snapshot of a single SSH session as understood by the domain layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,12 @@
+stages:
+  - verify
+
+verify:
+  stage: verify
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --all-features -- -D warnings
+    - cargo nextest run --test-threads num-cpus --lib
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

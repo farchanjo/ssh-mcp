@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-use super::output::{sanitize_value, truncate_utf8_safe_head};
+use crate::infra::mcp::helpers::output::{sanitize_value, truncate_utf8_safe_head};
 
 /// Default maximum bytes allowed in an error DETAIL field. Mirrors v3
 /// `DEFAULT_ERROR_DETAIL_MAX_BYTES` so the cap stays binary-compatible.

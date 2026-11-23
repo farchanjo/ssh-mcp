@@ -28,8 +28,8 @@ use bytes::Bytes;
 use tokio::sync::{OnceCell, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::types::{AsyncCommandInfo, AsyncCommandStatus};
 use crate::adapters::config::internal::resolve_command_broadcast_cap;
+use crate::adapters::ssh::internal::types::{AsyncCommandInfo, AsyncCommandStatus};
 
 /// Output buffer for collecting command output
 #[derive(Debug, Default, Clone)]

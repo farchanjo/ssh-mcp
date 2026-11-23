@@ -71,7 +71,7 @@ harness = true
 #     dependency tree are transitive (e.g. via rmcp) and outside our control.
 
 # MCP — official Anthropic Rust SDK with resources/subscribe + notifications
-rmcp = { version = "1.6", default-features = false, features = [
+rmcp = { version = "3.11", default-features = false, features = [
     "server",
     "client",                # v5 Phase 4: NDJSON daemon embeds an rmcp client
     "macros",
@@ -82,19 +82,19 @@ rmcp = { version = "1.6", default-features = false, features = [
 ] }
 
 # HTTP host for rmcp streamable-http transport
-# rmcp 1.6 declares `axum = "^0.8"`, so we align on the same major to share
-# the transitive copy and avoid two axum versions in the dep graph.
+# axum 0.8 is this package's own pin (`cargo tree -i axum`); rmcp 3.11 depends
+# on tower-service.
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 
 # SSH client (async)
-russh = "0.60"
-russh-sftp = "2"
+russh = "0.65"
+russh-sftp = "4"
 
 # Serial / UART / TTY / COM transport (v5.2 — ADR 0009)
 # Async serial port wrapper sharing the tokio runtime. Cross-platform:
@@ -107,7 +107,7 @@ trait-variant = "0.1"   # AFIT pattern for ports/adapters (v3 `async-trait` dire
 
 # Lock-free primitives
 arc-swap = "1.7"            # ArcSwap<RingBuffer> + ArcSwap<OutputBuffer>
-base64 = "0.22"             # ADR 0012 v7.1 inline-push — wire encoding for `notifications/ssh/output` `bytes_b64` field
+base64 = "0.23"             # ADR 0012 v7.1 inline-push — wire encoding for `notifications/ssh/output` `bytes_b64` field
 bytes = "1.10"              # COW byte slices for broadcast / history
 
 # Serialization and data handling
@@ -126,9 +126,9 @@ tracing = "0.1"                                                         # Tracin
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.16", features = ["v4", "v7", "serde"] }
 regex = "1.11"              # Filter pipeline regex (v5 Phase 2 lane filters)
-sha2 = "0.10"               # ADR 0010 — sha256 of resume prefix when verify=true
+sha2 = "0.11"               # ADR 0010 — sha256 of resume prefix when verify=true
 md4 = "0.11"                # ADR 0011 v7.0 wire transport (slice 3) — MD4 strong checksum + per-file digest (RFC 1320)
-md-5 = "0.10"               # ADR 0011 v7.0 wire transport (slice 5) — MD5 per-file digest at protocol >= 30 (rsync 3.x default xfer_sum_nni)
+md-5 = "0.11"               # ADR 0011 v7.0 wire transport (slice 5) — MD5 per-file digest at protocol >= 30 (rsync 3.x default xfer_sum_nni)
 globset = "0.4"             # ADR 0011 SFTP transport — gitignore-style include/exclude glob matcher
 
 # clap intentionally not added — its derive macros emit

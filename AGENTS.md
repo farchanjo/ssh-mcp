@@ -1,326 +1,167 @@
-# AGENTS.md
-
-ssh-mcp **v7.1.3** — subscribe-first SSH MCP server. Hexagonal core (v4.1) plus eight layered deltas: lifecycle binding ([ADR 0003](docs/adr/0003-lifecycle-binding.md), Phase 1 — merged), channel mux + sub_id ([ADR 0004](docs/adr/0004-channel-mux-fairness.md), Phase 2 — merged), LLM UX overhaul ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged), NDJSON daemon ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), serial transport ([ADR 0009](docs/adr/0009-serial-transport.md), v5.2 — merged), SFTP resume + verify ([ADR 0010](docs/adr/0010-sftp-resume.md), v6.1 — merged), the rsync hybrid transport ([ADR 0011](docs/adr/0011-rsync-hybrid-transport.md), v7.0 — merged), and inline-push notifications ([ADR 0012](docs/adr/0012-inline-push-notifications.md), v7.1 — **merged**, wire-additive `notifications/ssh/output` opt-in surface gated by `experimental.ssh_inline_push` capability handshake + per-`sub_open` `inline_push: bool` flag; default delivery cadence unchanged for every existing v7.0.x consumer). v6.0 split the 36-tool catalogue across three semantic eixos: **`ssh_*`** (21 tools, ops over SSH), **`sub_*`** (9 tools, lane management — cross-resource), **`serial_*`** (6 tools, local UART/TTY/COM — no SSH). v7.0 ships **`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`** with two integrated transports — `WireRsyncTransport` (canonical port of OpenBSD `openrsync` speaking rsync wire protocol v32 (downgrades to v31 against legacy servers via min(local, remote)) against a remote `rsync --server`) and `SftpRsyncTransport` (universal SFTP fallback). The Wire transport's openrsync port closed across ten slices: handshake (proto 27→31), file-list (16-bit `XMIT_EXTENDED_FLAGS` + varint30/varlong30), block-checksum decode + Adler32/MD4 hash kernels, MD4 (proto<30) / MD5 (proto≥30) per-file digest, multi-phase `send_files` loop, block-match path (Adler32 hashtable + sliding window), pull direction + receiver state machine, incremental pull, `--delete` + attrs apply (`-p -t -o -g -l`), `--partial` + `-S` sparse hole detection. **Push and pull both byte-identical against `rsync 3.2.7`** on a real Linux VM (six wire e2e tests in `tests/v7_rsync_wire_e2e_vm.rs`, gated `e2e-vm`). End-to-end MCP-path verified — `ssh_rsync transport=Wire` from local to `vm.services` against a live `rsync 3.2.7` server produces byte-identical sha256 across the 3-file fixture, riding the full `tool_router::ssh_rsync` → `RsyncSyncUseCase::execute` → `WireRsyncTransport::start_session` chain. The SFTP fallback ships the supported subset (recursive mirror, dry-run, `--delete`, exclude/include patterns, attribute preservation gated on a per-session `SftpFeatures` capability probe). Slices 11–12 (`-c` checksum delta over a wire-format extension and `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today. Resource URIs / push narrative / error taxonomy / structured-content payloads remain byte-identical to v5.x except for the additive `rsync://<id>/progress` scheme and 6 new error codes.
-
-**v7.0.0-alpha.2 architectural retrenchment** — the original v7.0 plan shipped a deployed-agent transport (linux-x86_64 cross-compiled binary, embedded via `include_bytes!`, SFTP-uploaded with sha256 verification). That path was retracted in favour of "tudo integrado": both transports live inside the host crate. The `crates/ssh-mcp-rsync-agent/` and `crates/ssh-mcp-rsync-proto/` sub-crates were deleted; the workspace collapsed back to a **single package**. 4 agent-specific error codes (`AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`, `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`) were dropped; 1 new code (`SFTP_FEATURE_MISSING`) was added. The `transport` enum is now `Auto | Wire | Sftp`. Resolver 3, edition 2024, MSRV 1.99.
-
-Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Host migration guide: [docs/MIGRATION.md → v7.1.2 → v7.1.3](docs/MIGRATION.md#v712--v713-bug-fix-patch) (latest — session-limit patch) and [v7.0 → v7.1](docs/MIGRATION.md#v70--v71-adr-0012).
-
-## Build commands
-
-```bash
-cargo build                                        # Dev profile: incremental, sccache, 4 jobs
-cargo build --bin ssh-mcp                          # HTTP server (axum 0.8 + rmcp 1.6)
-cargo build --bin ssh-mcp-stdio                    # Stdio MCP transport
-cargo build --bin ssh-mcp-tail                     # NDJSON daemon
-cargo build --no-default-features --target-dir target/no-default-features  # 38-tool surface, separate tree
-cargo nextest run --lib                            # 2103 lib tests
-cargo nextest run --tests --features test-fixtures # 167 integration tests across 12 binaries (v4_smoke 2, v5_smoke 12, v5_daemon_smoke 7, v6_resume_smoke 12, v7_rsync_smoke 9, chaos 41, chaos_inline_push 9, chaos_rsync 16, property 32, property_inline_push 11, property_resume 6, property_rsync 10) + 32 loom invariants across lockfree_invariants + lockfree_invariants_rsync + lockfree_invariants_inline_push (gated #[cfg(loom)]) + 8 e2e VM tests (v7_rsync_e2e_vm 2 + v7_rsync_wire_e2e_vm 6, gated e2e-vm) + 24 Python integration tests in scripts/test_v7_rsync_*.py (22 passed + 2 xfailed; xfails cover deferred local-FS adapter for RsyncSftpFsPort)
-cargo fmt --all -- --check
-cargo clippy --all-features -- -D warnings         # Dev-profile lint — fast local loop
-cargo clippy --release --all-features -- -D warnings   # Canonical lint gate (owned by CI)
-```
-
-nextest is the only test runner. `cargo test` (libtest) still compiles the same
-targets, but nothing in the loop calls it: nextest runs one process per test, so
-a hung SSH/SFTP/rsync adapter cannot wedge its neighbours.
-
-### Fast dev loop
-
-Everything goes through the `Makefile`; `.cargo/config.toml` supplies the
-sccache wrapper and the en-US locale, and the profiles in `Cargo.toml` control
-optimisation and incremental. Dev/test are incremental, `codegen-units =
-256`, `opt-level = 0`; release is `incremental = false`, fat LTO, one codegen
-unit, `panic = "abort"`, stripped symbols. On macOS `make release` ad-hoc
-codesigns before install; `CODESIGN_IDENTITY` overrides the identity.
-
-```bash
-make gates                                     # dev pipeline: fmt + dev clippy + both suites
-make dev                                       # incremental debug build
-make test                                      # lib tests via nextest
-make test-integration                          # integration suite via nextest
-make ci-test                                   # same, `ci` profile + JUnit
-make fmt lint-dev check                        # individual gates
-sudo make all                                  # OWNER ONLY: gates + release + sign + install + verify
-sudo make release                              # OWNER ONLY: optimised build + install to /usr/local/bin
-```
-
-`JOBS` is pinned to **4** for every cargo invocation — dev and release alike —
-and is exported as `CARGO_BUILD_JOBS`; `.cargo/config.toml` sets the same 4 for
-a bare `cargo build`, and `.config/nextest.toml` pins `test-threads = 4`. An
-unset `JOBS` would mean "all cores"; the pin keeps wall-clock comparable across
-machines and leaves the host usable during a build. Override per run with
-`JOBS=8 make dev` — values above the core count clamp to it, and non-integers
-abort before any work starts. The recipes strip a shell-exported
-`CARGO_INCREMENTAL` so the profiles decide instead, and pin `RUSTC_WRAPPER` to
-`scripts/sccache-rustc.sh` because an exported `RUSTC_WRAPPER` outranks
-`.cargo/config.toml`. `NATIVE=1 make release` adds `-C target-cpu=native` at
-the cost of portability and a full rebuild. Schedules live in
-`.config/nextest.toml` — `default` locally, `ci` with 2 retries and a JUnit
-report (needs a `junit`-feature nextest build).
-
-### Working agreement — dev only
-
-**Agents work in the dev profile. Release builds are the owner's alone.**
-
-- Run `make dev`, `make gates`, `make test`, `make test-integration`,
-  `make fmt`, `make lint-dev`, `make check`. These are incremental, unoptimised
-  and the fastest path to a verified change.
-- **Never run `make release`, `make release-min`, `make all`, `make install`,
-  `make sign`, or any `cargo build --release`.** Fat LTO with one codegen unit
-  costs minutes per run and produces artifacts only the owner installs. If a
-  change seems to need a release build to verify, say so and stop there.
-- `make lint` (`clippy --release`) is the canonical CI gate and is also
-  release-profile; during a session use `make lint-dev`, which applies the
-  identical lint set under the dev profile.
-- CI is not covered by this rule: the `quality`, `build-test` and `release`
-  jobs in `.github/workflows/ci.yml` build release on every push and tag. That
-  is the owner's pipeline, not a session command.
-
-sccache 0.19 caches neither `-C incremental` crates (mozilla/sccache#236) nor
-`--crate-type bin`, so for this single-package workspace it only serves
-third-party rlib dependencies. That is deliberate: the dev/test loop keeps
-incremental, release drops it and becomes fully cacheable.
-
-## Architecture summary (v5.0)
-
-The public MCP API is structurally compatible with every v3 / v4.x release — every legacy tool keeps its block-markdown wire shape, structured JSON twin, env vars, and error codes. v5.0 stacks four additive layers on top of the v4.1 hexagonal base. Detailed module-by-module breakdown lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#hexagonal-layer-map).
-
-```mermaid
-%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
-flowchart TB
-    subgraph BIN["bin — entry points"]
-        HTTP["src/main.rs<br/>HTTP"]
-        STDIO["src/bin/ssh_mcp_stdio.rs<br/>stdio"]
-        TAIL["src/bin/ssh_mcp_tail.rs<br/>NDJSON daemon"]
-    end
-    subgraph COMP["composition — wiring root"]
-        PROD["prod.rs"]
-        EMBED["embed.rs"]
-        FIX["fixtures.rs"]
-    end
-    subgraph INFRA["infra/mcp — inbound MCP"]
-        TR["tool_router.rs<br/>39 #[tool] fns"]
-        RES["resource_handlers.rs"]
-        PROMPTS["prompts.rs"]
-    end
-    subgraph APP["application — use cases"]
-        UC["~33 *UseCase generic<br/>over ports"]
-    end
-    subgraph PORTS["ports — trait skeletons"]
-        VPORTS["v4 ports + v5:<br/>lifecycle_policy<br/>channel_mux<br/>subscriber_lane"]
-    end
-    subgraph ADAPT["adapters — concrete impls"]
-        RUSSH["ssh / sftp"]
-        REPO["repo/dashmap"]
-        LIFE["lifecycle/<br/>(Phase 1)"]
-        SUBLANE["subscription/<br/>lane + mux<br/>(Phase 2)"]
-    end
-    subgraph DOMAIN["domain — pure"]
-        ENT["entities + ids +<br/>lifecycle.rs +<br/>subscription.rs"]
-    end
-
-    BIN --> COMP
-    COMP --> INFRA
-    INFRA --> APP
-    APP --> PORTS
-    PORTS -.-> ADAPT
-    ADAPT --> DOMAIN
-    APP --> DOMAIN
-    PORTS --> DOMAIN
-
-    style BIN fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style COMP fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style INFRA fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style APP fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style PORTS fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style ADAPT fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style DOMAIN fill:#161b22,color:#f0f6fc,stroke:#30363d
-    style HTTP fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
-    style STDIO fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
-    style TAIL fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
-    style LIFE fill:#238636,color:#f0f6fc,stroke:#2ea043
-    style SUBLANE fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
-```
-
-The five v5 deltas in one line each:
-
-- **Lifecycle binding** ([ADR 0003](docs/adr/0003-lifecycle-binding.md)) — every long-lived resource is wrapped in a CAS state machine (`Owned → Observed → Releasing → Closed`) plus a per-session refcount. Grace timer arms when last subscriber detaches; new subscribes within the window cancel it. Cascade through `SessionEntry.active_refs` so a session with active resources is never reaped by inactivity TTL alone.
-- **Channel mux + sub_id** ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)) — push lanes key on `(SubId, Uri)` (UUIDv7). Each subscription owns its own `mpsc::channel(N)`, `LagPolicy`, filter pipeline, replay window, and `SubscriberStats`. A `ChannelMux` round-robin drainer guarantees fair scheduling. Legacy `(PeerId, Uri)` hosts get a synthesised `sub_id`.
-- **LLM UX overhaul** ([ADR 0005](docs/adr/0005-llm-ux-priorities.md), Phase 3 — merged) — 9 net-new MCP tools (`sub_open`, `sub_close`, `sub_pause/resume/filter/replay/list/stats`, `sub_stats_all`); `HINT:` line severity escalation; 10-prompt catalog; `SUB_LEAK_RISK` watcher; the error taxonomy ([ADR 0007](docs/adr/0007-error-taxonomy.md)).
-- **NDJSON daemon binary** ([ADR 0008](docs/adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged) — `ssh-mcp-tail` embeds rmcp server + in-process rmcp client across `tokio::io::duplex` and translates stdin NDJSON ops into MCP tool calls + stdout NDJSON events. Single binary, no IPC, Unix-pipeline composable.
-- **Serial transport** ([ADR 0009](docs/adr/0009-serial-transport.md), v5.2 — merged) — 6 native UART / TTY / COM tools (`serial_open`, `serial_close`, `serial_write`, `serial_press`, `serial_scan`, `serial_active`) with the same lock-free reader / writer split, `serial://<id>/output` push lane, and `SUBSCRIPTION_REGISTRY` debouncer integration as `command://*/output`.
-
-The text channel stays byte-identical to v4.7.1 / v4.8 on the 21 carry-over tools. The 9 new tools follow the same `KEY: value` + 8-hex nonce + `--- name [nonce] ---` envelope.
-
-### Lifecycle state machine
-
-CAS state machine driven from `src/adapters/lifecycle/refcount.rs` with all hot-path fields atomic (`AtomicU8` state, `AtomicUsize` sub_count, `AtomicU64` grace_until_ms, `ArcSwap<LifecyclePolicy>`, `Notify` waker). Cascade through `SessionEntry.active_refs: AtomicUsize` inside `CascadeCoordinator` (`src/adapters/lifecycle/cascade.rs`). The session reaper consults `active_refs > 0` before honouring the inactivity TTL — refcount supersedes TTL.
-
-```mermaid
-%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
-stateDiagram-v2
-    [*] --> Owned: open / execute / upload
-    Owned --> Observed: first on_subscribe<br/>sub_count 0 -> 1
-    Observed --> Observed: on_subscribe / on_unsubscribe<br/>(sub_count > 0)
-    Observed --> Releasing: last on_unsubscribe<br/>policy.release_when_no_subs
-    Releasing --> Observed: on_subscribe within grace<br/>(cancel timer)
-    Releasing --> Closed: grace_until_ms expired<br/>(timer fires)
-    Owned --> Closed: explicit close
-    Observed --> Closed: explicit close
-    Closed --> [*]: cascade refcount--<br/>(CascadeCoordinator)
-
-    classDef owned fill:#21262d,color:#8b949e,stroke:#30363d
-    classDef observed fill:#238636,color:#f0f6fc,stroke:#2ea043
-    classDef releasing fill:#9e6a03,color:#f0f6fc,stroke:#bf8700
-    classDef closed fill:#cf222e,color:#f0f6fc,stroke:#f85149
-
-    class Owned owned
-    class Observed observed
-    class Releasing releasing
-    class Closed closed
-```
-
-Defaults preserve v4 semantics (`release_when_no_subs = false`); the flag is opt-in per `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download`. Field table, memory ordering, cascade orchestration: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#phase-1--lifecycle-binding-merged) and [docs/DEVELOPMENT.md → Lifecycle adapter invariants](docs/DEVELOPMENT.md#lifecycle-adapter-invariants-phase-1).
-
-### Channel mux pipeline
-
-Each `resources/subscribe` (legacy) or `sub_open` (new tool) call mints a `SubId` (UUIDv7) and creates a `LaneState` (`byte_cursor`, `tx`, `policy`, `filter`, `lifecycle` link, `stats`, `pause_flag`). The `ChannelMuxAdapter` (`src/adapters/subscription/channel_mux.rs`) owns `DashMap<SubId, Arc<LaneDrain>>` plus `cursor_lane: AtomicUsize` for round-robin draining. Fairness invariant: between two backlogged lanes, the mux alternates `try_recv` and bumps cursor on every successful drain.
-
-```mermaid
-%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#1f6feb','primaryTextColor':'#f0f6fc','primaryBorderColor':'#388bfd','lineColor':'#8b949e','secondaryColor':'#161b22','tertiaryColor':'#21262d','background':'#0d1117','mainBkg':'#161b22','secondBkg':'#21262d','tertiaryBkg':'#0d1117','nodeTextColor':'#f0f6fc','edgeLabelBackground':'#21262d','clusterBkg':'#161b22','clusterBorder':'#30363d','titleColor':'#f0f6fc'}}}%%
-flowchart LR
-    Producer["Producer<br/>(russh / SFTP / health)"]
-    Debouncer["per-resource debouncer<br/>1 s / 5 s flush"]
-    LaneA["LaneState<br/>SubId A<br/>policy + filter + stats"]
-    LaneB["LaneState<br/>SubId B<br/>policy + filter + stats"]
-    LaneN["LaneState<br/>SubId N<br/>..."]
-    Mux["ChannelMux<br/>cursor_lane: AtomicUsize<br/>round-robin"]
-    Out["outbound writer<br/>rmcp Peer or NDJSON"]
-
-    Producer --> Debouncer
-    Debouncer --> LaneA
-    Debouncer --> LaneB
-    Debouncer --> LaneN
-    LaneA --> Mux
-    LaneB --> Mux
-    LaneN --> Mux
-    Mux --> Out
-
-    style Producer fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
-    style Debouncer fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
-    style LaneA fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
-    style LaneB fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
-    style LaneN fill:#a371f7,color:#f0f6fc,stroke:#bc8cff
-    style Mux fill:#238636,color:#f0f6fc,stroke:#2ea043
-    style Out fill:#1f6feb,color:#f0f6fc,stroke:#388bfd
-```
-
-Per-lane field table and full subscribe pipeline (producer → debouncer → lane fan-out → mux drain → outbound writer): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#subscribe-pipeline-v5-layered-view).
-
-### LLM UX priorities
-
-27B-class instruction-tuned models (Gemma 3 27B IT, Mistral Small 3, Qwen 2.5 32B) hot-poll, forget to unsubscribe, and ignore lag stats. v5 fixes this with a layered escalation surface — same advisory at four sites of increasing specificity:
-
-1. Root `Implementation.instructions` — golden rules + 5 push-first happy paths.
-2. Tool description — every long-running tool ends with `When: / Push: / Cleanup: / Cost: / Idempotency: / Hygiene:`.
-3. Wire `HINT:` line — `REQUIRED NEXT STEP:` for required actions, `RECOMMENDED:` for soft suggestions.
-4. Wire `NEXT:` line — concrete tool calls in push-first priority order.
-
-Plus `SUB_LEAK_RISK` auto-warning watcher (background scan; default 2 s) and a 56-code error taxonomy with one-sentence DETAIL lines tuned for direct LLM consumption. Full guide: [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
-
-### Binary targets
-
-| Binary | Source | Transport | Notes |
-|---|---|---|---|
-| `ssh-mcp` | `src/main.rs` | HTTP (axum 0.8 + rmcp StreamableHttpService) | Tracks sessions through `Mcp-Session-Id` header. Default bind `0.0.0.0:8000`, path `/`. Root mount uses `Router::fallback_service` (axum 0.8 panics on a nested `/` mount). |
-| `ssh-mcp-stdio` | `src/bin/ssh_mcp_stdio.rs` | Stdio MCP (`rmcp::transport::io::stdio()`) | Logs to stderr via `RUST_LOG`. |
-| `ssh-mcp-tail` | `src/bin/ssh_mcp_tail.rs` | NDJSON over stdin/stdout | Three subcommands (`run`, `shell`, `daemon`); `daemon` is the primary deliverable. Reference: [docs/DAEMON.md](docs/DAEMON.md). |
-
-All three binaries are thin shells over `composition::prod` (and, for the daemon, `composition::embed`). Each spawns a background **peer-GC task** that scans the subscription registry on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed (rmcp 1.6 does not surface a peer-disconnect callback).
-
-### MCP tools
-
-39 tools with `port_forward` / 38 without. Three semantic eixos: `ssh_*` (24), `sub_*` (9), `serial_*` (6). Catalogue and per-tool schemas: [docs/API.md](docs/API.md).
-
-> **Lane fanout (v5.3)**: `sub_open` lanes carry the rmcp peer captured at tool-invocation time and receive `notifications/resources/updated` push delivery on stdio/HTTP transports through `LaneFanoutBridge` (in `src/adapters/subscription/lane_bridge.rs`). The bridge is installed on `MemoryRegistry` at composition; legacy `broadcast` walks the lane snapshot for the URI before the v4 peer fan-out, calls `notifier.notify_resource_updated` per lane peer, and increments per-lane atomics (`events_sent`, `bytes_sent`). The NDJSON daemon keeps the channel-mux outbound sink as its delivery path (lane peer = `None`).
-
-Each channel open retries the transient `MaxSessions` refusal (`open_session_with_retry`, backoff capped at 1 s) so rapid `execute + cancel` bursts never race OpenSSH's `MaxSessions` budget. The shared `SshHandleRegistry` lets the SFTP adapter reuse the russh handle for file transfers.
-
-### MCP resources
-
-7 push-capable schemes (`shell://<id>/output`, `command://<id>/output`, `transfer://<id>/progress`, `session://<id>/health`, `forward://<id>/events` (feature-gated), `serial://<id>/output` (v5.2 — ADR 0009), `rsync://<id>/progress` (v7.0 — ADR 0011)). Cursor support on `shell` / `command` / `forward` / `serial`. Subscriptions go through `MemoryRegistry<N>` (generic over the notifier port — no `Box<dyn>`). Debouncer coalesces on `SSH_NOTIFY_DEBOUNCE_MS` (default 1000 ms), force-flushes after `SSH_NOTIFY_FORCE_FLUSH_MS` (default 5 s), keepalives every `SSH_NOTIFY_KEEPALIVE_S` (default 30 s). v5 lagged subscribers auto-recover via the per-lane `Snapshot` policy ([ADR 0006](docs/adr/0006-backpressure-policies.md)). Full contract: [docs/RESOURCES.md](docs/RESOURCES.md).
-
-### Response format
-
-All 39 (or 38 without `port_forward`) MCP tools return a single markdown `Text<String>` plus a parallel `structured_content` JSON object:
-
-- First line: `TOOL_NAME: STATUS` (e.g. `SSH_CONNECT: OK`).
-- One `KEY: value` per line. All IDs suffixed with `_ID`.
-- Output blocks use an 8-hex-char nonce per response: `--- stdout [a3f2b1d7] ---\n<content>\n--- stderr [a3f2b1d7] (empty) ---`.
-- Errors: `SSH_X: ERROR\nREASON: [CODE] description\nDETAIL: <one-sentence cure>` plus structured `{ tool, status: "error", code, reason, detail }`. Codes: [ADR 0007](docs/adr/0007-error-taxonomy.md) and [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook).
-
-The v4 / v5 markdown shape is byte-identical to v3 on the legacy text channel (verified by snapshot tests in `tests/v4_smoke.rs`). Operators can silence the v4.7 JSON twin per process with `SSH_MCP_STRUCTURED_CONTENT=false` (markdown body and `is_error` flag stay unchanged).
-
-### Configuration
-
-All settings follow: **Parameter → Environment Variable → Default**. Full table (52 wired env vars across SSH, shell, command, transfer, notification, peer GC, subscriber lanes, daemon, plus 3 rsync knobs declared for forward-compat): [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Defaults preserve v4 behaviour.
-
-### Error handling
-
-- **Categorised** ([ADR 0007](docs/adr/0007-error-taxonomy.md), extended by [ADR 0010](docs/adr/0010-sftp-resume.md) and [ADR 0011](docs/adr/0011-rsync-hybrid-transport.md)): 56 codes across 7 categories (`AUTH`, `TRANSPORT`, `REMOTE`, `RESOURCE`, `POLICY`, `STATE`, `INTERNAL`) with explicit retry semantics. v6.1 adds `RESUME_OVERSHOOT` and `RESUME_MISMATCH` to the `STATE` bucket. LLM hosts can branch on category alone.
-- **Retryable**: `TRANSPORT` class — exponential backoff via `backon`, max 10 s.
-- **Non-retryable**: `AUTH`, `RESOURCE`, `STATE` (without `_meta.idempotency_key`), `INTERNAL`.
-- All tool returns are `Result<CallToolResult, McpError>` (rmcp). Internal layers use `Result<T, DomainError>` (`thiserror`).
-- Every error response carries a one-sentence `DETAIL:` line tuned for direct LLM consumption — see [docs/LLM_GUIDE.md → Error handbook](docs/LLM_GUIDE.md#error-handbook).
-
-## Code standards
-
-### Clippy
-
-Strict enforcement via `Cargo.toml` `[lints.clippy]`. Lock-free invariants are the headline:
-
-- **Lint groups**: `clippy::all`, `clippy::pedantic`, `clippy::nursery`, `clippy::cargo` at `deny`.
-- **Layer A (forbid)**: `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro`, `exit`, `mem_forget`, `infinite_loop`, `print_stdout`, `print_stderr`.
-- **Lock-free invariants** (deny): `await_holding_lock`, `await_holding_refcell_ref`, `significant_drop_in_scrutinee`, `significant_drop_tightening`, `mutex_atomic`, `mutex_integer`. Every hot-path state type (`RunningCommand`, `RunningShell`, `TransferShared`, `SessionRecord`, `ForwardHandle`, `ResourceLifecycle`, `SessionEntry`, `LaneState`, `ChannelMux`) carries **zero** `Mutex` fields.
-- **Quality denies**: `wildcard_enum_match_arm`, `as_conversions`, `clone_on_ref_ptr`, `implicit_clone`, `ref_patterns`, `absolute_paths`, `pub_use`, `allow_attributes_without_reason`, `format_push_string`, `if_then_some_else_none`, `rc_mutex`, `redundant_type_annotations`, `same_name_method`, `tests_outside_test_module`, etc.
-- **Thresholds** (`clippy.toml`): `cognitive-complexity-threshold = 25`, `too-many-lines-threshold = 30`, `too-many-arguments-threshold = 7`, `type-complexity-threshold = 250`.
-- **Allowed**: `multiple_crate_versions` (transitive deps from russh / axum).
-
-All `#[allow(...)]` attributes **must** include a `reason = "..."`. Never disable a lint to silence a warning — fix the code instead.
-
-**Clippy gate is production-only.** The canonical command is `cargo clippy --release --all-features -- -D warnings` and must always exit 0. Test targets are intentionally excluded — `forbid(clippy::unwrap_used)` / `forbid(clippy::expect_used)` is structurally incompatible with the `#[tokio::test]` macro expansion (the macro injects its own `#[allow(...)]` group, which `forbid` rejects via E0453). Production code stays under the full strict baseline; test code is gated by `cargo nextest run --lib` (must keep green) plus `cargo build --all-targets --features test-fixtures` (must stay warning-free — the feature is required, the fixture modules do not exist without it). New `unwrap()` / `expect()` outside test modules still fails the production clippy gate.
-
-Lock-free invariants enforced by these lints (rewritten for v5 — covers lifecycle adapter atomics, lane mpsc, mux fairness, cascade refcount): [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants).
-
-### General
-
-- Methods < 30 lines, SOLID principles.
-- Lock-free everywhere on the hot path: `DashMap`, `ArcSwap`, `OnceCell`, `Atomic*`, `tokio::sync::broadcast`, `tokio::sync::Notify`, `mpsc` for owned-resource serialization.
-- Use cases stay generic over their ports — **no `Box<dyn Trait>` in hot paths**. Async ports use `trait-variant` AFIT; the dyn-safe slices (`LaneAdmin`) live alongside the async slice for cold-path operations.
-- Match exhaustively (no `_ =>` for closed enums; `wildcard_enum_match_arm = "deny"`).
-- `Arc::clone(&x)` — never `x.clone()` on an `Arc` (`clone_on_ref_ptr = "deny"`).
-- 2103 ssh-mcp lib tests + 167 integration tests across 12 binaries (`v4_smoke` 2, `v5_smoke` 12, `v5_daemon_smoke` 7, `v6_resume_smoke` 12, `v7_rsync_smoke` 9, `chaos` 41, `chaos_inline_push` 9, `chaos_rsync` 16, `property` 32, `property_inline_push` 11, `property_resume` 6, `property_rsync` 10) + 32 loom invariants across 3 files (`tests/lockfree_invariants.rs` 20 + `tests/lockfree_invariants_rsync.rs` 7 + `tests/lockfree_invariants_inline_push.rs` 5, all gated `#[cfg(loom)]`) + 8 e2e VM tests (`v7_rsync_e2e_vm` 2 + `v7_rsync_wire_e2e_vm` 6, gated `e2e-vm`) + Python integration suites (`scripts/test_*.py`, including `scripts/test_v7_rsync_{http,stdio,vm}.py` 24 tests / 22 passed + 2 xfailed for the v7.0 `ssh_rsync` MCP surface) + 5 stress scripts (`scripts/stress_*.py`).
-- Feature flags: `port_forward` (default: enabled), `test-fixtures` (off — exposes deterministic adapters for downstream tests).
-- Loom invariant tests in `tests/lockfree_invariants.rs` (gated `#[cfg(loom)]`); 20 `#[test]` annotations covering lifecycle CAS race, grace fire vs re-subscribe, cascade double-disconnect, cursor monotonicity, mux fairness, lane mpsc full + drop_oldest, concurrent lane add/remove during drain, cursor advance under contention. Full loom mode is currently blocked by upstream tokio/loom incompatibility in russh + axum.
-
-## v5 migration notes
-
-- Public MCP API is **wire-compatible** with v3 / v4. v3 / v4 hosts work against v5 servers without any change to wire format, tool catalogue, env vars, or markdown response shape.
-- 9 net-new MCP tools (Phase 3) and a third binary `ssh-mcp-tail` (Phase 4). Both additive. v5.2 adds 6 serial / UART / TTY / COM tools (ADR 0009).
-- `release_when_no_subs: bool` (default `false` — v4 semantics preserved) on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` per [ADR 0003](docs/adr/0003-lifecycle-binding.md).
-- Cursors rekey from `(PeerId, Uri)` to `(SubId, Uri)` per [ADR 0004](docs/adr/0004-channel-mux-fairness.md). Legacy hosts get a synthesised `sub_id` — no host-side change required.
-- Default lane LagPolicy is `Snapshot` (was: implicit broadcast `RecvError::Lagged` recovery in v4). Behaviour matches v4 semantics — [ADR 0006](docs/adr/0006-backpressure-policies.md).
-- MSRV bumped to Rust **1.95** (Rust 2024 edition baseline + AFIT + APIs stabilised through 1.95).
-- New env vars (lifecycle / lane / mux / daemon) — defaults preserve v4 behaviour. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-
-Full host migration guide: [docs/MIGRATION.md → v4 → v5](docs/MIGRATION.md#v4--v5). v3 → v4 contributor narrative (the v4.1 deep-decouple addendum): [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4).
-
-## v6.1 migration notes (ADR 0010)
-
-- **Wire-additive** — every v6.0 host keeps working byte-for-byte. No tool name strings, env vars, or default-behaviour deltas. See [docs/MIGRATION.md → v6.0 → v6.1](docs/MIGRATION.md#v60--v61).
-- Two opt-in `bool?` flags on `ssh_upload` / `ssh_download`: `resume` (default `false`) and `verify` (default `false`). Per [ADR 0010](docs/adr/0010-sftp-resume.md).
-- One new response line: `RESUMED_FROM: <u64>` — emitted only when offset > 0. v6.0 callers see byte-identical wires.
-- One new structured-content / domain field: `resumed_from: u64` with `#[serde(default)] = 0`.
-- Two new wire codes: `RESUME_OVERSHOOT`, `RESUME_MISMATCH` (both `STATE`, neither retryable). Total error-taxonomy size grows from 38 to 40.
-- No new env vars — see [docs/CONFIGURATION.md → v6.1 / ADR 0010](docs/CONFIGURATION.md#v61--adr-0010--resume--verify-no-new-env-vars).
+# ssh-mcp — Agent Context
+
+Generated by `speckit generate agents`; only `## Notes` is human-owned.
+
+## Project
+
+ssh-mcp is a spec-driven project. `doc/arch` is the source of truth; code follows the spec, never the other way around.
+
+## How to act here (constraints and conventions)
+
+spec-first: doc/arch is the source of truth — run `speckit status` then `speckit next` and read the spec before writing any code.
+
+tooling-obligation: use speckit for every loop step; the file-level path is a fallback.
+
+- Run `speckit status`, then `speckit next`; execute exactly the phase it names.
+- `speckit validate` must be green before every commit.
+- Keep `.agents/skills/speckit/SKILL.md` current as the project evolves; update it in the change that moves the behavior it documents.
+- Angular commit headers `<type>(<scope>): <subject>`; no AI attribution (ADR-0026).
+
+## Constitution
+
+precedence: root > sub-constitution > artifact
+digest: cb33fbe25c884a0e5b6e2e26767bc70ee203120758e72548c026d83510355df7
+
+- D-01 (block): A feature is specified, planned and tasked before any production code is written, and the corpus is the source of truth over code and assumption. Run the… [llm-context.spec-first.missing, constitution.doctrines.missing, verify]
+- D-02 (block): The project validates itself with its own commands and keeps the dogfood gate green; a rule that is right for consumers is right for the project. Run… [arch_boundaries, validate, constitution.principle.duplicate]
+- D-03 (block): Dependencies point one way: infrastructure to application to ports and domain, with the domain free of I/O. Tag the model element with its layer, break the… [hexagonal.illegal-dependency, hexagonal.dependency-cycle, arch_boundaries, hexagonal.layers.untagged, layers.inward-import, layers.unknown-dir, layers.undeclared-import, layers.undeclared-dir, layers.cycle, layers.self-edge, layers.duplicate-edge, core.crate-denied, core.orm-import, core.crate-unadjudicated]
+- D-04 (block): Every model element declares its tactical role and every bounded-contact relationship declares one strategic kind. Declare the role, the aggregate root, the… [ddd-role.header.missing, ddd-role.role.unknown, ddd-tactical.missing-role, ddd-tactical.entity-identity, ddd-tactical.value-object-holds-identifiable, ddd-strategic.unknown-relationship, ddd-strategic.mutually-exclusive, ddd-strategic.mixed-relationship-sides, ddd-strategic.mixed-relationship-kinds, ddd-strategic.relationship-via-ref, ddd-strategic.relationship-deprecated, ddd-strategic.two-sources, context.pattern-missing, context.pattern-unknown, context.edge-untyped, context.property-orphan, context.on-layered-container, context.edge-reversed, context.kind-unknown, context.role-unknown, context.multiple-downstream-roles, context.roles-on-symmetric, context.conformist-in-customer-supplier, context.ohs-in-customer-supplier, context.acl-in-customer-supplier, aggregate.membership-missing, aggregate.root-unknown, aggregate.multiple-roots, aggregate.member-before-root, aggregate.cross-reference-object, repository.returns-member, repository.returns-tuple, doctrine.source-missing]
+- D-05 (block): Entities stay small, names stay meaningful, nesting stays shallow, and primitives and collections are wrapped. Split the entity, rename the binding, extract… [calisthenics.small-entities, calisthenics.no-abbreviation, calisthenics-code.small-entities, calisthenics-code.no-abbreviation, calisthenics-code.nesting-depth, calisthenics-code.getter-setter, calisthenics.wrap-primitives, calisthenics.first-class-collection, calisthenics.one-definition-per-file, calisthenics-code.wrap-primitives, calisthenics-code.first-class-collection, calisthenics-code.one-type-per-file, calisthenics-code.no-else, branch.else, chain.one-dot, comment.implementation-in-interface, comment.repeats-code, condition.negative, interface.fat, literal.magic-number, name.hard-to-describe, name.vague, switch.type-code, type.boolean-flag, inheritance.depth, calisthenics-code.two-instance-variables]
+- D-06 (block): Every first-party production import is a full `crate::…` path; glob imports and `crate::domain::` are test-only conveniences. Replace `use x::*;` with the… [fqcn.glob-import, fqcn.relative-super, fqcn.partial-include]
+- D-07 (block): Every detected ecosystem ships its lint configuration at the strongest level and pins its dependencies exactly. Commit the lint configuration and replace… [lint.rust.lints-missing, pin.cargo.lockfile-missing, pin.docker.unpinned-image, pin.ci.unpinned-action]
+- D-08 (block): Production code never panics on recoverable absence: `unwrap` and `expect` are denied, and an error is propagated or typed. Return a `Result`/`Option` up… [calisthenics-code.bare-unwrap, no-unwrap, clippy]
+- D-09 (block): A project declares its licence id and commits a matching `LICENSE` file; the two never drift. Run `speckit license set <id> --write-file` and keep the… [project-license.file.missing, project-license.fingerprint.mismatch]
+- D-10 (block): Every mutating command asks the guard before it writes, and the write lands inside the active scope. Call `GuardService::enforce_write` before the… [guard]
+- D-11 (block): The published surface — exit codes, `--json` shapes, and declared artifact contracts — moves only additively. Add a field instead of renaming one, keep the… [contract.info.missing, contract.operation.id-missing]
+- D-12 (advisory): One concern per change: a commit, a branch and a review stay reviewable in one sitting. Split the work by concern, use the Angular commit header as the… [function.long, function.long-parameter-list, module.pass-through, module.special-general-mix, module.shallow]
+- D-13 (block): The core loop validates, phases and guards without the network; a network path is opt-in and degrades. Keep network access behind a port and a flag, and let… [core.io-direct]
+- D-17 (advisory): A library publishes an exact, lockfile-anchored dependency set so a consumer resolves what its author tested. Commit the lockfile and pin direct… [pin.cargo.lockfile-missing]
+- P-01 (block): An import points inward through the six declared layers, and the layer table in `docs/ARCHITECTURE.md` names what each layer holds and what it is denied.… [layers, arch_boundaries]
+- P-02 (block): Every shared producer and consumer path on the hot path is lock-free: `DashMap`, `ArcSwap`, `OnceCell`, `Atomic*`, `tokio::sync::broadcast`,… [clippy]
+- P-03 (block): Production code never calls `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, `dbg!`, `print!` or `eprintln!`; an absence is propagated as `Result`… [no-unwrap, clippy]
+- P-04 (block): The published MCP surface stays byte-identical for every existing consumer: tool names, the block-markdown envelope (`TOOL_NAME: STATUS` first line, one… [verify]
+- P-05 (block): The wire grows by addition only, and every addition is opt-in: a new tool, a new argument that defaults to the current behaviour, or a capability advertised… [verify]
+- P-06 (block): `make gates` is the definition of done for any change: `cargo fmt --all -- --check`, clippy with `-D warnings` (dev profile in a session through `make… [validate, verify]
+- P-07 (advisory): A session or a contributor runs the dev loop and stops at `make gates`: `make dev`, `make fmt`, `make lint-dev`, `make test`, `make test-integration`, `make… [(manual)]
+- P-08 (block): A commit follows Conventional Commits, `<type>(<scope>): <subject>`, carries one logical change and its tests together, and lands only when the owner asks… [madr]
+- P-09 (advisory): Everything written to disk is en-US: identifiers, comments, log and error strings, commit messages, branch names, ADRs, and every document. A chat reply… [(manual)]
+
+## Architecture and corpus index
+
+One line per category root under `doc/arch/`:
+
+- `doc/arch/adr/` — MADR decision records
+- `doc/arch/specs/` — executable Gherkin specifications
+- `doc/arch/domain/` — bounded contexts and the ubiquitous language
+- `doc/arch/functional/` — product-level functional documentation
+- `doc/arch/runbooks/` — operational runbooks
+- `doc/arch/schemas/` — CUE data and configuration schemas
+- `doc/arch/commands/` — generated CLI reference, one document per command
+- `doc/arch/agents/` — project roles, one generated file per role
+- `doc/arch/skills/` — project capabilities, one generated file per capability
+
+## Agents and skills
+
+Every path below MUST be read and followed before acting on this repository. The mandate and the skills are the role; the artifact is the procedure.
+
+### implement
+
+- `doc/arch/agents/implement-lead.md` — Writes production code inside the declared scope, following the corpus rules it cites and the layering of the architecture model. (skills: rust)
+
+## Contracts
+
+doc/arch/contracts/INDEX.md
+
+- no contract registered yet
+
+## Commands
+
+The full reference is the committed corpus:
+
+doc/arch/commands/README.md
+
+- `speckit status`
+- `speckit next`
+- `speckit validate`
+- `speckit agent` — sub-verbs: `list`, `show`, `propose`, `confirm`, `reject`, `remove`, `stats`, `score`, `regenerate`, `index`, `source`
+- `speckit analyze`
+- `speckit ask`
+- `speckit brief`
+- `speckit check`
+- `speckit clarify`
+- `speckit commit` — sub-verbs: `check`, `suggest`
+- `speckit completions`
+- `speckit config` — sub-verbs: `list`, `get`, `set`, `unset`, `drift`
+- `speckit constitution`
+- `speckit context` — sub-verbs: `score`, `pack`
+- `speckit contract` — sub-verbs: `new`, `review`, `list`, `show`, `diff`, `approve`, `deprecate`, `withdraw`, `undeprecate`, `check`
+- `speckit crew` — sub-verbs: `review`, `backfill`
+- `speckit decision` — sub-verbs: `status`, `probe`, `extract`, `eval`, `probe-rule`
+- `speckit dedupe`
+- `speckit diagram` — sub-verbs: `render`
+- `speckit dismiss`
+- `speckit doctrine` — sub-verbs: `list`, `show`
+- `speckit explain`
+- `speckit feature` — sub-verbs: `new`, `list`, `select`, `renumber`, `reorder`, `insert`, `compact`, `archive`, `restore`, `land`
+- `speckit generate`
+- `speckit gitlab` — sub-verbs: `sync`, `status`
+- `speckit guard` — sub-verbs: `check`, `hook`
+- `speckit guide`
+- `speckit hook` — sub-verbs: `session-start`, `user-prompt`, `post-edit`, `pre-commit`, `stop`, `subagent-start`
+- `speckit implement`
+- `speckit init`
+- `speckit library` — sub-verbs: `add`, `list`, `validate`, `show`, `update`, `remove`, `ask`, `search`, `open`, `browse`, `extract`, `export`, `import`, `reembed`, `serve`
+- `speckit license` — sub-verbs: `list`, `show`, `set`, `check`
+- `speckit manual`
+- `speckit mcp` — sub-verbs: `serve`
+- `speckit mermaid` — sub-verbs: `render`
+- `speckit migrate`
+- `speckit missing`
+- `speckit model` — sub-verbs: `api`
+- `speckit module` — sub-verbs: `add`, `list`, `show`, `check`, `retire`, `remove`
+- `speckit nexttest`
+- `speckit off`
+- `speckit on`
+- `speckit pack` — sub-verbs: `add`, `list`, `update`, `remove`, `export`, `import`
+- `speckit plan` — sub-verbs: `setup`
+- `speckit provider` — sub-verbs: `list`, `status`, `probe`
+- `speckit reindex`
+- `speckit search`
+- `speckit semantic` — sub-verbs: `enable`, `off`, `status`, `deep-status`
+- `speckit skill` — sub-verbs: `list`, `show`, `propose`, `confirm`, `reject`, `remove`, `stats`, `score`, `regenerate`, `index`, `source`
+- `speckit spec` — sub-verbs: `score`
+- `speckit specify`
+- `speckit stats` — sub-verbs: `findings`, `guard`, `profile`, `attributes`, `compliance`, `corpus`, `recommendations`
+- `speckit tasks` — sub-verbs: `setup`
+- `speckit verify`
+- `speckit version`
+- `speckit watch`
+- `speckit workflow` — sub-verbs: `render`
+
+## Modules
+
+No module declared.
+
+## Tooling
+
+tooling: speckit
+
+The corpus is governed; use the binary for every loop step.
+
+## Notes
+
+<!-- notes:start -->
+- Working agreement — dev only: agents build in the dev profile and stop at
+  `make gates`; release builds, install and signing are the owner's alone.
+  Never run `make release`, `make release-min`, `make all`, `make install`,
+  `make sign` or a release-profile cargo build. See
+  [docs/DEVELOPMENT.md → Working agreement](docs/DEVELOPMENT.md#working-agreement--dev-only).
+- The gate is `make gates`: fmt, dev clippy with `-D warnings`, then both
+  nextest suites. Nextest is the only test runner.
+- Test policy: a test module may call `unwrap` / `expect` under an
+  `#[allow(..., reason = "…")]`; production code may not. The `reason` strings
+  in `src/` point back to this line.
+- Rest of the map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/API.md](docs/API.md),
+  [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md).
+<!-- notes:end -->

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use regex::Regex;
 
-use super::subscriber_lane::LaneMsg;
+use crate::adapters::subscription::subscriber_lane::LaneMsg;
 use crate::domain::error::DomainError;
 use crate::domain::subscription::FilterRule;
 

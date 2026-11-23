@@ -19,7 +19,7 @@
 //!
 //! ## Why no `tool_router` field
 //!
-//! The rmcp 1.5 `#[tool_router]` macro generates a `Self::tool_router()`
+//! The rmcp 3.11 `#[tool_router]` macro generates a `Self::tool_router()`
 //! associated function the `#[tool_handler]` macro calls directly; the
 //! field is no longer required (see the upstream macro doc:
 //! "in most cases you do not need to store the router in a field"). We
@@ -35,9 +35,9 @@ use std::sync::Arc;
 use crate::adapters::capability::registry::CapabilityRegistry;
 use crate::adapters::lifecycle::leak_watcher::{LeakWatcher, LeakWatcherProbe};
 
-use super::idempotency::IdempotencyCache;
-use super::peer_handle::PeerTable;
-use super::tool_router::{IdLister, noop_id_lister};
+use crate::infra::mcp::idempotency::IdempotencyCache;
+use crate::infra::mcp::peer_handle::PeerTable;
+use crate::infra::mcp::tool_router::{IdLister, noop_id_lister};
 
 /// v4 MCP server handler. Generic over the concrete [`crate::composition::UseCases`]
 /// container. The production binary instantiates one wiring; tests (H18) pick

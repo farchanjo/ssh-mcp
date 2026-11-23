@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
 use crate::domain::inline_payload::InlinePayload;
+use crate::domain::subscription::SubId;
 
 /// Stable, dyn-safe handle to a connected MCP peer.
 ///
@@ -164,6 +165,20 @@ pub trait LaneNotifierBridge: Send + Sync + Debug + 'static {
     /// Default impl is a no-op so test bridges that do not care about
     /// the inline path compile without change.
     fn notify_lanes_inline(&self, _uri: &str, _bytes_added: &[u8]) {}
+
+    /// Deliver the single catch-up `notifications/resources/updated` for a
+    /// lane that has just left the paused state.
+    ///
+    /// Called once, after [`crate::ports::subscriber_lane::LaneAdmin::resume`]
+    /// reports a true-to-false transition. Implementations resolve the lane
+    /// by `sub_id`; an unknown lane or a lane without a peer is a no-op, and
+    /// a transport failure is logged rather than returned.
+    fn notify_lane<'a>(
+        &'a self,
+        _sub_id: &'a SubId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 #[cfg(test)]

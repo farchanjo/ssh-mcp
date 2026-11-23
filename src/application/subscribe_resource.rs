@@ -26,14 +26,14 @@ use std::sync::Arc;
 use crate::application::read_resource::{canonical_uri, parse_uri};
 use crate::domain::error::DomainError;
 use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
-use crate::domain::subscription::SubId;
 use crate::ports::command_repo::CommandRepository;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
 use crate::ports::notifier::PeerHandle;
 use crate::ports::session_repo::SessionRepository;
 use crate::ports::shell_repo::ShellRepository;
-use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy};
-use crate::ports::subscriber_registry::{ResourceKind, SubscriberRegistryAsync};
+use crate::ports::subscriber_registry::{
+    ResourceKind, SubscribeDisposition, SubscriberRegistryAsync,
+};
 use crate::ports::transfer_repo::TransferRepository;
 
 /// Inbound DTO. The peer handle is wrapped in [`Arc`] so the registry
@@ -47,17 +47,12 @@ pub struct SubscribeResourceRequest {
 }
 
 /// Outbound DTO surfacing the canonical URI the inbound adapter must
-/// echo back to the client plus the v5 Phase 2 synthesised
-/// [`SubId`].
+/// echo back to the client. The subscription is peer-keyed and owns no
+/// lane, so no `SubId` is minted for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeResourceOutcome {
     /// Canonical URI (no `?cursor=` — the registry keys against this form).
     pub uri: String,
-    /// Per-call [`SubId`] minted by the `SubscriberLane` adapter
-    /// (Phase 2). Surfaced via `_meta.sub_id` on the rmcp
-    /// `resources/subscribe` response. `None` when the lane wiring
-    /// is not installed (legacy v4-only deployments).
-    pub sub_id: Option<SubId>,
 }
 
 /// Subscribe-resource use case.
@@ -82,12 +77,6 @@ where
     sessions: Arc<SR>,
     subscribers: Arc<Sub>,
     lifecycle: Arc<dyn LifecyclePolicyPort>,
-    /// v5 Phase 2 — optional [`LaneAdmin`] handle. When present the
-    /// use case opens a per-`SubId` lane after the v4 registry
-    /// subscribe succeeds and surfaces the [`SubId`] on the
-    /// outcome. When absent the use case mirrors v4 behaviour
-    /// exactly.
-    lane: Option<Arc<dyn LaneAdmin>>,
 }
 
 impl<ShR, CR, TR, SR, Sub> SubscribeResourceUseCase<ShR, CR, TR, SR, Sub>
@@ -115,19 +104,7 @@ where
             sessions,
             subscribers,
             lifecycle,
-            lane: None,
         }
-    }
-
-    /// Install the v5 Phase 2 [`LaneAdmin`] handle. Each subscribe
-    /// call will mint a per-`SubId` lane through the admin and
-    /// surface the `SubId` on the outcome. Compositional opt-in: v4
-    /// callers that omit this builder method see identical v4
-    /// behaviour.
-    #[must_use]
-    pub fn with_subscriber_lane(mut self, lane: Arc<dyn LaneAdmin>) -> Self {
-        self.lane = Some(lane);
-        self
     }
 
     /// Drive the subscribe orchestration.
@@ -156,39 +133,27 @@ where
         let canonical = canonical_uri(parsed.kind, &parsed.id);
         let parsed_kind = parsed.kind;
         let parsed_id = parsed.id.clone();
-        self.subscribers
+        let peer_id = req.peer.id();
+        let disposition = self
+            .subscribers
             .subscribe(parsed.kind, parsed.id, canonical.clone(), req.peer)
             .await?;
-        // v5 lifecycle: bump the resource refcount so the policy can
-        // drive Owned -> Observed transitions.
-        self.lifecycle.on_subscribe(parsed_kind, &parsed_id)?;
-        let sub_id = self
-            .open_lane_if_wired(canonical.clone(), parsed_kind, parsed_id)
-            .await?;
-        Ok(SubscribeResourceOutcome {
-            uri: canonical,
-            sub_id,
-        })
-    }
-
-    async fn open_lane_if_wired(
-        &self,
-        canonical: String,
-        kind: ResourceKind,
-        resource_id: String,
-    ) -> Result<Option<SubId>, DomainError> {
-        match self.lane.as_ref() {
-            Some(lane) => {
-                let policy = LanePolicy::default();
-                let sub_id = lane.open(canonical, kind, resource_id, policy).await?;
-                Ok(Some(sub_id))
-            }
-            None => Ok(None),
+        // v5 lifecycle: the refcount is per `(peer, uri)` entry, so only a
+        // created entry increments it. A refresh replaces the record in
+        // place and leaves the count alone.
+        if disposition == SubscribeDisposition::Created
+            && let Err(err) = self.lifecycle.on_subscribe(parsed_kind, &parsed_id)
+        {
+            // The call is about to fail; do not leave a live subscription
+            // behind. The lifecycle has already restored its count.
+            let _ = self.subscribers.unsubscribe(&peer_id, &canonical).await;
+            return Err(err);
         }
+        Ok(SubscribeResourceOutcome { uri: canonical })
     }
 }
 
-async fn ensure_exists<ShR, CR, TR, SR>(
+pub(crate) async fn ensure_exists<ShR, CR, TR, SR>(
     kind: ResourceKind,
     id: &str,
     shells: &ShR,
@@ -271,21 +236,27 @@ async fn ensure_session<SR: SessionRepository + Send + Sync>(
 #[cfg(test)]
 mod tests {
     use super::{SubscribeResourceRequest, SubscribeResourceUseCase};
+    use crate::adapters::id_generator::uuid::UuidIds;
     use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
     use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
     use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
     use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
+    use crate::adapters::subscription::memory_registry::MemoryRegistry;
+    use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
     use crate::domain::command::CommandEntity;
     use crate::domain::error::DomainError;
     use crate::domain::identity::Address;
     use crate::domain::ids::{CommandId, PeerId, SessionId, ShellId, TransferId};
+    use crate::domain::lifecycle::LifecyclePolicy;
     use crate::domain::session::SessionEntity;
     use crate::domain::shell::{ShellEntity, ShellTerminal};
     use crate::domain::transfer::{TransferDirection, TransferEntity};
     use crate::ports::command_repo::CommandRepository;
-    use crate::ports::notifier::PeerHandle;
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+    use crate::ports::notifier::{NotifierPort, PeerHandle};
     use crate::ports::session_repo::SessionRepository;
     use crate::ports::shell_repo::ShellRepository;
+    use crate::ports::subscriber_lane::SubscriberLanePort;
     use crate::ports::subscriber_registry::{
         ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,
     };
@@ -362,11 +333,11 @@ mod tests {
             resource_id: String,
             uri: String,
             peer: Arc<dyn PeerHandle>,
-        ) -> Result<(), DomainError> {
+        ) -> Result<crate::ports::subscriber_registry::SubscribeDisposition, DomainError> {
             if let Ok(mut g) = self.subs.lock() {
                 g.push((kind, resource_id, uri, peer.id()));
             }
-            Ok(())
+            Ok(crate::ports::subscriber_registry::SubscribeDisposition::Created)
         }
         async fn unsubscribe(&self, _peer_id: &PeerId, _uri: &str) -> bool {
             false
@@ -610,53 +581,240 @@ mod tests {
         assert_eq!(calls[0].2, "shell://sh-1/output");
     }
 
-    // --- v5 Phase 2 lane wiring ------------------------------------
+    const RESUB_URI: &str = "shell://sh-resub/output";
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn subscribe_outcome_sub_id_is_none_when_lane_not_wired() {
-        // Default constructor leaves the lane handle unset — outcome
-        // mirrors v4 behaviour with a None SubId.
-        let h = build_harness();
-        seed_shell(&h.shells, "sh-1").await;
-        let outcome =
-            h.uc.execute(req("shell://sh-1/output", "peer-1"))
-                .await
-                .expect("execute");
-        assert!(outcome.sub_id.is_none());
+    #[derive(Debug, Default)]
+    struct ResubNotifier {
+        events: Mutex<Vec<(PeerId, String)>>,
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn subscribe_with_lane_returns_sub_id_on_outcome() {
-        use crate::adapters::id_generator::uuid::UuidIds;
-        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    impl NotifierPort for ResubNotifier {
+        async fn notify_resource_updated(
+            &self,
+            peer: Arc<dyn PeerHandle>,
+            uri: &str,
+        ) -> Result<(), DomainError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((peer.id(), uri.to_string()));
+            Ok(())
+        }
+        async fn notify_ssh_output(
+            &self,
+            _peer: Arc<dyn PeerHandle>,
+            _payload: crate::domain::inline_payload::InlinePayload,
+        ) -> Result<(), DomainError> {
+            Ok(())
+        }
+    }
 
+    type ResubSubscribe = SubscribeResourceUseCase<
+        DashMapShellRepo,
+        DashMapCommandRepo,
+        DashMapTransferRepo,
+        DashMapSessionRepo,
+        MemoryRegistry<ResubNotifier>,
+    >;
+
+    struct ResubHarness {
+        subscribe: ResubSubscribe,
+        unsubscribe: crate::application::unsubscribe_resource::UnsubscribeResourceUseCase<
+            MemoryRegistry<ResubNotifier>,
+        >,
+        registry: Arc<MemoryRegistry<ResubNotifier>>,
+        lanes: Arc<SubscriberLaneAdapter<UuidIds>>,
+        lifecycle: Arc<dyn LifecyclePolicyPort>,
+        notifier: Arc<ResubNotifier>,
+        shells: Arc<DashMapShellRepo>,
+    }
+
+    fn resub_harness(max_per_uri: u16) -> ResubHarness {
         let shells = Arc::new(DashMapShellRepo::new());
         let commands = Arc::new(DashMapCommandRepo::new());
         let transfers = Arc::new(DashMapTransferRepo::new());
         let sessions = Arc::new(DashMapSessionRepo::new());
-        let registry = Arc::new(RecordingRegistry::default());
+        let notifier = Arc::new(ResubNotifier::default());
+        let registry = MemoryRegistry::new(Arc::clone(&notifier));
         let cascade = crate::adapters::lifecycle::cascade::CascadeCoordinator::new();
         let clock = Arc::new(crate::adapters::clock::system::SystemClock);
-        let lifecycle: Arc<dyn crate::ports::lifecycle_policy::LifecyclePolicyPort> =
+        let lifecycle_concrete =
             crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter::new(cascade, clock);
-        let lane: Arc<dyn crate::ports::subscriber_lane::LaneAdmin> =
-            SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
-        let uc = SubscribeResourceUseCase::new(
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            Arc::clone(&lifecycle_concrete) as Arc<dyn LifecyclePolicyPort>;
+        let lanes = SubscriberLaneAdapter::new(Arc::new(UuidIds), 1, max_per_uri, 64);
+        let subscribe = SubscribeResourceUseCase::new(
             Arc::clone(&shells),
             Arc::clone(&commands),
             Arc::clone(&transfers),
             Arc::clone(&sessions),
             Arc::clone(&registry),
+            Arc::clone(&lifecycle),
+        );
+        let unsubscribe = crate::application::unsubscribe_resource::UnsubscribeResourceUseCase::new(
+            Arc::clone(&registry),
+            Arc::clone(&lifecycle),
+        );
+        ResubHarness {
+            subscribe,
+            unsubscribe,
+            registry,
+            lanes,
             lifecycle,
-        )
-        .with_subscriber_lane(lane);
+            notifier,
+            shells,
+        }
+    }
 
-        seed_shell(&shells, "sh-1").await;
-        let outcome = uc
-            .execute(req("shell://sh-1/output", "peer-1"))
+    fn resub_req(peer: &str) -> SubscribeResourceRequest {
+        SubscribeResourceRequest {
+            uri: RESUB_URI.to_string(),
+            peer: StubPeer::new(peer) as Arc<dyn PeerHandle>,
+        }
+    }
+
+    fn resub_unsub(
+        peer: &str,
+    ) -> crate::application::unsubscribe_resource::UnsubscribeResourceRequest {
+        crate::application::unsubscribe_resource::UnsubscribeResourceRequest {
+            uri: RESUB_URI.to_string(),
+            peer_id: PeerId::new(peer.to_string()),
+        }
+    }
+
+    async fn seed_resub_shell(h: &ResubHarness) {
+        seed_shell(&h.shells, "sh-resub").await;
+        h.lifecycle.track_resource(
+            ResourceKind::Shell,
+            "sh-resub",
+            &SessionId::new("s".to_string()),
+            LifecyclePolicy::default(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_subscribe_records_no_lane_and_delivers_once() {
+        let h = resub_harness(16);
+        seed_resub_shell(&h).await;
+        h.subscribe.execute(resub_req("peer-resub")).await.unwrap();
+
+        assert_eq!(h.registry.subscribers_for_uri(RESUB_URI), 1);
+        assert!(h.lanes.list_subs().is_empty(), "no lane may be opened");
+
+        let threshold = crate::adapters::config::internal::resolve_notify_flush_bytes();
+        SubscriberRegistryPort::record_bytes_with_tail(
+            h.registry.as_ref(),
+            ResourceKind::Shell,
+            "sh-resub",
+            &vec![b'x'; threshold],
+        );
+        let mut delivered = 0;
+        for _ in 0..400 {
+            delivered = h.notifier.events.lock().unwrap().len();
+            if delivered >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(delivered, 1, "the per-peer fan-out delivers once");
+        // Let a duplicate land before counting (the same 100 ms settle the
+        // lifecycle test below uses).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            h.notifier.events.lock().unwrap().len(),
+            1,
+            "exactly one notification, not a duplicate"
+        );
+        assert!(h.lanes.list_subs().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_resources_subscribe_counts_once_in_the_lifecycle() {
+        let h = resub_harness(16);
+        seed_resub_shell(&h).await;
+        h.subscribe.execute(resub_req("peer-rep")).await.unwrap();
+        h.subscribe.execute(resub_req("peer-rep")).await.unwrap();
+
+        assert_eq!(h.registry.subscribers_for_uri(RESUB_URI), 1);
+        assert_eq!(
+            h.lifecycle
+                .snapshot(ResourceKind::Shell, "sh-resub")
+                .unwrap()
+                .sub_count,
+            1,
+            "a refresh must not increment the lifecycle"
+        );
+        assert!(h.lanes.list_subs().is_empty());
+
+        h.unsubscribe
+            .execute(resub_unsub("peer-rep"))
             .await
-            .expect("execute");
-        let sub_id = outcome.sub_id.expect("sub_id must be set when lane wired");
-        assert!(!sub_id.as_str().is_empty());
+            .unwrap();
+        assert_eq!(h.registry.subscribers_for_uri(RESUB_URI), 0);
+        assert_eq!(
+            h.lifecycle
+                .snapshot(ResourceKind::Shell, "sh-resub")
+                .unwrap()
+                .sub_count,
+            0
+        );
+        h.unsubscribe
+            .execute(resub_unsub("peer-rep"))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.lifecycle
+                .snapshot(ResourceKind::Shell, "sh-resub")
+                .unwrap()
+                .sub_count,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lifecycle_refusal_leaves_no_registry_entry_and_no_delivery() {
+        let h = resub_harness(16);
+        seed_resub_shell(&h).await;
+        h.lifecycle
+            .force_close(ResourceKind::Shell, "sh-resub")
+            .unwrap();
+
+        let err = h
+            .subscribe
+            .execute(resub_req("peer-gone"))
+            .await
+            .expect_err("closed resource must fail");
+        assert!(matches!(err, DomainError::ResourceGone(_)));
+        assert!(h.registry.snapshot_subscribers(RESUB_URI).is_empty());
+        assert_eq!(
+            h.lifecycle
+                .snapshot(ResourceKind::Shell, "sh-resub")
+                .unwrap()
+                .sub_count,
+            0
+        );
+
+        let threshold = crate::adapters::config::internal::resolve_notify_flush_bytes();
+        SubscriberRegistryPort::record_bytes_with_tail(
+            h.registry.as_ref(),
+            ResourceKind::Shell,
+            "sh-resub",
+            &vec![b'x'; threshold],
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.notifier.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seventeenth_resources_subscribe_with_interleaved_unsubscribe_succeeds() {
+        let h = resub_harness(16);
+        seed_resub_shell(&h).await;
+        for round in 0..17 {
+            h.subscribe
+                .execute(resub_req("peer-17"))
+                .await
+                .unwrap_or_else(|e| panic!("subscribe round {round} failed: {e}"));
+            h.unsubscribe.execute(resub_unsub("peer-17")).await.unwrap();
+        }
     }
 }

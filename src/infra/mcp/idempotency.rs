@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use rmcp::RoleServer;
-use rmcp::model::{CallToolResult, Meta};
+use rmcp::model::{CallToolResult, MetaObject};
 use rmcp::service::RequestContext;
 use serde::Serialize;
 use serde_json::Value;
@@ -515,11 +515,11 @@ pub fn extract_idempotency_key(ctx: &RequestContext<RoleServer>) -> KeyOutcome {
     extract_from_meta(&ctx.meta)
 }
 
-/// Inspect a [`Meta`] envelope directly. Pulled out so tests can drive
+/// Inspect a [`MetaObject`] envelope directly. Pulled out so tests can drive
 /// the parsing without constructing a full [`RequestContext`] (the
 /// `rmcp::Peer::new` constructor is `pub(crate)`).
 #[must_use]
-pub fn extract_from_meta(meta: &Meta) -> KeyOutcome {
+pub fn extract_from_meta(meta: &MetaObject) -> KeyOutcome {
     let Some(value) = meta.get("idempotency_key") else {
         return KeyOutcome::Absent;
     };
@@ -632,7 +632,7 @@ mod tests {
         CachedResponse, DEFAULT_IDEMPOTENCY_MAX_ENTRIES, DEFAULT_IDEMPOTENCY_TTL_SECS,
         IDEMPOTENCY_KEY_MAX_BYTES, IdempotencyCache, KeyOutcome, extract_from_meta, replay,
     };
-    use rmcp::model::Meta;
+    use rmcp::model::MetaObject;
     use serde_json::{Value, json};
     use std::time::Duration;
     use std::time::Instant;
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn idempotency_key_present_returns_value() {
-        let mut meta = Meta::new();
+        let mut meta = MetaObject::new();
         meta.0.insert(
             "idempotency_key".to_string(),
             Value::String("retry-1".to_string()),
@@ -697,13 +697,13 @@ mod tests {
 
     #[test]
     fn idempotency_key_absent_when_meta_empty() {
-        let meta = Meta::new();
+        let meta = MetaObject::new();
         assert!(matches!(extract_from_meta(&meta), KeyOutcome::Absent));
     }
 
     #[test]
     fn idempotency_key_absent_when_string_empty() {
-        let mut meta = Meta::new();
+        let mut meta = MetaObject::new();
         meta.0
             .insert("idempotency_key".to_string(), Value::String(String::new()));
         assert!(matches!(extract_from_meta(&meta), KeyOutcome::Absent));
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn idempotency_key_too_long_when_exceeds_cap() {
-        let mut meta = Meta::new();
+        let mut meta = MetaObject::new();
         let big = "x".repeat(IDEMPOTENCY_KEY_MAX_BYTES + 1);
         meta.0
             .insert("idempotency_key".to_string(), Value::String(big));

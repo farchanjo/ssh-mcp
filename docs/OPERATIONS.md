@@ -50,7 +50,7 @@ flowchart TD
   1. [Subscriber receives no push events](#1-subscriber-receives-no-push-events)
   2. [Shell becomes a zombie after caller disconnects](#2-shell-becomes-a-zombie-after-caller-disconnects)
   3. [`lag_drops > 0` in subscriber stats](#3-lag_drops--0-in-subscriber-stats)
-  4. [`sub_open` returns `RESOURCE_GONE`](#4-sub_open-returns-resource_gone)
+  4. [`resources/subscribe` returns `RESOURCE_GONE`](#4-resourcessubscribe-returns-resource_gone)
   5. [Cascade disconnect closes session unexpectedly](#5-cascade-disconnect-closes-session-unexpectedly)
   6. [Stuck transfer (`bytes_transferred` not advancing)](#6-stuck-transfer-bytes_transferred-not-advancing)
   7. [High CPU under load](#7-high-cpu-under-load)
@@ -68,7 +68,7 @@ flowchart TD
 
 ### 1. Subscriber receives no push events
 
-**Symptom.** A host called `sub_open` (or the legacy `resources/subscribe`), the call returned a `sub_id`, and yet no `notifications/resources/updated` (or NDJSON `push` events) reach the consumer.
+**Symptom.** A host called `sub_open` and got a `sub_id` back (the legacy `resources/subscribe` returns no id), and yet no `notifications/resources/updated` (or NDJSON `push` events) reach the consumer.
 
 #### Causes
 
@@ -76,7 +76,7 @@ flowchart TD
 2. **Subscription was closed by peer GC.** Peer-GC scans the subscription registry every `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s) and drops peers whose rmcp transport closed. Reconnecting client gets a fresh `PeerId`; the old `sub_id` is dead.
 3. **Lifecycle moved to `Releasing` without a re-subscribe inside the grace window.** When the last subscriber on a `release_when_no_subs=true` resource unsubscribed, the per-call grace timer started counting down (`LifecyclePolicy.grace_ms`, default 2000 ms). A new `subscribe` after grace expired returns `RESOURCE_GONE`.
 4. **Filter excludes everything.** The lane has a regex / level filter that rejects every event before it hits the mpsc.
-5. **Lane is paused.** A prior `sub_pause` call suspended the drain loop. Producer is still emitting; the lane mpsc fills under its lag policy.
+5. **Lane is paused.** A prior `sub_pause` call suspended delivery for that lane. Producer is still emitting; the resource ring fills under its cap.
 
 #### Diagnosis
 
@@ -173,9 +173,9 @@ A lane with `queue_high_watermark = SSH_LANE_BUFFER` and growing `lagged_drops` 
 
 References: [ADR 0006](./adr/0006-backpressure-policies.md), [DAEMON.md](./DAEMON.md).
 
-### 4. `sub_open` returns `RESOURCE_GONE`
+### 4. `resources/subscribe` returns `RESOURCE_GONE`
 
-**Symptom.** A subscribe op returns `REASON: [RESOURCE_GONE] Resource closed (lifecycle Releasing/Closed)` with `DETAIL: recreate via ssh_shell_open / ssh_exec / ssh_upload.` The host expected the resource to still be alive.
+**Symptom.** A `resources/subscribe` returns `REASON: [RESOURCE_GONE] Resource closed (lifecycle Releasing/Closed)` with `DETAIL: recreate via ssh_shell_open / ssh_exec / ssh_upload.` The host expected the resource to still be alive. A `sub_open` of a missing id returns the per-kind `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `SESSION_NOT_FOUND` instead; `sub_open` never returns `RESOURCE_GONE`, because it does not call the lifecycle, so a resource whose lifecycle is `Closed` while its repository row still exists is accepted.
 
 #### Causes
 
@@ -258,7 +258,7 @@ References: [ADR 0003](./adr/0003-lifecycle-binding.md), [ADR 0007](./adr/0007-e
 1. **Network stall.** TCP backpressure on the underlying socket; russh recv window is full.
 2. **Remote disk full.** SFTP `STATUS_NO_SPACE_LEFT_ON_DEVICE`; the daemon would emit `SFTP_ERROR` with the underlying message in `DETAIL:` if the remote signalled the error.
 3. **Remote process killed.** OOM, signal; the SFTP session detects EOF and emits `SFTP_ERROR`.
-4. **Subscribe missing.** The transfer is alive (the bytes are flowing on the wire); the subscriber lane mpsc is paused (`sub_pause`) or has a filter that excludes progress events. The transfer is fine; observability is broken.
+4. **Subscribe missing.** The transfer is alive (the bytes are flowing on the wire); delivery for that lane is paused (`sub_pause`) or has a filter that excludes progress events. The transfer is fine; observability is broken.
 
 #### Diagnosis
 
@@ -406,7 +406,7 @@ The structured channel is byte-compatible across hosts that ignore `structured_c
 
 - `INVALID_PARAMS` for malformed URIs / arguments.
 - `RESOURCE_NOT_FOUND` for unknown `(scheme, id)` pairs.
-- `INTERNAL_ERROR` for registry-level failures (currently never raised — `subscribe` is infallible at runtime).
+- `INTERNAL_ERROR` for registry-level failures — returned when a lane cap is reached: `SSH_MAX_SUBS_PER_URI` (default 16) on one URI, or `SSH_MAX_SUBS_TOTAL` server-wide. The message carries the domain display, for example `max subs per URI exceeded for forward://x/events (limit 16)`.
 
 ### NOT_FOUND closest-match suggestions
 
@@ -707,7 +707,7 @@ sequenceDiagram
 
 ### Cancellation propagation
 
-`notifications/cancelled` is routed natively by rmcp 1.6 — no custom transport handling required.
+`notifications/cancelled` is routed natively by rmcp 3.11 — no custom transport handling required.
 
 ```mermaid
 sequenceDiagram
@@ -770,7 +770,7 @@ sequenceDiagram
 
 ### Peer disconnect GC
 
-`spawn_peer_gc` periodically removes peers whose rmcp transport has closed (rmcp 1.6 does not raise a callback).
+`spawn_peer_gc` periodically removes peers whose rmcp transport has closed (rmcp 3.11 does not raise a callback).
 
 ```mermaid
 sequenceDiagram
@@ -786,7 +786,7 @@ sequenceDiagram
         Reg->>Reg: snapshot subscribers and for each unique peer_id probe peer.is_transport_closed
         Reg->>Peer: is_transport_closed() returns true
         Reg->>Reg: drop_peer(peer_id) then for each URI unsubscribe(peer_id, uri)
-        Note over Reg: Last unsubscribe per URI aborts the debouncer task.
+        Note over Reg: Last consumer per URI (peer or lane) aborts the debouncer task.
     end
 
     Bin->>GC: cancel_token.cancel() (Ctrl-C / stdin close)

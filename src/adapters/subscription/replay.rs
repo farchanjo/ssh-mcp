@@ -9,7 +9,7 @@
 
 use crate::domain::error::DomainError;
 
-use super::subscriber_lane::LaneMsg;
+use crate::adapters::subscription::subscriber_lane::LaneMsg;
 
 /// Build a [`LaneMsg::Snapshot`] for the given cursor.
 ///

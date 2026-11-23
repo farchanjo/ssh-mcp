@@ -1,7 +1,6 @@
 # Generated files
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Environment variables
 .env
@@ -65,3 +64,4 @@ scripts/soak_metrics.csv
 # Release packaging output (uploaded as GitHub release assets)
 /dist/
 /ssh-mcp-v*.tar.gz
+doc/.specify/

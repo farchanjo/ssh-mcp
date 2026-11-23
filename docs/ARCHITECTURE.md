@@ -1,6 +1,8 @@
 # SSH MCP Architecture (v7.1 — rsync hybrid transport + inline push on subscribe-first hexagonal)
 
-Architecture of the SSH Model Context Protocol (MCP) server on `master` (v7.1.1). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with eight layered deltas stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged), the **SFTP resume + verify** primitive ([ADR 0010](./adr/0010-sftp-resume.md), v6.1 — merged), the **rsync hybrid transport** ([ADR 0011](./adr/0011-rsync-hybrid-transport.md), v7.0 — merged), and **inline-push notifications** ([ADR 0012](./adr/0012-inline-push-notifications.md), v7.1 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos, and v7.0 adds 3 rsync tools (39 tools / 38 without `port_forward`).
+Architecture of the SSH Model Context Protocol (MCP) server on `master` (v7.1.3). The hexagonal (Ports and Adapters) layout from v4.1 is preserved — same six top-level layers, same dependency rules, same lock-free invariants — with eight layered deltas stacked on top: **lifecycle binding** ([ADR 0003](./adr/0003-lifecycle-binding.md), Phase 1 — merged), **channel mux + sub_id** ([ADR 0004](./adr/0004-channel-mux-fairness.md), Phase 2 — merged), **LLM UX overhaul** ([ADR 0005](./adr/0005-llm-ux-priorities.md), Phase 3 — merged), the **NDJSON daemon** ([ADR 0008](./adr/0008-ndjson-daemon-protocol.md), Phase 4 — merged), the **serial transport** ([ADR 0009](./adr/0009-serial-transport.md), v5.2 — merged), the **SFTP resume + verify** primitive ([ADR 0010](./adr/0010-sftp-resume.md), v6.1 — merged), the **rsync hybrid transport** ([ADR 0011](./adr/0011-rsync-hybrid-transport.md), v7.0 — merged), and **inline-push notifications** ([ADR 0012](./adr/0012-inline-push-notifications.md), v7.1 — merged). The text channel stays byte-stable since v3 on the 21 carry-over tools; v5 adds 9 net-new subscription tools, the v5.2 release adds 6 serial tools, v6.0 splits the catalogue across the `ssh_*` / `sub_*` / `serial_*` eixos, and v7.0 adds 3 rsync tools (39 tools / 38 without `port_forward`).
+
+Every tool returns a single markdown `Text<String>` plus a parallel `structured_content` JSON object: `TOOL_NAME: STATUS` first line, one `KEY: value` per line, an 8-hex-char nonce per response on output blocks (`--- stdout [a3f2b1d7] ---`), and errors as `SSH_X: ERROR` + `REASON: [CODE] description` + `DETAIL: <one-sentence cure>`. The frozen shape is exercised by the `v5_smoke` suite (`tests/v5_smoke.rs`) and pinned by exact-string render tests (`src/infra/mcp/helpers/output.rs::tests::render_output_block_with_content`, `src/infra/mcp/render/connection.rs::tests::disconnect_render_emits_block`); no test compares a response with a capture from an earlier release.
 
 Version trail (one line each):
 
@@ -128,7 +130,7 @@ The crate root is `src/`. Library code lives under `src/{domain,ports,applicatio
 | `src/bin/ssh_mcp_stdio.rs` | Stdio transport (`ssh-mcp-stdio`). Calls `composition::prod::run_stdio()`. Logs to stderr via `RUST_LOG`. |
 | `src/bin/ssh_mcp_tail.rs` | NDJSON daemon (`ssh-mcp-tail`). Embeds rmcp client + server pair across `tokio::io::duplex` via `composition::embed::wire()`. |
 
-All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s). rmcp 1.6 does not expose a peer-disconnect callback, so the periodic scan is the only way to reclaim subscription state for closed transports.
+All three spawn the peer-GC task on `SSH_MCP_PEER_GC_INTERVAL_S` (default 30 s). rmcp 3.11 does not expose a peer-disconnect callback, so the periodic scan is the only way to reclaim subscription state for closed transports.
 
 ### `src/domain/` — pure layer
 
@@ -371,7 +373,7 @@ ADR: [adr/0004-channel-mux-fairness.md](./adr/0004-channel-mux-fairness.md). Cur
 | `filter` | `ArcSwap<FilterRule>` | hot-reloadable regex / level pipeline |
 | `lifecycle` | `Arc<ResourceLifecycle>` | links sub to ADR 0003 refcount |
 | `stats` | `SubscriberStats` (8 atomics) | events_sent, lag_drops, queue_depth, ... |
-| `pause_flag` | `AtomicBool` | suspend drain without disconnecting |
+| `pause_flag` | `AtomicBool` | suspend delivery without disconnecting |
 
 LagPolicy variants and per-fronteira behaviour: [ADR 0006](./adr/0006-backpressure-policies.md). `Snapshot` is the default — drop backlog and rebuild from the ring buffer; sub-ms on local memory.
 
@@ -542,6 +544,12 @@ flowchart TB
 ADR: [adr/0011-rsync-hybrid-transport.md](./adr/0011-rsync-hybrid-transport.md). Two-tier transport behind a single `ssh_rsync` MCP tool. Both transports live in-process inside the host crate (workspace is a single package). `WireRsyncTransport` is a canonical port of OpenBSD `openrsync` (BSD/ISC) speaking rsync wire protocol v32 (advertised; negotiates to v31 against rsync 3.x) against a remote `rsync --server` over the existing russh exec channel. `SftpRsyncTransport` is the universal fallback driving plain `readdir` + `stat` + `read` + `write` + `setstat` (no remote helper). Both are live for the supported feature set; push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM.
 
 The transports ride the existing russh session via the shared `SshHandleRegistry` — one handshake per host, one channel per sync, zero new `Mutex` on the hot path. The progress lane registers under `rsync://<id>/progress` exactly like every other v5 push resource.
+
+### v7.0.0-alpha.2 architectural retrenchment
+
+The original v7.0 plan shipped a deployed-agent transport — a linux-x86_64 cross-compiled binary embedded with `include_bytes!`, SFTP-uploaded and sha256-verified. That path was retracted in favour of "tudo integrado": both transports live inside the host crate. The `crates/ssh-mcp-rsync-agent/` and `crates/ssh-mcp-rsync-proto/` sub-crates were deleted and the workspace collapsed back to a single package (resolver 3). The four agent-specific error codes (`AGENT_DEPLOY_FAILED`, `AGENT_ARCH_UNSUPPORTED`, `AGENT_TRUST_VIOLATION`, `AGENT_NOEXEC_TARGET`) were dropped; one new code (`SFTP_FEATURE_MISSING`) was added. The `transport` enum is `Auto | Wire | Sftp`.
+
+The Wire transport's openrsync port closed across ten slices: handshake (proto 27→31), file-list (16-bit `XMIT_EXTENDED_FLAGS` + varint30/varlong30), block-checksum decode + Adler32/MD4 hash kernels, MD4 (proto<30) / MD5 (proto≥30) per-file digest, multi-phase `send_files` loop, block-match path (Adler32 hashtable + sliding window), pull direction + receiver state machine, incremental pull, `--delete` + attrs apply (`-p -t -o -g -l`), `--partial` + `-S` sparse hole detection. Push and pull are byte-identical against `rsync 3.2.7` on a real Linux VM (six wire e2e tests in `tests/v7_rsync_wire_e2e_vm.rs`, gated `e2e-vm`). Slices 11–12 (`-c` checksum delta over a wire-format extension, `-H` hardlinks) are deferred — both surface `SFTP_FEATURE_MISSING` today. The full MCP path is verified end-to-end: `ssh_rsync transport=Wire` from local to `vm.services` against a live `rsync 3.2.7` server produces byte-identical sha256 across the 3-file fixture, riding `tool_router::ssh_rsync` → `RsyncSyncUseCase::execute` → `WireRsyncTransport::start_session`. The full slice-by-slice narrative lives in [ADR 0011](./adr/0011-rsync-hybrid-transport.md).
 
 ### Hexagonal layer additions (v7.0)
 
@@ -769,12 +777,12 @@ Defaults preserve v4 behaviour. v4 hosts pointed at v5 servers see no behavioura
 | `tools/call` | One handler per tool, all returning `Result<CallToolResult, McpError>` |
 | `resources/list` | 7 schemes (`shell`, `command`, `transfer`, `session`, `forward`, `serial`, `rsync`) — see [RESOURCES.md](./RESOURCES.md) |
 | `resources/read` | All 7 schemes with `_meta` envelope; cursor support on `shell` / `command` / `forward` / `serial` |
-| `resources/subscribe` + `resources/unsubscribe` | Per `(SubId, Uri)` cursor in v5; `(PeerId, Uri)` synthesised for legacy hosts |
+| `resources/subscribe` + `resources/unsubscribe` | `(PeerId, Uri)` cursor only; the legacy method opens no lane (`sub_open` owns the lanes) |
 | `notifications/resources/updated` | Emitted by the per-resource debouncer task |
 | `notifications/resources/list_changed` | Capability advertised; emission still deferred (tracked under [Future work](#future-work)) |
 | `prompts/list` + `prompts/get` | 10 workflows in v5 (5 carry-overs + 5 push-first) |
 | `notifications/progress` | Best-effort; fires on long async waits when `_meta.progressToken` is supplied |
-| Cancellation | Native via rmcp 1.6 |
+| Cancellation | Native via rmcp 3.11 |
 
 ## Cross references
 

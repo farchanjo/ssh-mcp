@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use super::subscriber_lane::LaneMsg;
+use crate::adapters::subscription::subscriber_lane::LaneMsg;
 use crate::domain::subscription::SubId;
 use crate::ports::channel_mux::{AggregateStats, ChannelMuxPort};
 

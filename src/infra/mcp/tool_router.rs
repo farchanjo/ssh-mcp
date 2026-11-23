@@ -14,6 +14,7 @@
 
 use core::future::Future;
 use core::pin::{Pin, pin};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +23,11 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ExperimentalCapabilities, GetPromptRequestParams, GetPromptResult, Icon,
+    CallToolResult, ExperimentalCapabilities, GetPromptRequestParams, GetPromptResponse, Icon,
     Implementation, InitializeRequestParams, InitializeResult, JsonObject, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
+    ServerConfig, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use serde_json::Value as JsonValue;
@@ -131,29 +132,31 @@ use crate::ports::ssh_client::SshClientPort;
 use crate::ports::subscriber_registry::{SubscriberRegistryAsync, SubscriberRegistryPort};
 use crate::ports::transfer_repo::TransferRepository;
 
-use super::args::connection::{
+use crate::infra::mcp::args::connection::{
     SshConnectArgs, SshDisconnectAgentArgs, SshDisconnectArgs, SshDisconnectManyArgs,
     SshSessionsArgs, ssh_connect_input_schema,
 };
-use super::args::execute::{
+use crate::infra::mcp::args::execute::{
     SshCommandsArgs, SshExecArgs, SshExecBatchArgs, SshExecCancelArgs, SshExecOutputArgs,
     SshRunArgs,
 };
 #[cfg(feature = "port_forward")]
-use super::args::forward::SshForwardArgs;
-use super::args::rsync::{SshRsyncArgs, SshRsyncCancelArgs, SshRsyncStatsArgs};
-use super::args::sftp::{SshDownloadArgs, SshTransferProgressArgs, SshUploadArgs};
-use super::args::shell::{
+use crate::infra::mcp::args::forward::SshForwardArgs;
+use crate::infra::mcp::args::rsync::{
+    RsyncTransportArg, SshRsyncArgs, SshRsyncCancelArgs, SshRsyncStatsArgs,
+};
+use crate::infra::mcp::args::sftp::{SshDownloadArgs, SshTransferProgressArgs, SshUploadArgs};
+use crate::infra::mcp::args::shell::{
     SshShellCloseArgs, SshShellOpenArgs, SshShellPressArgs, SshShellReadArgs, SshShellWaitForArgs,
     SshShellWriteArgs,
 };
-use super::args::subscription::{
+use crate::infra::mcp::args::subscription::{
     LifetimeKind, SubCloseArgs, SubFilterArgs, SubListArgs, SubOpenArgs, SubPauseArgs,
     SubReplayArgs, SubResumeArgs, SubStatsAllArgs, SubStatsArgs,
 };
-use super::peer_handle::{PeerTable, RmcpPeerHandle};
-use super::resource_handlers;
-use super::server::McpSshServer;
+use crate::infra::mcp::peer_handle::{PeerTable, RmcpPeerHandle};
+use crate::infra::mcp::resource_handlers;
+use crate::infra::mcp::server::McpSshServer;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -694,10 +697,7 @@ fn render_rsync_started(args: &SshRsyncArgs, outcome: &RsyncStartedOutcome) -> C
 
 /// Map the inbound `RsyncTransportArg` enum onto the use-case-side
 /// [`RsyncTransportSelection`] enum.
-const fn rsync_transport_arg_to_selection(
-    arg: super::args::rsync::RsyncTransportArg,
-) -> RsyncTransportSelection {
-    use super::args::rsync::RsyncTransportArg;
+const fn rsync_transport_arg_to_selection(arg: RsyncTransportArg) -> RsyncTransportSelection {
     match arg {
         RsyncTransportArg::Auto => RsyncTransportSelection::Auto,
         RsyncTransportArg::Wire => RsyncTransportSelection::Wire,
@@ -2875,12 +2875,7 @@ where
 // (v5.2; ADR 0009).
 // ---------------------------------------------------------------------------
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "narrow blanket import for the serial tool helpers — keeps the section legible"
-)]
 mod serial_tool_helpers {
-    use super::*;
     use crate::adapters::serial::state::{
         self, SERIAL_REGISTRY, SerialConfig, SerialFlowControl, SerialOpenError, SerialParity,
         SerialStopBits, SerialWriteError,
@@ -2896,6 +2891,7 @@ mod serial_tool_helpers {
         SerialCloseResult, SerialListOpenResult, SerialListPortsResult, SerialOpenResult,
         SerialPressResult, SerialWriteResult,
     };
+    use crate::infra::mcp::tool_router::CallToolResult;
     use bytes::Bytes;
     use serde_json::json;
     use std::str::FromStr;
@@ -3960,8 +3956,8 @@ where
 /// omitted for now — flipping them on requires a stable hosted asset URL
 /// plus a tiny SVG.
 //
-// Field selection matches the rmcp 1.6 builder surface at
-// `~/.cargo/registry/.../rmcp-1.6.0/src/model.rs:1009-1056`. The struct
+// Field selection matches the rmcp 3.11 `Implementation` builder on docs.rs.
+// The struct
 // is `#[non_exhaustive]`, so we have to go through `Implementation::new`
 // + the `with_*` setters.
 fn build_implementation() -> Implementation {
@@ -3978,6 +3974,16 @@ fn build_implementation() -> Implementation {
                 .with_mime_type("image/svg+xml")
                 .with_sizes(vec!["any".to_string()]),
         ])
+}
+
+/// Highest MCP revision the server serves with the `initialize` lifecycle.
+/// A known revision up to this ceiling answers itself; a newer or an unknown
+/// revision answers the ceiling (FR-004, FR-006).
+const MAX_SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+/// Versions `initialize` may negotiate to, oldest first.
+fn supported_protocol_versions() -> &'static [ProtocolVersion] {
+    ProtocolVersion::known_up_to(&MAX_SUPPORTED_PROTOCOL_VERSION)
 }
 
 /// Shared [`ServerCapabilities`] fingerprint advertised on the
@@ -4175,13 +4181,17 @@ where
     Sfs: RsyncSftpFsPort + Send + Sync + 'static,
     Rs: RsyncRepository + Send + Sync + 'static,
 {
-    fn get_info(&self) -> ServerInfo {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(supported_protocol_versions())
+    }
+
+    fn get_info(&self) -> ServerConfig {
         #[cfg(feature = "port_forward")]
         let instructions = INSTRUCTIONS_WITH_FORWARD;
         #[cfg(not(feature = "port_forward"))]
         let instructions = INSTRUCTIONS_WITHOUT_FORWARD;
-        ServerInfo::new(server_capabilities())
-            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+        ServerConfig::new(server_capabilities())
+            .with_protocol_version(MAX_SUPPORTED_PROTOCOL_VERSION)
             .with_server_info(build_implementation())
             .with_instructions(instructions)
     }
@@ -4199,7 +4209,7 @@ where
         if let Some(registry) = self.capability_registry.as_ref() {
             record_inline_push_capability(registry, &self.peer_table, &context, &request);
         }
-        Ok(self.get_info())
+        self.negotiate_initialize(&request)
     }
 
     async fn list_resources(
@@ -4234,7 +4244,7 @@ where
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         // ADR 0011 — short-circuit `rsync://<id>/progress` reads
         // before falling through to the generic dispatcher.
         if let Some(outcome) =
@@ -4242,7 +4252,8 @@ where
         {
             return outcome
                 .map(|content| ReadResourceResult::new(vec![content]))
-                .map_err(|e| resource_handlers::map_rsync_read_error(&e));
+                .map_err(|e| resource_handlers::map_rsync_read_error(&e))
+                .map(Into::into);
         }
         resource_handlers::read_resource_impl(
             &self.use_cases.read_resource,
@@ -4251,6 +4262,7 @@ where
             &self.peer_table,
         )
         .await
+        .map(Into::into)
     }
 
     async fn subscribe(
@@ -4293,9 +4305,9 @@ where
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         let args = request.arguments.unwrap_or_default();
-        prompts::get_prompt(&request.name, &args)
+        prompts::get_prompt(&request.name, &args).map(Into::into)
     }
 }
 
@@ -4652,7 +4664,7 @@ mod tests {
             ShellId::new("sh-1".to_string()),
             SessionId::new("sess-1".to_string()),
             ShellTerminal::new("xterm".to_string(), 80, 24),
-            Utc::now(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             Duration::from_secs(900),
             1024,
         );
@@ -4886,7 +4898,7 @@ mod tests {
         use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
         use rmcp::ErrorData as McpError;
         use rmcp::model::CallToolResult;
-        use rmcp::model::Content;
+        use rmcp::model::ContentBlock;
         use serde_json::json;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4899,7 +4911,7 @@ mod tests {
 
         let make_body = |calls: Arc<AtomicUsize>| async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            let mut result = CallToolResult::success(vec![Content::text("BODY")]);
+            let mut result = CallToolResult::success(vec![ContentBlock::text("BODY")]);
             result.structured_content = Some(json!({"tool": "ssh_test", "status": "ok"}));
             Ok::<_, McpError>(result)
         };
@@ -4952,7 +4964,7 @@ mod tests {
         use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
         use rmcp::ErrorData as McpError;
         use rmcp::model::CallToolResult;
-        use rmcp::model::Content;
+        use rmcp::model::ContentBlock;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -4971,7 +4983,7 @@ mod tests {
                     String::new(),
                     || async move {
                         calls_inner.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, McpError>(CallToolResult::success(vec![Content::text("x")]))
+                        Ok::<_, McpError>(CallToolResult::success(vec![ContentBlock::text("x")]))
                     },
                 ))
                 .expect("call");
@@ -4992,7 +5004,7 @@ mod tests {
         use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
         use rmcp::ErrorData as McpError;
         use rmcp::model::CallToolResult;
-        use rmcp::model::Content;
+        use rmcp::model::ContentBlock;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -5012,7 +5024,7 @@ mod tests {
                     String::new(),
                     || async move {
                         calls_inner.fetch_add(1, Ordering::SeqCst);
-                        let mut r = CallToolResult::success(vec![Content::text("nope")]);
+                        let mut r = CallToolResult::success(vec![ContentBlock::text("nope")]);
                         r.is_error = Some(true);
                         Ok::<_, McpError>(r)
                     },
@@ -5026,6 +5038,64 @@ mod tests {
         );
     }
     // ---- ADR 0012 Phase 6 — initialize handshake unit tests ----
+
+    #[test]
+    fn supported_versions_stop_at_2025_11_25() {
+        use super::supported_protocol_versions;
+        use rmcp::model::ProtocolVersion;
+        assert_eq!(
+            supported_protocol_versions(),
+            &[
+                ProtocolVersion::V_2024_11_05,
+                ProtocolVersion::V_2025_03_26,
+                ProtocolVersion::V_2025_06_18,
+                ProtocolVersion::V_2025_11_25,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_client_is_negotiated_down_to_2025_11_25() {
+        use super::supported_protocol_versions;
+        use rmcp::model::ProtocolVersion;
+        use rmcp::service::select_protocol_version;
+        assert_eq!(
+            select_protocol_version(
+                &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2025_06_18],
+                supported_protocol_versions()
+            ),
+            Some(ProtocolVersion::V_2025_11_25)
+        );
+        assert_eq!(
+            select_protocol_version(
+                &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
+                supported_protocol_versions()
+            ),
+            Some(ProtocolVersion::V_2025_11_25)
+        );
+        assert_eq!(
+            select_protocol_version(
+                &[ProtocolVersion::V_2025_06_18],
+                supported_protocol_versions()
+            ),
+            Some(ProtocolVersion::V_2025_06_18)
+        );
+    }
+
+    #[test]
+    fn capability_set_is_the_frozen_one() {
+        use super::server_capabilities;
+        let caps = serde_json::to_value(server_capabilities()).expect("capabilities serialise");
+        assert_eq!(
+            caps,
+            serde_json::json!({
+                "tools": {"listChanged": true},
+                "resources": {"subscribe": true, "listChanged": true},
+                "prompts": {},
+                "experimental": {"ssh_inline_push": {"version": 1}}
+            })
+        );
+    }
 
     #[test]
     fn initialize_advertises_experimental_ssh_inline_push() {
@@ -5166,6 +5236,171 @@ mod tests {
             registry.len(),
             1,
             "exactly one peer entry must exist after recording"
+        );
+    }
+
+    fn sub_open_args(uri: &str) -> crate::infra::mcp::args::subscription::SubOpenArgs {
+        crate::infra::mcp::args::subscription::SubOpenArgs {
+            uri: uri.to_string(),
+            lifetime: None,
+            grace_ms: None,
+            ttl_secs: None,
+            lag_policy: None,
+            filter: None,
+            inline_push: false,
+        }
+    }
+
+    fn guarded_lane() -> crate::application::subscription_admin::SubscribeUseCase {
+        use std::sync::Arc;
+
+        use crate::adapters::id_generator::uuid::UuidIds;
+        use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
+        use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
+        use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
+        use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
+        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+        use crate::application::resource_guard::{RepositoryGuard, ResourceGuard};
+        use crate::ports::subscriber_lane::LaneAdmin;
+
+        let lane: Arc<dyn LaneAdmin> = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            Arc::new(DashMapShellRepo::new()),
+            Arc::new(DashMapCommandRepo::new()),
+            Arc::new(DashMapTransferRepo::new()),
+            Arc::new(DashMapSessionRepo::new()),
+        ));
+        crate::application::subscription_admin::SubscribeUseCase::new(lane)
+            .with_resource_guard(guard)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sub_open_refusal_answers_per_kind_code() {
+        let uc = guarded_lane();
+        for (uri, code) in [
+            ("shell://missing/output", "SHELL_NOT_FOUND"),
+            ("command://missing/output", "COMMAND_NOT_FOUND"),
+            ("transfer://missing/progress", "TRANSFER_NOT_FOUND"),
+            ("session://missing/health", "SESSION_NOT_FOUND"),
+        ] {
+            let result = super::run_sub_subscribe(&uc, sub_open_args(uri), None)
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{uri}");
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            assert!(text.starts_with("SUB_OPEN: ERROR"), "{text}");
+            assert!(text.contains(&format!("REASON: [{code}]")), "{text}");
+            assert_eq!(
+                result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v.get("code"))
+                    .and_then(|v| v.as_str()),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn sub_open_refusal_renders_per_kind_code() {
+        for (err, code) in [
+            (
+                DomainError::ShellNotFound(crate::domain::ids::ShellId::new("x".to_string())),
+                "SHELL_NOT_FOUND",
+            ),
+            (
+                DomainError::CommandNotFound(crate::domain::ids::CommandId::new("x".to_string())),
+                "COMMAND_NOT_FOUND",
+            ),
+            (
+                DomainError::TransferNotFound(crate::domain::ids::TransferId::new("x".to_string())),
+                "TRANSFER_NOT_FOUND",
+            ),
+            (
+                DomainError::SessionNotFound(crate::domain::ids::SessionId::new("x".to_string())),
+                "SESSION_NOT_FOUND",
+            ),
+        ] {
+            let body = super::render_tool_error("SUB_OPEN", &err);
+            let text = body
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            assert!(text.contains(&format!("REASON: [{code}]")), "{text}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_sub_open_is_not_cached_under_its_idempotency_key() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::adapters::id_generator::uuid::UuidIds;
+        use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
+        use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
+        use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
+        use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
+        use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+        use crate::application::resource_guard::{RepositoryGuard, ResourceGuard};
+        use crate::application::subscription_admin::SubscribeUseCase;
+        use crate::domain::ids::{SessionId, ShellId};
+        use crate::domain::shell::{ShellEntity, ShellTerminal};
+        use crate::infra::mcp::idempotency::{IdempotencyCache, KeyOutcome};
+        use crate::ports::shell_repo::ShellRepository;
+        use crate::ports::subscriber_lane::LaneAdmin;
+        use chrono::{TimeZone, Utc};
+
+        let shells = Arc::new(DashMapShellRepo::new());
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            Arc::clone(&shells),
+            Arc::new(DashMapCommandRepo::new()),
+            Arc::new(DashMapTransferRepo::new()),
+            Arc::new(DashMapSessionRepo::new()),
+        ));
+        let lane: Arc<dyn LaneAdmin> = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
+        let uc = SubscribeUseCase::new(lane).with_resource_guard(guard);
+        let cache = IdempotencyCache::new(Duration::from_secs(30), 8);
+        let first = super::with_idempotency_keyed(
+            &cache,
+            KeyOutcome::Present("k".to_string()),
+            "sub_open",
+            "fp".to_string(),
+            || super::run_sub_subscribe(&uc, sub_open_args("shell://cache/output"), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.is_error, Some(true));
+        shells
+            .insert(ShellEntity::new(
+                ShellId::new("cache".to_string()),
+                SessionId::new("s".to_string()),
+                ShellTerminal::new("xterm".to_string(), 80, 24),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Duration::from_secs(60),
+                1024,
+            ))
+            .await
+            .unwrap();
+        let second = super::with_idempotency_keyed(
+            &cache,
+            KeyOutcome::Present("k".to_string()),
+            "sub_open",
+            "fp".to_string(),
+            || super::run_sub_subscribe(&uc, sub_open_args("shell://cache/output"), None),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            second.is_error,
+            Some(true),
+            "a retry must re-run the check, not replay the cached refusal"
         );
     }
 }

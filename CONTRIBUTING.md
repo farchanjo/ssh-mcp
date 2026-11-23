@@ -4,7 +4,7 @@ Thanks for your interest in ssh-mcp. This guide is for contributors sending patc
 
 ## Before you start
 
-- Read [AGENTS.md](AGENTS.md) for the project map, build commands, and the lock-free / use-case-generic invariants the codebase enforces.
+- Read [docs/DEVELOPMENT.md → Working agreement](docs/DEVELOPMENT.md#working-agreement--dev-only) for the dev-only loop and the convention checklist the codebase enforces.
 - Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the hexagonal layer contract (domain / ports / application / adapters / infra / composition) and the dependency direction rule.
 - Read [docs/adr/0002-adopt-hexagonal-architecture.md](docs/adr/0002-adopt-hexagonal-architecture.md) for the architectural invariants and the rationale you must respect when crossing layers.
 - Read [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants) before touching anything on the hot path (`RunningCommand`, `RunningShell`, `RunningTransfer`, `SessionRef`, `ForwardHandle`, subscription registries).
@@ -26,7 +26,7 @@ cargo invocation is pinned to 4 jobs. Release builds (`make release`,
 not part of the contributor loop; CI covers the release-profile clippy gate with
 `make lint`.
 
-The `-D warnings` flag is non-negotiable: see the strict lint baseline declared in [`Cargo.toml`](Cargo.toml) and summarised in [AGENTS.md](AGENTS.md). Never silence a lint with `#[allow(...)]` to make CI green; fix the code instead. Every legitimate `#[allow(...)]` carries a `reason = "..."` (enforced by `clippy::allow_attributes_without_reason`).
+The `-D warnings` flag is non-negotiable: see the strict lint baseline declared in [`Cargo.toml`](Cargo.toml) and summarised in [docs/DEVELOPMENT.md → Clippy configuration](docs/DEVELOPMENT.md#clippy-configuration). Never silence a lint with `#[allow(...)]` to make CI green; fix the code instead. Every legitimate `#[allow(...)]` carries a `reason = "..."` (enforced by `clippy::allow_attributes_without_reason`).
 
 For larger refactors, also run `make test-integration` (integration, chaos and smoke suites) and, when the change touches the application layer, `make check`. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full developer loop including coverage and stress-test scripts.
 
@@ -46,7 +46,7 @@ Angular Conventional Commits: `<type>(<scope>): <subject>`.
 - **Scope**: a short module or area (`sftp`, `shell`, `tool_router`, `composition`, `subscription`, `adr`, `release`).
 - **Subject**: imperative mood ("add transfer progress watcher", not "added transfer progress watcher"); no trailing period; under 72 characters.
 - **Body**: wrap at 72 columns; explain *why*, not *what* (the diff already shows the *what*).
-- **Footer**: include a `Co-Authored-By:` trailer when the change was AI-assisted, and a `Refs: #NNN` / `Closes: #NNN` when an issue exists.
+- **Footer**: include a `Refs: #NNN` / `Closes: #NNN` when an issue exists. A commit carries no attribution to an AI model, assistant or tool (no `Co-Authored-By:` trailer, no "generated with" line naming one), and the author is the committer's own git identity.
 
 Break work into small, contextual commits — never `git add -A` a multi-feature blob. One logical change per commit, tests in the same commit as the feature.
 
@@ -69,7 +69,7 @@ Break work into small, contextual commits — never `git add -A` a multi-feature
 | Lock-free hot path (no `Mutex` on `Running*` state) | [docs/DEVELOPMENT.md → Lock-free invariants](docs/DEVELOPMENT.md#lock-free-invariants) |
 | Hexagonal layer dependency direction (domain knows nothing; adapters depend inward) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Use cases generic over ports — static dispatch, no `Box<dyn>` in hot paths | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Strict clippy baseline (`pedantic` + `nursery` + `cargo` at deny; Layer A forbids) | [`Cargo.toml`](Cargo.toml) `[lints.clippy]`, [AGENTS.md](AGENTS.md) |
+| Strict clippy baseline (`pedantic` + `nursery` + `cargo` at deny; Layer A forbids) | [`Cargo.toml`](Cargo.toml) `[lints.clippy]`, [docs/DEVELOPMENT.md → Clippy configuration](docs/DEVELOPMENT.md#clippy-configuration) |
 | ADR for any decision spanning more than one layer or changing a port surface | [docs/adr/](docs/adr/) |
 | Subscribe-first push delivery for `shell://`, `command://`, `transfer://`, `forward://` | [docs/RESOURCES.md](docs/RESOURCES.md) |
 | Wire compatibility with v3 / v4 hosts on the legacy 21-tool catalogue | [docs/MIGRATION.md → v3 → v4](docs/MIGRATION.md#v3--v4) |

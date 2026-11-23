@@ -62,7 +62,7 @@ This checklist is the gate every pull request must satisfy before it is merged. 
 
 - [ ] Commits follow the Angular Conventional Commits format: `<type>(<scope>): <subject>`.
 - [ ] Subject is ≤50 chars; body explains the **why** when not obvious.
-- [ ] No bundled commit covering more than one logical change — break into small contextual commits per [AGENTS.md](AGENTS.md).
+- [ ] No bundled commit covering more than one logical change — break into small contextual commits per [CONTRIBUTING.md → Commit message format](CONTRIBUTING.md#commit-message-format).
 - [ ] Branch name matches the change: `feat/<scope>`, `fix/<scope>`, `docs/<scope>`, etc.
 
 ---

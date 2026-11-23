@@ -66,11 +66,11 @@ Long-running resources are `shell://<id>/output`, `command://<id>/output`, `tran
 
 ### Rule 2 — Always unsubscribe when done; track every `sub_id`
 
-Every `sub_open` (or legacy `resources/subscribe`) returns a `sub_id` keyed to a per-channel state bag (cursor, filter, lag policy, mpsc lane, stats). Forgetting `sub_close` keeps the lane alive until peer GC fires (default 30 s) or the parent session is disconnected. Multiplied across a long agent loop this leaks lanes and distorts `events_sent`.
+Every `sub_open` returns a `sub_id` keyed to a per-channel state bag (cursor, filter, lag policy, mpsc lane, stats). A legacy `resources/subscribe` is peer-keyed and owns no lane; `resources/unsubscribe` removes it. Forgetting `sub_close` keeps a `sub_open` lane alive until peer GC fires (default 30 s) or the parent session is disconnected. Multiplied across a long agent loop this leaks lanes and distorts `events_sent`.
 
 **Violation.** Agent re-subscribes on every event-loop iteration without ever unsubscribing. After 100 turns the session has 100 `sub_id`s on a single URI, each with its own backlog and counters.
 
-**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each subscription its own bounded `mpsc::channel(N)` and a per-lane stats block. The server cannot reach into your conversation state to GC a stale `sub_id` — only explicit `sub_close` or peer-transport disconnect closes it.
+**Rationale.** [ADR 0004](./adr/0004-channel-mux-fairness.md) gives each `sub_open` subscription its own bounded `mpsc::channel(N)` and a per-lane stats block. The server cannot reach into your conversation state to GC a stale `sub_id` — only explicit `sub_close` or peer-transport disconnect closes it. A `resources/subscribe` subscription is removed by `resources/unsubscribe`.
 
 **How to comply.**
 - After every `sub_open`, store the returned `sub_id` in conversation state until the matching `sub_close`.
@@ -233,9 +233,11 @@ GOLDEN RULES:
    subscriber between creation and close. If you cannot guarantee a
    subscriber, set release_when_no_subs=true at creation time so
    the server self-cleans after the configured grace window.
-2. Track every sub_id returned by sub_open (or the legacy
-   resources/subscribe). Call sub_close(sub_id) before the
-   workflow ends. Forgotten subs leak lanes until peer GC fires.
+2. sub_open returns the sub_id that sub_close takes. Call
+   sub_close(sub_id) before the workflow ends. A legacy
+   resources/subscribe subscription is ended with
+   resources/unsubscribe. Forgotten subs leak lanes until peer GC
+   fires.
 3. After every nontrivial workflow query sub_stats. If
    lagged_drops > 0, choose between lag_policy=snapshot (default,
    gap-bridging via ring buffer rebuild) and lag_policy=block_slow
@@ -916,7 +918,7 @@ Reconnect after an unexpected transport drop and replay the lost segment of a kn
 
 - **Args**: `address`, `username`, `agent_id` (same as prior session), `uri`, `from_cursor` (last confirmed cursor).
 - **Sequence**: `ssh_connect` (`reuse=Auto` short-circuits if the prior session is live) → `sub_open(uri, lifetime=auto-close)` → `sub_replay(sub_id, from_cursor)` re-emits buffered events → consumer drains forward.
-- **Failure modes**: `[RESOURCE_GONE]` (RESOURCE — released during disconnect window; recreate via `ssh_shell_open` / `ssh_exec` and resume from a fresh cursor); `[RING_BUFFER_OVERFLOW]` (POLICY, recover — cursor predates the available window).
+- **Failure modes**: `[SHELL_NOT_FOUND]` / `[COMMAND_NOT_FOUND]` / `[TRANSFER_NOT_FOUND]` / `[SESSION_NOT_FOUND]` (RESOURCE — the id is gone; recreate and resume from a fresh cursor); `[RING_BUFFER_OVERFLOW]` (POLICY, recover — cursor predates the available window). `sub_open` does not return `RESOURCE_GONE`.
 
 ---
 
@@ -1424,7 +1426,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** A `ssh_shell_*` call referenced a closed or unknown shell.
+- **When:** A `ssh_shell_*` or `sub_open` call referenced a closed or unknown shell.
 - **Why:** The shell was closed (manual or grace), or the ID is stale.
 - **Cure:** `ssh_list_*` (when available) or simply recreate via `ssh_shell_open`.
 - **Prevention:** Subscribe to `shell://<id>/output` so a `resource_closed` event lands in your stream when the shell ends.
@@ -1434,7 +1436,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** `ssh_exec_output` / `ssh_exec_cancel` referenced a stale or never-existed `command_id`.
+- **When:** `ssh_exec_output` / `ssh_exec_cancel` or `sub_open` referenced a stale or never-existed `command_id`.
 - **Why:** The command finished and was reaped, or the ID is wrong.
 - **Cure:** `ssh_commands` to enumerate live commands; re-issue `ssh_exec` if needed.
 - **Prevention:** Subscribe to `command://<id>/output` and consume the `completed` event.
@@ -1444,7 +1446,7 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** `ssh_transfer_progress` referenced a finished or unknown transfer.
+- **When:** `ssh_transfer_progress` or `sub_open` referenced a finished or unknown transfer.
 - **Why:** The transfer completed and was reaped, or the ID is wrong.
 - **Cure:** Re-issue the upload/download to obtain a fresh ID.
 - **Prevention:** Subscribe to `transfer://<id>/progress` so completion is observed in-stream.
@@ -1464,8 +1466,8 @@ Never retry. The resource is gone or never existed. The cure is to recreate it (
 
 - **Category:** RESOURCE
 - **Retryable:** no
-- **When:** A subscribe attempt or operation hit a resource whose lifecycle state is `Releasing` or `Closed`. The resource has been released by the lifecycle layer (manual close, grace timer fired, or cascade).
-- **Why:** [ADR 0003 — Lifecycle Binding](./adr/0003-lifecycle-binding.md) defines `Closed` as a terminal state; new subscriptions are refused.
+- **When:** A `resources/subscribe` hit a resource whose lifecycle state is `Releasing` or `Closed`. The resource has been released by the lifecycle layer (manual close, grace timer fired, or cascade). `sub_open` does not return this code: it does not call the lifecycle, so a `Closed` resource whose repository row still exists is accepted.
+- **Why:** [ADR 0003 — Lifecycle Binding](./adr/0003-lifecycle-binding.md) defines `Closed` as a terminal state; `resources/subscribe` refuses it.
 - **Cure:** Recreate via `ssh_shell_open` / `ssh_exec` / `ssh_upload` and resume from a fresh cursor.
 - **Prevention:** Subscribe before the grace window expires; respect `release_when_no_subs=true` semantics; use `lifetime=manual` if the resource must outlive a transient agent.
 - **Related:** [SHELL_NOT_FOUND], [GRACE_TIMER_EXPIRED].

@@ -11,7 +11,7 @@
 #   * Dev and test are the default path: incremental, opt-level 0, sccache,
 #     4 jobs. nextest is the only test runner (one process per test).
 #   * Release is the owner's path: every codegen optimisation, no incremental
-#     artifacts. Agents never run it — see AGENTS.md → Working agreement.
+#     artifacts. Agents never run it — see docs/DEVELOPMENT.md → Working agreement.
 #   * CARGO_INCREMENTAL is stripped because it outranks every profile;
 #     `Cargo.toml` decides instead (dev/test incremental, release not).
 #   * sccache is pinned to the repository wrapper. A host-exported

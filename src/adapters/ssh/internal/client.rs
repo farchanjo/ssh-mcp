@@ -38,6 +38,7 @@
 //!
 //! Authentication failures are never retried to avoid account lockouts.
 
+use std::borrow::Cow;
 use std::env;
 use std::fmt;
 use std::future::Future;
@@ -98,6 +99,9 @@ pub fn build_client_config(
     };
 
     let preferred = Preferred {
+        // No host-certificate algorithm is offered: this client validates no
+        // certificate chain, so it never invites one.
+        host_key_certificates: Cow::Borrowed(&[]),
         compression,
         ..Default::default()
     };
@@ -522,8 +526,7 @@ pub async fn open_session_with_retry(
         match handle_arc.channel_open_session().await {
             Ok(ch) => return Ok(ch),
             Err(e) => {
-                let msg = e.to_string();
-                if is_transient_open_error(&msg) && attempt < MAX_ATTEMPTS {
+                if is_transient_open_error(&e) && attempt < MAX_ATTEMPTS {
                     time::sleep(Duration::from_millis(open_backoff_ms(attempt))).await;
                     continue;
                 }
@@ -669,7 +672,7 @@ async fn handle_open_error(
 ) -> bool {
     let msg = err.to_string();
     warn!("channel_open_session attempt {attempt} failed: {msg}");
-    if is_transient_open_error(&msg) && attempt < max_attempts {
+    if is_transient_open_error(err) && attempt < max_attempts {
         if wait_with_cancel(&command.cancel_token, attempt).await {
             finish_open_channel(command, AsyncCommandStatus::Cancelled);
             return true;
@@ -682,15 +685,21 @@ async fn handle_open_error(
 }
 
 /// Classify a `channel_open_session` error as transient (slot may reopen soon).
-fn is_transient_open_error(msg: &str) -> bool {
-    // OpenSSH surfaces `MaxSessions` exhaustion as `ConnectFailed` /
-    // `Administratively prohibited`. `RESOURCE_SHORTAGE` is the RFC label.
-    // Matching is case-insensitive: russh renders the variants with
-    // different capitalisation depending on the error path.
-    let lower = msg.to_lowercase();
-    lower.contains("connectfailed")
-        || lower.contains("resource_shortage")
-        || lower.contains("administratively")
+///
+/// The decision reads the typed error and never its rendered text, so a
+/// `reason` string supplied by the peer cannot decide a retry. OpenSSH
+/// surfaces `MaxSessions` exhaustion as `ConnectFailed` /
+/// `Administratively prohibited`, and `RESOURCE_SHORTAGE` is the RFC label
+/// for a peer out of slots; all three are transient.
+const fn is_transient_open_error(err: &russh::Error) -> bool {
+    matches!(
+        err,
+        russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::ConnectFailed
+                | russh::ChannelOpenFailure::AdministrativelyProhibited
+                | russh::ChannelOpenFailure::ResourceShortage
+        )
+    )
 }
 
 /// Sleep the exponential backoff for `attempt`, or return `true` if cancelled.
@@ -1300,6 +1309,15 @@ mod tests {
             let config = build_client_config(Duration::from_secs(300), true, false);
             assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(300)));
         }
+
+        #[test]
+        fn test_no_host_certificate_algorithm_is_offered() {
+            let config = build_client_config(Duration::from_secs(300), true, false);
+            assert!(
+                config.preferred.host_key_certificates.is_empty(),
+                "the client must offer no host-certificate algorithm"
+            );
+        }
     }
 
     mod retry_delay_constant {
@@ -1391,27 +1409,47 @@ mod tests {
         use super::*;
 
         #[test]
-        fn max_sessions_and_resource_shortage_are_transient() {
-            // The three spellings OpenSSH / russh use when the per-connection
+        fn exhaustion_reasons_are_transient() {
+            // The three reasons OpenSSH / russh report when the per-connection
             // channel budget is exhausted. Transfers share this retry path
             // through `open_sftp_session`.
-            assert!(is_transient_open_error(
-                "ConnectFailed: channel open failure"
-            ));
-            assert!(is_transient_open_error(
-                "Channel open failure: RESOURCE_SHORTAGE"
-            ));
-            assert!(is_transient_open_error(
-                "Channel open failure: administratively prohibited: open failed"
-            ));
+            use russh::{ChannelOpenFailure, Error};
+
+            for reason in [
+                ChannelOpenFailure::ConnectFailed,
+                ChannelOpenFailure::AdministrativelyProhibited,
+                ChannelOpenFailure::ResourceShortage,
+            ] {
+                let err = Error::ChannelOpenFailure(reason);
+                assert!(
+                    is_transient_open_error(&err),
+                    "an exhaustion refusal must be transient: {err}"
+                );
+            }
         }
 
         #[test]
-        fn non_exhaustion_errors_are_not_transient() {
-            assert!(!is_transient_open_error(
-                "Channel open failure: connection refused"
-            ));
-            assert!(!is_transient_open_error("EOF"));
+        fn other_reasons_and_errors_are_not_transient() {
+            use russh::{ChannelOpenFailure, Error};
+
+            let peer_reason = Error::ChannelOpenFailure(ChannelOpenFailure::Other {
+                code: 1,
+                reason: "resource_shortage".to_string(),
+            });
+            assert!(
+                !is_transient_open_error(&peer_reason),
+                "a reason string supplied by the peer must not decide a retry"
+            );
+            for err in [
+                Error::ChannelOpenFailure(ChannelOpenFailure::UnknownChannelType),
+                Error::Disconnect,
+                Error::HUP,
+            ] {
+                assert!(
+                    !is_transient_open_error(&err),
+                    "must not be transient: {err}"
+                );
+            }
         }
 
         #[test]

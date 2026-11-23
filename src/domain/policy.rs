@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::command::CommandStatus;
+use crate::domain::command::CommandStatus;
 
 /// Reuse strategy applied by `connect_session` when an existing session
 /// already matches the requested identity triple `(host, port, username)`.

@@ -11,7 +11,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{SessionId, ShellId};
+use crate::domain::ids::{SessionId, ShellId};
 
 /// Lifecycle states of an interactive shell session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

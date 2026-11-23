@@ -136,7 +136,7 @@ impl PeerTable {
     /// transport has closed. Returns the number of peers dropped.
     ///
     /// Called periodically by the binary entry points
-    /// (`spawn_peer_gc`) since rmcp 1.6 does not raise a callback on
+    /// (`spawn_peer_gc`) since rmcp 3.11 does not raise a callback on
     /// peer disconnect.
     #[must_use]
     pub fn gc_closed_peers(&self) -> usize {

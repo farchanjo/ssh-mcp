@@ -2,10 +2,12 @@
 
 This project ships a subscribe-first **Model Context Protocol (MCP) server** that lets any MCP-capable LLM host drive remote shells, async commands, SFTP transfers, **rsync v32 wire-compat sync** (downgrades to v31 against legacy servers), TCP port forwards, and local UART/TTY/COM ports — over a single, lock-free, hexagonal Rust core. This server is maintained by [@farchanjo](https://github.com/farchanjo).
 
-## Contents
+![SSH MCP icon](assets/icon.svg)
+
+## Table of Contents
 
 - [SSH MCP Server](#ssh-mcp-server)
-  - [Contents](#contents)
+  - [Table of Contents](#table-of-contents)
   - [Description](#description)
   - [Requirements](#requirements)
     - [Rust version compatibility](#rust-version-compatibility)
@@ -29,9 +31,17 @@ This server enables any MCP host (desktop apps, CLI harnesses, IDE plugins, insp
 
 The server provides tools to open persistent SSH sessions, run async commands, drive interactive PTYs, transfer files via SFTP (with resume + verify), mirror directory trees through a built-in rsync wire-protocol v32 client (downgrades to v31 against legacy servers via negotiation) (byte-identical against `rsync 3.2.7`), bind local TCP forwards, and talk to local serial ports — all streamed back to the model as MCP `notifications/resources/updated` push events the moment bytes arrive. No polling loops, no empty payloads, no wasted tokens.
 
-Architecture is **hexagonal** ([ADR 0002](docs/adr/0002-adopt-hexagonal-architecture.md)) with **lock-free hot paths** (`DashMap`, `ArcSwap`, `Atomic*`, `tokio::sync::broadcast`, `mpsc` — zero `Mutex` on `RunningCommand` / `RunningShell` / `RunningTransfer` / `SessionRef` / `ForwardHandle` / lane state). Every long-lived resource carries a CAS state machine (`Owned → Observed → Releasing → Closed`) plus per-session refcount cascade ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). Each `resources/subscribe` mints a `SubId` (UUIDv7) with its own `mpsc::channel`, lag policy, filter pipeline, replay buffer, and stats ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)).
+Architecture is **hexagonal** ([ADR 0002](docs/adr/0002-adopt-hexagonal-architecture.md)) with **lock-free hot paths** (`DashMap`, `ArcSwap`, `Atomic*`, `tokio::sync::broadcast`, `mpsc` — zero `Mutex` on `RunningCommand` / `RunningShell` / `RunningTransfer` / `SessionRef` / `ForwardHandle` / lane state). Every long-lived resource carries a CAS state machine (`Owned → Observed → Releasing → Closed`) plus per-session refcount cascade ([ADR 0003](docs/adr/0003-lifecycle-binding.md)). Each `sub_open` mints a `SubId` (UUIDv7) with its own `mpsc::channel`, lag policy, filter pipeline, replay buffer, and stats ([ADR 0004](docs/adr/0004-channel-mux-fairness.md)); a legacy `resources/subscribe` registers a peer-keyed subscription with no lane.
 
 Full module map and design rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+```mermaid
+flowchart LR
+    Host[MCP host] --> Core[ssh-mcp core]
+    Core --> SSH[SSH, SFTP and rsync targets]
+    Core --> Serial[Local serial devices]
+    Core --> Forward[TCP forwards]
+```
 
 ## Requirements
 
@@ -205,6 +215,7 @@ See the [changelog](CHANGELOG.md).
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — lock-free invariants, contributor narrative
 - [docs/MIGRATION.md](docs/MIGRATION.md) — host migration guide across versions
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — production runbook
+- [doc/arch/](doc/arch/) — validated architecture corpus, feature specifications, ADRs and runbooks
 - [docs/adr/](docs/adr/) — 12 ADRs (rmcp adoption, hexagonal, lifecycle, channel mux, LLM UX, backpressure, error taxonomy, NDJSON daemon, serial, SFTP resume, rsync hybrid, inline push)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor guide
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community code of conduct

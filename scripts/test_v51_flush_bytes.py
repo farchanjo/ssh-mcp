@@ -78,7 +78,7 @@ def test_subscribe_hint_mentions_flush_bytes_knob(flush_bytes_http_server):
         body = call_tool_text(
             client,
             "sub_open",
-            {"uri": "command://placeholder/output"},
+            {"uri": "forward://placeholder/events"},
         )
         # v7.0.1 renamed the tool from ssh_subscribe to sub_open; the header
         # changed accordingly from SSH_SUBSCRIBE to SUB_OPEN.

@@ -144,7 +144,7 @@ Open a push channel. Returns `ack` with `sub_id`.
 | `start_cursor` | no | 0 | Replay from this cursor on the lane's first drain. |
 | `id` | no | — | Correlation. |
 
-Errors: `SUB_NOT_FOUND` (parent resource gone), `RESOURCE_GONE`, `MAX_SUBS_PER_URI_EXCEEDED`, `MAX_SUBS_TOTAL_EXCEEDED`, `INVALID_LIFETIME`, `INVALID_LAG_POLICY`.
+Errors: `SUBSCRIBE_FAILED` — the dispatcher collapses every `resources/subscribe` failure into this code, and the domain message (`max subs per URI exceeded ...`, `resource gone ...`, `... not found ...`) is carried in `detail`.
 
 ### `unsubscribe`
 

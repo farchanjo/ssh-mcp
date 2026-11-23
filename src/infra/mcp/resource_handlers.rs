@@ -16,15 +16,14 @@ use std::sync::Arc;
 use rmcp::ErrorData as McpError;
 use rmcp::RoleServer;
 use rmcp::model::{
-    AnnotateAble, ListResourcesResult, Meta, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, Resource, ResourceContents, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    ListResourcesResult, MetaObject, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use super::helpers::nonce::generate_nonce;
-use super::helpers::output::render_output_block;
+use crate::infra::mcp::helpers::nonce::generate_nonce;
+use crate::infra::mcp::helpers::output::render_output_block;
 
 use crate::adapters::lifecycle::leak_watcher::{
     LeakRiskAlert, LeakRiskSeverity, LeakWatcherProbe, alert_canonical_uri,
@@ -37,9 +36,7 @@ use crate::application::read_resource::{
     parse_uri,
 };
 use crate::application::rsync_sync::{RsyncStatsSnapshot, RsyncSyncUseCase};
-use crate::application::subscribe_resource::{
-    SubscribeResourceOutcome, SubscribeResourceRequest, SubscribeResourceUseCase,
-};
+use crate::application::subscribe_resource::{SubscribeResourceRequest, SubscribeResourceUseCase};
 use crate::application::unsubscribe_resource::{
     UnsubscribeResourceRequest, UnsubscribeResourceUseCase,
 };
@@ -63,7 +60,7 @@ use crate::ports::subscriber_registry::{
 };
 use crate::ports::transfer_repo::TransferRepository;
 
-use super::peer_handle::{PeerTable, RmcpPeerHandle};
+use crate::infra::mcp::peer_handle::{PeerTable, RmcpPeerHandle};
 
 /// Map a [`DomainError`] onto an [`McpError`] for resource handlers.
 ///
@@ -254,10 +251,9 @@ const fn kind_label(k: ResourceKind) -> &'static str {
 /// v3 parity.
 fn make_resource(entry: &ResourceListing) -> Resource {
     let (uri, name, description, mime) = describe_listing(entry);
-    RawResource::new(uri, name)
+    Resource::new(uri, name)
         .with_description(description)
         .with_mime_type(mime)
-        .no_annotation()
 }
 
 /// Map a [`ResourceListing`] variant onto display metadata for the rmcp
@@ -618,14 +614,13 @@ where
     let snapshots = use_case.list_active().await?;
     for snapshot in snapshots {
         let uri = format!("rsync://{}/progress", snapshot.rsync_id);
-        let resource = RawResource::new(uri.clone(), format!("Rsync {}", snapshot.rsync_id))
+        let resource = Resource::new(uri.clone(), format!("Rsync {}", snapshot.rsync_id))
             .with_description(format!(
                 "Rsync session {} progress (status={})",
                 snapshot.rsync_id,
                 rsync_status_label(&snapshot),
             ))
-            .with_mime_type("application/json")
-            .no_annotation();
+            .with_mime_type("application/json");
         result.resources.push(resource);
     }
     Ok(())
@@ -706,7 +701,7 @@ fn render_shell_outcome(
     buffer_size: u64,
     last_seq: u64,
     status: &str,
-) -> (String, String, &'static str, Meta) {
+) -> (String, String, &'static str, MetaObject) {
     let body = String::from_utf8_lossy(data).into_owned();
     let meta = build_stream_meta("shell", cursor, buffer_size, last_seq, status);
     (uri, body, "text/plain", meta)
@@ -721,7 +716,7 @@ fn render_command_outcome(
     buffer_size: u64,
     last_seq: u64,
     status: &str,
-) -> (String, String, &'static str, Meta) {
+) -> (String, String, &'static str, MetaObject) {
     let body = render_command_body(stdout, stderr, status);
     let meta = build_stream_meta("command", cursor, buffer_size, last_seq, status);
     (uri, body, "text/plain", meta)
@@ -735,7 +730,7 @@ fn render_snapshot_outcome(
     json_payload: String,
     last_seq: u64,
     status: &str,
-) -> (String, String, &'static str, Meta) {
+) -> (String, String, &'static str, MetaObject) {
     let meta = build_snapshot_meta(kind, last_seq, status);
     (uri, json_payload, "application/json", meta)
 }
@@ -770,24 +765,24 @@ fn build_stream_meta(
     buffer_size: u64,
     last_seq: u64,
     status: &str,
-) -> Meta {
+) -> MetaObject {
     let mut map = JsonMap::new();
     map.insert("kind".to_string(), JsonValue::from(kind));
     map.insert("cursor".to_string(), JsonValue::from(cursor));
     map.insert("buffer_size".to_string(), JsonValue::from(buffer_size));
     map.insert("last_seq".to_string(), JsonValue::from(last_seq));
     map.insert("status".to_string(), JsonValue::from(status));
-    Meta(map)
+    MetaObject(map)
 }
 
 /// Build the `_meta` envelope for point-in-time snapshots
 /// (transfer / session / forward) — no cursor, no buffer size.
-fn build_snapshot_meta(kind: &str, last_seq: u64, status: &str) -> Meta {
+fn build_snapshot_meta(kind: &str, last_seq: u64, status: &str) -> MetaObject {
     let mut map = JsonMap::new();
     map.insert("kind".to_string(), JsonValue::from(kind));
     map.insert("last_seq".to_string(), JsonValue::from(last_seq));
     map.insert("status".to_string(), JsonValue::from(status));
-    Meta(map)
+    MetaObject(map)
 }
 
 /// Handle `resources/subscribe` for the v4 server.
@@ -809,29 +804,14 @@ where
     Sub: SubscriberRegistryAsync + Send + Sync,
 {
     let handle: Arc<dyn PeerHandle> = Arc::new(RmcpPeerHandle::resolve(ctx, peer_table));
-    let outcome = use_case
+    use_case
         .execute(SubscribeResourceRequest {
             uri: request.uri,
             peer: handle,
         })
         .await
-        .map_err(|e| map_resource_error(&e))?;
-    log_subscribe_outcome(&outcome);
-    Ok(())
-}
-
-/// v5 Phase 2: log the synthesised `SubId` so operators can
-/// correlate subscriptions across logs. The Phase 3 `sub_open` tool
-/// returns the `SubId` in the response body for callers that drive
-/// the lane explicitly.
-fn log_subscribe_outcome(outcome: &SubscribeResourceOutcome) {
-    if let Some(sub_id) = outcome.sub_id.as_ref() {
-        tracing::info!(
-            uri = %outcome.uri,
-            sub_id = %sub_id,
-            "resources/subscribe: SubId synthesised"
-        );
-    }
+        .map(|_outcome| ())
+        .map_err(|e| map_resource_error(&e))
 }
 
 /// Handle `resources/unsubscribe` for the v4 server.
@@ -860,13 +840,6 @@ where
         .execute(UnsubscribeResourceRequest {
             uri: request.uri,
             peer_id,
-            // v5 Phase 2: the rmcp `resources/unsubscribe` schema
-            // does not carry a `sub_id`; the v6.0 `sub_close` tool
-            // (formerly Phase 3 `ssh_sub_close`) is the path that
-            // passes it explicitly. The use case skips the
-            // lane close-by-id path when the protocol cannot supply
-            // the sub_id.
-            sub_id: None,
         })
         .await
         .map(|_outcome| ())

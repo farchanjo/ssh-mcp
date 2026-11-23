@@ -18,12 +18,13 @@ use std::sync::Arc;
 
 use crate::adapters::capability::registry::{CapabilityFlag, CapabilityRegistry};
 use crate::application::read_resource::{canonical_uri, parse_uri};
+use crate::application::resource_guard::ResourceGuard;
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
 };
-use crate::ports::notifier::{DebouncerActivator, PeerHandle};
+use crate::ports::notifier::{DebouncerActivator, LaneNotifierBridge, PeerHandle};
 use crate::ports::subscriber_lane::{InlineLaneCounters, LaneAdmin, LanePolicy, SubSummary};
 use crate::ports::subscriber_registry::ResourceKind;
 
@@ -82,6 +83,7 @@ pub struct SubscribeUseCase {
     lane: Arc<dyn LaneAdmin>,
     activator: Option<Arc<dyn DebouncerActivator>>,
     capabilities: Option<Arc<CapabilityRegistry>>,
+    guard: Option<Arc<dyn ResourceGuard>>,
 }
 
 impl SubscribeUseCase {
@@ -95,7 +97,16 @@ impl SubscribeUseCase {
             lane,
             activator: None,
             capabilities: None,
+            guard: None,
         }
+    }
+
+    /// Install the existence guard. Callers that do not install it keep the
+    /// permissive behaviour; the production composition always installs it.
+    #[must_use]
+    pub fn with_resource_guard(mut self, guard: Arc<dyn ResourceGuard>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Build the use case with both the lane handle and the debouncer
@@ -111,6 +122,7 @@ impl SubscribeUseCase {
             lane,
             activator: Some(activator),
             capabilities: None,
+            guard: None,
         }
     }
 
@@ -135,6 +147,7 @@ impl SubscribeUseCase {
     pub async fn execute(&self, req: SubscribeRequest) -> Result<SubscribeOutcome, DomainError> {
         let parsed =
             parse_uri(&req.uri).map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
+        self.guard_resource(parsed.kind, &parsed.id).await?;
         let canonical = canonical_uri(parsed.kind, &parsed.id);
         let lifetime = req.lifetime;
         let lag_policy = req.lag_policy;
@@ -159,6 +172,13 @@ impl SubscribeUseCase {
             inline_push_requested,
             inline_push_honored,
         })
+    }
+
+    async fn guard_resource(&self, kind: ResourceKind, id: &str) -> Result<(), DomainError> {
+        match self.guard.as_ref() {
+            Some(guard) => guard.ensure(kind, id).await,
+            None => Ok(()),
+        }
     }
 
     fn honor_inline_push(&self, sub_id: &SubId, requested: bool, peer_id: Option<&PeerId>) -> bool {
@@ -324,13 +344,14 @@ impl PauseSubUseCase {
 #[derive(Debug, Clone)]
 pub struct ResumeSubUseCase {
     lane: Arc<dyn LaneAdmin>,
+    notifier: Arc<dyn LaneNotifierBridge>,
 }
 
 impl ResumeSubUseCase {
     /// Build the use case.
     #[must_use]
-    pub const fn new(lane: Arc<dyn LaneAdmin>) -> Self {
-        Self { lane }
+    pub const fn new(lane: Arc<dyn LaneAdmin>, notifier: Arc<dyn LaneNotifierBridge>) -> Self {
+        Self { lane, notifier }
     }
 
     /// Resume the lane.
@@ -339,7 +360,9 @@ impl ResumeSubUseCase {
     ///
     /// [`DomainError::SubNotFound`] for unknown lanes.
     pub async fn execute(&self, req: SubToggleRequest) -> Result<SubToggleOutcome, DomainError> {
-        self.lane.resume(&req.sub_id).await?;
+        if self.lane.resume(&req.sub_id).await? {
+            self.notifier.notify_lane(&req.sub_id).await;
+        }
         Ok(SubToggleOutcome {
             sub_id: req.sub_id,
             paused: false,
@@ -660,14 +683,66 @@ mod tests {
         UnsubscribeUseCase, summary_kind_str,
     };
     use crate::adapters::id_generator::uuid::UuidIds;
+    use crate::adapters::repo::dashmap::command::DashMapCommandRepo;
+    use crate::adapters::repo::dashmap::session::DashMapSessionRepo;
+    use crate::adapters::repo::dashmap::shell::DashMapShellRepo;
+    use crate::adapters::repo::dashmap::transfer::DashMapTransferRepo;
     use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use crate::application::resource_guard::{RepositoryGuard, ResourceGuard};
+    use crate::domain::command::{CommandEntity, CommandStatus};
     use crate::domain::error::DomainError;
+    use crate::domain::ids::{CommandId, SessionId, ShellId, TransferId};
+    use crate::domain::shell::{ShellEntity, ShellTerminal};
     use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
+    use crate::domain::transfer::{TransferDirection, TransferEntity, TransferStatus};
+    use crate::ports::command_repo::CommandRepository;
+    use crate::ports::notifier::{DebouncerActivator, LaneNotifierBridge};
+    use crate::ports::shell_repo::ShellRepository;
     use crate::ports::subscriber_lane::{
         LaneAdmin, LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
     };
     use crate::ports::subscriber_registry::ResourceKind;
-    use std::sync::Arc;
+    use crate::ports::transfer_repo::TransferRepository;
+    use chrono::{TimeZone, Utc};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingLaneBridge {
+        calls: Mutex<Vec<SubId>>,
+    }
+
+    impl RecordingLaneBridge {
+        fn calls(&self) -> Vec<SubId> {
+            self.calls.lock().map_or_else(
+                |poisoned| poisoned.into_inner().clone(),
+                |guard| guard.clone(),
+            )
+        }
+    }
+
+    impl LaneNotifierBridge for RecordingLaneBridge {
+        fn notify_lanes<'a>(
+            &'a self,
+            _uri: &'a str,
+            _bytes_added: usize,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn notify_lane<'a>(
+            &'a self,
+            sub_id: &'a SubId,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(sub_id.clone());
+            })
+        }
+    }
 
     fn lane_admin() -> Arc<dyn LaneAdmin> {
         let adapter = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 8, 64);
@@ -809,7 +884,7 @@ mod tests {
             .await
             .unwrap();
         let pause = PauseSubUseCase::new(Arc::clone(&lane));
-        let resume = ResumeSubUseCase::new(lane);
+        let resume = ResumeSubUseCase::new(lane, Arc::new(RecordingLaneBridge::default()));
         let p = pause
             .execute(SubToggleRequest {
                 sub_id: sub_id.clone(),
@@ -840,7 +915,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_unknown_returns_sub_not_found() {
-        let uc = ResumeSubUseCase::new(lane_admin());
+        let uc = ResumeSubUseCase::new(lane_admin(), Arc::new(RecordingLaneBridge::default()));
         let err = uc
             .execute(SubToggleRequest {
                 sub_id: SubId::new("ghost".to_string()),
@@ -848,6 +923,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::SubNotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_paused_lane_notifies_once_with_its_sub_id() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let recording = Arc::new(RecordingLaneBridge::default());
+        let notifier: Arc<dyn LaneNotifierBridge> = Arc::<RecordingLaneBridge>::clone(&recording);
+        let sub_id = adapter
+            .open_lane(
+                "shell://sh-n/output".to_string(),
+                ResourceKind::Shell,
+                "sh-n".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        PauseSubUseCase::new(Arc::clone(&lane))
+            .execute(SubToggleRequest {
+                sub_id: sub_id.clone(),
+            })
+            .await
+            .unwrap();
+        ResumeSubUseCase::new(lane, notifier)
+            .execute(SubToggleRequest {
+                sub_id: sub_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(recording.calls(), vec![sub_id]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_running_lane_does_not_notify() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let recording = Arc::new(RecordingLaneBridge::default());
+        let notifier: Arc<dyn LaneNotifierBridge> = Arc::<RecordingLaneBridge>::clone(&recording);
+        let sub_id = adapter
+            .open_lane(
+                "shell://sh-r/output".to_string(),
+                ResourceKind::Shell,
+                "sh-r".to_string(),
+                LanePolicy::default(),
+            )
+            .await
+            .unwrap();
+        ResumeSubUseCase::new(lane, notifier)
+            .execute(SubToggleRequest { sub_id })
+            .await
+            .unwrap();
+        assert!(recording.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_unknown_does_not_notify() {
+        let recording = Arc::new(RecordingLaneBridge::default());
+        let notifier: Arc<dyn LaneNotifierBridge> = Arc::<RecordingLaneBridge>::clone(&recording);
+        let err = ResumeSubUseCase::new(lane_admin(), notifier)
+            .execute(SubToggleRequest {
+                sub_id: SubId::new("ghost".to_string()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::SubNotFound(_)));
+        assert!(recording.calls().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1561,5 +1702,249 @@ mod tests {
         );
         let counters = adapter.inline_stats(&outcome.sub_id).expect("lane present");
         assert!(!counters.inline_push, "lane gate must stay opt-out");
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingActivator {
+        uris: Mutex<Vec<String>>,
+    }
+
+    impl RecordingActivator {
+        fn uris(&self) -> Vec<String> {
+            self.uris
+                .lock()
+                .map_or_else(|p| p.into_inner().clone(), |g| g.clone())
+        }
+    }
+
+    impl DebouncerActivator for RecordingActivator {
+        fn ensure_for_uri(&self, uri: &str) {
+            let mut guard = self.uris.lock().unwrap_or_else(|p| p.into_inner());
+            guard.push(uri.to_string());
+        }
+    }
+
+    fn req(uri: &str) -> SubscribeRequest {
+        SubscribeRequest {
+            uri: uri.to_string(),
+            lifetime: SubscriptionLifetime::Manual,
+            lag_policy: LagPolicy::Snapshot,
+            filter: FilterRule::None,
+            peer: None,
+            inline_push: false,
+        }
+    }
+
+    fn repos() -> (
+        Arc<DashMapShellRepo>,
+        Arc<DashMapCommandRepo>,
+        Arc<DashMapTransferRepo>,
+        Arc<DashMapSessionRepo>,
+    ) {
+        (
+            Arc::new(DashMapShellRepo::new()),
+            Arc::new(DashMapCommandRepo::new()),
+            Arc::new(DashMapTransferRepo::new()),
+            Arc::new(DashMapSessionRepo::new()),
+        )
+    }
+
+    fn guarded(
+        lane: Arc<dyn LaneAdmin>,
+        shells: Arc<DashMapShellRepo>,
+        commands: Arc<DashMapCommandRepo>,
+        transfers: Arc<DashMapTransferRepo>,
+        sessions: Arc<DashMapSessionRepo>,
+    ) -> SubscribeUseCase {
+        let guard: Arc<dyn ResourceGuard> =
+            Arc::new(RepositoryGuard::new(shells, commands, transfers, sessions));
+        SubscribeUseCase::new(lane).with_resource_guard(guard)
+    }
+
+    fn sample_shell(id: &str) -> ShellEntity {
+        ShellEntity::new(
+            ShellId::new(id.to_string()),
+            SessionId::new("s".to_string()),
+            ShellTerminal::new("xterm".to_string(), 80, 24),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            std::time::Duration::from_secs(60),
+            1024,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_unknown_shell_is_refused() {
+        let (shells, commands, transfers, sessions) = repos();
+        let uc = guarded(lane_admin(), shells, commands, transfers, sessions);
+        let err = uc.execute(req("shell://missing/output")).await.unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::ShellNotFound(ShellId::new("missing".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_unknown_command_is_refused() {
+        let (shells, commands, transfers, sessions) = repos();
+        let uc = guarded(lane_admin(), shells, commands, transfers, sessions);
+        let err = uc
+            .execute(req("command://missing/output"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::CommandNotFound(CommandId::new("missing".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_unknown_transfer_is_refused() {
+        let (shells, commands, transfers, sessions) = repos();
+        let uc = guarded(lane_admin(), shells, commands, transfers, sessions);
+        let err = uc
+            .execute(req("transfer://missing/progress"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::TransferNotFound(TransferId::new("missing".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscribe_unknown_session_is_refused() {
+        let (shells, commands, transfers, sessions) = repos();
+        let uc = guarded(lane_admin(), shells, commands, transfers, sessions);
+        let err = uc
+            .execute(req("session://missing/health"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::SessionNotFound(SessionId::new("missing".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_sub_open_leaves_no_lane_and_no_debouncer() {
+        let adapter = lane_admin_concrete();
+        let activator = Arc::new(RecordingActivator::default());
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let (shells, commands, transfers, sessions) = repos();
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            Arc::clone(&shells),
+            commands,
+            transfers,
+            sessions,
+        ));
+        let uc = SubscribeUseCase::with_activator(
+            lane,
+            Arc::clone(&activator) as Arc<dyn DebouncerActivator>,
+        )
+        .with_resource_guard(guard);
+        let err = uc.execute(req("shell://ghost/output")).await.unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::ShellNotFound(ShellId::new("ghost".to_string()))
+        );
+        assert!(adapter.list_subs().is_empty());
+        assert!(activator.uris().is_empty());
+        shells.insert(sample_shell("ghost")).await.unwrap();
+        uc.execute(req("shell://ghost/output")).await.unwrap();
+        assert_eq!(adapter.list_subs().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_then_created_resource_can_be_subscribed() {
+        let (shells, commands, transfers, sessions) = repos();
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            Arc::clone(&shells),
+            commands,
+            transfers,
+            sessions,
+        ));
+        let uc = SubscribeUseCase::new(lane_admin()).with_resource_guard(guard);
+        assert!(uc.execute(req("shell://later/output")).await.is_err());
+        shells.insert(sample_shell("later")).await.unwrap();
+        assert!(uc.execute(req("shell://later/output")).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forward_serial_and_rsync_stay_permissive() {
+        let adapter = lane_admin_concrete();
+        let lane: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
+        let (shells, commands, transfers, sessions) = repos();
+        let uc = guarded(lane, shells, commands, transfers, sessions);
+        for uri in [
+            "forward://f/events",
+            "serial://s/output",
+            "rsync://r/progress",
+        ] {
+            uc.execute(req(uri)).await.unwrap();
+        }
+        assert_eq!(adapter.list_subs().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_command_row_is_accepted() {
+        let commands = Arc::new(DashMapCommandRepo::new());
+        commands
+            .insert(CommandEntity::new(
+                CommandId::new("c-done".to_string()),
+                SessionId::new("s".to_string()),
+                "true".to_string(),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let mut entity = commands
+            .get(&CommandId::new("c-done".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        entity.status = CommandStatus::Completed;
+        commands.update(entity).await.unwrap();
+        let (shells, _, transfers, sessions) = repos();
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            shells,
+            Arc::clone(&commands),
+            transfers,
+            sessions,
+        ));
+        let uc = SubscribeUseCase::new(lane_admin()).with_resource_guard(guard);
+        uc.execute(req("command://c-done/output")).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_transfer_row_is_accepted() {
+        let transfers = Arc::new(DashMapTransferRepo::new());
+        transfers
+            .insert(TransferEntity::new(
+                TransferId::new("x-done".to_string()),
+                SessionId::new("s".to_string()),
+                TransferDirection::Upload,
+                "/tmp/x".to_string(),
+                "/r/x".to_string(),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                1024,
+            ))
+            .await
+            .unwrap();
+        let mut entity = transfers
+            .get(&TransferId::new("x-done".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        entity.status = TransferStatus::Completed;
+        transfers.update(entity).await.unwrap();
+        let (shells, commands, _, sessions) = repos();
+        let guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+            shells,
+            commands,
+            Arc::clone(&transfers),
+            sessions,
+        ));
+        let uc = SubscribeUseCase::new(lane_admin()).with_resource_guard(guard);
+        uc.execute(req("transfer://x-done/progress")).await.unwrap();
     }
 }

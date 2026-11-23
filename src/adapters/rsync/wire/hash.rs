@@ -599,4 +599,20 @@ mod tests {
         Md5Digest::update(&mut want, b"x");
         assert_eq!(&got[..], want.finalize().as_slice());
     }
+
+    #[test]
+    fn file_hasher_known_answers() {
+        fn hex16(bytes: [u8; 16]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        // RFC 1321, appendix A.5.
+        let mut empty = FileHasher::for_protocol(0, 31);
+        empty.update(b"");
+        assert_eq!(hex16(empty.finish()), "d41d8cd98f00b204e9800998ecf8427e");
+
+        let mut abc = FileHasher::for_protocol(0, 31);
+        abc.update(b"abc");
+        assert_eq!(hex16(abc.finish()), "900150983cd24fb0d6963f7d28e17f72");
+    }
 }

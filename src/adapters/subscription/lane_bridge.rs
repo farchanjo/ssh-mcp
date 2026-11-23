@@ -32,8 +32,11 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::adapters::config::internal::resolve_inline_push_max_bytes_per_notify;
+use crate::adapters::id_generator::uuid::UuidIds;
+use crate::adapters::subscription::memory_registry::MemoryRegistry;
 use crate::adapters::subscription::subscriber_lane::{LaneState, SubscriberLaneAdapter};
 use crate::domain::inline_payload::InlinePayload;
+use crate::domain::subscription::SubId;
 use crate::ports::id_generator::IdGeneratorPort;
 use crate::ports::notifier::{LaneNotifierBridge, NotifierPort, PeerHandle};
 
@@ -265,7 +268,7 @@ where
             };
             let fragments =
                 Self::compose_inline_payload(&lane, uri, bytes_added, self.inline_max_bytes);
-            if fragments.is_empty() {
+            if fragments.is_empty() || lane.paused.load(Ordering::Acquire) {
                 continue;
             }
             dispatches.push(InlineDispatch {
@@ -281,7 +284,13 @@ where
         let Some(peer) = lane.peer().map(Arc::clone) else {
             return;
         };
+        // Compose even while paused so `seq` and the absolute byte cursor
+        // keep advancing; the fragments are dropped and the resume use case
+        // sends the catch-up notification.
         let fragments = Self::compose_inline_payload(lane, uri, bytes_added, self.inline_max_bytes);
+        if lane.paused.load(Ordering::Acquire) {
+            return;
+        }
         if !fragments.is_empty() {
             Self::ship_inline_fragments(&self.notifier, lane, Arc::clone(&peer), fragments).await;
         }
@@ -293,7 +302,7 @@ where
             return;
         };
         let fragments = Self::compose_inline_payload(lane, uri, bytes_added, self.inline_max_bytes);
-        if fragments.is_empty() {
+        if lane.paused.load(Ordering::Acquire) || fragments.is_empty() {
             return;
         }
         Self::ship_inline_fragments(&self.notifier, lane, peer, fragments).await;
@@ -473,6 +482,9 @@ where
             peer,
             fragments,
         } = dispatch;
+        if lane.paused.load(Ordering::Acquire) {
+            return;
+        }
         Self::ship_inline_fragments(notifier, &lane, peer, fragments).await;
     }
 }
@@ -514,6 +526,49 @@ where
         // synchronously here (producer-call order), spawn only the send.
         self.dispatch_inline_now(uri, bytes_added);
     }
+
+    fn notify_lane<'a>(
+        &'a self,
+        sub_id: &'a SubId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(lane) = self.lanes.lane_by_id(sub_id) else {
+                return;
+            };
+            let Some(peer) = lane.peer().map(Arc::clone) else {
+                return;
+            };
+            self.ship_legacy_notify(&lane, peer, &lane.uri, &[]).await;
+        })
+    }
+}
+
+/// Install the lane lifetime link: the presence query and the close hook.
+///
+/// Both handles are weak, so the link forms no cycle; `on_close` lets the
+/// caller compose the mux unregister around it. Home is this module because it
+/// already holds the lane adapter and is installed into the registry, so no
+/// lower layer imports `crate::composition` for it.
+pub fn install_lane_lifetime<N>(
+    registry: &Arc<MemoryRegistry<N>>,
+    adapter: &Arc<SubscriberLaneAdapter<UuidIds>>,
+    on_close: impl Fn(&SubId) + Send + Sync + 'static,
+) where
+    N: NotifierPort + Send + Sync + 'static,
+{
+    let weak_lanes = Arc::downgrade(adapter);
+    registry.install_lane_presence(Arc::new(move |uri: &str| {
+        weak_lanes
+            .upgrade()
+            .is_some_and(|lanes| !lanes.lanes_for_uri_public(uri).is_empty())
+    }));
+    let weak_registry = Arc::downgrade(registry);
+    adapter.install_close_sink(Box::new(move |sub_id, uri| {
+        on_close(sub_id);
+        if let Some(registry) = weak_registry.upgrade() {
+            registry.release_if_idle_uri(uri);
+        }
+    }));
 }
 
 #[cfg(test)]
@@ -534,9 +589,11 @@ mod tests {
     use crate::domain::error::DomainError;
     use crate::domain::ids::PeerId;
     use crate::domain::inline_payload::InlinePayload;
-    use crate::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
     use crate::ports::notifier::{LaneNotifierBridge, NotifierPort, PeerHandle};
-    use crate::ports::subscriber_lane::{LanePolicy, SubscriberLaneAsync};
+    use crate::ports::subscriber_lane::{
+        LaneAdmin, LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
+    };
     use crate::ports::subscriber_registry::ResourceKind;
 
     #[derive(Debug, Default)]
@@ -640,6 +697,18 @@ mod tests {
         inline_max: usize,
     ) -> Arc<LaneFanoutBridge<UuidIds, RecordingNotifier>> {
         LaneFanoutBridge::with_inline_max(a, n, inline_max)
+    }
+
+    async fn resume_lane(
+        a: &SubscriberLaneAdapter<UuidIds>,
+        b: &LaneFanoutBridge<UuidIds, RecordingNotifier>,
+        sub_id: &SubId,
+    ) -> Result<bool, DomainError> {
+        let was_paused = a.resume_lane(sub_id).await?;
+        if was_paused {
+            b.notify_lane(sub_id).await;
+        }
+        Ok(was_paused)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -980,5 +1049,242 @@ mod tests {
         );
         assert_eq!(legacy[0].1, "shell://x/output");
         assert_eq!(inline[0].1.uri, "shell://x/output");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_lane_receives_no_delivery_until_resume() {
+        // `sub_pause` promises that subsequent events stop reaching the
+        // consumer until `sub_resume`. The delivery path must consult
+        // the pause flag.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-pause"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        a.pause(&lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"while-paused")
+            .await;
+        assert!(
+            n.resource_events.lock().unwrap().is_empty(),
+            "legacy notify must not reach a paused lane"
+        );
+        assert!(
+            n.inline_events.lock().unwrap().is_empty(),
+            "inline push must not reach a paused lane"
+        );
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"after-resume")
+            .await;
+        // The resume itself sends one catch-up notification; the write
+        // after it sends one more.
+        assert_eq!(n.resource_events.lock().unwrap().len(), 2);
+        assert_eq!(n.inline_events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_does_not_gate_another_lane_on_the_same_uri() {
+        // Pause is per lane. A second lane bound to the same URI must keep
+        // receiving on the same fan-out tick.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let paused = open_lane(&a, StubPeer::new("peer-a"), "shell://x/output").await;
+        let _running = open_lane(&a, StubPeer::new("peer-b"), "shell://x/output").await;
+        a.pause(&paused.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"burst")
+            .await;
+        let events = n.resource_events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "only the running lane delivers");
+        assert_eq!(events[0].0.as_str(), "peer-b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_running_lane_sends_no_extra_notification() {
+        // A resume of a lane that is not paused is a no-op: no catch-up
+        // notification may be emitted.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let _b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-run"), "shell://x/output").await;
+        resume_lane(&a, &_b, &lane.sub_id).await.unwrap();
+        assert!(
+            n.resource_events.lock().unwrap().is_empty(),
+            "resuming a running lane must not notify"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_a_quiet_pause_sends_exactly_one_notification() {
+        // The catch-up signal is what tells a paused consumer to read.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let _b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-quiet"), "shell://x/output").await;
+        a.pause(&lane.sub_id).await.unwrap();
+        resume_lane(&a, &_b, &lane.sub_id).await.unwrap();
+        assert_eq!(n.resource_events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_inline_lane_keeps_cursor_and_seq_monotonic_across_the_gap() {
+        // While paused the fragment is composed (seq/cursor advance) but
+        // not shipped. The next shipped fragment must carry the absolute
+        // cursor and a seq that jumped by the paused fragment count.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-gap"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        b.notify_lanes_with_bytes("shell://x/output", b"aaaaa")
+            .await;
+        a.pause(&lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"bbbbb")
+            .await;
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"cccc").await;
+        let events = n.inline_events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "the paused fragment is not shipped");
+        assert_eq!(events[0].1.seq, 0);
+        assert_eq!(events[0].1.cursor_after, 5);
+        assert_eq!(events[1].1.seq, 2, "seq jumped over the paused fragment");
+        assert_eq!(
+            events[1].1.cursor_after, 14,
+            "cursor_after is the absolute produced offset"
+        );
+        assert_eq!(events[1].1.bytes, b"cccc".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_lane_counters_do_not_advance() {
+        // Delivery counters count what reached the peer. A paused write
+        // must leave them untouched; the write after resume advances them.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-counters"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        a.pause(&lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"while-paused")
+            .await;
+        let stats = a.stats_snapshot(&lane.sub_id).expect("lane present");
+        assert_eq!(stats.events_sent, 0);
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(lane.inline_events_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(lane.inline_bytes_sent.load(Ordering::Relaxed), 0);
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        b.notify_lanes_with_bytes("shell://x/output", b"ok").await;
+        let stats = a.stats_snapshot(&lane.sub_id).expect("lane present");
+        assert_eq!(stats.events_sent, 2, "the catch-up and the write");
+        assert_eq!(stats.bytes_sent, 2);
+        assert_eq!(lane.inline_events_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(lane.inline_bytes_sent.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_lane_inline_only_path_is_gated() {
+        // `notify_lanes_inline_bytes` is the producer entry; the gate sits
+        // before its send.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-inline-only"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        a.pause(&lane.sub_id).await.unwrap();
+        b.notify_lanes_inline_bytes("shell://x/output", b"paused")
+            .await;
+        assert!(n.inline_events.lock().unwrap().is_empty());
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        b.notify_lanes_inline_bytes("shell://x/output", b"running")
+            .await;
+        assert_eq!(n.inline_events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_inline_dispatch_skips_a_paused_lane() {
+        // The producer hook still composes (seq advances) but enqueues
+        // nothing while the lane is paused.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-prepare"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        let first = b.prepare_inline_dispatch("shell://x/output", b"aa");
+        assert_eq!(first.len(), 1);
+        a.pause(&lane.sub_id).await.unwrap();
+        let paused = b.prepare_inline_dispatch("shell://x/output", b"bb");
+        assert!(paused.is_empty(), "no dispatch is enqueued while paused");
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        let after = b.prepare_inline_dispatch("shell://x/output", b"cc");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].fragments[0].seq, 2, "seq jumped the paused write");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_inline_dispatch_is_dropped_when_the_lane_is_paused() {
+        // A dispatch already dequeued by the consumer is re-checked at
+        // `ship_one`, so a pause that lands after the enqueue still wins.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let lane = open_lane(&a, StubPeer::new("peer-ship"), "shell://x/output").await;
+        lane.set_inline_push(true);
+        let mut queued = b.prepare_inline_dispatch("shell://x/output", b"queued");
+        assert_eq!(queued.len(), 1);
+        a.pause(&lane.sub_id).await.unwrap();
+        LaneFanoutBridge::<UuidIds, RecordingNotifier>::ship_one(&n, queued.remove(0)).await;
+        assert!(n.inline_events.lock().unwrap().is_empty());
+        resume_lane(&a, &b, &lane.sub_id).await.unwrap();
+        let after = b.prepare_inline_dispatch("shell://x/output", b"after");
+        LaneFanoutBridge::<UuidIds, RecordingNotifier>::ship_one(
+            &n,
+            after.into_iter().next().unwrap(),
+        )
+        .await;
+        assert_eq!(n.inline_events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_unknown_lane_returns_sub_not_found() {
+        use crate::domain::error::DomainError;
+        use crate::domain::subscription::SubId;
+        let a = adapter();
+        let err = a
+            .pause_lane(&SubId::new("ghost".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::SubNotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_lane_closed_while_paused_returns_sub_not_found() {
+        use crate::domain::error::DomainError;
+        let a = adapter();
+        let lane = open_lane(&a, StubPeer::new("peer-closed"), "shell://x/output").await;
+        let b = bridge(
+            Arc::clone(&a),
+            Arc::new(RecordingNotifier::default()),
+            DEFAULT_INLINE_MAX_BYTES,
+        );
+        a.pause(&lane.sub_id).await.unwrap();
+        a.close(&lane.sub_id).await.unwrap();
+        let err = resume_lane(&a, &b, &lane.sub_id).await.unwrap_err();
+        assert!(matches!(err, DomainError::SubNotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapter_and_bridge_are_released_after_drop() {
+        // The adapter and the bridge must not keep each other alive: the
+        // HTTP transport builds one composition per session, so a cycle
+        // would retain every closed session's lanes.
+        let a = adapter();
+        let n = Arc::new(RecordingNotifier::default());
+        let b = bridge(Arc::clone(&a), Arc::clone(&n), DEFAULT_INLINE_MAX_BYTES);
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        drop(a);
+        drop(b);
+        drop(n);
+        assert!(weak_a.upgrade().is_none(), "adapter retained");
+        assert!(weak_b.upgrade().is_none(), "bridge retained");
     }
 }

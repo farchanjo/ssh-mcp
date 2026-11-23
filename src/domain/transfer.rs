@@ -5,7 +5,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{SessionId, TransferId};
+use crate::domain::ids::{SessionId, TransferId};
 
 /// Direction of a single SFTP transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

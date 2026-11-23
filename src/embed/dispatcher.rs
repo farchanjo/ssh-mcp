@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResult, ClientRequest, ReadResourceRequestParams, Request,
+    ServerResult, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{RoleClient, RunningService, Service};
 use serde_json::{Map, Value};
@@ -75,7 +75,7 @@ pub fn op_call_arguments(op: &Op) -> Option<Map<String, Value>> {
 }
 
 fn connect_args_for(op: &Op) -> Map<String, Value> {
-    let Op::Connect {
+    if let Op::Connect {
         host,
         user,
         key,
@@ -85,36 +85,36 @@ fn connect_args_for(op: &Op) -> Map<String, Value> {
         reuse_policy,
         ..
     } = op
-    else {
-        return Map::new();
-    };
-    connect_arguments(
-        host,
-        user,
-        key.as_deref(),
-        password.as_deref(),
-        *port,
-        agent_id.as_deref(),
-        reuse_policy.as_deref(),
-    )
+    {
+        return connect_arguments(
+            host,
+            user,
+            key.as_deref(),
+            password.as_deref(),
+            *port,
+            agent_id.as_deref(),
+            reuse_policy.as_deref(),
+        );
+    }
+    Map::new()
 }
 
 fn exec_args_for(op: &Op) -> Map<String, Value> {
-    let Op::Exec {
+    if let Op::Exec {
         sid,
         cmd,
         pty,
         release_when_no_subs,
         ..
     } = op
-    else {
-        return Map::new();
-    };
-    exec_arguments(sid.as_str(), cmd, *pty, *release_when_no_subs)
+    {
+        return exec_arguments(sid.as_str(), cmd, *pty, *release_when_no_subs);
+    }
+    Map::new()
 }
 
 fn shell_open_args_for(op: &Op) -> Map<String, Value> {
-    let Op::ShellOpen {
+    if let Op::ShellOpen {
         sid,
         cols,
         rows,
@@ -123,17 +123,17 @@ fn shell_open_args_for(op: &Op) -> Map<String, Value> {
         max_buffer_size,
         ..
     } = op
-    else {
-        return Map::new();
-    };
-    shell_open_arguments(
-        sid.as_str(),
-        *cols,
-        *rows,
-        *release_when_no_subs,
-        *inactivity_ttl_secs,
-        *max_buffer_size,
-    )
+    {
+        return shell_open_arguments(
+            sid.as_str(),
+            *cols,
+            *rows,
+            *release_when_no_subs,
+            *inactivity_ttl_secs,
+            *max_buffer_size,
+        );
+    }
+    Map::new()
 }
 
 fn shell_write_args_for(op: &Op) -> Map<String, Value> {
@@ -144,17 +144,17 @@ fn shell_write_args_for(op: &Op) -> Map<String, Value> {
 }
 
 fn shell_key_args_for(op: &Op) -> Map<String, Value> {
-    let Op::ShellKey {
+    if let Op::ShellKey {
         shid, key, repeat, ..
     } = op
-    else {
-        return Map::new();
-    };
-    shell_key_arguments(shid.as_str(), key, *repeat)
+    {
+        return shell_key_arguments(shid.as_str(), key, *repeat);
+    }
+    Map::new()
 }
 
 fn upload_args_for(op: &Op) -> Map<String, Value> {
-    let Op::Upload {
+    if let Op::Upload {
         sid,
         local,
         remote,
@@ -163,21 +163,21 @@ fn upload_args_for(op: &Op) -> Map<String, Value> {
         verify,
         ..
     } = op
-    else {
-        return Map::new();
-    };
-    upload_arguments(
-        sid.as_str(),
-        local,
-        remote,
-        *release_when_no_subs,
-        *resume,
-        *verify,
-    )
+    {
+        return upload_arguments(
+            sid.as_str(),
+            local,
+            remote,
+            *release_when_no_subs,
+            *resume,
+            *verify,
+        );
+    }
+    Map::new()
 }
 
 fn download_args_for(op: &Op) -> Map<String, Value> {
-    let Op::Download {
+    if let Op::Download {
         sid,
         remote,
         local,
@@ -186,17 +186,17 @@ fn download_args_for(op: &Op) -> Map<String, Value> {
         verify,
         ..
     } = op
-    else {
-        return Map::new();
-    };
-    download_arguments(
-        sid.as_str(),
-        remote,
-        local,
-        *release_when_no_subs,
-        *resume,
-        *verify,
-    )
+    {
+        return download_arguments(
+            sid.as_str(),
+            remote,
+            local,
+            *release_when_no_subs,
+            *resume,
+            *verify,
+        );
+    }
+    Map::new()
 }
 
 fn cancel_args_for(op: &Op) -> Map<String, Value> {
@@ -577,8 +577,12 @@ where
 {
     match client
         .peer()
-        .subscribe(SubscribeRequestParams::new(uri.to_string()))
+        .send_request(ClientRequest::SubscribeRequest(Request::new(
+            SubscribeRequestParams::new(uri.to_string()),
+        )))
         .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| expect_empty_result(&result, "subscribe"))
     {
         Ok(()) => Event::Ack {
             id: opt_owned(correlation),
@@ -593,9 +597,19 @@ where
             id: opt_owned(correlation),
             code: "SUBSCRIBE_FAILED".to_string(),
             reason: format!("subscribe {uri} failed"),
-            detail: Some(err.to_string()),
+            detail: Some(err),
         },
     }
+}
+
+/// `resources/subscribe` and `resources/unsubscribe` answer with the empty
+/// result. Any other variant is a protocol surprise; turn it into the same
+/// error event the transport arm produces.
+fn expect_empty_result(result: &ServerResult, op: &str) -> Result<(), String> {
+    if matches!(result, ServerResult::EmptyResult(_)) {
+        return Ok(());
+    }
+    Err(format!("{op}: unexpected response {result:?}"))
 }
 
 async fn dispatch_unsubscribe<S>(
@@ -608,8 +622,12 @@ where
 {
     match client
         .peer()
-        .unsubscribe(UnsubscribeRequestParams::new(sub_id.to_string()))
+        .send_request(ClientRequest::UnsubscribeRequest(Request::new(
+            UnsubscribeRequestParams::new(sub_id.to_string()),
+        )))
         .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| expect_empty_result(&result, "unsubscribe"))
     {
         Ok(()) => Event::Ack {
             id: opt_owned(correlation),
@@ -624,7 +642,7 @@ where
             id: opt_owned(correlation),
             code: "UNSUBSCRIBE_FAILED".to_string(),
             reason: format!("unsubscribe {sub_id} failed"),
-            detail: Some(err.to_string()),
+            detail: Some(err),
         },
     }
 }
@@ -689,6 +707,7 @@ mod tests {
     use super::*;
     use crate::domain::ids::{CommandId, SessionId, ShellId};
     use crate::domain::subscription::SubId;
+    use rmcp::model::{CustomResult, ServerResult};
     use serde_json::json;
 
     fn connect_op() -> Op {
@@ -702,6 +721,15 @@ mod tests {
             reuse_policy: Some("auto".to_string()),
             id: Some("c1".to_string()),
         }
+    }
+
+    #[test]
+    fn expect_empty_result_accepts_empty_and_reports_other_variants() {
+        assert!(expect_empty_result(&ServerResult::EmptyResult(().into()), "subscribe").is_ok());
+        let other =
+            ServerResult::CustomResult(CustomResult::new(serde_json::json!({"unexpected": true})));
+        let detail = expect_empty_result(&other, "subscribe").expect_err("must reject");
+        assert!(detail.starts_with("subscribe: unexpected response"));
     }
 
     #[test]

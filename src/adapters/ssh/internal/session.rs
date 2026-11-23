@@ -121,13 +121,23 @@ impl client::Handler for SshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &keys::PublicKey,
+        server_public_key: &keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         if self.skip_verification {
             warn!("host-key verification disabled — MITM exposure");
             return Ok(true);
         }
-        Ok(self.verify_host_key(server_public_key))
+        match server_public_key {
+            keys::PublicKeyOrCertificate::PublicKey { key, .. } => Ok(self.verify_host_key(key)),
+            keys::PublicKeyOrCertificate::Certificate(_) => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    "server presented a host certificate — rejecting connection (no certificate validation)"
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -202,6 +212,36 @@ mod tests {
         // without re-learning (already-known path).
         let accepted_again = handler.verify_host_key(key.public_key());
         assert!(accepted_again);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certificate_is_rejected_and_not_recorded() -> Result<(), Box<dyn std::error::Error>> {
+        use russh::client::Handler as _;
+        use russh::keys::PublicKeyOrCertificate;
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+
+        let dir = tempdir()?;
+        let known_hosts_path = dir.path().join("known_hosts");
+        let authority = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let subject = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let mut builder =
+            Builder::new(b"probe".to_vec(), subject.public_key().clone(), 0, u64::MAX)?;
+        builder.cert_type(CertType::Host)?;
+        builder.key_id("probe")?;
+        builder.all_principals_valid()?;
+        let certificate = builder.sign(&authority)?;
+        let presented = PublicKeyOrCertificate::Certificate(certificate);
+
+        let mut handler = make_handler("example.invalid", 22, known_hosts_path.clone());
+        let accepted = handler.check_server_key(&presented).await?;
+        let recorded = std::fs::read_to_string(&known_hosts_path).unwrap_or_default();
+
+        assert!(!accepted, "a host certificate must be rejected");
+        assert!(
+            recorded.is_empty(),
+            "no known_hosts record may be written for a certificate"
+        );
         Ok(())
     }
 }

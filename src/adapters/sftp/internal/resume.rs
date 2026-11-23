@@ -15,7 +15,7 @@
     reason = "narrow re-export for ADR 0010 property tests; the canonical definition stays in `super::sftp` where the streaming chunk loop consumes it"
 )]
 
-use super::sftp;
+use crate::adapters::sftp::internal::sftp;
 
 pub use sftp::ResumePlan;
 

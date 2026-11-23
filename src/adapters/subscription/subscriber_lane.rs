@@ -30,7 +30,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::filter::FilterPipeline;
+use crate::adapters::subscription::filter::FilterPipeline;
 use crate::domain::error::DomainError;
 use crate::domain::subscription::{
     FilterRule, LagPolicy, SubId, SubscriberStats, SubscriptionLifetime,
@@ -363,7 +363,7 @@ pub type RxSink = Box<dyn Fn(SubId, mpsc::Receiver<LaneMsg>) + Send + Sync>;
 /// the channel mux. Without it the mux lane table grows unbounded for the
 /// process lifetime because `close_lane` only drops the adapter-local
 /// maps.
-pub type CloseSink = Box<dyn Fn(&SubId) + Send + Sync>;
+pub type CloseSink = Box<dyn Fn(&SubId, &str) + Send + Sync>;
 
 impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// Build a fresh adapter.
@@ -406,10 +406,10 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     }
 
     /// Invoke the installed close sink (if any) for `sub_id`.
-    fn fire_close_sink(&self, sub_id: &SubId) {
+    fn fire_close_sink(&self, sub_id: &SubId, uri: &str) {
         let sink = self.close_sink.load_full();
         if let Some(sink) = sink.as_ref() {
-            (sink)(sub_id);
+            (sink)(sub_id, uri);
         }
     }
 
@@ -441,6 +441,13 @@ impl<I: IdGeneratorPort> SubscriberLaneAdapter<I> {
     /// channel-mux outbound sink instead).
     pub fn lanes_for_uri_public(&self, uri: &str) -> Vec<Arc<LaneState>> {
         self.snapshot_lanes_for_uri(uri)
+    }
+
+    /// Resolve one lane by id. Cold path; used by the resume catch-up.
+    pub fn lane_by_id(&self, sub_id: &SubId) -> Option<Arc<LaneState>> {
+        self.lanes
+            .get(sub_id)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     fn snapshot_lanes_for_uri(&self, uri: &str) -> Vec<Arc<LaneState>> {
@@ -734,7 +741,7 @@ impl<I: IdGeneratorPort + fmt::Debug> LaneAdmin for SubscriberLaneAdapter<I> {
         Box::pin(async move { <Self as SubscriberLaneAsync>::pause_lane(self, sub_id).await })
     }
 
-    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<(), DomainError>> {
+    fn resume<'a>(&'a self, sub_id: &'a SubId) -> LaneFuture<'a, Result<bool, DomainError>> {
         Box::pin(async move { <Self as SubscriberLaneAsync>::resume_lane(self, sub_id).await })
     }
 
@@ -815,14 +822,15 @@ impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
     }
 
     async fn close_lane(&self, sub_id: &SubId) -> Result<(), DomainError> {
-        if self.remove_lane(sub_id).is_some() {
-            // BUG #3: drop the channel-mux registration too, else the
-            // mux lane table grows unbounded for the process lifetime.
-            self.fire_close_sink(sub_id);
-            Ok(())
-        } else {
-            Err(DomainError::SubNotFound(sub_id.clone()))
-        }
+        self.remove_lane(sub_id).map_or_else(
+            || Err(DomainError::SubNotFound(sub_id.clone())),
+            |lane| {
+                // BUG #3: drop the channel-mux registration too, else the
+                // mux lane table grows unbounded for the process lifetime.
+                self.fire_close_sink(sub_id, &lane.uri);
+                Ok(())
+            },
+        )
     }
 
     async fn pause_lane(&self, sub_id: &SubId) -> Result<(), DomainError> {
@@ -835,14 +843,12 @@ impl<I: IdGeneratorPort> SubscriberLaneAsync for SubscriberLaneAdapter<I> {
         )
     }
 
-    async fn resume_lane(&self, sub_id: &SubId) -> Result<(), DomainError> {
-        self.lanes.get(sub_id).map_or_else(
-            || Err(DomainError::SubNotFound(sub_id.clone())),
-            |entry| {
-                entry.value().paused.store(false, Ordering::Release);
-                Ok(())
-            },
-        )
+    async fn resume_lane(&self, sub_id: &SubId) -> Result<bool, DomainError> {
+        let Some(entry) = self.lanes.get(sub_id) else {
+            return Err(DomainError::SubNotFound(sub_id.clone()));
+        };
+        let was_paused = entry.value().paused.swap(false, Ordering::AcqRel);
+        Ok(was_paused)
     }
 
     async fn set_filter(&self, sub_id: &SubId, filter: FilterRule) -> Result<(), DomainError> {

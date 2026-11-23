@@ -22,9 +22,7 @@
 //! constructors + `with_*` setters instead of struct-literal syntax.
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{
-    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
-};
+use rmcp::model::{ContentBlock, GetPromptResult, Prompt, PromptArgument, PromptMessage, Role};
 use serde_json::{Map, Value};
 
 /// Map shape consumed by [`get_prompt`]. Aliases `serde_json::Map`
@@ -211,8 +209,8 @@ pub fn get_prompt(name: &str, args: &PromptArguments) -> Result<GetPromptResult,
         .ok_or_else(|| McpError::invalid_request(format!("unknown prompt: {name}"), None))?;
     let text = render_prompt_text(def, args)?;
     Ok(GetPromptResult::new(vec![PromptMessage::new(
-        PromptMessageRole::User,
-        PromptMessageContent::text(text),
+        Role::User,
+        ContentBlock::text(text),
     )])
     .with_description(def.description.to_string()))
 }
@@ -382,7 +380,7 @@ fn render_chaos_resume(args: &PromptArguments) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{CATALOG, PromptArguments, get_prompt, list_prompts};
-    use rmcp::model::PromptMessageContent;
+    use rmcp::model::ContentBlock;
     use serde_json::{Value, json};
 
     fn build_args(pairs: &[(&str, Value)]) -> PromptArguments {
@@ -445,14 +443,14 @@ mod tests {
         ]);
         let result = get_prompt("run_one_shot_command", &args).expect("prompt body");
         let message = result.messages.first().expect("at least one message");
-        let PromptMessageContent::Text { text } = &message.content else {
+        let ContentBlock::Text(content) = &message.content else {
             panic!("expected text content");
         };
-        assert!(text.contains("uptime"));
-        assert!(text.contains("h.example.com:22"));
-        assert!(text.contains("alice"));
-        assert!(text.contains("ssh_run"));
-        assert!(text.contains("disconnect_after=true"));
+        assert!(content.text.contains("uptime"));
+        assert!(content.text.contains("h.example.com:22"));
+        assert!(content.text.contains("alice"));
+        assert!(content.text.contains("ssh_run"));
+        assert!(content.text.contains("disconnect_after=true"));
     }
 
     #[test]
@@ -473,22 +471,26 @@ mod tests {
     fn investigate_session_lists_three_steps() {
         let args = build_args(&[("session_id", json!("sess-x"))]);
         let result = get_prompt("investigate_session", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_commands(session_id=sess-x)"));
-        assert!(text.contains("session://sess-x/health"));
-        assert!(text.contains("ssh_disconnect(session_id=sess-x)"));
+        assert!(content.text.contains("ssh_commands(session_id=sess-x)"));
+        assert!(content.text.contains("session://sess-x/health"));
+        assert!(content.text.contains("ssh_disconnect(session_id=sess-x)"));
     }
 
     #[test]
     fn cleanup_agent_renders_disconnect_agent_call() {
         let args = build_args(&[("agent_id", json!("host-9"))]);
         let result = get_prompt("cleanup_agent", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_disconnect_agent(agent_id=host-9)"));
+        assert!(
+            content
+                .text
+                .contains("ssh_disconnect_agent(agent_id=host-9)")
+        );
     }
 
     #[test]
@@ -508,13 +510,13 @@ mod tests {
             ("command", json!("tail -f /var/log/app.log")),
         ]);
         let result = get_prompt("push_first_long_command", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_exec(session_id=s-1"));
-        assert!(text.contains("sub_open"));
-        assert!(text.contains("command://<COMMAND_ID>/output"));
-        assert!(text.contains("sub_close"));
+        assert!(content.text.contains("ssh_exec(session_id=s-1"));
+        assert!(content.text.contains("sub_open"));
+        assert!(content.text.contains("command://<COMMAND_ID>/output"));
+        assert!(content.text.contains("sub_close"));
     }
 
     #[test]
@@ -524,12 +526,12 @@ mod tests {
             ("prompt_pattern", json!("$ ")),
         ]);
         let result = get_prompt("push_first_interactive_shell", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("release_when_no_subs=true"));
-        assert!(text.contains("sub_open"));
-        assert!(text.contains("filter=\"$ \""));
+        assert!(content.text.contains("release_when_no_subs=true"));
+        assert!(content.text.contains("sub_open"));
+        assert!(content.text.contains("filter=\"$ \""));
     }
 
     #[test]
@@ -540,28 +542,28 @@ mod tests {
             ("remote_path", json!("/r/x")),
         ]);
         let result = get_prompt("push_first_file_transfer", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("ssh_upload"));
-        assert!(text.contains("transfer://<TRANSFER_ID>/progress"));
-        assert!(text.contains("status=completed"));
+        assert!(content.text.contains("ssh_upload"));
+        assert!(content.text.contains("transfer://<TRANSFER_ID>/progress"));
+        assert!(content.text.contains("status=completed"));
     }
 
     #[test]
     fn subscription_hygiene_audit_supports_optional_prefix() {
         let mut args = PromptArguments::new();
         let result = get_prompt("subscription_hygiene_audit", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("all schemes"));
+        assert!(content.text.contains("all schemes"));
         args.insert("uri_prefix".to_string(), json!("shell://"));
         let with_prefix = get_prompt("subscription_hygiene_audit", &args).expect("body");
-        let PromptMessageContent::Text { text } = &with_prefix.messages[0].content else {
+        let ContentBlock::Text(content) = &with_prefix.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("uri_prefix=shell://"));
+        assert!(content.text.contains("uri_prefix=shell://"));
     }
 
     #[test]
@@ -613,15 +615,19 @@ mod tests {
         let mut args = PromptArguments::new();
         args.insert("sub_id".to_string(), json!("019"));
         let result = get_prompt("chaos_resume_after_disconnect", &args).expect("body");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(content) = &result.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("sub_replay(sub_id=019, from_cursor=0)"));
+        assert!(
+            content
+                .text
+                .contains("sub_replay(sub_id=019, from_cursor=0)")
+        );
         args.insert("from_cursor".to_string(), json!(2_048));
         let with_cursor = get_prompt("chaos_resume_after_disconnect", &args).expect("body");
-        let PromptMessageContent::Text { text } = &with_cursor.messages[0].content else {
+        let ContentBlock::Text(content) = &with_cursor.messages[0].content else {
             panic!("text expected");
         };
-        assert!(text.contains("from_cursor=2048"));
+        assert!(content.text.contains("from_cursor=2048"));
     }
 }

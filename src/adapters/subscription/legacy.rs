@@ -297,7 +297,7 @@ impl SubscriptionRegistry {
     /// Walk every subscriber and drop the ones whose rmcp transport has
     /// closed. Returns the number of peers dropped. Used by the binary
     /// entry points (`ssh-mcp` and `ssh-mcp-stdio`) as a periodic GC pass
-    /// since rmcp 1.6 does not surface a peer-disconnect callback.
+    /// since rmcp 3.11 does not surface a peer-disconnect callback.
     #[must_use]
     pub fn gc_closed_peers(&self) -> usize {
         // Snapshot a unique set of (peer_id, peer) pairs before mutating —
@@ -603,9 +603,7 @@ async fn broadcast_resource_updated(uri: &str) {
         return;
     }
     for sub in subs {
-        let params = ResourceUpdatedNotificationParam {
-            uri: uri.to_string(),
-        };
+        let params = ResourceUpdatedNotificationParam::new(uri.to_string());
         if let Err(err) = sub.peer.notify_resource_updated(params).await {
             debug!(
                 "notify_resource_updated failed for peer {}: {err}",
@@ -617,7 +615,7 @@ async fn broadcast_resource_updated(uri: &str) {
 
 /// Spawn the periodic peer-GC pump.
 ///
-/// rmcp 1.6 does not raise a callback on peer disconnect, so the binary
+/// rmcp 3.11 does not raise a callback on peer disconnect, so the binary
 /// entry points poll instead. The task exits cleanly when `cancel` is
 /// triggered.
 ///

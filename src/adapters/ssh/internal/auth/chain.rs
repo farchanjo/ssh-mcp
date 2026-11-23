@@ -14,10 +14,10 @@ use tracing::debug;
 
 use crate::adapters::ssh::internal::session::SshClientHandler;
 
-use super::agent::AgentAuth;
-use super::key::KeyAuth;
-use super::password::PasswordAuth;
-use super::traits::AuthStrategy;
+use crate::adapters::ssh::internal::auth::agent::AgentAuth;
+use crate::adapters::ssh::internal::auth::key::KeyAuth;
+use crate::adapters::ssh::internal::auth::password::PasswordAuth;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
 
 /// Statically dispatched russh-handshake strategy variant.
 ///

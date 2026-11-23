@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CancelledNotificationParam, ClientCapabilities, ClientInfo, CustomNotification, Implementation,
-    ProgressNotificationParam, ProtocolVersion, ResourceUpdatedNotificationParam,
+    CancelledNotificationParam, ClientCapabilities, ClientConfig, CustomNotification,
+    Implementation, ProgressNotificationParam, ResourceUpdatedNotificationParam,
 };
 use rmcp::service::{NotificationContext, RoleClient};
 use tokio::io::AsyncWrite;
@@ -36,7 +36,7 @@ use tokio::time::{MissedTickBehavior, interval as tokio_interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::config::internal::resolve_inline_push_daemon_relay;
-use crate::embed::duplex_transport::embed_client_info;
+use crate::embed::duplex_transport::{EMBED_PROTOCOL_VERSION, embed_client_info};
 use crate::embed::formatter::{Event, NdjsonWriter, PROTOCOL_VERSION};
 
 /// Default mpsc capacity for the outbound event mux. Mirrors
@@ -201,7 +201,7 @@ async fn stats_loop(tx: EventTx, interval: Duration, shutdown: CancellationToken
 /// same order they crossed the duplex transport.
 #[derive(Debug)]
 pub struct EmbedClient {
-    info: ClientInfo,
+    info: ClientConfig,
     tx: EventTx,
 }
 
@@ -218,7 +218,7 @@ impl EmbedClient {
 
     /// Build a handler with caller-supplied identity (test override).
     #[must_use]
-    pub const fn with_info(tx: EventTx, info: ClientInfo) -> Self {
+    pub const fn with_info(tx: EventTx, info: ClientConfig) -> Self {
         Self { info, tx }
     }
 
@@ -232,20 +232,20 @@ impl EmbedClient {
 impl Default for EmbedClient {
     fn default() -> Self {
         let (tx, _rx) = mpsc::channel(DEFAULT_MUX_CAPACITY);
-        // rmcp 1.6 marks ClientInfo + Implementation as
+        // rmcp 3.11 marks `ClientConfig` + Implementation as
         // `#[non_exhaustive]`; build through the public `::new`
         // constructor (capabilities + implementation) and
         // `with_protocol_version` chain instead of struct literals.
         let implementation =
             Implementation::new("ssh-mcp-tail (embed default)", env!("CARGO_PKG_VERSION"));
-        let info = ClientInfo::new(ClientCapabilities::default(), implementation)
-            .with_protocol_version(ProtocolVersion::default());
+        let info = ClientConfig::new(ClientCapabilities::default(), implementation)
+            .with_protocol_version(EMBED_PROTOCOL_VERSION);
         Self { info, tx }
     }
 }
 
 impl ClientHandler for EmbedClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
 
@@ -711,6 +711,15 @@ mod tests {
                 Event::Err { code, .. } => assert_eq!(code, INLINE_PUSH_BAD_PARAMS_CODE),
                 other => panic!("expected Event::Err, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn default_client_reports_the_embedded_revision() {
+            use rmcp::handler::client::ClientHandler;
+            assert_eq!(
+                EmbedClient::default().get_info().protocol_version,
+                EMBED_PROTOCOL_VERSION
+            );
         }
 
         #[tokio::test]

@@ -17,6 +17,8 @@
 //! [`SubscriberRegistryAsync`]: crate::ports::subscriber_registry::SubscriberRegistryAsync
 
 pub mod channel_mux;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fake;
 pub mod filter;
 pub mod lane_bridge;
 pub mod legacy;

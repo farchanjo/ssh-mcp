@@ -37,6 +37,7 @@ flowchart LR
 | [v5 → v6](#v5--v6) | MCP host operators / contributors / downstream automations | Tool name eixos (`ssh_*` / `sub_*` / `serial_*`); wire-breaking on tool name strings only |
 | [v6.0 → v6.1](#v60--v61) | MCP host operators | SFTP resume + verify on `ssh_upload` / `ssh_download`; 2 new error codes (`RESUME_OVERSHOOT`, `RESUME_MISMATCH`); wire-additive |
 | [v6.1 → v7.0](#v61--v70) | MCP host operators | Rsync hybrid transport (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`), `rsync://` push lane, `transport=Auto\|Wire\|Sftp`; 6 new error codes; v7.0.0-alpha.2 retracted the deployed-agent path; wire-additive |
+| [v7.1.3 → unreleased](#v713--unreleased-dependency-security-update) | MCP host operators | `russh` 0.65 / `russh-sftp` 4 requirement (six advisories closed), host-certificate rejection, `RESOURCE_SHORTAGE` channel-open retry, four direct dependencies on their current lines; wire-unchanged |
 
 The 11 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md), [0009 serial](./adr/0009-serial-transport.md), [0010 SFTP resume](./adr/0010-sftp-resume.md), [0011 rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
 
@@ -571,6 +572,16 @@ If you only consume the v4 MCP surface and never opt into the new tools, env var
 
 > **Status.** v5.x is shipped on `master`. Phases 1 / 2 / 3 / 4 are merged; the v5.2 release added the 6 serial / UART / TTY / COM tools (ADR 0009). v6.0.0 builds on v5.3.2 and only renames tool strings (`ssh_*` / `sub_*` / `serial_*` eixos) — see [v5 → v6](#v5--v6). All v4 → v5 surfaces below are wire-compatible.
 
+### v5 migration notes
+
+- The public MCP API is **wire-compatible** with v3 / v4: a v3 / v4 host needs no change to the wire format, tool catalogue, env vars or markdown response shape.
+- 9 net-new MCP tools (Phase 3) and the third binary `ssh-mcp-tail` (Phase 4) are additive; v5.2 adds the 6 serial / UART / TTY / COM tools (ADR 0009).
+- `release_when_no_subs: bool` defaults to `false` — v4 semantics — on `ssh_shell_open` / `ssh_exec` / `ssh_upload` / `ssh_download` ([ADR 0003](./adr/0003-lifecycle-binding.md)).
+- Cursors rekey from `(PeerId, Uri)` to `(SubId, Uri)` ([ADR 0004](./adr/0004-channel-mux-fairness.md)); a legacy host gets a synthesised `sub_id` and never changes.
+- The default lane `LagPolicy` is `Snapshot` — the v4 `RecvError::Lagged` recovery, made explicit per lane ([ADR 0006](./adr/0006-backpressure-policies.md)).
+- New env vars (lifecycle / lane / mux / daemon) keep v4 defaults; [CONFIGURATION.md](./CONFIGURATION.md) lists them.
+- MSRV: the v5 line bumped the Rust floor; the current floor is **1.99** with edition 2024 (`rust-version = "1.99"` in `Cargo.toml`), raised from 1.85 through 1.95 as AFIT and the stabilised APIs the core needs landed.
+
 ### Wire compatibility summary
 
 | Surface | v4.8.x | v5.0.x | Compat? |
@@ -626,6 +637,8 @@ The tool catalogue grows from 21 to 30 (or from 20 to 29 without `port_forward`)
 | `sub_stats_all` | Global stats aggregating across all sub_ids (active sessions, total subs, mux backlog, peer GC pace, ...). | typed `DaemonStats` | n/a |
 
 Every new tool emits the same dual channel as the v4 tools: a markdown body with `KEY: value` lines and an 8-hex-char nonce framing block, plus a parallel `structured_content` JSON object.
+
+**Pause delivery.** `sub_pause` gates the two lane notification paths for that `sub_id`: `notifications/resources/updated` and, on an inline lane, `notifications/ssh/output`. The producer and the resource ring keep running. `sub_resume` emits one `notifications/resources/updated` as the catch-up signal, counted in `events_sent` as one event with zero bytes; the host reads the missed range with `resources/read?cursor=<last cursor_after>` and then resumes the inline stream. On an inline lane the next fragment's `seq` jumps by the dropped fragment count and `cursor_after` is the absolute produced offset, so the gap is `cursor_after` minus the last delivered cursor. A lane opened by `resources/subscribe` is delivered by the per-peer fan-out and is not gated.
 
 #### New binary: `ssh-mcp-tail` (Phase 4)
 
@@ -863,6 +876,33 @@ Operational follow-on:
 - [DEVELOPMENT.md](./DEVELOPMENT.md) — lock-free invariants enforced by Clippy.
 - [RESOURCES.md](./RESOURCES.md) — resource scheme contract.
 - [CONFIGURATION.md](./CONFIGURATION.md) — full env var table.
+
+## v7.1.3 → unreleased (dependency security update)
+
+**A missing id is refused before any lane.** `sub_open` checks the four repository-backed kinds and returns the per-kind `*_NOT_FOUND`; a refused call opens no lane. `forward`, `serial` and `rsync` stay permissive. The wire is otherwise unchanged.
+
+**Legacy subscriptions own no lane.** `resources/subscribe` now registers a peer-keyed subscription only: no `SubId` is minted, no lane is opened, and `resources/unsubscribe` removes the registry entry. `sub_list`, `sub_stats` and `sub_stats_all` no longer show a row for a `resources/subscribe` subscription, and such a subscription no longer consumes `SSH_MAX_SUBS_PER_URI` / `SSH_MAX_SUBS_TOTAL` of the lane adapter. The wire is unchanged. Use `sub_open` when you need a `sub_id`, `sub_pause`, `sub_filter` or `sub_replay`.
+
+For **operators** running a released server binary. **Nothing to do on the wire** — no tool string, response envelope, structured-content key, error code, or env-var default changed; a v7.1.3 client is byte-identical against this server. Three facts bear on the upgrade:
+
+- **The manifest now requires `russh` 0.65 and `russh-sftp` 4** (`Cargo.toml:96-97`), which closes RUSTSEC-2026-0492, RUSTSEC-2026-0493, RUSTSEC-2026-0494 and RUSTSEC-2026-0495 on the old `russh 0.60.3`, plus RUSTSEC-2023-0071 and RUSTSEC-2026-0387 that arrived through it. A stale `Cargo.lock` needs no manual step: cargo re-resolves it on the next invocation, and the result is identical to the repository lock.
+- **The client offers no host-certificate algorithm, and a server that presents a host certificate anyway is rejected.** With no certificate algorithm offered, a server that holds both a plain host key and a host certificate keeps serving the plain key and nothing changes for it; only a server that answers the handshake with a certificate is rejected. The key inside a certificate is not checked against `known_hosts` and no record is written for it. A plain host key keeps its three outcomes: unknown hosts are learned through TOFU, a recorded key that differs is rejected, and `SSH_MCP_INSECURE_SKIP_HOST_KEY_CHECK=true` still accepts any key.
+- **A `RESOURCE_SHORTAGE` channel-open refusal is retried** on the 25-attempt, 100 ms → 1 s backoff this guide already documents for the SFTP and exec paths. The classifier now reads the typed error instead of the rendered text, so a real resource-shortage refusal is retried where it failed at once before, and a `reason` string an untrusted peer supplies can no longer steer a retry.
+
+Contributor-side: with the new library resolved, `cargo check --all-features --all-targets` fails with `E0053` on `check_server_key` until the handler takes the new argument type, so the handler change and the manifest change land together.
+
+Four direct dependencies moved to their current lines: `base64` 0.23, `sha2` 0.11, `md-5` 0.11 and `tower-http` 0.7 (`Cargo.toml:110`, `:129`, `:131`, `:89`). Ten packages leave the lock, including the duplicate `base64 0.22.1` and `sha2 0.10.9` copies and the whole `digest` 0.10 chain. The wire is unchanged, pinned by known-answer tests for the `bytes_b64` text, the resume-prefix sha256 and the rsync MD5 trailer. A `Cargo.lock` left from before the change needs no manual step: cargo re-resolves it on the next build, and the resolved set is the same.
+
+The trace layer logs at DEBUG and nothing of it is visible under the default `info` filter. On `tower-http` 0.7.1 a response with a fixed `content-length` gains one `on_eos` line. `OnEos` receives no response headers, so the line cannot be filtered without also dropping the `on_eos` line of a streamed response; the events of a streamed response are unchanged.
+
+The MCP SDK moved to `rmcp` 3.11 (RUSTSEC-2026-0462). The server keeps the `initialize` handshake and advertises protocol revision `2025-11-25` as its ceiling; every known revision up to it answers itself. Two answers differ from the previous release, and they are the only wire differences:
+
+| Client asks | Before | Now |
+| --- | --- | --- |
+| `2026-07-28` | `2026-07-28` (echoed, not implemented) | `2025-11-25` |
+| a revision the server does not know | the `get_info` version, `2025-06-18` | `2025-11-25` |
+
+A client that skips `initialize` and sends `server/discover` with `2026-07-28` is refused with `-32022` and the supported list (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`). The HTTP transport keeps protocol-level sessions through the SDK's `legacy_session_mode` setting (the 3.x name of `stateful_mode`), so `Mcp-Session-Id` keeps working. The loopback-only `Host` validation is unchanged: a loopback `Host` is served and any other `Host` receives 403 `Forbidden: Host header is not allowed`.
 
 ## v7.1.2 → v7.1.3 (bug-fix patch)
 

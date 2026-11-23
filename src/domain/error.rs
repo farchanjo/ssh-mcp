@@ -6,10 +6,10 @@
 
 use thiserror::Error;
 
-use super::auth::AuthError;
-use super::ids::{CommandId, ForwardId, SerialId, SessionId, ShellId, TransferId};
-use super::lifecycle::LifecycleState;
-use super::subscription::SubId;
+use crate::domain::auth::AuthError;
+use crate::domain::ids::{CommandId, ForwardId, SerialId, SessionId, ShellId, TransferId};
+use crate::domain::lifecycle::LifecycleState;
+use crate::domain::subscription::SubId;
 
 /// Top-level error variant produced by use cases.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

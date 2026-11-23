@@ -1,6 +1,6 @@
 """Cargo build-profile resolution shared by the Python suites.
 
-The dev loop never runs a release build (see AGENTS.md → Working agreement), so
+The dev loop never runs a release build (see docs/DEVELOPMENT.md → Working agreement), so
 every fixture, stress script and chaos orchestrator drives ``target/debug`` by
 default. Two environment overrides are honoured:
 

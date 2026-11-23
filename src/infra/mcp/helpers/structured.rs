@@ -8,7 +8,7 @@
 //!   the Markdown KEY: value pairs in `snake_case` so smaller LLMs can
 //!   index into the response without parsing prose.
 //!
-//! The rmcp 1.6 `CallToolResult` struct is `#[non_exhaustive]`, so the
+//! The rmcp 3.11 `CallToolResult` struct is `#[non_exhaustive]`, so the
 //! helpers below construct via the public `success` / `error`
 //! constructors and then populate `structured_content` through the
 //! exposed field. This keeps both the legacy `is_error` flag and the
@@ -28,7 +28,7 @@
 use std::env;
 use std::sync::OnceLock;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
 use crate::adapters::config::internal::STRUCTURED_CONTENT_ENV_VAR;
@@ -80,7 +80,7 @@ fn structured_enabled() -> bool {
 /// payload is suppressed and the result is markdown-only.
 #[must_use]
 pub fn ok_text_and_structured(text: String, structured: Value) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     if structured_enabled() {
         result.structured_content = Some(structured);
     }
@@ -103,7 +103,7 @@ pub fn ok_text_and_structured(text: String, structured: Value) -> CallToolResult
 /// payload is gated by the env var.
 #[must_use]
 pub fn error_text_and_structured(text: String, structured: Value) -> CallToolResult {
-    let mut result = CallToolResult::error(vec![Content::text(text)]);
+    let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
     if structured_enabled() {
         result.structured_content = Some(structured);
     }

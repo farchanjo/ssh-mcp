@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rmcp::ServiceExt as _;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, ExperimentalCapabilities, Implementation, JsonObject,
+    ClientCapabilities, ClientConfig, ExperimentalCapabilities, Implementation, JsonObject,
     ProtocolVersion,
 };
 use rmcp::service::{RoleClient, RunningService, Service};
@@ -26,6 +26,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::composition::prod::ProdUseCases;
 use crate::infra::mcp::server::McpSshServer;
+
+/// Protocol revision the embedded daemon client asks for, written out so
+/// that an SDK default cannot move it.
+pub(crate) const EMBED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// Errors surfaced when the embed transport cannot be wired.
 #[derive(Debug, Error)]
@@ -46,7 +50,7 @@ pub enum EmbedError {
 /// cancellation token.
 ///
 /// Generic over the rmcp client `Service` so test harnesses can use the
-/// default `ClientInfo` while production wiring uses the custom
+/// default `ClientConfig` while production wiring uses the custom
 /// [`crate::embed::event_mux::EmbedClient`] handler that forwards
 /// notifications onto the formatter mpsc.
 #[derive(Debug)]
@@ -109,13 +113,13 @@ where
 /// peer.
 pub const EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH: &str = "ssh_inline_push";
 
-/// Build the standard `ClientInfo` advertised by the embedded daemon
+/// Build the standard `ClientConfig` advertised by the embedded daemon
 /// client.
 ///
 /// Capabilities are intentionally minimal — the embed client only
 /// consumes `tools/call`, `resources/subscribe`, and the matching
 /// notifications, so we leave roots / sampling / elicitation off.
-/// `rmcp::model::{ClientInfo, Implementation}` are
+/// `rmcp::model::{ClientConfig, Implementation}` are
 /// `#[non_exhaustive]`, so the builder goes through the public
 /// `::new` constructors and `with_protocol_version` chained setter
 /// rather than struct literals.
@@ -130,7 +134,7 @@ pub const EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH: &str = "ssh_inline_push";
 /// translates into NDJSON `inline_push` events (env-gated by
 /// `SSH_INLINE_PUSH_DAEMON_RELAY`).
 #[must_use]
-pub fn embed_client_info() -> ClientInfo {
+pub fn embed_client_info() -> ClientConfig {
     let implementation = Implementation::new("ssh-mcp-tail (embed)", env!("CARGO_PKG_VERSION"));
     let mut capabilities = ClientCapabilities::default();
     let mut experimental = ExperimentalCapabilities::new();
@@ -139,7 +143,7 @@ pub fn embed_client_info() -> ClientInfo {
         JsonObject::new(),
     );
     capabilities.experimental = Some(experimental);
-    ClientInfo::new(capabilities, implementation).with_protocol_version(ProtocolVersion::default())
+    ClientConfig::new(capabilities, implementation).with_protocol_version(EMBED_PROTOCOL_VERSION)
 }
 
 /// Wire one half of a `tokio::io::duplex` pair as the rmcp server side
@@ -173,7 +177,7 @@ pub fn spawn_server_side(
 /// `tools/call` and `resources/subscribe` requests. Production wiring
 /// passes an [`crate::embed::event_mux::EmbedClient`] so
 /// notifications surface on the daemon's NDJSON stdout; tests pass
-/// the rmcp default `ClientInfo` when notification capture isn't
+/// the rmcp default `ClientConfig` when notification capture isn't
 /// needed.
 ///
 /// # Errors
@@ -233,6 +237,7 @@ where
 )]
 mod tests {
     use super::*;
+    use rmcp::model::ProtocolVersion;
 
     #[test]
     fn embed_client_info_has_implementation_name() {
@@ -253,6 +258,12 @@ mod tests {
             experimental.contains_key(EMBED_CLIENT_EXPERIMENTAL_INLINE_PUSH),
             "experimental map must include ssh_inline_push so the in-process recorder activates"
         );
+    }
+
+    #[test]
+    fn embed_client_info_names_the_embedded_revision() {
+        assert_eq!(embed_client_info().protocol_version, EMBED_PROTOCOL_VERSION);
+        assert_eq!(EMBED_PROTOCOL_VERSION, ProtocolVersion::V_2025_11_25);
     }
 
     #[test]

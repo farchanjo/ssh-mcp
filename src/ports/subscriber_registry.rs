@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::domain::error::DomainError;
 use crate::domain::ids::PeerId;
 
-use super::notifier::PeerHandle;
+use crate::ports::notifier::PeerHandle;
 
 /// Resource scheme handled by the registry. Mirrors the v3
 /// [`crate::adapters::subscription::legacy::ResourceKind`] but lives in the port layer
@@ -140,8 +140,18 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
     /// Walk every subscriber and drop the ones whose transport has
     /// closed. Returns the number of peers dropped. Used by the
     /// [`crate::application::peer_gc`] use case as a periodic GC pass
-    /// (rmcp 1.6 does not raise a peer-disconnect callback).
+    /// (rmcp 3.11 does not raise a peer-disconnect callback).
     fn gc_closed_peers(&self) -> usize;
+}
+
+/// What a [`LocalSubscriberRegistryAsync::subscribe`] call did to the
+/// `(peer, uri)` entry: it created one or refreshed an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeDisposition {
+    /// The pair had no entry; one was created.
+    Created,
+    /// The pair already had an entry; it was replaced in place.
+    Refreshed,
 }
 
 /// Async slice of the subscription registry. `subscribe` may spawn a
@@ -149,6 +159,9 @@ pub trait SubscriberRegistryPort: Send + Sync + 'static {
 #[trait_variant::make(SubscriberRegistryAsync: Send)]
 pub trait LocalSubscriberRegistryAsync: Sync {
     /// Register `peer` as a subscriber to `uri`.
+    ///
+    /// Returns whether the `(peer, uri)` entry was created or refreshed, so
+    /// the caller can keep the lifecycle refcount per entry.
     ///
     /// # Errors
     ///
@@ -160,7 +173,7 @@ pub trait LocalSubscriberRegistryAsync: Sync {
         resource_id: String,
         uri: String,
         peer: Arc<dyn PeerHandle>,
-    ) -> Result<(), DomainError>;
+    ) -> Result<SubscribeDisposition, DomainError>;
 
     /// Unregister `peer_id` from `uri`.
     ///

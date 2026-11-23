@@ -56,6 +56,7 @@ use ssh_mcp::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLi
 use ssh_mcp::infra::mcp::leak_warn_bridge::{LeakWarnBridgeHandle, spawn_bridge_with_receiver};
 use ssh_mcp::infra::mcp::progress::ProgressEmitter;
 use ssh_mcp::ports::lifecycle_policy::LifecyclePolicyPort;
+use ssh_mcp::ports::notifier::LaneNotifierBridge;
 use ssh_mcp::ports::subscriber_lane::{LaneAdmin, LanePolicy, SubscriberLaneAsync};
 use ssh_mcp::ports::subscriber_registry::ResourceKind;
 
@@ -276,6 +277,19 @@ async fn t09_sub_leak_risk_warn() {
     let _ = handle.task.await;
 }
 
+#[derive(Debug, Default)]
+struct NoopLaneBridge;
+
+impl LaneNotifierBridge for NoopLaneBridge {
+    fn notify_lanes<'a>(
+        &'a self,
+        _uri: &'a str,
+        _bytes_added: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t12_pause_resume_round_trip_via_lane_admin() {
     // Bonus integration: pause / resume mutate the same lane state
@@ -309,7 +323,10 @@ async fn t12_pause_resume_round_trip_via_lane_admin() {
     // Direct adapter call -> same outcome via the dyn port.
     drop(lane);
     let lane2: Arc<dyn LaneAdmin> = Arc::clone(&adapter) as Arc<dyn LaneAdmin>;
-    let resume = ssh_mcp::application::subscription_admin::ResumeSubUseCase::new(lane2);
+    let resume = ssh_mcp::application::subscription_admin::ResumeSubUseCase::new(
+        lane2,
+        Arc::new(NoopLaneBridge),
+    );
     let _ = resume
         .execute(SubToggleRequest {
             sub_id: sub_id.clone(),

@@ -61,6 +61,7 @@ use crate::adapters::sftp::russh_sftp_adapter::{RusshSftpAdapter, SshHandleRegis
 use crate::adapters::ssh::russh_adapter::RusshAdapter;
 use crate::adapters::subscription::channel_mux::ChannelMuxAdapter;
 use crate::adapters::subscription::lane_bridge::LaneFanoutBridge;
+use crate::adapters::subscription::lane_bridge::install_lane_lifetime;
 use crate::adapters::subscription::legacy::{SUBSCRIPTION_REGISTRY, spawn_peer_gc};
 use crate::adapters::subscription::memory_registry::MemoryRegistry;
 use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
@@ -82,6 +83,7 @@ use crate::application::open_shell::OpenShellUseCase;
 use crate::application::peer_gc::PeerGcUseCase;
 use crate::application::read_resource::ReadResourceUseCase;
 use crate::application::read_shell::ReadShellUseCase;
+use crate::application::resource_guard::{RepositoryGuard, ResourceGuard};
 use crate::application::rsync_sync::{RsyncSyncDeps, RsyncSyncUseCase};
 use crate::application::send_key::SendKeyUseCase;
 use crate::application::subscribe_resource::SubscribeResourceUseCase;
@@ -104,7 +106,7 @@ use crate::infra::mcp::peer_handle::{PeerTable, new_peer_table};
 use crate::infra::mcp::server::McpSshServer;
 use crate::infra::mcp::tool_router::IdLister;
 use crate::ports::lifecycle_policy::LifecyclePolicyPort;
-use crate::ports::notifier::{DebouncerActivator, ProducerForwarder};
+use crate::ports::notifier::{DebouncerActivator, LaneNotifierBridge, ProducerForwarder};
 use crate::ports::subscriber_lane::LaneAdmin;
 
 /// Boxed transport error returned by the v4 runtime helpers. Same shape
@@ -211,20 +213,14 @@ type ProdWiring = (
     Arc<CapabilityRegistry>,
 );
 
-/// Build the production [`UseCases`] container plus the shared peer
-/// table the rmcp `RmcpPeerHandle` writes into and the dedup cache the
-/// v4.7-step5 mutating-tool layer reads.
-///
-/// All three handles are returned together because the [`McpSshServer`]
-/// constructor (`infra::mcp::server`) takes them as a triple — the
-/// table feeds the notifier, the cache wraps mutating tools, the use
-/// cases drive everything else.
-#[must_use]
+/// Build the production wiring and also return the subscriber registry, which
+/// the in-file test reads to observe the debouncer. Every other caller uses
+/// [`build_use_cases`].
 #[allow(
     clippy::too_many_lines,
     reason = "composition root naturally instantiates every adapter + use case (22 use cases x ~5 lines each); H17 may extract sub-builders per domain"
 )]
-pub fn build_use_cases() -> ProdWiring {
+fn build_use_cases_inner() -> (ProdWiring, Arc<MemoryRegistry<RmcpNotifier>>) {
     let sessions = Arc::new(DashMapSessionRepo::new());
     let commands = Arc::new(DashMapCommandRepo::new());
     let shells = Arc::new(DashMapShellRepo::new());
@@ -338,9 +334,9 @@ pub fn build_use_cases() -> ProdWiring {
     // process lifetime (`close_lane` previously only dropped the
     // adapter-local maps).
     let mux_for_close = Arc::clone(&channel_mux);
-    subscriber_lane_adapter.install_close_sink(Box::new(move |sub_id| {
+    install_lane_lifetime(&subscribers, &subscriber_lane_adapter, move |sub_id| {
         mux_for_close.unregister_lane(sub_id);
-    }));
+    });
     let (mux_outbound_tx, _mux_outbound_rx) = mpsc::channel(resolve_mux_buffer());
     channel_mux.install_outbound(mux_outbound_tx);
     let lane_admin: Arc<dyn LaneAdmin> = lane_admin_from(&subscriber_lane_adapter);
@@ -360,7 +356,9 @@ pub fn build_use_cases() -> ProdWiring {
     // recompiling.
     let lane_bridge =
         LaneFanoutBridge::from_env(Arc::clone(&subscriber_lane_adapter), Arc::clone(&notifier));
-    subscribers.install_lane_bridge(lane_bridge);
+    subscribers.install_lane_bridge(Arc::<LaneFanoutBridge<UuidIds, RmcpNotifier>>::clone(
+        &lane_bridge,
+    ));
 
     let connect = Arc::new(ConnectSessionUseCase::new(
         Arc::clone(&ssh),
@@ -512,22 +510,19 @@ pub fn build_use_cases() -> ProdWiring {
         Arc::clone(&subscribers),
     ));
 
-    let subscribe_resource = Arc::new(
-        SubscribeResourceUseCase::new(
-            Arc::clone(&shells),
-            Arc::clone(&commands),
-            Arc::clone(&transfers),
-            Arc::clone(&sessions),
-            Arc::clone(&subscribers),
-            Arc::clone(&lifecycle),
-        )
-        .with_subscriber_lane(Arc::clone(&lane_admin)),
-    );
+    let subscribe_resource = Arc::new(SubscribeResourceUseCase::new(
+        Arc::clone(&shells),
+        Arc::clone(&commands),
+        Arc::clone(&transfers),
+        Arc::clone(&sessions),
+        Arc::clone(&subscribers),
+        Arc::clone(&lifecycle),
+    ));
 
-    let unsubscribe_resource = Arc::new(
-        UnsubscribeResourceUseCase::new(Arc::clone(&subscribers), Arc::clone(&lifecycle))
-            .with_subscriber_lane(Arc::clone(&lane_admin)),
-    );
+    let unsubscribe_resource = Arc::new(UnsubscribeResourceUseCase::new(
+        Arc::clone(&subscribers),
+        Arc::clone(&lifecycle),
+    ));
     let peer_gc = Arc::new(PeerGcUseCase::new(Arc::clone(&subscribers)));
 
     // v5 Phase 3 — subscription-administration use cases. All share the
@@ -542,13 +537,25 @@ pub fn build_use_cases() -> ProdWiring {
     let forwarder: Arc<dyn ProducerForwarder> =
         Arc::<MemoryRegistry<RmcpNotifier>>::clone(&subscribers);
     SUBSCRIPTION_REGISTRY.install_forwarder(forwarder);
+    let resource_guard: Arc<dyn ResourceGuard> = Arc::new(RepositoryGuard::new(
+        Arc::clone(&shells),
+        Arc::clone(&commands),
+        Arc::clone(&transfers),
+        Arc::clone(&sessions),
+    ));
     let sub_subscribe = Arc::new(
         SubscribeUseCase::with_activator(Arc::clone(&lane_admin), activator)
-            .with_capabilities(Arc::clone(&capability_registry)),
+            .with_capabilities(Arc::clone(&capability_registry))
+            .with_resource_guard(resource_guard),
     );
     let sub_unsubscribe = Arc::new(UnsubscribeUseCase::new(Arc::clone(&lane_admin)));
     let sub_pause = Arc::new(PauseSubUseCase::new(Arc::clone(&lane_admin)));
-    let sub_resume = Arc::new(ResumeSubUseCase::new(Arc::clone(&lane_admin)));
+    let resume_notifier: Arc<dyn LaneNotifierBridge> =
+        Arc::<LaneFanoutBridge<UuidIds, RmcpNotifier>>::clone(&lane_bridge);
+    let sub_resume = Arc::new(ResumeSubUseCase::new(
+        Arc::clone(&lane_admin),
+        resume_notifier,
+    ));
     let sub_filter = Arc::new(SetFilterUseCase::new(Arc::clone(&lane_admin)));
     let sub_replay = Arc::new(ReplaySubUseCase::new(Arc::clone(&lane_admin)));
     let sub_list = Arc::new(ListSubsUseCase::new(Arc::clone(&lane_admin)));
@@ -644,13 +651,29 @@ pub fn build_use_cases() -> ProdWiring {
     });
 
     (
-        use_cases,
-        peer_table,
-        idempotency,
-        id_lister,
-        lifecycle_concrete,
-        capability_registry,
+        (
+            use_cases,
+            peer_table,
+            idempotency,
+            id_lister,
+            lifecycle_concrete,
+            capability_registry,
+        ),
+        subscribers,
     )
+}
+
+/// Build the production [`UseCases`] container plus the shared peer
+/// table the rmcp `RmcpPeerHandle` writes into and the dedup cache the
+/// v4.7-step5 mutating-tool layer reads.
+///
+/// All three handles are returned together because the [`McpSshServer`]
+/// constructor (`infra::mcp::server`) takes them as a triple — the
+/// table feeds the notifier, the cache wraps mutating tools, the use
+/// cases drive everything else.
+#[must_use]
+pub fn build_use_cases() -> ProdWiring {
+    build_use_cases_inner().0
 }
 
 /// Erase the concrete [`SubscriberLaneAdapter`] handle behind a
@@ -748,10 +771,16 @@ fn resolve_http_bind() -> (String, String) {
 }
 
 fn build_http_service() -> StreamableHttpService<McpSshServer<ProdUseCases>, LocalSessionManager> {
+    // The legacy session mode is set explicitly so protocol-level sessions
+    // stay on the revisions the server serves with `initialize` (FR-005).
+    // The SDK's loopback-only `Host` allow-list is left at its default, so a
+    // request is served only for a loopback `Host` (TM-001).
+    let mut config = StreamableHttpServerConfig::default();
+    config.legacy_session_mode = true;
     StreamableHttpService::new(
         || Ok(build_server()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        config,
     )
 }
 
@@ -861,4 +890,63 @@ pub async fn run_stdio() -> Result<(), RuntimeError> {
 
     waiting_result?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "tests use unwrap for brevity per AGENTS.md test policy"
+)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::build_use_cases_inner;
+    use crate::application::subscription_admin::{SubscribeRequest, UnsubscribeRequest};
+    use crate::domain::ids::PeerId;
+    use crate::domain::subscription::{FilterRule, LagPolicy, SubscriptionLifetime};
+    use crate::ports::notifier::PeerHandle;
+    use crate::ports::subscriber_registry::ResourceKind;
+
+    #[derive(Debug)]
+    struct StubPeer(PeerId);
+
+    impl PeerHandle for StubPeer {
+        fn id(&self) -> PeerId {
+            self.0.clone()
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_wiring_stops_the_debouncer_when_the_last_lane_closes() {
+        let ((use_cases, ..), registry) = build_use_cases_inner();
+        let peer: Arc<dyn PeerHandle> = Arc::new(StubPeer(PeerId::new("p-wire".to_string())));
+        let outcome = use_cases
+            .sub_subscribe
+            .execute(SubscribeRequest {
+                uri: "forward://wire-probe/events".to_string(),
+                lifetime: SubscriptionLifetime::Manual,
+                lag_policy: LagPolicy::Snapshot,
+                filter: FilterRule::None,
+                peer: Some(peer),
+                inline_push: false,
+            })
+            .await
+            .unwrap();
+        assert!(registry.has_debouncer(ResourceKind::Forward, "wire-probe"));
+        use_cases
+            .sub_unsubscribe
+            .execute(UnsubscribeRequest {
+                sub_id: outcome.sub_id,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !registry.has_debouncer(ResourceKind::Forward, "wire-probe"),
+            "the production composition must stop the task when the last lane closes"
+        );
+    }
 }

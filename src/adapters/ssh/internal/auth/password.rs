@@ -4,7 +4,7 @@ use russh::client;
 
 use crate::adapters::ssh::internal::session::SshClientHandler;
 
-use super::traits::AuthStrategy;
+use crate::adapters::ssh::internal::auth::traits::AuthStrategy;
 
 /// Password authentication strategy.
 ///

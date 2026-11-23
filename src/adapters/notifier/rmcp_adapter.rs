@@ -23,7 +23,7 @@ use crate::domain::error::DomainError;
 use crate::domain::inline_payload::InlinePayload;
 use crate::ports::notifier::{NotifierPort, PeerHandle};
 
-use super::rmcp_peer::PeerTable;
+use crate::adapters::notifier::rmcp_peer::PeerTable;
 
 /// MCP notification method ADR 0012 reserves for v7.1 inline-push
 /// delivery. Hosts that signed the matching capability flag at
@@ -66,9 +66,7 @@ impl NotifierPort for RmcpNotifier {
             // an error.
             return Ok(());
         };
-        let params = ResourceUpdatedNotificationParam {
-            uri: uri.to_string(),
-        };
+        let params = ResourceUpdatedNotificationParam::new(uri.to_string());
         rmcp_peer
             .notify_resource_updated(params)
             .await
@@ -306,5 +304,36 @@ mod tests {
         assert_eq!(params["truncated"], true);
         // "hello" -> base64 standard `aGVsbG8=`
         assert_eq!(params["bytes_b64"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn inline_payload_params_known_answers() {
+        use crate::domain::inline_payload::InlinePayload;
+        use crate::domain::subscription::SubId;
+
+        let encode = |bytes: &[u8]| {
+            let payload = InlinePayload::new(
+                SubId::new("0193f04e-3a2b-7c12-8d11-1f1f04ab92e1".to_string()),
+                "shell://abc/output".to_string(),
+                0,
+                bytes.len() as u64,
+                bytes.to_vec(),
+                false,
+            );
+            super::inline_payload_params(&payload)["bytes_b64"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The empty input is the empty string (RFC 4648 section 10).
+        assert_eq!(encode(b""), "");
+
+        // Every byte value, standard alphabet with padding (RFC 4648 section 4).
+        let all: Vec<u8> = (0_u8..=255).collect();
+        assert_eq!(
+            encode(&all),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+        );
     }
 }

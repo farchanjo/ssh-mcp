@@ -1,0 +1,19 @@
+# SSH MCP
+
+> SSH MCP is a Rust Model Context Protocol server for remote shells, commands, SFTP, rsync, TCP forwards, serial devices and push subscriptions.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md): module boundaries and lifecycle design.
+- [API](docs/API.md): tools, arguments and responses.
+- [Resources](docs/RESOURCES.md): subscription URIs, cursors and notifications.
+- [Configuration](docs/CONFIGURATION.md): environment variables and limits.
+- [Development](docs/DEVELOPMENT.md): build, test and contribution workflow.
+- [Operations](docs/OPERATIONS.md): deployment and runtime operations.
+- [Migration](docs/MIGRATION.md): version-specific migration guidance.
+
+## Architecture corpus
+
+- [Validated corpus](doc/arch/functional/functional.md): functional behavior and requirements.
+- [Quality scenarios](doc/arch/quality/quality-scenarios.md): measurable quality scenarios.
+- [Threat model](doc/arch/threat-model/threat-model.md): security boundaries and mitigations.

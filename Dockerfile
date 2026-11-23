@@ -1,7 +1,7 @@
 ####################################
 # STAGE 1: Build the binary
 ####################################
-FROM rust:alpine AS builder
+FROM rust:alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS builder
 
 # Copy the actual source code
 WORKDIR /usr/src/ssh-mcp
@@ -17,7 +17,7 @@ RUN cargo build --release
 ####################################
 # STAGE 2: Create the runtime image
 ####################################
-FROM alpine:latest
+FROM alpine:latest@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 RUN apk update && apk add --no-cache \
     ca-certificates \

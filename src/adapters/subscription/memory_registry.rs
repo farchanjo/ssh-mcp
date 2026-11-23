@@ -39,6 +39,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::{Entry, OccupiedEntry};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior, interval};
@@ -56,7 +57,8 @@ use crate::ports::notifier::{
     DebouncerActivator, LaneNotifierBridge, NotifierPort, PeerHandle, ProducerForwarder,
 };
 use crate::ports::subscriber_registry::{
-    ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort, SubscriberSnapshot,
+    ResourceKind, SubscribeDisposition, SubscriberRegistryAsync, SubscriberRegistryPort,
+    SubscriberSnapshot,
 };
 
 /// Per-`(peer, uri)` cursor state shared with `resources/read`.
@@ -111,6 +113,11 @@ type SubUriKey = (SubId, String);
 /// etc.) emitted at connection cadence, not bulk byte-stream throughput,
 /// so this ceiling is generous without risking unbounded growth.
 const FORWARD_EVENT_TAIL_CAP: usize = 64 * 1024;
+
+/// Query installed by the composition root: `true` when at least one lane is
+/// bound to the URI. A registry without one treats the peer list as the only
+/// consumer kind.
+pub type LanePresence = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// In-process [`SubscriberRegistryPort`] +
 /// [`SubscriberRegistryAsync`] adapter.
@@ -183,6 +190,11 @@ pub struct MemoryRegistry<N> {
     /// dedicated channel-mux drain task. Lock-free swap via
     /// [`ArcSwap`].
     lane_bridge: ArcSwap<Option<Arc<dyn LaneNotifierBridge>>>,
+    /// Optional lane-presence query installed by the composition root.
+    /// Consulted by [`Self::release_if_idle_uri`] and by the pre-spawn
+    /// check so a lane counts as a consumer. `None` on a hand-built
+    /// registry, which then follows the peer list alone.
+    lane_presence: ArcSwap<Option<LanePresence>>,
 }
 
 impl<N> fmt::Debug for MemoryRegistry<N> {
@@ -251,6 +263,7 @@ where
             max_total: total,
             self_ref: Weak::clone(weak),
             lane_bridge: ArcSwap::from_pointee(None),
+            lane_presence: ArcSwap::from_pointee(None),
         })
     }
 
@@ -260,6 +273,75 @@ where
     /// on stdio/HTTP transports.
     pub fn install_lane_bridge(&self, bridge: Arc<dyn LaneNotifierBridge>) {
         self.lane_bridge.store(Arc::new(Some(bridge)));
+    }
+
+    /// Install (or replace) the lane-presence query. Installed by the
+    /// composition root beside [`Self::install_lane_bridge`]; a registry
+    /// without it follows the peer list alone.
+    pub fn install_lane_presence(&self, presence: LanePresence) {
+        self.lane_presence.store(Arc::new(Some(presence)));
+    }
+
+    /// `true` when neither consumer kind is present. `presence` is the query
+    /// the caller loaded once for this decision; without one the peer list is
+    /// the only kind, which keeps the pre-feature behavior.
+    fn consumers_empty(
+        &self,
+        uri: &str,
+        presence: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    ) -> bool {
+        let peers_empty = self
+            .subscribers
+            .get(uri)
+            .is_none_or(|entry| entry.value().is_empty());
+        presence.map_or(peers_empty, |query| peers_empty && !query(uri))
+    }
+
+    /// Stop the debouncer of `uri` when both consumer kinds are empty.
+    ///
+    /// Takes the `debounce_tasks` entry, evaluates the consumers under that
+    /// shard guard, and removes the wakeup maps before the entry so a
+    /// concurrent [`Self::ensure_debouncer`] waits on the same entry and
+    /// rebuilds all of them together. Without a presence query the peer list
+    /// is the only consumer kind, which is the pre-feature behavior.
+    pub fn release_if_idle_uri(&self, uri: &str) {
+        let Some((kind, id)) = parse_uri(uri) else {
+            return;
+        };
+        let key = (kind, id);
+        let entry = self.debounce_tasks.entry(key.clone());
+        if matches!(&entry, Entry::Vacant(_)) {
+            return;
+        }
+        let presence = self.lane_presence.load_full();
+        if !self.consumers_empty(uri, presence.as_deref()) {
+            return;
+        }
+        if let Entry::Occupied(occupied) = entry {
+            Self::remove_debouncer(
+                &self.wakers,
+                &self.flush_now,
+                &self.bytes_since_flush,
+                &key,
+                occupied,
+            );
+        }
+    }
+
+    fn remove_debouncer(
+        wakers: &DashMap<ResourceKey, Arc<Notify>>,
+        flush_now: &DashMap<ResourceKey, Arc<Notify>>,
+        bytes_since_flush: &DashMap<ResourceKey, Arc<AtomicUsize>>,
+        key: &ResourceKey,
+        occupied: OccupiedEntry<'_, ResourceKey, JoinHandle<()>>,
+    ) {
+        // The wakeup maps go first, while the entry guard still holds the
+        // shard: a concurrent `ensure_debouncer` waits on that shard, then
+        // finds the entry vacant and rebuilds all four entries together.
+        wakers.remove(key);
+        flush_now.remove(key);
+        bytes_since_flush.remove(key);
+        occupied.remove().abort();
     }
 
     /// Get-or-create the cursor entry for `(sub_id, uri)`. Phase 2
@@ -369,7 +451,16 @@ where
     )]
     fn ensure_debouncer(&self, kind: ResourceKind, resource_id: &str) {
         let key = (kind, resource_id.to_string());
-        if self.debounce_tasks.contains_key(&key) {
+        let entry = self.debounce_tasks.entry(key.clone());
+        if matches!(&entry, Entry::Occupied(_)) {
+            return;
+        }
+        // Decide before spawning: with a presence query installed, an opener
+        // whose consumer already left must not spawn a task it would abort at
+        // once. Every caller registers its consumer before it calls here.
+        let uri = format_uri(kind, resource_id);
+        let presence = self.lane_presence.load_full();
+        if presence.is_some() && self.consumers_empty(&uri, presence.as_deref()) {
             return;
         }
         let Some(registry) = self.self_ref.upgrade() else {
@@ -390,8 +481,7 @@ where
                 .value(),
         );
         self.wakers.insert(key.clone(), Arc::clone(&waker));
-        self.flush_now.insert(key.clone(), Arc::clone(&flush_now));
-        let uri = format_uri(kind, resource_id);
+        self.flush_now.insert(key, Arc::clone(&flush_now));
         let cfg = DebouncerConfig {
             debounce_ms: resolve_notify_debounce_ms(),
             force_flush_ms: resolve_notify_force_flush_ms(),
@@ -405,17 +495,13 @@ where
             bytes_counter,
             cfg,
         ));
-        self.debounce_tasks.insert(key, task);
+        entry.insert(task);
     }
 
-    fn stop_debouncer(&self, kind: ResourceKind, resource_id: &str) {
-        let key = (kind, resource_id.to_string());
-        if let Some((_, handle)) = self.debounce_tasks.remove(&key) {
-            handle.abort();
-        }
-        self.wakers.remove(&key);
-        self.flush_now.remove(&key);
-        self.bytes_since_flush.remove(&key);
+    #[cfg(test)]
+    pub(crate) fn has_debouncer(&self, kind: ResourceKind, resource_id: &str) -> bool {
+        self.debounce_tasks
+            .contains_key(&(kind, resource_id.to_string()))
     }
 
     /// Sync flavour of `drop_peer` used by `gc_closed_peers` (which is
@@ -461,9 +547,7 @@ where
         });
         if became_empty {
             self.subscribers.remove(uri);
-            if let Some((kind, resource_id)) = parse_uri(uri) {
-                self.stop_debouncer(kind, &resource_id);
-            }
+            self.release_if_idle_uri(uri);
         }
         self.peer_progress
             .remove(&(peer_id.clone(), uri.to_string()));
@@ -493,7 +577,7 @@ where
         peer: Arc<dyn PeerHandle>,
         sub_id: SubId,
     ) -> Result<SubId, DomainError> {
-        let first = self.insert_subscriber(kind, resource_id, uri, peer, sub_id.clone())?;
+        let (first, _) = self.insert_subscriber(kind, resource_id, uri, peer, sub_id.clone())?;
         if first {
             self.ensure_debouncer(kind, resource_id);
         }
@@ -579,7 +663,7 @@ where
         uri: &str,
         peer: Arc<dyn PeerHandle>,
         sub_id: SubId,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<(bool, SubscribeDisposition), DomainError> {
         let peer_id = peer.id();
         self.check_capacity(uri, &peer_id)?;
         let sub = Subscriber {
@@ -590,11 +674,19 @@ where
             resource_id: resource_id.to_string(),
         };
         let mut entry = self.subscribers.entry(uri.to_string()).or_default();
+        // The pair's prior presence is known under the same shard guard
+        // that replaces it; no second lookup and no lock are needed.
+        let existed = entry.iter().any(|s| s.peer_id == peer_id);
         // Replace any prior subscription from the same peer on this URI.
         entry.retain(|s| s.peer_id != peer_id);
         entry.push(sub);
         let first = entry.len() == 1;
         drop(entry);
+        let disposition = if existed {
+            SubscribeDisposition::Refreshed
+        } else {
+            SubscribeDisposition::Created
+        };
 
         // Make sure the (peer, uri) and (sub_id, uri) cursors exist
         // before any read happens. The two paths share `PeerProgress`
@@ -606,7 +698,7 @@ where
         self.sub_progress
             .entry((sub_id, uri.to_string()))
             .or_insert_with(|| Arc::new(PeerProgress::default()));
-        Ok(first)
+        Ok((first, disposition))
     }
 }
 
@@ -816,21 +908,22 @@ where
         resource_id: String,
         uri: String,
         peer: Arc<dyn PeerHandle>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<SubscribeDisposition, DomainError> {
         // v4-compat path: synthesise a fresh UUIDv7 sub_id so the
         // (sub_id, uri) cursor index is populated alongside the v4
         // (peer_id, uri) cursor. Hosts that consume the new
         // `_meta.sub_id` channel get a stable handle; legacy hosts
         // that ignore it observe identical v4 behaviour.
         let sub_id = SubId::new(Uuid::now_v7().to_string());
-        let first = self.insert_subscriber(kind, &resource_id, &uri, peer, sub_id)?;
+        let (first, disposition) =
+            self.insert_subscriber(kind, &resource_id, &uri, peer, sub_id)?;
         if first {
             // First subscriber for this resource — spawn the debouncer.
             // The task itself runs against an `Arc<Self>` upgraded from
             // the cyclic back-reference, so `&self` is enough here.
             self.ensure_debouncer(kind, &resource_id);
         }
-        Ok(())
+        Ok(disposition)
     }
 
     async fn unsubscribe(&self, peer_id: &PeerId, uri: &str) -> bool {
@@ -999,11 +1092,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use super::{MemoryRegistry, format_uri, parse_uri};
+    use crate::adapters::id_generator::uuid::UuidIds;
+    use crate::adapters::subscription::lane_bridge::LaneFanoutBridge;
+    use crate::adapters::subscription::lane_bridge::install_lane_lifetime;
+    use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
     use crate::domain::error::DomainError;
     use crate::domain::ids::PeerId;
-    use crate::ports::notifier::{NotifierPort, PeerHandle};
+    use crate::domain::subscription::{FilterRule, LagPolicy, SubId, SubscriptionLifetime};
+    use crate::ports::notifier::{DebouncerActivator, NotifierPort, PeerHandle};
+    use crate::ports::subscriber_lane::{LaneAdmin, LanePolicy, SubscriberLaneAsync};
     use crate::ports::subscriber_registry::{
         ResourceKind, SubscriberRegistryAsync, SubscriberRegistryPort,
     };
@@ -1782,5 +1882,642 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reg.subscribers_for_uri("shell://x/output"), 1);
+    }
+
+    fn adapter() -> Arc<SubscriberLaneAdapter<UuidIds>> {
+        SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 16, 64)
+    }
+
+    fn policy(peer: Option<Arc<dyn PeerHandle>>) -> LanePolicy {
+        LanePolicy {
+            lag_policy: LagPolicy::Snapshot,
+            lifetime: SubscriptionLifetime::Manual,
+            filter: FilterRule::None,
+            buffer_size: 16,
+            peer,
+        }
+    }
+
+    fn wired() -> (
+        Arc<MemoryRegistry<RecordingNotifier>>,
+        Arc<SubscriberLaneAdapter<UuidIds>>,
+        Arc<RecordingNotifier>,
+    ) {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let reg = MemoryRegistry::new(Arc::clone(&notifier));
+        let lanes = adapter();
+        let bridge = LaneFanoutBridge::new(Arc::clone(&lanes), Arc::clone(&notifier));
+        reg.install_lane_bridge(bridge);
+        install_lane_lifetime(&reg, &lanes, |_| {});
+        (reg, lanes, notifier)
+    }
+
+    async fn wait_events(notifier: &RecordingNotifier, wanted: usize) -> Vec<(PeerId, String)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let seen = notifier.events.lock().unwrap().clone();
+            if seen.len() >= wanted {
+                return seen;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {wanted} event(s); saw {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_without_a_presence_query_keeps_the_task() {
+        let reg = MemoryRegistry::new(Arc::new(RecordingNotifier::default()));
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), "shell://no-query/output");
+        assert!(reg.has_debouncer(ResourceKind::Shell, "no-query"));
+        reg.release_if_idle_uri("shell://no-query/output");
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_unsubscribe_without_a_presence_query_stops_the_task() {
+        let reg = MemoryRegistry::new(Arc::new(RecordingNotifier::default()));
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-no-query");
+        let uri = "shell://no-query-peer/output";
+        reg.subscribe_with_sub_id(
+            ResourceKind::Shell,
+            "no-query-peer",
+            uri,
+            Arc::clone(&peer),
+            SubId::new("legacy".into()),
+        )
+        .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        assert!(SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer.id(), uri).await);
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "no-query-peer"));
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_unsubscribe_keeps_the_debouncer_a_lane_still_needs() {
+        let (reg, lanes, notifier) = wired();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-both");
+        let uri = "shell://sh-d2/output".to_string();
+        let lane_peer: Arc<dyn PeerHandle> = Arc::clone(&peer);
+        lanes
+            .open_lane(
+                uri.clone(),
+                ResourceKind::Shell,
+                "sh-d2".into(),
+                policy(Some(lane_peer)),
+            )
+            .await
+            .unwrap();
+        reg.subscribe_with_sub_id(
+            ResourceKind::Shell,
+            "sh-d2",
+            &uri,
+            Arc::clone(&peer),
+            SubId::new("legacy".into()),
+        )
+        .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), &uri);
+        assert!(SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer.id(), &uri).await);
+        assert_eq!(lanes.list().len(), 1);
+        assert!(reg.has_debouncer(ResourceKind::Shell, "sh-d2"));
+        SubscriberRegistryPort::record_bytes_with_tail(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "sh-d2",
+            b"x",
+        );
+        SubscriberRegistryPort::poke(reg.as_ref(), ResourceKind::Shell, "sh-d2");
+        assert_eq!(wait_events(&notifier, 1).await[0].1, uri);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_lane_close_stops_the_debouncer() {
+        let (reg, lanes, _) = wired();
+        let sub = lanes
+            .open_lane(
+                "shell://sh-last/output".into(),
+                ResourceKind::Shell,
+                "sh-last".into(),
+                policy(None),
+            )
+            .await
+            .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), "shell://sh-last/output");
+        lanes.close_lane(&sub).await.unwrap();
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "sh-last"));
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_after_the_last_consumer_left_spawns_nothing() {
+        let (reg, lanes, _) = wired();
+        let sub = lanes
+            .open_lane(
+                "shell://sh-gone/output".into(),
+                ResourceKind::Shell,
+                "sh-gone".into(),
+                policy(None),
+            )
+            .await
+            .unwrap();
+        // The close runs while the entry is still vacant, so it cannot stop
+        // anything; the ensure that follows must decide before spawning and
+        // leave nothing behind.
+        lanes.close_lane(&sub).await.unwrap();
+        let before = Arc::strong_count(&reg);
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), "shell://sh-gone/output");
+        assert_eq!(
+            Arc::strong_count(&reg),
+            before,
+            "no task may be spawned, so no strong handle is taken"
+        );
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "sh-gone"));
+        assert!(reg.debounce_tasks.is_empty());
+        assert!(reg.wakers.is_empty());
+        assert!(reg.flush_now.is_empty());
+        assert!(reg.bytes_since_flush.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_open_and_close_cycle_leaves_no_task() {
+        let (reg, lanes, _) = wired();
+        for i in 0..8_u8 {
+            let id = format!("g-{i}");
+            let uri = format!("shell://{id}/output");
+            let sub = lanes
+                .open_lane(uri.clone(), ResourceKind::Shell, id, policy(None))
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), &uri);
+            lanes.close_lane(&sub).await.unwrap();
+        }
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_peer_unsubscribe_without_a_lane_stops_the_debouncer() {
+        let (reg, _, _) = wired();
+        let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-only");
+        let uri = "shell://peer-only/output";
+        reg.subscribe_with_sub_id(
+            ResourceKind::Shell,
+            "peer-only",
+            uri,
+            Arc::clone(&peer),
+            SubId::new("legacy".into()),
+        )
+        .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        assert!(SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer.id(), uri).await);
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "peer-only"));
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bytes_written_before_a_debouncer_exists_are_delivered_by_the_next_wakeup() {
+        let (reg, lanes, notifier) = wired();
+        let uri = "shell://pre/output";
+        let threshold = reg.flush_bytes_threshold().max(1);
+        SubscriberRegistryPort::record_bytes_with_tail(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "pre",
+            b"x",
+        );
+        SubscriberRegistryPort::record_bytes_with_tail(
+            reg.as_ref(),
+            ResourceKind::Shell,
+            "pre",
+            &vec![b'y'; threshold],
+        );
+        lanes
+            .open_lane(
+                uri.into(),
+                ResourceKind::Shell,
+                "pre".into(),
+                policy(Some(StubPeer::new("peer-pre"))),
+            )
+            .await
+            .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        SubscriberRegistryPort::poke(reg.as_ref(), ResourceKind::Shell, "pre");
+        assert_eq!(wait_events(&notifier, 1).await[0].1, uri);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forward_tail_survives_without_a_task() {
+        let reg = MemoryRegistry::new(Arc::new(RecordingNotifier::default()));
+        SubscriberRegistryPort::record_bytes_with_tail(
+            reg.as_ref(),
+            ResourceKind::Forward,
+            "f",
+            b"tail-before-task",
+        );
+        let tail = SubscriberRegistryPort::tail_snapshot(reg.as_ref(), ResourceKind::Forward, "f");
+        assert_eq!(&tail[..], b"tail-before-task");
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_is_released_after_the_last_consumer_leaves() {
+        let (reg, lanes, _) = wired();
+        let sub = lanes
+            .open_lane(
+                "shell://released/output".into(),
+                ResourceKind::Shell,
+                "released".into(),
+                policy(None),
+            )
+            .await
+            .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), "shell://released/output");
+        let weak = Arc::downgrade(&reg);
+        drop(reg);
+        lanes.close_lane(&sub).await.unwrap();
+        drop(lanes);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the registry must be released once the last consumer is gone"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_resource_maps_keep_the_sequence_and_tail_after_a_stop() {
+        let (reg, lanes, _) = wired();
+        for i in 0..8_u8 {
+            let id = format!("g-{i}");
+            let uri = format!("shell://{id}/output");
+            let sub = lanes
+                .open_lane(uri.clone(), ResourceKind::Shell, id.clone(), policy(None))
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), &uri);
+            SubscriberRegistryPort::next_seq(reg.as_ref(), ResourceKind::Shell, &id);
+            SubscriberRegistryPort::record_bytes_with_tail(
+                reg.as_ref(),
+                ResourceKind::Forward,
+                &id,
+                b"e",
+            );
+            lanes.close_lane(&sub).await.unwrap();
+        }
+        assert!(reg.debounce_tasks.is_empty());
+        assert!(reg.wakers.is_empty());
+        assert!(reg.flush_now.is_empty());
+        assert_eq!(
+            reg.bytes_since_flush.len(),
+            8,
+            "the forward counter is a different key"
+        );
+        assert_eq!(
+            reg.sequence_counters.len(),
+            8,
+            "sequence counters are not the debouncer's"
+        );
+        assert_eq!(
+            reg.event_tails.len(),
+            8,
+            "event tails are not the debouncer's"
+        );
+    }
+
+    fn assert_live_task(reg: &MemoryRegistry<RecordingNotifier>) {
+        assert!(
+            reg.debounce_tasks
+                .contains_key(&(ResourceKind::Shell, "race".to_string()))
+        );
+        assert_eq!(reg.debounce_tasks.len(), 1);
+        assert!(
+            reg.wakers
+                .contains_key(&(ResourceKind::Shell, "race".to_string()))
+        );
+        assert!(
+            reg.flush_now
+                .contains_key(&(ResourceKind::Shell, "race".to_string()))
+        );
+    }
+
+    /// One wakeup must reach `peer` for the URI. The sample is taken before
+    /// the write: the debouncer can deliver between the write and a later
+    /// sample, and a sample taken afterwards would wait for an event that
+    /// already arrived.
+    async fn assert_one_delivery(
+        reg: &MemoryRegistry<RecordingNotifier>,
+        notifier: &RecordingNotifier,
+        peer: &str,
+    ) {
+        let already = notifier.events.lock().unwrap().len();
+        let flushes = reg.byte_triggered_flushes_total();
+        let payload = vec![b'x'; reg.flush_bytes_threshold().max(1)];
+        SubscriberRegistryPort::record_bytes_with_tail(reg, ResourceKind::Shell, "race", &payload);
+        // A force-flush or keepalive tick also notifies, so wait on both
+        // facts that are asserted: the threshold write woke the debouncer and
+        // an event from the expected peer reached the URI.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let seen = notifier.events.lock().unwrap().clone();
+            let delivered = seen
+                .iter()
+                .skip(already)
+                .any(|(id, uri)| id.as_str() == peer && uri == "shell://race/output");
+            if reg.byte_triggered_flushes_total() > flushes && delivered {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a delivery to {peer}; saw {:?}",
+                &seen[already.min(seen.len())..]
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_racing_stop_never_splits_the_task_from_its_waker() {
+        let (reg, lanes, notifier) = wired();
+        let uri = "shell://race/output";
+        for _ in 0..5_000_u16 {
+            let lane = lanes
+                .open_lane(uri.into(), ResourceKind::Shell, "race".into(), policy(None))
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+            let close_lanes = Arc::clone(&lanes);
+            let close = tokio::spawn(async move {
+                close_lanes.close_lane(&lane).await.unwrap();
+            });
+            let mut ensures = Vec::new();
+            for _ in 0..32 {
+                let ensure_reg = Arc::clone(&reg);
+                ensures.push(tokio::spawn(async move {
+                    DebouncerActivator::ensure_for_uri(ensure_reg.as_ref(), uri);
+                }));
+            }
+            close.await.unwrap();
+            for ensure in ensures {
+                ensure.await.unwrap();
+            }
+            // Every round ends with the lane closed and every task joined,
+            // so the only correct state is no task and no wakeup entry.
+            let task = reg.debounce_tasks.len();
+            let waker = reg.wakers.len();
+            let flush = reg.flush_now.len();
+            assert_eq!(task, 0, "no consumer left, so no task");
+            assert_eq!(waker, 0, "no task, so no waker");
+            assert_eq!(flush, 0, "no task, so no flush entry");
+        }
+        // A live consumer must end with all three entries present.
+        let lane = lanes
+            .open_lane(
+                uri.into(),
+                ResourceKind::Shell,
+                "race".into(),
+                policy(Some(StubPeer::new("peer-race"))),
+            )
+            .await
+            .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        assert_live_task(&reg);
+        assert_one_delivery(&reg, &notifier, "peer-race").await;
+        lanes.close_lane(&lane).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_that_holds_the_entry_makes_the_opener_rebuild_every_map() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let reg = MemoryRegistry::new(Arc::clone(&notifier));
+        let lanes = adapter();
+        let bridge = LaneFanoutBridge::new(Arc::clone(&lanes), Arc::clone(&notifier));
+        reg.install_lane_bridge(bridge);
+        let lane = lanes
+            .open_lane(
+                "shell://race/output".into(),
+                ResourceKind::Shell,
+                "race".into(),
+                policy(Some(StubPeer::new("peer-race"))),
+            )
+            .await
+            .unwrap();
+        reg.ensure_debouncer(ResourceKind::Shell, "race");
+        let (evaluating_tx, evaluating_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_query = Arc::clone(&calls);
+        // First answer: the lane is gone, so the stop removes. Second answer:
+        // the opener is back, so the task the opener spawns stays.
+        reg.install_lane_presence(Arc::new(move |_uri: &str| {
+            if calls_for_query.fetch_add(1, Ordering::SeqCst) == 0 {
+                evaluating_tx.send(()).unwrap();
+                go_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                return false;
+            }
+            true
+        }));
+        let stop_reg = Arc::clone(&reg);
+        let stopper =
+            std::thread::spawn(move || stop_reg.release_if_idle_uri("shell://race/output"));
+        // The stop now holds the entry shard and waits in the query.
+        evaluating_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let ensure_reg = Arc::clone(&reg);
+        let (opener_started_tx, opener_started_rx) = std::sync::mpsc::channel();
+        let opener = tokio::spawn(async move {
+            opener_started_tx.send(()).unwrap();
+            DebouncerActivator::ensure_for_uri(ensure_reg.as_ref(), "shell://race/output");
+        });
+        // Let the opener task run and park on the entry shard the stop holds,
+        // then release the stop: a stop that took the shard before evaluating
+        // now removes the entries, and the opener rebuilds them.
+        opener_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        go_tx.send(()).unwrap();
+        stopper.join().unwrap();
+        opener.await.unwrap();
+        // Whatever the stop removed, the opener rebuilt: the four entries
+        // must be present together.
+        assert_live_task(&reg);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_one_delivery(&reg, &notifier, "peer-race").await;
+        lanes.close_lane(&lane).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ensure_spawns_one_task() {
+        let (reg, lanes, _) = wired();
+        let uri = "shell://race/output".to_string();
+        let sub = lanes
+            .open_lane(
+                uri.clone(),
+                ResourceKind::Shell,
+                "race".into(),
+                policy(None),
+            )
+            .await
+            .unwrap();
+        let before = Arc::strong_count(&reg);
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let reg = Arc::clone(&reg);
+            let barrier = Arc::clone(&barrier);
+            let uri = uri.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                DebouncerActivator::ensure_for_uri(reg.as_ref(), &uri);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(Arc::strong_count(&reg) - before, 1);
+        assert_live_task(&reg);
+        lanes.close_lane(&sub).await.unwrap();
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    async fn one_round(
+        reg: &Arc<MemoryRegistry<RecordingNotifier>>,
+        lanes: &Arc<SubscriberLaneAdapter<UuidIds>>,
+        notifier: &RecordingNotifier,
+    ) {
+        let uri = "shell://race/output";
+        let l1 = lanes
+            .open_lane(
+                uri.into(),
+                ResourceKind::Shell,
+                "race".into(),
+                policy(Some(StubPeer::new("peer-race"))),
+            )
+            .await
+            .unwrap();
+        DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        let stop_lanes = Arc::clone(lanes);
+        let stopper = tokio::spawn(async move {
+            stop_lanes.close_lane(&l1).await.unwrap();
+        });
+        let open_reg = Arc::clone(reg);
+        let open_lanes = Arc::clone(lanes);
+        let opener = tokio::spawn(async move {
+            let l2 = open_lanes
+                .open_lane(
+                    uri.into(),
+                    ResourceKind::Shell,
+                    "race".into(),
+                    policy(Some(StubPeer::new("peer-race-2"))),
+                )
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(open_reg.as_ref(), uri);
+            l2
+        });
+        stopper.await.unwrap();
+        let l2 = opener.await.unwrap();
+        assert_live_task(reg);
+        assert_one_delivery(reg, notifier, "peer-race-2").await;
+        lanes.close_lane(&l2).await.unwrap();
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_racing_last_lane_close_keeps_one_debouncer() {
+        let (reg, lanes, notifier) = wired();
+        for _ in 0..200_u16 {
+            one_round(&reg, &lanes, &notifier).await;
+        }
+        assert!(reg.debounce_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_subscribe_racing_last_lane_close_keeps_one_debouncer() {
+        let (reg, lanes, notifier) = wired();
+        let uri = "shell://race/output";
+        for _round in 0..200_u16 {
+            let sub = lanes
+                .open_lane(uri.into(), ResourceKind::Shell, "race".into(), policy(None))
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+            let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-sub-race");
+            let reg_s = Arc::clone(&reg);
+            let peer_s = Arc::clone(&peer);
+            let subscriber = tokio::spawn(async move {
+                SubscriberRegistryAsync::subscribe(
+                    reg_s.as_ref(),
+                    ResourceKind::Shell,
+                    "race".into(),
+                    uri.into(),
+                    peer_s,
+                )
+                .await
+                .unwrap();
+            });
+            let lanes_c = Arc::clone(&lanes);
+            let sub_c = sub.clone();
+            let closer = tokio::spawn(async move {
+                lanes_c.close_lane(&sub_c).await.unwrap();
+            });
+            subscriber.await.unwrap();
+            closer.await.unwrap();
+            assert_live_task(&reg);
+            assert_one_delivery(&reg, &notifier, "peer-sub-race").await;
+            assert!(SubscriberRegistryAsync::unsubscribe(reg.as_ref(), &peer.id(), uri).await);
+            assert!(reg.debounce_tasks.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_unsubscribe_racing_sub_open_keeps_one_debouncer() {
+        let (reg, lanes, notifier) = wired();
+        let uri = "shell://race/output";
+        for _ in 0..200_u16 {
+            let peer: Arc<dyn PeerHandle> = StubPeer::new("peer-race");
+            reg.subscribe_with_sub_id(
+                ResourceKind::Shell,
+                "race",
+                uri,
+                Arc::clone(&peer),
+                SubId::new("legacy".into()),
+            )
+            .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+            let reg_u = Arc::clone(&reg);
+            let peer_u = Arc::clone(&peer);
+            let unsubscriber = tokio::spawn(async move {
+                SubscriberRegistryAsync::unsubscribe(reg_u.as_ref(), &peer_u.id(), uri).await;
+            });
+            let open_reg = Arc::clone(&reg);
+            let open_lanes = Arc::clone(&lanes);
+            let opener = tokio::spawn(async move {
+                let lane = open_lanes
+                    .open_lane(
+                        uri.into(),
+                        ResourceKind::Shell,
+                        "race".into(),
+                        policy(Some(StubPeer::new("peer-lane"))),
+                    )
+                    .await
+                    .unwrap();
+                DebouncerActivator::ensure_for_uri(open_reg.as_ref(), uri);
+                lane
+            });
+            unsubscriber.await.unwrap();
+            let lane = opener.await.unwrap();
+            assert_live_task(&reg);
+            assert_one_delivery(&reg, &notifier, "peer-lane").await;
+            lanes.close_lane(&lane).await.unwrap();
+            assert!(reg.debounce_tasks.is_empty());
+        }
     }
 }

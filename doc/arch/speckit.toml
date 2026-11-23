@@ -1,0 +1,6 @@
+[compliance]
+enabled = true
+
+# Use the repository's actual integration branch.
+[workflow]
+integrationBranch = "master"

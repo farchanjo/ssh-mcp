@@ -660,7 +660,7 @@ class TestSshSubscribeAdversarial:
     def test_subscribe_invalid_filter_regex(self, adv_client: McpClient) -> None:
         """Malformed regex compiled at subscribe time -> ``INVALID_ARGUMENT``."""
         rsp = call(adv_client, "sub_open",
-                   {"uri": "shell://x/output", "filter": "["})
+                   {"uri": "forward://x/events", "filter": "["})
         assert rsp.status == "ERROR"
         assert rsp.reason_code == "INVALID_ARGUMENT"
 
@@ -730,7 +730,7 @@ class TestSshSubscribeAdversarial:
             "SSH_MAX_SUBS_PER_URI": "2",
             "SSH_MAX_SUBS_TOTAL": "32",
         }) as client:
-            uri = "shell://overflow-test/output"
+            uri = "forward://overflow-test/events"
             ok = []
             for _i in range(2):
                 ok.append(subscribe_uri(client, uri))
@@ -752,7 +752,7 @@ class TestSshSubscribeAdversarial:
             def worker(idx: int) -> None:
                 try:
                     sub_id = subscribe_uri(
-                        client, f"shell://burst-{idx}/output"
+                        client, f"forward://burst-{idx}/events"
                     )
                     call(client, "sub_close", {"sub_id": sub_id})
                 except Exception as exc:
@@ -782,12 +782,12 @@ class TestSshSubscribeAdversarial:
         self, adv_client: McpClient
     ) -> None:
         """A successful subscribe always carries the ``HINT: REQUIRED NEXT STEP`` line."""
-        sub_id = subscribe_uri(adv_client, "shell://hint-test/output")
+        sub_id = subscribe_uri(adv_client, "forward://hint-test/events")
         try:
             # Body parse already happened; re-fetch via raw response is overkill.
             # Subscribe with the same client and inspect raw text.
             rsp_text = call_tool_text(
-                adv_client, "sub_open", {"uri": "shell://hint-test-2/output"}
+                adv_client, "sub_open", {"uri": "forward://hint-test-2/events"}
             )
             assert "HINT: REQUIRED NEXT STEP" in rsp_text
         finally:
@@ -964,7 +964,7 @@ class TestDaemonStatsAdversarial:
         """Subscribe / unsubscribe burst then list — list reflects current state without corruption."""
         sub_ids: list[str] = []
         for i in range(10):
-            sub_ids.append(subscribe_uri(adv_client, f"shell://churn-{i}/output"))
+            sub_ids.append(subscribe_uri(adv_client, f"forward://churn-{i}/events"))
         # Unsubscribe half before listing.
         for sub_id in sub_ids[:5]:
             call(adv_client, "sub_close", {"sub_id": sub_id})

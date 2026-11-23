@@ -358,6 +358,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::adapters::clock::system::SystemClock;
+    use crate::adapters::id_generator::uuid::UuidIds;
+    use crate::adapters::lifecycle::cascade::CascadeCoordinator;
+    use crate::adapters::lifecycle::refcount::RefcountedLifecycleAdapter;
+    use crate::adapters::subscription::fake::StubNotifier;
+    use crate::adapters::subscription::lane_bridge::install_lane_lifetime;
+    use crate::adapters::subscription::memory_registry::MemoryRegistry;
+    use crate::adapters::subscription::subscriber_lane::SubscriberLaneAdapter;
+    use crate::ports::lifecycle_policy::LifecyclePolicyPort;
+    use crate::ports::notifier::DebouncerActivator;
+    use crate::ports::subscriber_lane::{
+        LaneAdmin, LanePolicy, SubscriberLaneAsync, SubscriberLanePort,
+    };
+    use crate::ports::subscriber_registry::ResourceKind;
+
     type UseCaseUnderTest = DisconnectAgentUseCase<
         FakeSshClient,
         DashMapSessionRepo,
@@ -830,5 +845,42 @@ mod tests {
         let agent = AgentId::new("host-instance-7".to_string());
         let outcome = h.uc.execute(req(&agent)).await.expect("execute");
         assert_eq!(outcome.agent_id, agent);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cascade_stops_child_debouncers_and_spares_the_health_one() {
+        let h = build_harness();
+        let agent = AgentId::new("host-instance-r".to_string());
+        seed_session(&h.sessions, "sess-ar", Some(&agent)).await;
+        seed_shell(&h.shells, "sh-ar", "sess-ar").await;
+        let notifier = Arc::new(StubNotifier);
+        let reg = MemoryRegistry::new(notifier);
+        let lanes = SubscriberLaneAdapter::new(Arc::new(UuidIds), 16, 16, 64);
+        install_lane_lifetime(&reg, &lanes, |_| {});
+        for (uri, kind, id) in [
+            ("shell://sh-ar/output", ResourceKind::Shell, "sh-ar"),
+            ("session://sess-ar/health", ResourceKind::Session, "sess-ar"),
+        ] {
+            lanes
+                .open_lane(uri.to_string(), kind, id.to_string(), LanePolicy::default())
+                .await
+                .unwrap();
+            DebouncerActivator::ensure_for_uri(reg.as_ref(), uri);
+        }
+        let lifecycle: Arc<dyn LifecyclePolicyPort> =
+            RefcountedLifecycleAdapter::new(CascadeCoordinator::new(), Arc::new(SystemClock));
+        let uc = DisconnectAgentUseCase::with_lifecycle(
+            Arc::clone(&h.ssh),
+            Arc::clone(&h.sessions),
+            Arc::clone(&h.commands),
+            Arc::clone(&h.shells),
+            Arc::clone(&h.transfers),
+            lifecycle,
+            Arc::clone(&lanes) as Arc<dyn LaneAdmin>,
+        );
+        uc.execute(req(&agent)).await.unwrap();
+        assert!(!reg.has_debouncer(ResourceKind::Shell, "sh-ar"));
+        assert!(reg.has_debouncer(ResourceKind::Session, "sess-ar"));
+        assert_eq!(lanes.list_subs().len(), 1);
     }
 }
