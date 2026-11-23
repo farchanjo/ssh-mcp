@@ -172,13 +172,28 @@ jobs:
   release:
     name: Release (${{ matrix.os }})
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: [self-hosted, "${{ matrix.os }}"]
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        os: [Linux, Windows, macOS]
+        include:
+          - os: Linux
+            runner: Linux
+            suffix: Linux-X64
+            raw: "true"
+          - os: Windows
+            runner: Windows
+            suffix: Windows-X64
+            ext: .exe
+          - os: macOS
+            runner: macOS
+            suffix: macOS-ARM64
+          - os: macOS Intel
+            runner: macOS
+            suffix: macOS-X64
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -197,7 +212,16 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build release
-        run: cargo build --release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            rustup target add "${{ matrix.target }}"
+            cargo build --release --target "${{ matrix.target }}"
+            echo "BINDIR=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+          else
+            cargo build --release
+            echo "BINDIR=target/release" >> "$GITHUB_ENV"
+          fi
 
       - name: Ensure cargo-nextest
         shell: bash
@@ -209,31 +233,73 @@ jobs:
           fi
 
       - name: Smoke (lib tests)
+        if: matrix.target == ''
         run: cargo nextest run --lib
 
       - name: Stage and package
         shell: bash
         run: |
-          EXT=""
-          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          EXT="${{ matrix.ext }}"
           mkdir -p dist
           for b in ssh-mcp ssh-mcp-stdio ssh-mcp-tail; do
-            cp "target/release/$b$EXT" dist/
+            cp "$BINDIR/$b$EXT" dist/
           done
           ( cd dist && sha256sum * > SHA256SUMS.txt )
-          ARCHIVE="ssh-mcp-${GITHUB_REF_NAME}-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+          ARCHIVE="ssh-mcp-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz"
           tar czf "$ARCHIVE" -C dist .
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Select upload files
+        shell: bash
+        run: |
+          FILES="$ARCHIVE"
+          if [ "${{ matrix.raw }}" = "true" ]; then
+            FILES="$FILES dist/ssh-mcp*"
+          fi
+          if [ -n "${{ matrix.ext }}" ]; then
+            FILES="$FILES dist/*.exe"
+          fi
+          { echo "UPLOAD_FILES<<EOF"; echo "$FILES"; echo "EOF"; } >> "$GITHUB_ENV"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            ${{ env.ARCHIVE }}
-            dist/SHA256SUMS.txt
-            dist/ssh-mcp*
+          files: ${{ env.UPLOAD_FILES }}
 
       - name: Cleanup target dir
         if: success()
         shell: bash
         run: rm -rf "$GITHUB_WORKSPACE/target"
+
+  # ---------------------------------------------------------------------
+  # Manifest: runs after every release job and publishes one checksum
+  # file covering all assets of the tag.
+  # ---------------------------------------------------------------------
+  manifest:
+    name: Checksum manifest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release
+    runs-on: [self-hosted, Linux]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" --dir assets --pattern '*' --clobber
+          rm -f assets/SHA256SUMS.txt
+
+      - name: Rebuild manifest
+        shell: bash
+        working-directory: assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Upload manifest
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: assets/SHA256SUMS.txt
