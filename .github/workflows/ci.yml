@@ -285,19 +285,46 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Download release assets
+      - name: Build manifest from asset digests
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p assets
-          gh release download "$GITHUB_REF_NAME" --dir assets --pattern '*' --clobber
-          rm -f assets/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
 
-      - name: Rebuild manifest
-        shell: bash
-        working-directory: assets
-        run: sha256sum * > SHA256SUMS.txt
+          tag = os.environ["GITHUB_REF_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+              },
+          )
+          with urllib.request.urlopen(request) as response:
+              release = json.load(response)
+
+          lines = []
+          for asset in release["assets"]:
+              if asset["name"] == "SHA256SUMS.txt":
+                  continue
+              digest = asset.get("digest") or ""
+              if not digest.startswith("sha256:"):
+                  raise SystemExit(f"missing sha256 digest for {asset['name']}")
+              lines.append(f"{digest.split(':', 1)[1]}  {asset['name']}")
+
+          if not lines:
+              raise SystemExit("release has no assets")
+          with open("assets/SHA256SUMS.txt", "w", encoding="utf-8") as handle:
+              handle.write("\n".join(sorted(lines)) + "\n")
+          print(f"{len(lines)} assets written to assets/SHA256SUMS.txt")
+          PY
 
       - name: Upload manifest
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
