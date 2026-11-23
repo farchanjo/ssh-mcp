@@ -1,8 +1,8 @@
-# Session resume — ssh-mcp v7.1.3 session-limit patch + dev-loop hardening
+# Session resume — ssh-mcp v7.1.4 release preparation
 
-**Last touched:** 2026-11-21
+**Last touched:** 2026-11-22
 **Repo:** `/root/dev/ssh-mcp`
-**Branch:** `chore/speckit-bootstrap` (stacked on `master` at `aac7fc4`; the bootstrap series is uncommitted until the owner runs it)
+**Branch:** `master` (in sync with `origin/master` at `fe8ca65`)
 **Latest tag:** `v7.1.3`
 
 ## Session 2026-11-21: speckit adoption and update plan
@@ -559,14 +559,17 @@ dev-only loop; CHANGELOG `[Unreleased]` entry added.
    session (owner-authorised).
 3. Optional carry-over: `clap` `--version` / `--help` on `ssh-mcp` and
    `ssh-mcp-stdio` so deploy validation has a clean `exit 0` path.
+4. Cut `v7.1.4`: the version bump, release notes and generated catalogues are
+   prepared; the two release builds, the install, the tag and the push follow
+   the owner's release path.
 
 ## Ground truth (for any agent dispatched next session)
 
 | key | value | source |
 |---|---|---|
-| version | 7.1.3 | Cargo.toml |
-| lib_tests_passed | 2114 | `cargo nextest run --lib` |
-| integration_tests | 167 across 12 binaries | tests/ |
+| version | 7.1.4 | Cargo.toml |
+| lib_tests_passed | 2174 | `cargo nextest run --lib` |
+| total_tests_passed | 2349 across 24 binaries (175 beyond lib) | `cargo nextest run --tests --features test-fixtures` |
 | loom_invariants | 32 across 3 files | tests/lockfree_invariants*.rs |
 | rsync_proto_advertised | 32 (downgrades to 31 via min(local, remote)) | src/adapters/rsync/wire/session.rs |
 | error_codes_total | 56 | ADR 0007 + 0010 + 0011 |

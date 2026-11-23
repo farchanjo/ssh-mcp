@@ -37,7 +37,7 @@ flowchart LR
 | [v5 → v6](#v5--v6) | MCP host operators / contributors / downstream automations | Tool name eixos (`ssh_*` / `sub_*` / `serial_*`); wire-breaking on tool name strings only |
 | [v6.0 → v6.1](#v60--v61) | MCP host operators | SFTP resume + verify on `ssh_upload` / `ssh_download`; 2 new error codes (`RESUME_OVERSHOOT`, `RESUME_MISMATCH`); wire-additive |
 | [v6.1 → v7.0](#v61--v70) | MCP host operators | Rsync hybrid transport (`ssh_rsync` / `ssh_rsync_cancel` / `ssh_rsync_stats`), `rsync://` push lane, `transport=Auto\|Wire\|Sftp`; 6 new error codes; v7.0.0-alpha.2 retracted the deployed-agent path; wire-additive |
-| [v7.1.3 → unreleased](#v713--unreleased-dependency-security-update) | MCP host operators | `russh` 0.65 / `russh-sftp` 4 requirement (six advisories closed), host-certificate rejection, `RESOURCE_SHORTAGE` channel-open retry, four direct dependencies on their current lines; wire-unchanged |
+| [v7.1.3 → v7.1.4](#v713--v714-dependency-security-update) | MCP host operators | `russh` 0.65 / `russh-sftp` 4 requirement (six advisories closed), host-certificate rejection, `RESOURCE_SHORTAGE` channel-open retry, four direct dependencies on their current lines; wire-unchanged |
 
 The 11 ADRs at [adr/](./adr/) are the canonical source for every design decision. Read in order: [0001 rmcp](./adr/0001-migrate-to-rmcp.md), [0002 hexagonal](./adr/0002-adopt-hexagonal-architecture.md), [0003 lifecycle](./adr/0003-lifecycle-binding.md), [0004 mux+sub_id](./adr/0004-channel-mux-fairness.md), [0005 LLM UX](./adr/0005-llm-ux-priorities.md), [0006 backpressure](./adr/0006-backpressure-policies.md), [0007 errors](./adr/0007-error-taxonomy.md), [0008 daemon](./adr/0008-ndjson-daemon-protocol.md), [0009 serial](./adr/0009-serial-transport.md), [0010 SFTP resume](./adr/0010-sftp-resume.md), [0011 rsync hybrid transport](./adr/0011-rsync-hybrid-transport.md).
 
@@ -877,7 +877,7 @@ Operational follow-on:
 - [RESOURCES.md](./RESOURCES.md) — resource scheme contract.
 - [CONFIGURATION.md](./CONFIGURATION.md) — full env var table.
 
-## v7.1.3 → unreleased (dependency security update)
+## v7.1.3 → v7.1.4 (dependency security update)
 
 **A missing id is refused before any lane.** `sub_open` checks the four repository-backed kinds and returns the per-kind `*_NOT_FOUND`; a refused call opens no lane. `forward`, `serial` and `rsync` stay permissive. The wire is otherwise unchanged.
 

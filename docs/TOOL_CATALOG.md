@@ -2,7 +2,7 @@
 
 Exported from a live `tools/list` handshake by `scripts/export_tool_catalog.py`. Regenerate with `make tools-export`.
 
-- Server: `ssh-mcp` 7.1.3
+- Server: `ssh-mcp` 7.1.4
 - Tools: 39
 - Parameter descriptions: 141
 

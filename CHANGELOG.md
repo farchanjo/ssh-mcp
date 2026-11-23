@@ -5,7 +5,15 @@ All notable changes to ssh-mcp are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [7.1.4] — 2026-11-22
+
+Patch release. Dependency security updates on the SSH and MCP transports, a
+subscription-lifetime correction, per-kind resource refusals on `sub_open`, and
+the repository validation gate brought back to green.
+**Fully backwards compatible with `[7.1.3]`** — no tool string, env-var
+default, response envelope, or structured-content key changed. The
+`[Cargo.toml]` package version is bumped from `7.1.3` to `7.1.4`;
+`[Cargo.lock]` is refreshed in lockstep.
 
 ### Security
 
@@ -18,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`sub_open` refuses a missing repository-backed resource.** A `shell`, `command`, `transfer` or `session` id that no repository holds now returns the per-kind `SHELL_NOT_FOUND` / `COMMAND_NOT_FOUND` / `TRANSFER_NOT_FOUND` / `SESSION_NOT_FOUND` before any lane is opened, so a refused call takes no lane slot, leaves no stats row and starts no debouncer. `forward`, `serial` and `rsync` stay permissive. The wire is otherwise unchanged (`src/application/subscription_admin.rs`, `src/application/resource_guard.rs`).
 - **`resources/subscribe` no longer opens a lane.** The subscription is peer-keyed: one registry entry, no `SubId`, no lane slot, and `resources/unsubscribe` removes it. `sub_list`, `sub_stats` and `sub_stats_all` show no row for it, and a subscribe/unsubscribe loop no longer exhausts `SSH_MAX_SUBS_PER_URI`. A repeated subscribe of the same `(peer, URI)` counts once in the lifecycle refcount, and a failed subscribe leaves no entry behind (`src/application/subscribe_resource.rs`, `src/application/unsubscribe_resource.rs`, `src/ports/subscriber_registry.rs`).
 - **The MCP SDK moved to `rmcp` 3.11** (`Cargo.toml:74`), one `cargo update -p rmcp` resolving the set. The server keeps the `initialize` handshake, advertises protocol revision `2025-11-25` as its ceiling and serves every known revision up to it. A `2026-07-28` client and a client that asks for an unknown revision are answered `2025-11-25`; that answer is the only `initialize` difference, and a client that skips `initialize` is refused with `-32022` and the supported list.
-- **The SSH client library moved to `russh` 0.65 and `russh-sftp` 4** (`Cargo.toml:96-97`), one `cargo update -p russh -p russh-sftp` resolving the set; `Cargo.lock` is untracked and re-resolves with it. The published MCP surface is untouched: the tool catalogue, the argument descriptors and the response envelope are byte-identical.
+- **The SSH client library moved to `russh` 0.65 and `russh-sftp` 4** (`Cargo.toml:96-97`), one `cargo update -p russh -p russh-sftp` resolving the set; the committed `Cargo.lock` re-resolves with it. The published MCP surface is untouched: the tool catalogue, the argument descriptors and the response envelope are byte-identical.
 - **Four direct dependencies moved to their current lines: `base64` 0.23, `sha2` 0.11, `md-5` 0.11 and `tower-http` 0.7** (`Cargo.toml:110`, `:129`, `:131`, `:89`). Ten packages leave the lock, including the duplicate `base64 0.22.1` and `sha2 0.10.9` copies and the whole `digest` 0.10 chain. The wire is unchanged, pinned by known-answer tests for the base64 `bytes_b64` text, the resume-prefix sha256 and the rsync MD5 trailer. The trace layer logs at DEBUG, so nothing of it is visible under the default `info` filter; a response with a fixed `content-length` gains one `on_eos` line on `tower-http` 0.7.1.
 - **The client offers no host-certificate algorithm, and a server that presents a host certificate anyway is rejected.** The offered list is set empty explicitly in the client's own builder instead of inherited from the library default; `check_server_key` returns a rejection and logs one `warn` line carrying the host and the port. The key inside a certificate is not checked against `known_hosts` and no record is written for it. A plain host key keeps its three outcomes unchanged (`src/adapters/ssh/internal/session.rs`, `src/adapters/ssh/internal/client.rs`).
+- **The repository passes its own validation gate.** First-party imports use full `crate::` paths, the GitHub Actions and Docker images are pinned by digest, `.gitlab-ci.yml` runs the format, clippy and lib-test gate, and the `llms.txt` and `implement-lead` agent roster artifacts are present (`.github/workflows/ci.yml`, `Dockerfile`, `.gitlab-ci.yml`, `llms.txt`, `doc/arch/agents/implement-lead.md`).
 
 ### Fixed
 
